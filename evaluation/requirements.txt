@@ -1,0 +1,10 @@
+jinja2>=3.1
+markupsafe>=3.0
+openai>=2.0
+plotly>=5.18
+pytest>=9.0
+python-dotenv>=1.0
+tqdm>=4.66
+
+# LoCoMo mem0 backend (optional, only needed for mem0 comparisons)
+# mem0ai>=2.0  # uncomment if running the mem0 backend

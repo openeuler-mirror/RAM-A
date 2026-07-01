@@ -1,0 +1,81 @@
+[
+  {
+    "sample_id": "locomo-sample-1",
+    "conversation": {
+      "speaker_a": "Alex",
+      "speaker_b": "Jamie",
+      "session_1_date_time": "9:00 am on 1 June, 2026",
+      "session_1": [
+        {
+          "speaker": "Alex",
+          "dia_id": "D1:0",
+          "text": "I left my blue notebook on the kitchen table before leaving for work."
+        },
+        {
+          "speaker": "Jamie",
+          "dia_id": "D1:1",
+          "text": "I saw it there next to the coffee mug."
+        }
+      ],
+      "session_2_date_time": "7:30 pm on 2 June, 2026",
+      "session_2": [
+        {
+          "speaker": "Alex",
+          "dia_id": "D2:0",
+          "text": "Tomorrow morning I am meeting Priya at the library to plan the community workshop."
+        },
+        {
+          "speaker": "Jamie",
+          "dia_id": "D2:1",
+          "text": "Good idea. You said the workshop is about practical budgeting."
+        }
+      ]
+    },
+    "qa": [
+      {
+        "question": "Where did Alex leave the blue notebook?",
+        "answer": "On the kitchen table.",
+        "evidence": ["D1:0"],
+        "category": 1
+      },
+      {
+        "question": "Who is Alex meeting at the library?",
+        "answer": "Priya.",
+        "evidence": ["D2:0"],
+        "category": 2
+      },
+      {
+        "question": "What train did Alex book for Friday?",
+        "answer": "Not enough information.",
+        "evidence": [],
+        "category": 5
+      }
+    ],
+    "event_summary": {
+      "events_session_1": {
+        "Alex": ["Alex left a blue notebook on the kitchen table."],
+        "Jamie": ["Jamie saw the notebook next to the coffee mug."],
+        "date": "1 June, 2026"
+      },
+      "events_session_2": {
+        "Alex": ["Alex planned to meet Priya at the library."],
+        "Jamie": ["Jamie remembered the workshop topic was practical budgeting."],
+        "date": "2 June, 2026"
+      }
+    },
+    "observation": {
+      "session_1_observation": {
+        "Alex": [["Alex left a blue notebook on the kitchen table.", "D1:0"]],
+        "Jamie": [["Jamie saw the notebook beside a coffee mug.", "D1:1"]]
+      },
+      "session_2_observation": {
+        "Alex": [["Alex is meeting Priya at the library.", "D2:0"]],
+        "Jamie": [["The workshop topic is practical budgeting.", "D2:1"]]
+      }
+    },
+    "session_summary": {
+      "summary_session_1": "Alex left a blue notebook on the kitchen table and Jamie saw it.",
+      "summary_session_2": "Alex planned to meet Priya at the library about a budgeting workshop."
+    }
+  }
+]

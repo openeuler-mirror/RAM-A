@@ -1,0 +1,20 @@
+{
+  "conversation": [
+    {
+      "speaker": "alice",
+      "text": "部署前必须检查 health endpoint。"
+    },
+    {
+      "speaker": "bob",
+      "text": "Alice 喜欢简洁的状态更新。"
+    }
+  ],
+  "questions": [
+    {
+      "question": "部署前需要检查什么？"
+    },
+    {
+      "question": "Alice 喜欢什么样的更新？"
+    }
+  ]
+}
