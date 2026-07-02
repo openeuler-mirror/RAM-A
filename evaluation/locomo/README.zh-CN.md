@@ -20,7 +20,10 @@ cargo build
 # pip install "mem0ai>=2.0"
 
 # 默认 smoke fixture 为 evaluation/fixtures/locomo_sample.json
-# 完整 benchmark 文件位于 data/locomo/locomo10.json
+# 完整 benchmark 是本地下载文件，不提交到仓库：
+mkdir -p data/locomo
+curl -L https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json \
+  -o data/locomo/locomo10.json
 ```
 
 ## 环境变量
@@ -78,6 +81,9 @@ cd evaluation
 
 # RAM-A 后端
 ./run_locomo_eval.sh memory_bench
+
+# 下载 data/locomo/locomo10.json 后运行完整 LoCoMo
+DATASET=../data/locomo/locomo10.json ./run_locomo_eval.sh memory_bench
 
 # mem0 后端
 ./run_locomo_eval.sh mem0
@@ -157,4 +163,5 @@ ram-a/  （或 mem0/）
 ## 参考文献
 
 - [LoCoMo GitHub](https://github.com/snap-research/locomo)
+- [LoCoMo locomo10.json](https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json)
 - 论文：*Evaluating Very Long-Term Conversational Memory of LLM Agents* (ACL 2024)

@@ -20,7 +20,10 @@ cargo build
 # pip install "mem0ai>=2.0"
 
 # The default smoke fixture is evaluation/fixtures/locomo_sample.json
-# The full benchmark file lives at data/locomo/locomo10.json
+# The full benchmark is a local download, not a checked-in file:
+mkdir -p data/locomo
+curl -L https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json \
+  -o data/locomo/locomo10.json
 ```
 
 ## Environment Variables
@@ -78,6 +81,9 @@ cd evaluation
 
 # RAM-A backend
 ./run_locomo_eval.sh memory_bench
+
+# Full LoCoMo benchmark after downloading data/locomo/locomo10.json
+DATASET=../data/locomo/locomo10.json ./run_locomo_eval.sh memory_bench
 
 # mem0 backend
 ./run_locomo_eval.sh mem0
@@ -157,4 +163,5 @@ ram-a/  (or mem0/)
 ## Reference
 
 - [LoCoMo GitHub](https://github.com/snap-research/locomo)
+- [LoCoMo locomo10.json](https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json)
 - Paper: *Evaluating Very Long-Term Conversational Memory of LLM Agents* (ACL 2024)

@@ -40,7 +40,6 @@ RAM-A/
   data/
     locomo/
       README.md
-      locomo10.json
 
   evaluation/
     README.md
@@ -76,7 +75,7 @@ RAM-A/
 - 顶层 README 已改为正式 `RAM-A` 表述，不再保留 `xiaoO` 抽离叙事。
 - 文档已按 `docs/benchmarks/`、`docs/design/`、`docs/guides/` 分层。
 - `evaluation/fixtures/` 只保留轻量 smoke 数据：通用 sample、PersonaMem sample、合成 LoCoMo sample。
-- 完整 LoCoMo benchmark 文件保留在 `data/locomo/locomo10.json`，不再放在 fixtures。
+- 完整 benchmark 数据不进入主仓；LoCoMo、LongMemEval、PersonaMem 的来源链接和本地放置路径写在 README 中。
 - `evaluation/baselines/` 已加入 Git-friendly 的结果索引模板，用于后续记录跑分摘要。
 - `memory-euler` 原仓保持为对照仓，当前没有 tracked 改动。
 
@@ -97,7 +96,7 @@ RAM-A/
 - 未发现公司内部、保密、机密、客户数据、企微、飞书等内部信息字样。
 - 未发现设计文档中有“借鉴、复刻、照搬、竞品、市面上某记忆软件”等风险表达。
 - `mem0`、`memos`、`MemTensor` 的出现属于评测对照、可选后端或公开 baseline 来源归因，不是设计借鉴表述。
-- LoCoMo 完整数据中存在上游图片 URL 的 `token=` query 参数，以及一处图片文件名片段命中 `sk-` 形状；均来自 upstream benchmark 数据，不是 RAM-A 仓库密钥。
+- LoCoMo 完整数据不再提交到主仓，因此上游图片 URL query token 这类数据集内容不会进入正式提交。
 - 已清理 guide 验证记录中的本机绝对路径，改为仓库相对命令和 `<repo>` 占位。
 
 ### 1.5 未进入首批导入
@@ -121,14 +120,14 @@ RAM-A/
 
 | ID | 裁决 | 当前处理 | 建议同事重点看 |
 | --- | --- | --- | --- |
-| D1 | 完整 LoCoMo `locomo10.json` 放在 `data/locomo/`，不放在 `evaluation/fixtures/`。 | `evaluation/fixtures/` 只保留合成 `locomo_sample.json`；完整文件保留在 `data/locomo/locomo10.json`。 | 是否接受首批导入直接保留完整 LoCoMo 文件。 |
+| D1 | 完整 LoCoMo `locomo10.json` 不放入主仓。 | `evaluation/fixtures/` 只保留合成 `locomo_sample.json`；`data/locomo/README.md` 写明上游下载链接、license 和本地路径。 | 是否认可主仓只保留下载说明，不提交完整数据。 |
 | D2 | LoCoMo 评测代码从 `evaluation/scripts/locomo/` 拆到 `evaluation/locomo/`。 | `run_locomo_eval.sh`、README、测试和 dashboard 路径已同步。 | 是否认可 `evaluation/scripts/` 只保留跨数据集脚本和 shell wrapper。 |
 | D3 | LoCoMo mem0 对比后端放在 `evaluation/locomo/backends/mem0/`。 | 不放入全局 `evaluation/backends/`，也不并入 `evaluation/clients/`；通用 mem0 SDK helper 仍在 `evaluation/clients/mem0_local.py`。 | 是否认可它是 LoCoMo-only baseline backend，而不是通用 client。 |
 | D4 | `memory-euler` 不再作为 backend key 保留兼容。 | 正式 backend key 为 `RAM-A`；LoCoMo 输出目录使用 `ram-a/`。 | 是否接受不做旧 key 兼容层。 |
 | D5 | PersonaMem v1 shell 属于首批导入。 | `run_personalmem_ram_a_v1.sh` 和 `run_personalmem_mem0_local_v1.sh` 作为 full-run convenience wrapper 保留。 | 是否接受 shell wrapper 先保留，后续随 adapter 小步维护。 |
 | D6 | `sqlite-hybrid-search.md` 保留为历史设计，不压缩为 ADR。 | 后续 chunk、semantic extraction、timeline-aware reasoning 另放 `docs/design/memory-pipeline-roadmap.md`。 | 是否认可历史实现文档和未来路线图分开维护。 |
 | D7 | `evaluation/baselines/index.example.jsonl` 先作为轻量 baseline index 模板。 | 当前不升级为严格 schema；等 dashboard/CI 消费 `index.jsonl` 后再补 `schema_version`、`created_at`、`pipeline_version`、`run_status`、`notes`。 | 是否认可首批导入不复杂化 baseline index。 |
-| D8 | `data/` 下可提交 benchmark 输入文件必须带 provenance/license/checksum。 | `data/locomo/README.md` 已写明上游路径、CC BY-NC 4.0、非商业限制、文件大小和 SHA256。 | 是否接受 LoCoMo 的 CC BY-NC 4.0 非商业限制随仓记录方式。 |
+| D8 | 完整 benchmark 输入文件默认不提交到 `data/`。 | 顶层 README 和 evaluation README 已携带 LoCoMo、LongMemEval、PersonaMem 数据来源链接；`data/locomo/README.md` 只保留下载与 license/checksum 说明。 | 是否认可数据集通过 README 链接和本地下载路径管理。 |
 
 ## 3. 关键文件说明
 
@@ -144,7 +143,7 @@ RAM-A/
 | `evaluation/personalmem/` | PersonaMem adapter、报告和 mem0 local 对比入口。 | wrapper 输出已对齐 `outputs/personalmem/<run>/` artifact 布局。 |
 | `evaluation/longmemeval/` | LongMemEval adapter、预处理、QA/retrieval 评测和报告。 | 数据默认约定在 `data/longmemeval/`。 |
 | `evaluation/baselines/` | 跑分摘要索引规范和示例 JSONL。 | 首批导入保持轻量模板。 |
-| `data/locomo/` | LoCoMo 完整 benchmark 文件和 license/checksum 说明。 | `locomo10.json` SHA256 已记录。 |
+| `data/locomo/` | LoCoMo 本地下载占位和 license/checksum 说明。 | 不提交 `locomo10.json`；README 记录上游链接、非商业限制和预期 SHA256。 |
 | `docs/design/` | 已落地设计说明和后续 roadmap。 | SQLite/hybrid 历史设计与 memory pipeline roadmap 分开。 |
 
 ## 4. 验证记录
@@ -164,7 +163,6 @@ docker run --rm -v "<repo>:/workspace" -w /workspace xiaoo:latest sh -n evaluati
 docker run --rm -v "<repo>:/workspace" -w /workspace xiaoo:latest bash -n evaluation/run_locomo_eval.sh
 docker run --rm -v "<repo>:/workspace" -w /workspace xiaoo:latest bash -n evaluation/scripts/run_personalmem_ram_a_v1.sh
 docker run --rm -v "<repo>:/workspace" -w /workspace xiaoo:latest bash -n evaluation/scripts/run_personalmem_mem0_local_v1.sh
-Get-FileHash data\locomo\locomo10.json -Algorithm SHA256
 cargo run --quiet -p memory-bench -- --store outputs\locomo_sample_smoke\store.sqlite --embedding hash add --dataset evaluation\fixtures\locomo_sample.json --text-fields text
 cargo run --quiet -p memory-bench -- --store outputs\locomo_sample_smoke\store.sqlite --embedding hash search --dataset evaluation\fixtures\locomo_sample.json --query-fields question --top-k 2 --output outputs\locomo_sample_smoke\search_results.json
 python evaluation\locomo\locomo_retrieval.py --dataset evaluation\fixtures\locomo_sample.json --input outputs\locomo_sample_smoke\search_results.json --output-json outputs\locomo_sample_smoke\retrieval_metrics.json --html-report outputs\locomo_sample_smoke\retrieval_report.html
@@ -181,7 +179,7 @@ python evaluation\locomo\locomo_retrieval.py --dataset evaluation\fixtures\locom
 - LoCoMo shell syntax check in `xiaoo:latest`: `sh -n` and `bash -n` passed
 - PersonaMem v1 shell syntax check in `xiaoo:latest`: `bash -n` passed for RAM-A and mem0 local wrappers
 - LoCoMo data layout smoke: `locomo_sample.json` passed `memory-bench` hash add/search and `locomo_retrieval.py`
-- LoCoMo full data integrity: `data/locomo/locomo10.json` SHA256 is `79FA87E90F04081343B8C8DEBECB80A9A6842B76A7AA537DC9FDF651EA698FF4`
+- Full benchmark data policy: complete LoCoMo/LongMemEval/PersonaMem files are referenced in README and kept out of Git
 - Active backend-key scan: no active `memory-euler` backend key usage remains outside historical migration notes and guard test assertions
 
 合并前仍建议按正式 CI 口径重跑完整验证。
@@ -191,7 +189,7 @@ python evaluation\locomo\locomo_retrieval.py --dataset evaluation\fixtures\locom
 短期：
 
 - 将现有 `run_meta.json` 字段沉淀成轻量 schema 文档或校验测试，避免 PersonaMem、LoCoMo、LongMemEval 的运行元数据继续漂移。
-- 给 `evaluation/fixtures/` 增加 fixture 来源说明或 checksum，和 `data/` 下完整 benchmark 文件的 provenance 规则保持一致。
+- 给 `evaluation/fixtures/` 增加 fixture 来源说明或 checksum，并保持完整 benchmark 数据只通过 README 链接下载。
 - 合并前按正式仓 CI 口径重跑 `cargo fmt`、`cargo clippy`、`cargo test` 和完整 `pytest evaluation`；LoCoMo mem0 后端的外部依赖可作为可选集成测试处理。
 
 中期：

@@ -9,7 +9,7 @@ def test_locomo_source_lives_under_dataset_directory():
     assert not (EVALUATION_ROOT / "scripts" / "locomo").exists()
     assert (EVALUATION_ROOT / "fixtures" / "locomo_sample.json").is_file()
     assert not (EVALUATION_ROOT / "fixtures" / "locomo10.json").exists()
-    assert (EVALUATION_ROOT.parent / "data" / "locomo" / "locomo10.json").is_file()
+    assert (EVALUATION_ROOT.parent / "data" / "locomo" / "README.md").is_file()
 
 
 def test_locomo_mem0_backend_is_dataset_local():

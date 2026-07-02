@@ -7,5 +7,5 @@ Small checked-in datasets used for smoke tests and local documentation examples.
 - `locomo_sample.json`: tiny synthetic LoCoMo-style fixture for smoke tests and local examples.
 
 Large raw datasets and prepared full benchmark files should not live in `evaluation/fixtures/`.
-If they are checked in under `data/`, include provenance and redistribution notes next to
-the file; otherwise keep them in external artifact storage.
+Keep them as local downloads under `data/` and include source links plus redistribution
+notes in the relevant README.

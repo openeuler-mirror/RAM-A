@@ -1,8 +1,7 @@
 # Dataset Placement
 
-This directory documents dataset conventions. Full benchmark datasets are normally kept
-out of `evaluation/fixtures/`; if a benchmark file is checked in, keep it under `data/`
-with explicit provenance, license or redistribution notes, and a checksum.
+This directory documents dataset conventions. Full benchmark datasets are kept out of
+Git and downloaded locally under `data/`.
 
 Use these locations locally:
 
@@ -10,14 +9,15 @@ Use these locations locally:
 data/personalmem/raw/          # downloaded PersonaMem CSV/JSONL files
 data/personalmem/prepared/     # prepared PersonaMem JSON files
 data/longmemeval/              # downloaded LongMemEval files
-data/locomo/                   # LoCoMo benchmark file and provenance notes
+data/locomo/                   # downloaded LoCoMo file plus README/provenance notes
 ```
 
 Small fixtures that are safe to commit belong in `evaluation/fixtures/`.
+Do not commit downloaded full benchmark files under `data/`.
 
-For any future checked-in benchmark file under `data/`, document:
+For any future benchmark dataset, document:
 
 - upstream project or download URL
 - upstream license and redistribution constraints
-- SHA256 checksum of the exact file used for evaluation
-- whether the file may be redistributed with the formal repository
+- SHA256 checksum of the exact file used for evaluation, when available
+- expected local path

@@ -1,8 +1,8 @@
 /target/
 /data/*
 !/data/locomo/
+/data/locomo/*
 !/data/locomo/README.md
-!/data/locomo/locomo10.json
 /dataset/
 /dataset/longmemeval/
 /outputs/

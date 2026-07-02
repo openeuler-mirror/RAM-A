@@ -6,11 +6,14 @@ Entry point for benchmarking the RAM-A memory system. This file is a usage guide
 
 ## Datasets
 
-| Dataset | Focus | Questions | Source |
-|---------|-------|-----------|--------|
-| PersonaMem | Personalized multiple-choice answering from long user profiles | 589 questions for 32k; additional 128k and 1M splits | [bowen-upenn/PersonaMem](https://github.com/bowen-upenn/PersonaMem) |
-| LongMemEval | Long-term memory QA across multi-session chats | 500 | [xiaowu0162/longmemeval](https://github.com/xiaowu0162/longmemeval) |
-| LoCoMo | Very long-term conversational memory QA | ~1,986 questions | [snap-research/locomo](https://github.com/snap-research/locomo) |
+| Dataset | Focus | Questions | Source / download | Local placement |
+|---------|-------|-----------|-------------------|-----------------|
+| PersonaMem | Personalized multiple-choice answering from long user profiles | 589 questions for 32k; additional 128k and 1M splits | [GitHub](https://github.com/bowen-upenn/PersonaMem), [HuggingFace](https://huggingface.co/datasets/bowen-upenn/PersonaMem) | `data/personalmem/raw/`, then `data/personalmem/prepared/` |
+| LongMemEval | Long-term memory QA across multi-session chats | 500 | [GitHub](https://github.com/xiaowu0162/longmemeval), [cleaned oracle JSON](https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_oracle.json) | `data/longmemeval/longmemeval_oracle.json` |
+| LoCoMo | Very long-term conversational memory QA | ~1,986 questions | [GitHub](https://github.com/snap-research/locomo), [locomo10.json](https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json) | `data/locomo/locomo10.json` |
+
+Full benchmark datasets are local downloads only. The repository keeps small fixtures
+under `evaluation/fixtures/` for smoke tests.
 
 ## Setup
 

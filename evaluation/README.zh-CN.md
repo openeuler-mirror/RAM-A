@@ -6,11 +6,14 @@ RAM-A 记忆系统的评估流水线总览。这里是使用指南入口；各�
 
 ## 数据集
 
-| 数据集 | 关注点 | 问题数 | 来源 |
-|--------|--------|--------|------|
-| PersonaMem | 长对话画像下的个性化选择题回答 | 32k 切分 589 题；另有 128k、1M | [bowen-upenn/PersonaMem](https://github.com/bowen-upenn/PersonaMem) |
-| LongMemEval | 多轮会话长期记忆问答 | 500 | [xiaowu0162/longmemeval](https://github.com/xiaowu0162/longmemeval) |
-| LoCoMo | 超长对话记忆问答 | 约 1,986 题 | [snap-research/locomo](https://github.com/snap-research/locomo) |
+| 数据集 | 关注点 | 问题数 | 来源 / 下载 | 本地放置位置 |
+|--------|--------|--------|-------------|--------------|
+| PersonaMem | 长对话画像下的个性化选择题回答 | 32k 切分 589 题；另有 128k、1M | [GitHub](https://github.com/bowen-upenn/PersonaMem), [HuggingFace](https://huggingface.co/datasets/bowen-upenn/PersonaMem) | `data/personalmem/raw/`，再生成到 `data/personalmem/prepared/` |
+| LongMemEval | 多轮会话长期记忆问答 | 500 | [GitHub](https://github.com/xiaowu0162/longmemeval), [cleaned oracle JSON](https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_oracle.json) | `data/longmemeval/longmemeval_oracle.json` |
+| LoCoMo | 超长对话记忆问答 | 约 1,986 题 | [GitHub](https://github.com/snap-research/locomo), [locomo10.json](https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json) | `data/locomo/locomo10.json` |
+
+完整 benchmark 数据只作为本地下载文件使用，不提交到主仓。仓库内仅保留
+`evaluation/fixtures/` 下的小型 smoke 数据。
 
 ## 环境准备
 

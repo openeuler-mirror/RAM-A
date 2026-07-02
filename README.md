@@ -41,6 +41,20 @@ Large raw datasets, generated stores, HTML reports, and full run artifacts are n
 the source tree. Keep them under `data/`, `outputs/`, `artifacts/`, or external object
 storage and record reproducible summaries in `evaluation/baselines/`.
 
+## Dataset Sources
+
+Full benchmark datasets are not committed to this repository. Use the upstream links
+below and keep local downloads under `data/`:
+
+| Dataset | Source / download | Local placement |
+|---------|-------------------|-----------------|
+| PersonaMem | [GitHub](https://github.com/bowen-upenn/PersonaMem), [HuggingFace](https://huggingface.co/datasets/bowen-upenn/PersonaMem) | `data/personalmem/raw/` and `data/personalmem/prepared/` |
+| LongMemEval | [GitHub](https://github.com/xiaowu0162/longmemeval), [cleaned oracle JSON](https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_oracle.json) | `data/longmemeval/longmemeval_oracle.json` |
+| LoCoMo | [GitHub](https://github.com/snap-research/locomo), [locomo10.json](https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json) | `data/locomo/locomo10.json` |
+
+The repository only keeps small synthetic or truncated fixtures under
+`evaluation/fixtures/` for smoke tests.
+
 ## Core API
 
 `memory-core` exposes the minimal long-term memory interface:

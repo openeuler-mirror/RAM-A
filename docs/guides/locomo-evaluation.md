@@ -21,7 +21,16 @@ cd evaluation
 
 The default dataset fixture is the tiny synthetic
 `evaluation/fixtures/locomo_sample.json` and the default retrieval count is `TOP_K=30`.
-For the full LoCoMo benchmark, use `DATASET=../data/locomo/locomo10.json`.
+For the full LoCoMo benchmark, download the upstream file locally first:
+
+```bash
+mkdir -p data/locomo
+curl -L https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json \
+  -o data/locomo/locomo10.json
+```
+
+Then run with `DATASET=../data/locomo/locomo10.json`. Full benchmark files are
+not committed to this repository.
 
 ```bash
 cd evaluation
