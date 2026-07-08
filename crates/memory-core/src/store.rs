@@ -10,6 +10,12 @@ use crate::{MemoryRecord, MemoryResult};
 pub trait MemoryStore: Send + Sync {
     fn as_any(&self) -> &dyn Any;
     async fn add_record(&self, record: &MemoryRecord) -> MemoryResult<()>;
+    async fn add_records(&self, records: &[MemoryRecord]) -> MemoryResult<()> {
+        for record in records {
+            self.add_record(record).await?;
+        }
+        Ok(())
+    }
     async fn list_records(&self) -> MemoryResult<Vec<MemoryRecord>>;
     async fn replace_all(&self, records: &[MemoryRecord]) -> MemoryResult<()>;
 }
@@ -39,6 +45,21 @@ impl MemoryStore for FileMemoryStore {
         records.retain(|existing| existing.id != record.id);
         records.push(record.clone());
         self.replace_all(&records).await
+    }
+
+    async fn add_records(&self, records: &[MemoryRecord]) -> MemoryResult<()> {
+        let new_ids = records
+            .iter()
+            .map(|record| record.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let mut existing = self
+            .list_records()
+            .await?
+            .into_iter()
+            .filter(|record| !new_ids.contains(record.id.as_str()))
+            .collect::<Vec<_>>();
+        existing.extend(records.iter().cloned());
+        self.replace_all(&existing).await
     }
 
     async fn list_records(&self) -> MemoryResult<Vec<MemoryRecord>> {

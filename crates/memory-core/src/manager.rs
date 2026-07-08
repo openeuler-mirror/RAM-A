@@ -4,6 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use uuid::Uuid;
 
+use crate::record::metadata_matches;
 use crate::{
     cosine_similarity, AddMemoryRequest, AddMemoryResponse, EmbeddingProvider, MemoryError,
     MemoryRecord, MemoryResult, MemoryStore, RetrievalConfig, ScoredMemory, SearchMemoryRequest,
@@ -124,19 +125,7 @@ impl MemoryManager {
             });
         }
 
-        let new_ids = new_records
-            .iter()
-            .map(|record| record.id.as_str())
-            .collect::<HashSet<_>>();
-        let mut records = self
-            .store
-            .list_records()
-            .await?
-            .into_iter()
-            .filter(|record| !new_ids.contains(record.id.as_str()))
-            .collect::<Vec<_>>();
-        records.extend(new_records);
-        self.store.replace_all(&records).await?;
+        self.store.add_records(&new_records).await?;
 
         Ok(responses)
     }
@@ -214,7 +203,6 @@ impl MemoryManager {
             });
         }
 
-        let records = self.store.list_records().await?;
         let mut all_results = Vec::with_capacity(requests.len());
         for (request, query_embedding) in requests.into_iter().zip(query_embeddings) {
             if request.top_k == 0 {
@@ -222,36 +210,10 @@ impl MemoryManager {
                 continue;
             }
 
-            let mut results = records
-                .iter()
-                .filter(|record| metadata_matches(&record.metadata, request.filter.as_ref()))
-                .map(|record| {
-                    if record.embedding.len() != query_embedding.len() {
-                        return Err(MemoryError::Embedding {
-                            message: format!(
-                                "embedding dimension mismatch: query has {} dims but record '{}' has {} dims",
-                                query_embedding.len(),
-                                record.id,
-                                record.embedding.len()
-                            ),
-                        });
-                    }
-                    let score = cosine_similarity(&query_embedding, &record.embedding);
-                    Ok(ScoredMemory {
-                        record: record.clone(),
-                        score,
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-
-            results.sort_by(|left, right| {
-                right
-                    .score
-                    .partial_cmp(&left.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            results.truncate(request.top_k);
-            all_results.push(results);
+            all_results.push(
+                self.dense_candidates(&query_embedding, request.filter.as_ref(), request.top_k)
+                    .await?,
+            );
         }
 
         Ok(all_results)
@@ -357,6 +319,12 @@ impl MemoryManager {
         filter: Option<&serde_json::Value>,
         limit: usize,
     ) -> MemoryResult<Vec<ScoredMemory>> {
+        if let Some(sqlite_store) = self.store.as_any().downcast_ref::<SqliteMemoryStore>() {
+            return sqlite_store
+                .dense_candidates(query_embedding, filter, limit)
+                .await;
+        }
+
         let mut results = self
             .store
             .list_records()
@@ -541,53 +509,9 @@ impl LongTermMemory for MemoryManager {
         }
 
         let query_embedding = self.embedder.embed_one(query).await?;
-        let mut results = self
-            .store
-            .list_records()
-            .await?
-            .into_iter()
-            .filter(|record| metadata_matches(&record.metadata, request.filter.as_ref()))
-            .map(|record| {
-                if record.embedding.len() != query_embedding.len() {
-                    return Err(MemoryError::Embedding {
-                        message: format!(
-                            "embedding dimension mismatch: query has {} dims but record '{}' has {} dims",
-                            query_embedding.len(),
-                            record.id,
-                            record.embedding.len()
-                        ),
-                    });
-                }
-                let score = cosine_similarity(&query_embedding, &record.embedding);
-                Ok(ScoredMemory { record, score })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        results.sort_by(|left, right| {
-            right
-                .score
-                .partial_cmp(&left.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        results.truncate(request.top_k);
-        Ok(results)
+        self.dense_candidates(&query_embedding, request.filter.as_ref(), request.top_k)
+            .await
     }
-}
-
-fn metadata_matches(metadata: &serde_json::Value, filter: Option<&serde_json::Value>) -> bool {
-    let Some(filter) = filter else {
-        return true;
-    };
-    let Some(filter_object) = filter.as_object() else {
-        return true;
-    };
-    let Some(metadata_object) = metadata.as_object() else {
-        return false;
-    };
-
-    filter_object
-        .iter()
-        .all(|(key, expected)| metadata_object.get(key) == Some(expected))
 }
 
 fn current_time_ms() -> u64 {
@@ -605,6 +529,8 @@ mod tests {
         SqliteMemoryStore,
     };
     use async_trait::async_trait;
+    use std::any::Any;
+    use std::sync::Mutex;
 
     struct StaticEmbedding {
         vector: Vec<f32>,
@@ -618,6 +544,51 @@ mod tests {
 
         async fn embed(&self, texts: &[String]) -> MemoryResult<Vec<Vec<f32>>> {
             Ok(texts.iter().map(|_| self.vector.clone()).collect())
+        }
+    }
+
+    struct BatchOnlyStore {
+        records: Mutex<Vec<MemoryRecord>>,
+    }
+
+    impl BatchOnlyStore {
+        fn new() -> Self {
+            Self {
+                records: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl MemoryStore for BatchOnlyStore {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        async fn add_record(&self, _record: &MemoryRecord) -> MemoryResult<()> {
+            Err(MemoryError::StoreBackend {
+                message: "add_record should not be called by add_many".to_string(),
+            })
+        }
+
+        async fn add_records(&self, records: &[MemoryRecord]) -> MemoryResult<()> {
+            self.records
+                .lock()
+                .expect("records lock")
+                .extend(records.iter().cloned());
+            Ok(())
+        }
+
+        async fn list_records(&self) -> MemoryResult<Vec<MemoryRecord>> {
+            Err(MemoryError::StoreBackend {
+                message: "list_records should not be called by add_many".to_string(),
+            })
+        }
+
+        async fn replace_all(&self, _records: &[MemoryRecord]) -> MemoryResult<()> {
+            Err(MemoryError::StoreBackend {
+                message: "replace_all should not be called by add_many".to_string(),
+            })
         }
     }
 
@@ -681,6 +652,39 @@ mod tests {
             .expect_err("duplicate IDs should fail");
 
         assert!(format!("{error}").contains("duplicate memory id"));
+    }
+
+    #[tokio::test]
+    async fn add_many_uses_store_batch_upsert_without_listing_all_records() {
+        let store = Arc::new(BatchOnlyStore::new());
+        let embedder = Arc::new(HashEmbedding::new(8));
+        let manager = MemoryManager::new(store.clone(), embedder);
+
+        let responses = manager
+            .add_many(vec![
+                AddMemoryRequest {
+                    id: Some("m1".to_string()),
+                    text: "first memory".to_string(),
+                    metadata: serde_json::json!({}),
+                },
+                AddMemoryRequest {
+                    id: Some("m2".to_string()),
+                    text: "second memory".to_string(),
+                    metadata: serde_json::json!({}),
+                },
+            ])
+            .await
+            .expect("batch add");
+
+        assert_eq!(responses.len(), 2);
+        let stored_ids = store
+            .records
+            .lock()
+            .expect("records lock")
+            .iter()
+            .map(|record| record.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(stored_ids, vec!["m1", "m2"]);
     }
 
     #[tokio::test]

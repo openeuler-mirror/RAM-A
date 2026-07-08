@@ -1,10 +1,17 @@
 use std::any::Any;
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 
 use async_trait::async_trait;
-use rusqlite::{params, Connection};
+use rusqlite::{ffi::sqlite3_auto_extension, params, Connection};
+use sqlite_vec::sqlite3_vec_init;
 
-use crate::{MemoryError, MemoryRecord, MemoryResult, MemoryStore, ScoredMemory};
+use crate::{
+    record::{extract_scope_id, extract_scope_id_from_filter, metadata_matches},
+    MemoryError, MemoryRecord, MemoryResult, MemoryStore, ScoredMemory,
+};
+
+static REGISTER_SQLITE_VEC: Once = Once::new();
 
 pub struct SqliteMemoryStore {
     path: PathBuf,
@@ -42,6 +49,26 @@ impl SqliteMemoryStore {
         })
         .await
     }
+
+    pub async fn dense_candidates(
+        &self,
+        query_embedding: &[f32],
+        filter: Option<&serde_json::Value>,
+        limit: usize,
+    ) -> MemoryResult<Vec<ScoredMemory>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let path = self.path.clone();
+        let query_embedding = query_embedding.to_vec();
+        let filter = filter.cloned();
+        run_sqlite_operation(move || {
+            let connection = open_connection(&path)?;
+            dense_candidates(&connection, &query_embedding, filter.as_ref(), limit)
+        })
+        .await
+    }
 }
 
 #[async_trait]
@@ -56,6 +83,21 @@ impl MemoryStore for SqliteMemoryStore {
         run_sqlite_operation(move || {
             let connection = open_connection(&path)?;
             upsert_record(&connection, &record)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn add_records(&self, records: &[MemoryRecord]) -> MemoryResult<()> {
+        let path = self.path.clone();
+        let records = records.to_vec();
+        run_sqlite_operation(move || {
+            let mut connection = open_connection(&path)?;
+            let transaction = connection.transaction()?;
+            for record in &records {
+                upsert_record(&transaction, record)?;
+            }
+            transaction.commit()?;
             Ok(())
         })
         .await
@@ -100,12 +142,19 @@ where
 }
 
 fn open_connection(path: &Path) -> MemoryResult<Connection> {
+    register_sqlite_vec_extension();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let connection = Connection::open(path)?;
     initialize_schema(&connection)?;
     Ok(connection)
+}
+
+fn register_sqlite_vec_extension() {
+    REGISTER_SQLITE_VEC.call_once(|| unsafe {
+        sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ())));
+    });
 }
 
 fn initialize_schema(connection: &Connection) -> MemoryResult<()> {
@@ -292,6 +341,169 @@ fn bm25_candidates(
     Ok(candidates)
 }
 
+fn dense_candidates(
+    connection: &Connection,
+    query_embedding: &[f32],
+    filter: Option<&serde_json::Value>,
+    limit: usize,
+) -> MemoryResult<Vec<ScoredMemory>> {
+    if query_embedding.is_empty() {
+        return Err(MemoryError::Embedding {
+            message: "query embedding must not be empty".to_string(),
+        });
+    }
+
+    let query_dims = query_embedding.len();
+    ensure_no_dense_dimension_mismatch(connection, query_dims, filter)?;
+    let query_embedding = embedding_to_blob(query_embedding);
+    let scope_id = extract_scope_id_from_filter(filter);
+    let mut candidates = if let Some(scope_id) = scope_id.as_deref() {
+        let mut statement = connection.prepare(
+            r#"
+            SELECT
+                id,
+                text,
+                metadata_json,
+                embedding,
+                embedding_dims,
+                created_at_ms,
+                updated_at_ms,
+                vec_distance_cosine(vec_f32(embedding), vec_f32(?1)) AS distance
+            FROM memories
+            WHERE embedding_dims = ?2
+              AND scope_id = ?3
+            ORDER BY distance ASC, id ASC
+            LIMIT ?4
+            "#,
+        )?;
+        collect_dense_rows(
+            &mut statement,
+            params![query_embedding, query_dims as i64, scope_id, limit as i64],
+        )?
+    } else {
+        let mut statement = connection.prepare(
+            r#"
+            SELECT
+                id,
+                text,
+                metadata_json,
+                embedding,
+                embedding_dims,
+                created_at_ms,
+                updated_at_ms,
+                vec_distance_cosine(vec_f32(embedding), vec_f32(?1)) AS distance
+            FROM memories
+            WHERE embedding_dims = ?2
+            ORDER BY distance ASC, id ASC
+            LIMIT ?3
+            "#,
+        )?;
+        collect_dense_rows(
+            &mut statement,
+            params![query_embedding, query_dims as i64, limit as i64],
+        )?
+    };
+
+    candidates.retain(|candidate| metadata_matches(&candidate.record.metadata, filter));
+    candidates.truncate(limit);
+    Ok(candidates)
+}
+
+fn ensure_no_dense_dimension_mismatch(
+    connection: &Connection,
+    query_dims: usize,
+    filter: Option<&serde_json::Value>,
+) -> MemoryResult<()> {
+    let scope_id = extract_scope_id_from_filter(filter);
+    let mismatch_count: i64 = if let Some(scope_id) = scope_id.as_deref() {
+        connection.query_row(
+            "SELECT COUNT(*) FROM memories WHERE embedding_dims != ?1 AND scope_id = ?2",
+            params![query_dims as i64, scope_id],
+            |row| row.get(0),
+        )?
+    } else {
+        connection.query_row(
+            "SELECT COUNT(*) FROM memories WHERE embedding_dims != ?1",
+            params![query_dims as i64],
+            |row| row.get(0),
+        )?
+    };
+
+    if mismatch_count > 0 {
+        return Err(MemoryError::Embedding {
+            message: format!(
+                "embedding dimension mismatch: query has {query_dims} dims but {mismatch_count} stored records have different dimensions"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn collect_dense_rows<P>(
+    statement: &mut rusqlite::Statement<'_>,
+    params: P,
+) -> MemoryResult<Vec<ScoredMemory>>
+where
+    P: rusqlite::Params,
+{
+    let rows = statement.query_map(params, |row| {
+        let id: String = row.get(0)?;
+        let text: String = row.get(1)?;
+        let metadata_json: String = row.get(2)?;
+        let embedding_blob: Vec<u8> = row.get(3)?;
+        let embedding_dims: i64 = row.get(4)?;
+        let created_at_ms: i64 = row.get(5)?;
+        let updated_at_ms: i64 = row.get(6)?;
+        let distance: f32 = row.get(7)?;
+        Ok((
+            id,
+            text,
+            metadata_json,
+            embedding_blob,
+            embedding_dims,
+            created_at_ms,
+            updated_at_ms,
+            distance,
+        ))
+    })?;
+
+    let mut candidates = Vec::new();
+    for row in rows {
+        let (
+            id,
+            text,
+            metadata_json,
+            embedding_blob,
+            embedding_dims,
+            created_at_ms,
+            updated_at_ms,
+            distance,
+        ) = row?;
+        let metadata = serde_json::from_str(&metadata_json)?;
+        let embedding = blob_to_embedding(&embedding_blob)?;
+        if embedding.len() != embedding_dims as usize {
+            return Err(MemoryError::StoreBackend {
+                message: format!(
+                    "embedding dims mismatch for record '{id}': blob has {} dims but stored dims is {embedding_dims}",
+                    embedding.len()
+                ),
+            });
+        }
+        candidates.push(ScoredMemory {
+            record: MemoryRecord {
+                id,
+                text,
+                metadata,
+                embedding,
+                created_at_ms: created_at_ms as u64,
+                updated_at_ms: updated_at_ms as u64,
+            },
+            score: 1.0 - distance,
+        });
+    }
+    Ok(candidates)
+}
+
 fn collect_bm25_rows<P>(
     statement: &mut rusqlite::Statement<'_>,
     params: P,
@@ -355,36 +567,6 @@ where
         });
     }
     Ok(candidates)
-}
-
-fn extract_scope_id(metadata: &serde_json::Value) -> Option<String> {
-    metadata
-        .get("scope_id")
-        .and_then(|value| value.as_str())
-        .map(str::to_string)
-}
-
-fn extract_scope_id_from_filter(filter: Option<&serde_json::Value>) -> Option<String> {
-    filter
-        .and_then(|value| value.get("scope_id"))
-        .and_then(|value| value.as_str())
-        .map(str::to_string)
-}
-
-fn metadata_matches(metadata: &serde_json::Value, filter: Option<&serde_json::Value>) -> bool {
-    let Some(filter) = filter else {
-        return true;
-    };
-    let Some(filter_object) = filter.as_object() else {
-        return true;
-    };
-    let Some(metadata_object) = metadata.as_object() else {
-        return false;
-    };
-
-    filter_object
-        .iter()
-        .all(|(key, expected)| metadata_object.get(key) == Some(expected))
 }
 
 fn sanitize_fts_query(query: &str) -> String {
