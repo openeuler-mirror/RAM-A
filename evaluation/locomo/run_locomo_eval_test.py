@@ -32,6 +32,16 @@ def test_run_locomo_eval_uses_locomo_entrypoints():
     assert 'DATASET="${DATASET:-fixtures/locomo_sample.json}"' in content
     assert 'JUDGE_MODEL="${JUDGE_MODEL:-${MODEL:-gpt-4o-mini}}"' in content
     assert 'LLM_API_KEY_ENV="${LLM_API_KEY_ENV:-OPENAI_API_KEY}"' in content
+    assert 'RERANK="${RERANK:-0}"' in content
+    assert 'RERANK_PROVIDER="${RERANK_PROVIDER:-openrouter}"' in content
+    assert 'RERANK_MODEL="${RERANK_MODEL:-cohere/rerank-v3.5}"' in content
+    assert 'RERANK_API_KEY_ENV="${RERANK_API_KEY_ENV:-OPENROUTER_API_KEY}"' in content
+    assert 'RERANK_BASE_URL="${RERANK_BASE_URL:-https://openrouter.ai/api/v1}"' in content
+    assert 'RERANK_INPUT_K="${RERANK_INPUT_K:-40}"' in content
+    assert 'MEMORY_BENCH_RERANK_ARGS="' in content
+    assert '--rerank --rerank-provider $RERANK_PROVIDER' in content
+    assert '--rerank-api-key-env $RERANK_API_KEY_ENV' in content
+    assert '$MEMORY_BENCH_RERANK_ARGS \\' in content
     assert '--judge-model "$JUDGE_MODEL"' in content
     assert '--llm-api-key-env "$LLM_API_KEY_ENV"' in content
     assert '--llm-base-url "$LLM_BASE_URL"' in content

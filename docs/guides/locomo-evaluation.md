@@ -38,6 +38,20 @@ TOP_K=20 DATASET=fixtures/locomo_sample.json ./run_locomo_eval.sh memory_bench
 TOP_K=30 DATASET=../data/locomo/locomo10.json ./run_locomo_eval.sh memory_bench
 ```
 
+To run the RAM-A rerank variant, keep the same entry point and enable rerank with
+environment variables:
+
+```bash
+cd evaluation
+RERANK=1 \
+RERANK_MODEL=cohere/rerank-v3.5 \
+RERANK_INPUT_K=40 \
+TOP_K=30 \
+DATASET=../data/locomo/locomo10.json \
+RUN_ID=locomo-rerank-40 \
+./run_locomo_eval.sh memory_bench
+```
+
 ## Environment
 
 The pipeline reads `evaluation/.env` and the current environment:
@@ -53,7 +67,8 @@ MEM0_TELEMETRY=False
 
 `OPENAI_API_KEY` is used by answer generation and is the default API key env for the
 LLM judge. `OPENROUTER_API_KEY` is used by the RAM-A embedding stage unless another
-embedding backend is added.
+embedding backend is added. When `RERANK=1`, `OPENROUTER_API_KEY` is also the default
+API key env for the OpenRouter rerank stage.
 
 The judge stage now uses the shared RAM-A OpenAI-compatible client. Override it with:
 
@@ -63,6 +78,23 @@ LLM_API_KEY_ENV="OPENAI_API_KEY"
 LLM_BASE_URL="https://openrouter.ai/api/v1"
 LLM_THINKING="default"
 ```
+
+Rerank knobs for the RAM-A backend:
+
+```bash
+RERANK=1
+RERANK_PROVIDER=openrouter
+RERANK_MODEL=cohere/rerank-v3.5
+RERANK_API_KEY_ENV=OPENROUTER_API_KEY
+RERANK_BASE_URL=https://openrouter.ai/api/v1
+RERANK_INPUT_K=40
+RERANK_TIMEOUT_MS=30000
+RERANK_FAIL_OPEN=0
+```
+
+The default rerank failure mode is fail closed. For benchmark runs this is preferred:
+if rerank times out or the API key/quota is wrong, the run fails instead of silently
+falling back to hybrid retrieval.
 
 ## Pipeline
 

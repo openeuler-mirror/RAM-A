@@ -8,8 +8,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use memory_core::{
     AddMemoryRequest, EmbeddingProvider, FileMemoryStore, HashEmbedding, LongTermMemory,
-    MemoryManager, MemoryStore, OpenRouterEmbedding, RetrievalConfig, SearchMemoryRequest,
-    SearchMode, SqliteMemoryStore,
+    MemoryManager, MemoryStore, OpenRouterEmbedding, OpenRouterReranker, RerankConfig,
+    RerankProvider, Reranker, RetrievalConfig, SearchMemoryRequest, SearchMode, SqliteMemoryStore,
 };
 use serde::Serialize;
 
@@ -33,6 +33,22 @@ struct Cli {
     bm25_weight: f32,
     #[arg(long)]
     candidate_k: Option<usize>,
+    #[arg(long)]
+    rerank: bool,
+    #[arg(long, value_enum, default_value_t = RerankProviderKind::Openrouter)]
+    rerank_provider: RerankProviderKind,
+    #[arg(long, default_value = "cohere/rerank-v3.5")]
+    rerank_model: String,
+    #[arg(long, default_value = "OPENROUTER_API_KEY")]
+    rerank_api_key_env: String,
+    #[arg(long, default_value = "https://openrouter.ai/api/v1")]
+    rerank_base_url: String,
+    #[arg(long, default_value_t = 40)]
+    rerank_input_k: usize,
+    #[arg(long)]
+    rerank_timeout_ms: Option<u64>,
+    #[arg(long)]
+    rerank_fail_open: bool,
     #[arg(long, default_value = "OPENROUTER_API_KEY")]
     api_key_env: String,
     #[arg(long, default_value = "baai/bge-m3")]
@@ -64,12 +80,25 @@ enum SearchModeKind {
     Hybrid,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum RerankProviderKind {
+    Openrouter,
+}
+
 impl From<SearchModeKind> for SearchMode {
     fn from(value: SearchModeKind) -> Self {
         match value {
             SearchModeKind::Dense => SearchMode::Dense,
             SearchModeKind::Bm25 => SearchMode::Bm25,
             SearchModeKind::Hybrid => SearchMode::Hybrid,
+        }
+    }
+}
+
+impl From<RerankProviderKind> for RerankProvider {
+    fn from(value: RerankProviderKind) -> Self {
+        match value {
+            RerankProviderKind::Openrouter => RerankProvider::OpenRouter,
         }
     }
 }
@@ -164,17 +193,53 @@ fn build_runtime(cli: &Cli) -> Result<BenchRuntime> {
         }
         EmbeddingKind::Hash => Arc::new(HashEmbedding::new(cli.dimensions)),
     };
-    let manager = MemoryManager::with_retrieval_config(
-        store.clone(),
-        embedder,
-        RetrievalConfig {
-            mode: cli.search_mode.into(),
-            embedding_weight: cli.embedding_weight,
-            bm25_weight: cli.bm25_weight,
-            candidate_k: cli.candidate_k,
-        },
-    );
+    let rerank_config = RerankConfig {
+        enabled: cli.rerank,
+        provider: cli.rerank_provider.into(),
+        model: cli.rerank_model.clone(),
+        api_key_env: cli.rerank_api_key_env.clone(),
+        base_url: cli.rerank_base_url.clone(),
+        input_k: cli.rerank_input_k,
+        timeout_ms: cli.rerank_timeout_ms,
+        fail_open: cli.rerank_fail_open,
+    };
+    let reranker = build_reranker(cli, &rerank_config)?;
+    let retrieval_config = RetrievalConfig {
+        mode: cli.search_mode.into(),
+        embedding_weight: cli.embedding_weight,
+        bm25_weight: cli.bm25_weight,
+        candidate_k: cli.candidate_k,
+        rerank: rerank_config,
+    };
+    let manager = if let Some(reranker) = reranker {
+        MemoryManager::with_retrieval_config_and_reranker(
+            store.clone(),
+            embedder,
+            retrieval_config,
+            reranker,
+        )
+    } else {
+        MemoryManager::with_retrieval_config(store.clone(), embedder, retrieval_config)
+    };
     Ok(BenchRuntime { manager, store })
+}
+
+fn build_reranker(cli: &Cli, rerank_config: &RerankConfig) -> Result<Option<Arc<dyn Reranker>>> {
+    if !rerank_config.enabled {
+        return Ok(None);
+    }
+
+    match cli.rerank_provider {
+        RerankProviderKind::Openrouter => {
+            let api_key = std::env::var(&rerank_config.api_key_env).with_context(|| {
+                format!("missing rerank API key env {}", rerank_config.api_key_env)
+            })?;
+            Ok(Some(Arc::new(OpenRouterReranker::from_config(
+                api_key,
+                rerank_config,
+            ))))
+        }
+    }
 }
 
 fn build_store(cli: &Cli) -> Arc<dyn MemoryStore> {
@@ -900,6 +965,17 @@ mod tests {
         assert_eq!(cli.embedding_weight, 0.7);
         assert_eq!(cli.bm25_weight, 0.3);
         assert_eq!(cli.candidate_k, None);
+        assert!(!cli.rerank);
+        assert!(matches!(
+            cli.rerank_provider,
+            RerankProviderKind::Openrouter
+        ));
+        assert_eq!(cli.rerank_model, "cohere/rerank-v3.5");
+        assert_eq!(cli.rerank_api_key_env, "OPENROUTER_API_KEY");
+        assert_eq!(cli.rerank_base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(cli.rerank_input_k, 40);
+        assert_eq!(cli.rerank_timeout_ms, None);
+        assert!(!cli.rerank_fail_open);
     }
 
     #[test]
@@ -948,5 +1024,87 @@ mod tests {
         assert_eq!(cli.embedding_weight, 0.6);
         assert_eq!(cli.bm25_weight, 0.4);
         assert_eq!(cli.candidate_k, Some(42));
+    }
+
+    #[test]
+    fn cli_parses_rerank_options() {
+        let cli = Cli::try_parse_from([
+            "memory-bench",
+            "--embedding",
+            "hash",
+            "--rerank",
+            "--rerank-provider",
+            "openrouter",
+            "--rerank-model",
+            "cohere/rerank-v3.5",
+            "--rerank-api-key-env",
+            "OPENROUTER_API_KEY",
+            "--rerank-base-url",
+            "https://openrouter.ai/api/v1",
+            "--rerank-input-k",
+            "40",
+            "--rerank-timeout-ms",
+            "2500",
+            "--rerank-fail-open",
+            "search",
+            "--query",
+            "Pacific melodies",
+            "--output",
+            "outputs/search.json",
+        ])
+        .expect("parse rerank CLI");
+
+        assert!(cli.rerank);
+        assert!(matches!(
+            cli.rerank_provider,
+            RerankProviderKind::Openrouter
+        ));
+        assert_eq!(cli.rerank_model, "cohere/rerank-v3.5");
+        assert_eq!(cli.rerank_api_key_env, "OPENROUTER_API_KEY");
+        assert_eq!(cli.rerank_base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(cli.rerank_input_k, 40);
+        assert_eq!(cli.rerank_timeout_ms, Some(2500));
+        assert!(cli.rerank_fail_open);
+    }
+
+    #[test]
+    fn build_runtime_does_not_require_rerank_api_key_when_rerank_is_disabled() {
+        let cli = Cli::try_parse_from([
+            "memory-bench",
+            "--embedding",
+            "hash",
+            "--rerank-api-key-env",
+            "RAM_A_TEST_MISSING_RERANK_KEY_DISABLED",
+            "add",
+            "--dataset",
+            "data/test.json",
+        ])
+        .expect("parse CLI");
+
+        let _runtime = build_runtime(&cli).expect("runtime without rerank API key");
+    }
+
+    #[test]
+    fn build_runtime_requires_rerank_api_key_when_rerank_is_enabled() {
+        let cli = Cli::try_parse_from([
+            "memory-bench",
+            "--embedding",
+            "hash",
+            "--rerank",
+            "--rerank-api-key-env",
+            "RAM_A_TEST_MISSING_RERANK_KEY_ENABLED",
+            "add",
+            "--dataset",
+            "data/test.json",
+        ])
+        .expect("parse CLI");
+
+        let error = match build_runtime(&cli) {
+            Ok(_) => panic!("missing rerank API key should fail"),
+            Err(error) => error,
+        };
+
+        assert!(format!("{error}")
+            .contains("missing rerank API key env RAM_A_TEST_MISSING_RERANK_KEY_ENABLED"));
     }
 }

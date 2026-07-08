@@ -7,8 +7,8 @@ use uuid::Uuid;
 use crate::record::metadata_matches;
 use crate::{
     cosine_similarity, AddMemoryRequest, AddMemoryResponse, EmbeddingProvider, MemoryError,
-    MemoryRecord, MemoryResult, MemoryStore, RetrievalConfig, ScoredMemory, SearchMemoryRequest,
-    SearchMode, SqliteMemoryStore,
+    MemoryRecord, MemoryResult, MemoryStore, Reranker, RetrievalConfig, ScoredMemory,
+    SearchMemoryRequest, SearchMode, SqliteMemoryStore,
 };
 
 const DEFAULT_EMBEDDING_BATCH_SIZE: usize = 64;
@@ -23,6 +23,7 @@ pub struct MemoryManager {
     store: Arc<dyn MemoryStore>,
     embedder: Arc<dyn EmbeddingProvider>,
     retrieval_config: RetrievalConfig,
+    reranker: Option<Arc<dyn Reranker>>,
 }
 
 impl MemoryManager {
@@ -39,6 +40,21 @@ impl MemoryManager {
             store,
             embedder,
             retrieval_config,
+            reranker: None,
+        }
+    }
+
+    pub fn with_retrieval_config_and_reranker(
+        store: Arc<dyn MemoryStore>,
+        embedder: Arc<dyn EmbeddingProvider>,
+        retrieval_config: RetrievalConfig,
+        reranker: Arc<dyn Reranker>,
+    ) -> Self {
+        Self {
+            store,
+            embedder,
+            retrieval_config,
+            reranker: Some(reranker),
         }
     }
 
@@ -304,13 +320,54 @@ impl MemoryManager {
             .bm25_candidates(query, request.filter.as_ref(), candidate_k)
             .await?;
 
-        Ok(fuse_hybrid_candidates(
+        let result_limit = if self.retrieval_config.rerank.enabled {
+            self.retrieval_config.rerank.input_limit(request.top_k)
+        } else {
+            request.top_k
+        };
+        let candidates = fuse_hybrid_candidates(
             dense_candidates,
             bm25_candidates,
-            request.top_k,
+            result_limit,
             self.retrieval_config.embedding_weight,
             self.retrieval_config.bm25_weight,
-        ))
+        );
+
+        if self.retrieval_config.rerank.enabled {
+            self.rerank_candidates(query, candidates, request.top_k)
+                .await
+        } else {
+            Ok(candidates)
+        }
+    }
+
+    async fn rerank_candidates(
+        &self,
+        query: &str,
+        mut candidates: Vec<ScoredMemory>,
+        top_k: usize,
+    ) -> MemoryResult<Vec<ScoredMemory>> {
+        let Some(reranker) = self.reranker.as_ref() else {
+            if self.retrieval_config.rerank.fail_open {
+                candidates.truncate(top_k);
+                return Ok(candidates);
+            }
+            return Err(MemoryError::Rerank {
+                message: "rerank is enabled but no reranker is configured".to_string(),
+            });
+        };
+
+        match reranker.rerank(query, candidates.clone(), top_k).await {
+            Ok(mut results) => {
+                results.truncate(top_k);
+                Ok(results)
+            }
+            Err(_error) if self.retrieval_config.rerank.fail_open => {
+                candidates.truncate(top_k);
+                Ok(candidates)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn dense_candidates(
@@ -525,8 +582,8 @@ fn current_time_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::{
-        EmbeddingProvider, FileMemoryStore, HashEmbedding, RetrievalConfig, SearchMode,
-        SqliteMemoryStore,
+        EmbeddingProvider, FileMemoryStore, HashEmbedding, RerankConfig, Reranker, RetrievalConfig,
+        SearchMode, SqliteMemoryStore,
     };
     use async_trait::async_trait;
     use std::any::Any;
@@ -544,6 +601,65 @@ mod tests {
 
         async fn embed(&self, texts: &[String]) -> MemoryResult<Vec<Vec<f32>>> {
             Ok(texts.iter().map(|_| self.vector.clone()).collect())
+        }
+    }
+
+    struct FakeReranker {
+        scores_by_id: HashMap<String, f32>,
+        seen_candidate_counts: Arc<Mutex<Vec<usize>>>,
+        fail: bool,
+    }
+
+    impl FakeReranker {
+        fn with_scores(scores: &[(&str, f32)]) -> Self {
+            Self {
+                scores_by_id: scores
+                    .iter()
+                    .map(|(id, score)| ((*id).to_string(), *score))
+                    .collect(),
+                seen_candidate_counts: Arc::new(Mutex::new(Vec::new())),
+                fail: false,
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                scores_by_id: HashMap::new(),
+                seen_candidate_counts: Arc::new(Mutex::new(Vec::new())),
+                fail: true,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Reranker for FakeReranker {
+        async fn rerank(
+            &self,
+            _query: &str,
+            candidates: Vec<ScoredMemory>,
+            top_k: usize,
+        ) -> MemoryResult<Vec<ScoredMemory>> {
+            self.seen_candidate_counts
+                .lock()
+                .expect("candidate count lock")
+                .push(candidates.len());
+
+            if self.fail {
+                return Err(MemoryError::Rerank {
+                    message: "fake reranker failed".to_string(),
+                });
+            }
+
+            let mut results = candidates
+                .into_iter()
+                .map(|mut candidate| {
+                    candidate.score = *self.scores_by_id.get(&candidate.record.id).unwrap_or(&0.0);
+                    candidate
+                })
+                .collect::<Vec<_>>();
+            sort_scored_desc(&mut results);
+            results.truncate(top_k);
+            Ok(results)
         }
     }
 
@@ -597,6 +713,55 @@ mod tests {
             mode: SearchMode::Dense,
             ..RetrievalConfig::default()
         }
+    }
+
+    fn hybrid_config_with_rerank(input_k: usize, fail_open: bool) -> RetrievalConfig {
+        RetrievalConfig {
+            mode: SearchMode::Hybrid,
+            embedding_weight: 0.7,
+            bm25_weight: 0.3,
+            candidate_k: Some(3),
+            rerank: RerankConfig {
+                enabled: true,
+                input_k,
+                fail_open,
+                ..RerankConfig::default()
+            },
+        }
+    }
+
+    async fn seed_rerank_hybrid_store(temp: &tempfile::TempDir) -> Arc<SqliteMemoryStore> {
+        let store = Arc::new(SqliteMemoryStore::new(temp.path().join("memory.sqlite")));
+        store
+            .replace_all(&[
+                MemoryRecord {
+                    id: "hybrid-first".to_string(),
+                    text: "User loves Pacific Islander melodies.".to_string(),
+                    metadata: serde_json::json!({"scope_id": "scope-a"}),
+                    embedding: vec![1.0, 0.0],
+                    created_at_ms: 10,
+                    updated_at_ms: 10,
+                },
+                MemoryRecord {
+                    id: "rerank-winner".to_string(),
+                    text: "User loves Pacific melodies remixed by the new artist.".to_string(),
+                    metadata: serde_json::json!({"scope_id": "scope-a"}),
+                    embedding: vec![0.8, 0.6],
+                    created_at_ms: 10,
+                    updated_at_ms: 10,
+                },
+                MemoryRecord {
+                    id: "third".to_string(),
+                    text: "User bought running shoes.".to_string(),
+                    metadata: serde_json::json!({"scope_id": "scope-a"}),
+                    embedding: vec![0.1, 0.9949874],
+                    created_at_ms: 10,
+                    updated_at_ms: 10,
+                },
+            ])
+            .await
+            .expect("seed sqlite records");
+        store
     }
 
     #[tokio::test]
@@ -933,6 +1098,7 @@ mod tests {
                 embedding_weight: 0.7,
                 bm25_weight: 0.3,
                 candidate_k: Some(3),
+                ..RetrievalConfig::default()
             },
         );
 
@@ -986,6 +1152,7 @@ mod tests {
                 embedding_weight: 0.7,
                 bm25_weight: 0.3,
                 candidate_k: Some(1),
+                ..RetrievalConfig::default()
             },
         );
 
@@ -1003,6 +1170,123 @@ mod tests {
         assert!((results[0].score - 0.7).abs() < 0.0001);
         assert_eq!(results[1].record.id, "bm25-only");
         assert!((results[1].score - 0.3).abs() < 0.0001);
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_reranks_fused_candidates_when_enabled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = seed_rerank_hybrid_store(&temp).await;
+        let reranker = Arc::new(FakeReranker::with_scores(&[
+            ("rerank-winner", 0.98),
+            ("hybrid-first", 0.12),
+            ("third", 0.01),
+        ]));
+        let manager = MemoryManager::with_retrieval_config_and_reranker(
+            store,
+            Arc::new(StaticEmbedding {
+                vector: vec![1.0, 0.0],
+            }),
+            hybrid_config_with_rerank(3, false),
+            reranker,
+        );
+
+        let results = manager
+            .search(SearchMemoryRequest {
+                query: "Pacific melodies".to_string(),
+                top_k: 1,
+                filter: Some(serde_json::json!({"scope_id": "scope-a"})),
+            })
+            .await
+            .expect("reranked hybrid search");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].record.id, "rerank-winner");
+        assert!((results[0].score - 0.98).abs() < 0.0001);
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_limits_candidates_before_rerank() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = seed_rerank_hybrid_store(&temp).await;
+        let fake = FakeReranker::with_scores(&[
+            ("rerank-winner", 0.98),
+            ("hybrid-first", 0.12),
+            ("third", 0.01),
+        ]);
+        let seen_candidate_counts = fake.seen_candidate_counts.clone();
+        let manager = MemoryManager::with_retrieval_config_and_reranker(
+            store,
+            Arc::new(StaticEmbedding {
+                vector: vec![1.0, 0.0],
+            }),
+            hybrid_config_with_rerank(2, false),
+            Arc::new(fake),
+        );
+
+        manager
+            .search(SearchMemoryRequest {
+                query: "Pacific melodies".to_string(),
+                top_k: 1,
+                filter: Some(serde_json::json!({"scope_id": "scope-a"})),
+            })
+            .await
+            .expect("reranked hybrid search");
+
+        assert_eq!(
+            *seen_candidate_counts.lock().expect("candidate count lock"),
+            vec![2]
+        );
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_fail_closed_returns_rerank_error() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = seed_rerank_hybrid_store(&temp).await;
+        let manager = MemoryManager::with_retrieval_config_and_reranker(
+            store,
+            Arc::new(StaticEmbedding {
+                vector: vec![1.0, 0.0],
+            }),
+            hybrid_config_with_rerank(3, false),
+            Arc::new(FakeReranker::failing()),
+        );
+
+        let error = manager
+            .search(SearchMemoryRequest {
+                query: "Pacific melodies".to_string(),
+                top_k: 1,
+                filter: Some(serde_json::json!({"scope_id": "scope-a"})),
+            })
+            .await
+            .expect_err("fail closed rerank should fail search");
+
+        assert!(format!("{error}").contains("fake reranker failed"));
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_fail_open_returns_hybrid_order() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = seed_rerank_hybrid_store(&temp).await;
+        let manager = MemoryManager::with_retrieval_config_and_reranker(
+            store,
+            Arc::new(StaticEmbedding {
+                vector: vec![1.0, 0.0],
+            }),
+            hybrid_config_with_rerank(3, true),
+            Arc::new(FakeReranker::failing()),
+        );
+
+        let results = manager
+            .search(SearchMemoryRequest {
+                query: "Pacific melodies".to_string(),
+                top_k: 1,
+                filter: Some(serde_json::json!({"scope_id": "scope-a"})),
+            })
+            .await
+            .expect("fail open should return hybrid results");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].record.id, "hybrid-first");
     }
 
     #[tokio::test]

@@ -17,6 +17,14 @@ JUDGE_MODEL="${JUDGE_MODEL:-${MODEL:-gpt-4o-mini}}"
 LLM_API_KEY_ENV="${LLM_API_KEY_ENV:-OPENAI_API_KEY}"
 LLM_BASE_URL="${LLM_BASE_URL:-${OPENAI_BASE_URL:-${OPENAI_API_BASE:-}}}"
 LLM_THINKING="${LLM_THINKING:-default}"
+RERANK="${RERANK:-0}"
+RERANK_PROVIDER="${RERANK_PROVIDER:-openrouter}"
+RERANK_MODEL="${RERANK_MODEL:-cohere/rerank-v3.5}"
+RERANK_API_KEY_ENV="${RERANK_API_KEY_ENV:-OPENROUTER_API_KEY}"
+RERANK_BASE_URL="${RERANK_BASE_URL:-https://openrouter.ai/api/v1}"
+RERANK_INPUT_K="${RERANK_INPUT_K:-40}"
+RERANK_TIMEOUT_MS="${RERANK_TIMEOUT_MS:-}"
+RERANK_FAIL_OPEN="${RERANK_FAIL_OPEN:-0}"
 RUN_ID="${RUN_ID:-$(date +%Y-%m-%dT%H%M%S)}"
 if [ "${RUN_DIR:-}" ]; then
     case "$RUN_DIR" in
@@ -54,6 +62,21 @@ MEMORY_BENCH_MAIN_REPORT="${MEMORY_BENCH_DIR}/report.html"
 MEMORY_BENCH_ERROR_REPORT="${MEMORY_BENCH_DIR}/errors.html"
 
 mkdir -p "$MEM0_DIR" "$MEMORY_BENCH_DIR" "$MEM0_STAGE_REPORT_DIR" "$MEMORY_BENCH_STAGE_REPORT_DIR"
+
+MEMORY_BENCH_RERANK_ARGS=""
+case "$RERANK" in
+    1|true|TRUE|yes|YES)
+        MEMORY_BENCH_RERANK_ARGS="--rerank --rerank-provider $RERANK_PROVIDER --rerank-model $RERANK_MODEL --rerank-api-key-env $RERANK_API_KEY_ENV --rerank-base-url $RERANK_BASE_URL --rerank-input-k $RERANK_INPUT_K"
+        if [ -n "$RERANK_TIMEOUT_MS" ]; then
+            MEMORY_BENCH_RERANK_ARGS="$MEMORY_BENCH_RERANK_ARGS --rerank-timeout-ms $RERANK_TIMEOUT_MS"
+        fi
+        case "$RERANK_FAIL_OPEN" in
+            1|true|TRUE|yes|YES)
+                MEMORY_BENCH_RERANK_ARGS="$MEMORY_BENCH_RERANK_ARGS --rerank-fail-open"
+                ;;
+        esac
+        ;;
+esac
 
 stage_start() {
     STAGE_STARTED="$(date +%s)"
@@ -178,6 +201,7 @@ run_memory_bench() {
         --store "$MEMORY_BENCH_STORE" \
         --store-backend sqlite \
         --search-mode hybrid \
+        $MEMORY_BENCH_RERANK_ARGS \
         search --dataset "$DATASET" --query-fields question --top-k "$TOP_K" \
         --output "$MEMORY_BENCH_RETRIEVAL"
     stage_done 2 7 "RAM-A search"
