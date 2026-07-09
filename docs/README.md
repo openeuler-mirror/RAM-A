@@ -9,12 +9,13 @@ repository.
   dataset schema for benchmark adapters.
 - [design/memory-pipeline-roadmap.md](design/memory-pipeline-roadmap.md): roadmap for
   chunking, semantic memory extraction, and timeline-aware memory reasoning.
-- [design/sqlite-hybrid-search.md](design/sqlite-hybrid-search.md): historical design note
-  for the SQLite and hybrid retrieval implementation.
-- [guides/first-import-review.md](guides/first-import-review.md): first-import structure,
-  migration status, and review checklist.
+- [design/conversation-chunking-design.md](design/conversation-chunking-design.md):
+  detailed Chinese design for the first conversation chunking phase, including
+  UML/Mermaid diagrams, rationale, evaluation plan, and references.
+- [design/sqlite-hybrid-search.md](design/sqlite-hybrid-search.md): SQLite storage and
+  dense/BM25/hybrid retrieval reference.
 - [guides/locomo-evaluation.md](guides/locomo-evaluation.md): LoCoMo execution guide and
   output reference.
 
-Historical extraction notes, assistant context, generated reports, and one-off artifact
-manifests are intentionally excluded from the first import.
+One-off review notes, assistant context, generated reports, and artifact manifests are
+intentionally excluded from the formal documentation set.

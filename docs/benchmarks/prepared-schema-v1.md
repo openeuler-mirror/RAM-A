@@ -4,8 +4,6 @@ This document defines the unified prepared dataset format for memory benchmark a
 
 ## Quick Start: Adding a New Benchmark Adapter
 
-这一节面向后续接入 LoCoMo / LongMemEval / 其他 benchmark 的同事。
-
 新增 benchmark 时，原则上只需要新增一个数据集适配器：
 
 ```text
