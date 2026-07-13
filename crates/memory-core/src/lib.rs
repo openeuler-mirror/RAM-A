@@ -5,6 +5,7 @@ pub mod graph;
 pub mod manager;
 pub mod record;
 pub mod rerank;
+pub mod sqlite;
 pub mod sqlite_store;
 pub mod store;
 pub mod vector;

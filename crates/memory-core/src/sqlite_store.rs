@@ -13,6 +13,12 @@ use crate::{
 
 static REGISTER_SQLITE_VEC: Once = Once::new();
 
+type SqliteAutoExtensionEntry = unsafe extern "C" fn(
+    *mut rusqlite::ffi::sqlite3,
+    *mut *mut i8,
+    *const rusqlite::ffi::sqlite3_api_routines,
+) -> i32;
+
 pub struct SqliteMemoryStore {
     path: PathBuf,
 }
@@ -153,7 +159,10 @@ fn open_connection(path: &Path) -> MemoryResult<Connection> {
 
 fn register_sqlite_vec_extension() {
     REGISTER_SQLITE_VEC.call_once(|| unsafe {
-        sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ())));
+        sqlite3_auto_extension(Some(std::mem::transmute::<
+            *const (),
+            SqliteAutoExtensionEntry,
+        >(sqlite3_vec_init as *const ())));
     });
 }
 
