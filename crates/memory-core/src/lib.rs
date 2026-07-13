@@ -1,6 +1,7 @@
 pub mod api;
 pub mod embedding;
 pub mod error;
+pub mod graph;
 pub mod manager;
 pub mod record;
 pub mod rerank;
