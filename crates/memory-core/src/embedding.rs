@@ -8,6 +8,11 @@ use crate::{MemoryError, MemoryResult};
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
     fn dimensions(&self) -> usize;
+
+    fn model_name(&self) -> &str {
+        "unknown-embedding-model"
+    }
+
     async fn embed(&self, texts: &[String]) -> MemoryResult<Vec<Vec<f32>>>;
 
     async fn embed_one(&self, text: &str) -> MemoryResult<Vec<f32>> {
@@ -118,6 +123,10 @@ impl OpenRouterEmbedding {
 impl EmbeddingProvider for OpenRouterEmbedding {
     fn dimensions(&self) -> usize {
         self.dimensions
+    }
+
+    fn model_name(&self) -> &str {
+        &self.model
     }
 
     async fn embed(&self, texts: &[String]) -> MemoryResult<Vec<Vec<f32>>> {
@@ -249,6 +258,10 @@ impl HashEmbedding {
 impl EmbeddingProvider for HashEmbedding {
     fn dimensions(&self) -> usize {
         self.dimensions
+    }
+
+    fn model_name(&self) -> &str {
+        "hash-embedding"
     }
 
     async fn embed(&self, texts: &[String]) -> MemoryResult<Vec<Vec<f32>>> {
