@@ -1,4 +1,5 @@
 use memory_core::{MemoryRecord, MemoryStore, SqliteMemoryStore};
+use rusqlite::Connection;
 
 fn record(id: &str, text: &str, scope_id: &str, embedding: Vec<f32>) -> MemoryRecord {
     MemoryRecord {
@@ -27,6 +28,29 @@ async fn sqlite_store_roundtrips_records() {
     assert_eq!(records[0].embedding, original.embedding);
     assert_eq!(records[0].created_at_ms, original.created_at_ms);
     assert_eq!(records[0].updated_at_ms, original.updated_at_ms);
+}
+
+#[tokio::test]
+async fn sqlite_store_does_not_initialize_graph_schema() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("memory.sqlite");
+    let store = SqliteMemoryStore::new(&path);
+
+    store
+        .add_record(&record("m1", "alpha likes coffee", "scope-a", vec![0.1]))
+        .await
+        .expect("add record");
+
+    let connection = Connection::open(path).expect("open sqlite file");
+    let graph_table_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'graph_%'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count graph tables");
+
+    assert_eq!(graph_table_count, 0);
 }
 
 #[tokio::test]
