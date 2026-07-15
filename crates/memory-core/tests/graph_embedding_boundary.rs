@@ -75,7 +75,10 @@ async fn vector_stage_marks_failed_without_publishing_graph() {
         .to_string();
 
     assert!(error.contains("embedding unavailable"));
-    let run = repo.get_run(&accepted.ingestion_run_id).await.unwrap();
+    let run = repo
+        .get_run(&accepted.ingestion_run_id, "space-a")
+        .await
+        .unwrap();
     assert_eq!(run.status, "failed");
     assert_eq!(run.stage, "embedding");
     assert_eq!(repo.count_facts("space-a").await.unwrap(), 0);
@@ -94,7 +97,7 @@ async fn vector_stage_commits_record_embedding_before_graph_work() {
         .unwrap();
 
     let record = repo
-        .get_graph_memory_record(&accepted.memory_record_id)
+        .get_graph_memory_record(&accepted.memory_record_id, "space-a")
         .await
         .unwrap();
     assert_eq!(record.embedding, Some(vec![1.0, 0.0]));
@@ -106,7 +109,10 @@ async fn vector_stage_commits_record_embedding_before_graph_work() {
         record.embedding_version.as_deref(),
         Some("graph-embedding-v1")
     );
-    let run = repo.get_run(&accepted.ingestion_run_id).await.unwrap();
+    let run = repo
+        .get_run(&accepted.ingestion_run_id, "space-a")
+        .await
+        .unwrap();
     assert_eq!(run.status, "running");
     assert_eq!(run.stage, "extraction");
 }
@@ -122,7 +128,10 @@ async fn vector_stage_does_not_rewrite_embedding_after_leaving_embedding_stage()
         .process_vector_stage(&accepted.ingestion_run_id)
         .await
         .unwrap();
-    let run = repo.get_run(&accepted.ingestion_run_id).await.unwrap();
+    let run = repo
+        .get_run(&accepted.ingestion_run_id, "space-a")
+        .await
+        .unwrap();
 
     let error = repo
         .store_record_embedding(RecordEmbeddingUpdate {
@@ -191,7 +200,10 @@ async fn vector_stage_marks_failed_when_embedding_store_fails() {
         .to_string();
 
     assert!(!error.is_empty());
-    let run = repo.get_run(&accepted.ingestion_run_id).await.unwrap();
+    let run = repo
+        .get_run(&accepted.ingestion_run_id, "space-a")
+        .await
+        .unwrap();
     assert_eq!(run.status, "failed");
     assert_eq!(run.stage, "embedding");
     assert_eq!(run.error_code.as_deref(), Some("EMBEDDING_STORE_FAILED"));

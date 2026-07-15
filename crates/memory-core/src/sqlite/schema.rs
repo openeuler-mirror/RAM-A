@@ -252,6 +252,7 @@ fn initialize_evidence_and_run_schema(connection: &Connection) -> MemoryResult<(
             error_message TEXT,
             created_at_ms INTEGER NOT NULL,
             completed_at_ms INTEGER,
+            UNIQUE (memory_space_id, ingestion_run_id, attempt_number),
             FOREIGN KEY (ingestion_run_id, memory_space_id)
                 REFERENCES graph_ingestion_runs(id, memory_space_id)
         );

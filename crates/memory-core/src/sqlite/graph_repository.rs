@@ -4,7 +4,9 @@ use std::time::Duration;
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
-use crate::graph::{stable_input_hash, GraphInputHashFields, GraphMemoryRecord, IngestionRun};
+use crate::graph::{
+    stable_input_hash, ExtractionRun, GraphInputHashFields, GraphMemoryRecord, IngestionRun,
+};
 use crate::{GraphAddMemoryRequest, GraphAddMemoryResponse, MemoryError, MemoryResult};
 
 const GRAPH_PIPELINE_VERSION: &str = "graph-pipeline-v1";
@@ -32,6 +34,53 @@ pub struct RecordEmbeddingUpdate {
     pub embedding: Vec<f32>,
     pub embedding_model: String,
     pub embedding_version: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ClaimedExtractionRun {
+    pub ingestion_run_id: String,
+    pub memory_space_id: String,
+    pub memory_record_id: String,
+    pub text: String,
+    pub metadata: serde_json::Value,
+    pub attempt_count: i64,
+    pub extraction_attempt_number: i64,
+    pub context_record_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExtractionRunCompletion {
+    pub ingestion_run_id: String,
+    pub memory_space_id: String,
+    pub attempt_count: i64,
+    pub attempt_number: i64,
+    pub extractor_name: String,
+    pub model: String,
+    pub prompt_version: String,
+    pub schema_version: String,
+    pub type_registry_version: String,
+    pub context_record_ids: Vec<String>,
+    pub structured_output: serde_json::Value,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub latency_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExtractionRunFailure {
+    pub ingestion_run_id: String,
+    pub memory_space_id: String,
+    pub attempt_count: i64,
+    pub attempt_number: i64,
+    pub extractor_name: String,
+    pub model: String,
+    pub prompt_version: String,
+    pub schema_version: String,
+    pub type_registry_version: String,
+    pub context_record_ids: Vec<String>,
+    pub latency_ms: Option<i64>,
+    pub error_code: String,
+    pub error_message: String,
 }
 
 impl GraphRepository {
@@ -65,6 +114,31 @@ impl GraphRepository {
         run_sqlite_operation(move || store_record_embedding_sync(&path, &update)).await
     }
 
+    pub async fn claim_extraction_run(
+        &self,
+        ingestion_run_id: &str,
+    ) -> MemoryResult<ClaimedExtractionRun> {
+        let path = self.path.clone();
+        let ingestion_run_id = ingestion_run_id.to_string();
+        run_sqlite_operation(move || claim_extraction_run_sync(&path, &ingestion_run_id)).await
+    }
+
+    pub async fn store_extraction_success(
+        &self,
+        completion: ExtractionRunCompletion,
+    ) -> MemoryResult<ExtractionRun> {
+        let path = self.path.clone();
+        run_sqlite_operation(move || store_extraction_success_sync(&path, &completion)).await
+    }
+
+    pub async fn store_extraction_failure(
+        &self,
+        failure: ExtractionRunFailure,
+    ) -> MemoryResult<ExtractionRun> {
+        let path = self.path.clone();
+        run_sqlite_operation(move || store_extraction_failure_sync(&path, &failure)).await
+    }
+
     pub async fn mark_run_failed_if_current_attempt(
         &self,
         ingestion_run_id: &str,
@@ -91,19 +165,43 @@ impl GraphRepository {
         .await
     }
 
-    pub async fn get_run(&self, ingestion_run_id: &str) -> MemoryResult<IngestionRun> {
+    pub async fn get_run(
+        &self,
+        ingestion_run_id: &str,
+        memory_space_id: &str,
+    ) -> MemoryResult<IngestionRun> {
         let path = self.path.clone();
         let ingestion_run_id = ingestion_run_id.to_string();
-        run_sqlite_operation(move || get_run_sync(&path, &ingestion_run_id)).await
+        let memory_space_id = memory_space_id.to_string();
+        run_sqlite_operation(move || get_run_sync(&path, &ingestion_run_id, &memory_space_id)).await
     }
 
     pub async fn get_graph_memory_record(
         &self,
         memory_record_id: &str,
+        memory_space_id: &str,
     ) -> MemoryResult<GraphMemoryRecord> {
         let path = self.path.clone();
         let memory_record_id = memory_record_id.to_string();
-        run_sqlite_operation(move || get_graph_memory_record_sync(&path, &memory_record_id)).await
+        let memory_space_id = memory_space_id.to_string();
+        run_sqlite_operation(move || {
+            get_graph_memory_record_sync(&path, &memory_record_id, &memory_space_id)
+        })
+        .await
+    }
+
+    pub async fn get_extraction_run(
+        &self,
+        extraction_run_id: &str,
+        memory_space_id: &str,
+    ) -> MemoryResult<ExtractionRun> {
+        let path = self.path.clone();
+        let extraction_run_id = extraction_run_id.to_string();
+        let memory_space_id = memory_space_id.to_string();
+        run_sqlite_operation(move || {
+            get_extraction_run_sync(&path, &extraction_run_id, &memory_space_id)
+        })
+        .await
     }
 
     pub async fn count_facts(&self, memory_space_id: &str) -> MemoryResult<i64> {
@@ -430,6 +528,258 @@ fn store_record_embedding_sync(path: &Path, update: &RecordEmbeddingUpdate) -> M
     Ok(())
 }
 
+fn claim_extraction_run_sync(
+    path: &Path,
+    ingestion_run_id: &str,
+) -> MemoryResult<ClaimedExtractionRun> {
+    let mut connection = open_graph_connection(path)?;
+    let transaction = connection.transaction()?;
+    let (memory_space_id, memory_record_id, text, metadata_json, status, stage, attempt_count) =
+        transaction.query_row(
+            "SELECT runs.memory_space_id,
+                runs.memory_record_id,
+                records.text,
+                records.metadata_json,
+                runs.status,
+                runs.stage,
+                runs.attempt_count
+         FROM graph_ingestion_runs runs
+         JOIN graph_memory_records records
+           ON records.id = runs.memory_record_id
+          AND records.memory_space_id = runs.memory_space_id
+         WHERE runs.id = ?1",
+            params![ingestion_run_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
+        )?;
+
+    if status != "running" || stage != "extraction" {
+        return Err(MemoryError::InvalidInput {
+            message: format!("ingestion run is not ready for extraction: {status}/{stage}"),
+        });
+    }
+
+    let now = current_time_ms() as i64;
+    let updated = transaction.execute(
+        "UPDATE graph_ingestion_runs
+         SET stage = 'extracting',
+             updated_at_ms = ?1
+         WHERE id = ?2
+           AND status = 'running'
+           AND stage = 'extraction'
+           AND attempt_count = ?3",
+        params![now, ingestion_run_id, attempt_count],
+    )?;
+    if updated != 1 {
+        return Err(MemoryError::StoreBackend {
+            message: "failed to claim extraction run".to_string(),
+        });
+    }
+
+    let extraction_attempt_number: i64 = transaction.query_row(
+        "SELECT COALESCE(MAX(attempt_number), 0) + 1
+         FROM graph_extraction_runs
+         WHERE ingestion_run_id = ?1
+           AND memory_space_id = ?2",
+        params![ingestion_run_id, &memory_space_id],
+        |row| row.get(0),
+    )?;
+    let metadata = serde_json::from_str(&metadata_json)?;
+    // Extraction only uses the current record as context. Cross-record extraction context
+    // requires a separate retrieval/selection step and is intentionally not done here.
+    let context_record_ids = vec![memory_record_id.clone()];
+
+    transaction.commit()?;
+    Ok(ClaimedExtractionRun {
+        ingestion_run_id: ingestion_run_id.to_string(),
+        memory_space_id,
+        memory_record_id,
+        text,
+        metadata,
+        attempt_count,
+        extraction_attempt_number,
+        context_record_ids,
+    })
+}
+
+fn store_extraction_success_sync(
+    path: &Path,
+    completion: &ExtractionRunCompletion,
+) -> MemoryResult<ExtractionRun> {
+    let mut connection = open_graph_connection(path)?;
+    let transaction = connection.transaction()?;
+    let now = current_time_ms() as i64;
+    let extraction_run_id = Uuid::new_v4().to_string();
+    let context_record_ids_json = serde_json::to_string(&completion.context_record_ids)?;
+    let structured_output_json = serde_json::to_string(&completion.structured_output)?;
+
+    transaction.execute(
+        "INSERT INTO graph_extraction_runs (
+            id, memory_space_id, ingestion_run_id, attempt_number, status,
+            extractor_name, model, prompt_version, schema_version, type_registry_version,
+            context_record_ids_json, structured_output_json, input_tokens, output_tokens,
+            latency_ms, created_at_ms, completed_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, 'completed', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)",
+        params![
+            &extraction_run_id,
+            &completion.memory_space_id,
+            &completion.ingestion_run_id,
+            completion.attempt_number,
+            &completion.extractor_name,
+            &completion.model,
+            &completion.prompt_version,
+            &completion.schema_version,
+            &completion.type_registry_version,
+            &context_record_ids_json,
+            &structured_output_json,
+            completion.input_tokens,
+            completion.output_tokens,
+            completion.latency_ms,
+            now,
+        ],
+    )?;
+
+    let updated = transaction.execute(
+        "UPDATE graph_ingestion_runs
+         SET stage = 'resolution',
+             updated_at_ms = ?1
+         WHERE id = ?2
+           AND memory_space_id = ?3
+           AND status = 'running'
+           AND stage = 'extracting'
+           AND attempt_count = ?4",
+        params![
+            now,
+            &completion.ingestion_run_id,
+            &completion.memory_space_id,
+            completion.attempt_count
+        ],
+    )?;
+    if updated != 1 {
+        return Err(MemoryError::StoreBackend {
+            message: "ingestion run is no longer current for extraction completion".to_string(),
+        });
+    }
+
+    transaction.commit()?;
+    Ok(ExtractionRun {
+        id: extraction_run_id,
+        memory_space_id: completion.memory_space_id.clone(),
+        ingestion_run_id: completion.ingestion_run_id.clone(),
+        attempt_number: completion.attempt_number,
+        status: "completed".to_string(),
+        extractor_name: completion.extractor_name.clone(),
+        model: completion.model.clone(),
+        prompt_version: completion.prompt_version.clone(),
+        schema_version: completion.schema_version.clone(),
+        type_registry_version: completion.type_registry_version.clone(),
+        context_record_ids: completion.context_record_ids.clone(),
+        structured_output: Some(completion.structured_output.clone()),
+        input_tokens: completion.input_tokens,
+        output_tokens: completion.output_tokens,
+        latency_ms: completion.latency_ms,
+        error_code: None,
+        error_message: None,
+        created_at_ms: now as u64,
+        completed_at_ms: Some(now as u64),
+    })
+}
+
+fn store_extraction_failure_sync(
+    path: &Path,
+    failure: &ExtractionRunFailure,
+) -> MemoryResult<ExtractionRun> {
+    let mut connection = open_graph_connection(path)?;
+    let transaction = connection.transaction()?;
+    let now = current_time_ms() as i64;
+    let extraction_run_id = Uuid::new_v4().to_string();
+    let context_record_ids_json = serde_json::to_string(&failure.context_record_ids)?;
+
+    transaction.execute(
+        "INSERT INTO graph_extraction_runs (
+            id, memory_space_id, ingestion_run_id, attempt_number, status,
+            extractor_name, model, prompt_version, schema_version, type_registry_version,
+            context_record_ids_json, latency_ms, error_code, error_message,
+            created_at_ms, completed_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, 'failed', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
+        params![
+            &extraction_run_id,
+            &failure.memory_space_id,
+            &failure.ingestion_run_id,
+            failure.attempt_number,
+            &failure.extractor_name,
+            &failure.model,
+            &failure.prompt_version,
+            &failure.schema_version,
+            &failure.type_registry_version,
+            &context_record_ids_json,
+            failure.latency_ms,
+            &failure.error_code,
+            &failure.error_message,
+            now,
+        ],
+    )?;
+
+    let updated = transaction.execute(
+        "UPDATE graph_ingestion_runs
+         SET status = 'failed',
+             error_code = ?1,
+             error_message = ?2,
+             updated_at_ms = ?3,
+             completed_at_ms = ?3
+         WHERE id = ?4
+           AND memory_space_id = ?5
+           AND status = 'running'
+           AND stage = 'extracting'
+           AND attempt_count = ?6",
+        params![
+            &failure.error_code,
+            &failure.error_message,
+            now,
+            &failure.ingestion_run_id,
+            &failure.memory_space_id,
+            failure.attempt_count
+        ],
+    )?;
+    if updated != 1 {
+        return Err(MemoryError::StoreBackend {
+            message: "ingestion run is no longer current for extraction failure".to_string(),
+        });
+    }
+
+    transaction.commit()?;
+    Ok(ExtractionRun {
+        id: extraction_run_id,
+        memory_space_id: failure.memory_space_id.clone(),
+        ingestion_run_id: failure.ingestion_run_id.clone(),
+        attempt_number: failure.attempt_number,
+        status: "failed".to_string(),
+        extractor_name: failure.extractor_name.clone(),
+        model: failure.model.clone(),
+        prompt_version: failure.prompt_version.clone(),
+        schema_version: failure.schema_version.clone(),
+        type_registry_version: failure.type_registry_version.clone(),
+        context_record_ids: failure.context_record_ids.clone(),
+        structured_output: None,
+        input_tokens: None,
+        output_tokens: None,
+        latency_ms: failure.latency_ms,
+        error_code: Some(failure.error_code.clone()),
+        error_message: Some(failure.error_message.clone()),
+        created_at_ms: now as u64,
+        completed_at_ms: Some(now as u64),
+    })
+}
+
 fn mark_run_failed_if_current_attempt_sync(
     path: &Path,
     ingestion_run_id: &str,
@@ -471,7 +821,11 @@ fn mark_run_failed_if_current_attempt_sync(
     Ok(())
 }
 
-fn get_run_sync(path: &Path, ingestion_run_id: &str) -> MemoryResult<IngestionRun> {
+fn get_run_sync(
+    path: &Path,
+    ingestion_run_id: &str,
+    memory_space_id: &str,
+) -> MemoryResult<IngestionRun> {
     let connection = open_graph_connection(path)?;
     connection
         .query_row(
@@ -479,8 +833,9 @@ fn get_run_sync(path: &Path, ingestion_run_id: &str) -> MemoryResult<IngestionRu
                     status, stage, attempt_count, pipeline_version, error_code, error_message,
                     created_at_ms, started_at_ms, updated_at_ms, completed_at_ms
              FROM graph_ingestion_runs
-             WHERE id = ?1",
-            params![ingestion_run_id],
+             WHERE id = ?1
+               AND memory_space_id = ?2",
+            params![ingestion_run_id, memory_space_id],
             |row| {
                 Ok(IngestionRun {
                     id: row.get(0)?,
@@ -504,9 +859,95 @@ fn get_run_sync(path: &Path, ingestion_run_id: &str) -> MemoryResult<IngestionRu
         .map_err(Into::into)
 }
 
+fn get_extraction_run_sync(
+    path: &Path,
+    extraction_run_id: &str,
+    memory_space_id: &str,
+) -> MemoryResult<ExtractionRun> {
+    let connection = open_graph_connection(path)?;
+    let (
+        id,
+        memory_space_id,
+        ingestion_run_id,
+        attempt_number,
+        status,
+        extractor_name,
+        model,
+        prompt_version,
+        schema_version,
+        type_registry_version,
+        context_record_ids_json,
+        structured_output_json,
+        input_tokens,
+        output_tokens,
+        latency_ms,
+        error_code,
+        error_message,
+        created_at_ms,
+        completed_at_ms,
+    ) = connection.query_row(
+        "SELECT id, memory_space_id, ingestion_run_id, attempt_number, status,
+                extractor_name, model, prompt_version, schema_version, type_registry_version,
+                context_record_ids_json, structured_output_json, input_tokens, output_tokens,
+                latency_ms, error_code, error_message, created_at_ms, completed_at_ms
+         FROM graph_extraction_runs
+         WHERE id = ?1
+           AND memory_space_id = ?2",
+        params![extraction_run_id, memory_space_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<i64>>(12)?,
+                row.get::<_, Option<i64>>(13)?,
+                row.get::<_, Option<i64>>(14)?,
+                row.get::<_, Option<String>>(15)?,
+                row.get::<_, Option<String>>(16)?,
+                row.get::<_, i64>(17)?,
+                row.get::<_, Option<i64>>(18)?,
+            ))
+        },
+    )?;
+
+    Ok(ExtractionRun {
+        id,
+        memory_space_id,
+        ingestion_run_id,
+        attempt_number,
+        status,
+        extractor_name,
+        model,
+        prompt_version,
+        schema_version,
+        type_registry_version,
+        context_record_ids: serde_json::from_str(&context_record_ids_json)?,
+        structured_output: structured_output_json
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?,
+        input_tokens,
+        output_tokens,
+        latency_ms,
+        error_code,
+        error_message,
+        created_at_ms: created_at_ms as u64,
+        completed_at_ms: completed_at_ms.map(|value| value as u64),
+    })
+}
+
 fn get_graph_memory_record_sync(
     path: &Path,
     memory_record_id: &str,
+    memory_space_id: &str,
 ) -> MemoryResult<GraphMemoryRecord> {
     let connection = open_graph_connection(path)?;
     let (
@@ -535,8 +976,9 @@ fn get_graph_memory_record_sync(
                 created_by_agent_id, observed_at_ms, embedding, embedding_dims,
                 embedding_model, embedding_version, created_at_ms, updated_at_ms, deleted_at_ms
          FROM graph_memory_records
-         WHERE id = ?1",
-        params![memory_record_id],
+         WHERE id = ?1
+           AND memory_space_id = ?2",
+        params![memory_record_id, memory_space_id],
         |row| {
             Ok((
                 row.get::<_, String>(0)?,

@@ -80,7 +80,7 @@ async fn dataset_shaped_memories_flow_through_graph_add_and_embedding() {
     assert_eq!(accepted.len(), samples.len());
     for (index, response) in accepted.iter().enumerate() {
         let record = repo
-            .get_graph_memory_record(&response.memory_record_id)
+            .get_graph_memory_record(&response.memory_record_id, "personalmem-user-001")
             .await
             .unwrap();
         assert_eq!(record.text, samples[index]);
@@ -90,7 +90,10 @@ async fn dataset_shaped_memories_flow_through_graph_add_and_embedding() {
             Some("dataset-smoke-embedding")
         );
 
-        let run = repo.get_run(&response.ingestion_run_id).await.unwrap();
+        let run = repo
+            .get_run(&response.ingestion_run_id, "personalmem-user-001")
+            .await
+            .unwrap();
         assert_eq!(run.status, "running");
         assert_eq!(run.stage, "extraction");
     }

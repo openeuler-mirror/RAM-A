@@ -103,6 +103,63 @@ fn graph_schema_links_run_scoped_tables_to_ingestion_runs() {
     );
 }
 
+#[test]
+fn graph_schema_rejects_duplicate_extraction_attempt_numbers() {
+    let connection = Connection::open_in_memory().unwrap();
+    initialize_schema(&connection).unwrap();
+
+    connection
+        .execute_batch(
+            r#"
+            INSERT INTO graph_memory_spaces (
+                id, owner_id, status, next_ingestion_sequence, created_at_ms
+            ) VALUES ('space-a', 'user-a', 'active', 1, 1);
+
+            INSERT INTO graph_memory_records (
+                id, memory_space_id, ingestion_sequence, text, metadata_json,
+                source_kind, content_role, created_at_ms, updated_at_ms
+            ) VALUES (
+                'record-a', 'space-a', 1, 'Alice lives in Shanghai.', '{}',
+                'conversation', 'user', 1, 1
+            );
+
+            INSERT INTO graph_ingestion_runs (
+                id, memory_space_id, memory_record_id, idempotency_key, input_hash,
+                status, stage, attempt_count, pipeline_version, created_at_ms, updated_at_ms
+            ) VALUES (
+                'run-a', 'space-a', 'record-a', 'key-a', 'hash-a',
+                'running', 'extracting', 1, 'graph-pipeline-v1', 1, 1
+            );
+
+            INSERT INTO graph_extraction_runs (
+                id, memory_space_id, ingestion_run_id, attempt_number, status,
+                extractor_name, model, prompt_version, schema_version,
+                type_registry_version, context_record_ids_json, created_at_ms
+            ) VALUES (
+                'extraction-a', 'space-a', 'run-a', 1, 'completed',
+                'extractor', 'model', 'prompt-v1', 'schema-v1',
+                'graph-type-registry-v1', '["record-a"]', 1
+            );
+            "#,
+        )
+        .unwrap();
+
+    let duplicate = connection.execute(
+        "INSERT INTO graph_extraction_runs (
+            id, memory_space_id, ingestion_run_id, attempt_number, status,
+            extractor_name, model, prompt_version, schema_version,
+            type_registry_version, context_record_ids_json, created_at_ms
+         ) VALUES (
+            'extraction-b', 'space-a', 'run-a', 1, 'completed',
+            'extractor', 'model', 'prompt-v1', 'schema-v1',
+            'graph-type-registry-v1', '[\"record-a\"]', 2
+         )",
+        [],
+    );
+
+    assert!(duplicate.is_err());
+}
+
 fn foreign_key_columns_to_table(
     connection: &Connection,
     table_name: &str,
