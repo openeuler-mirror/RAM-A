@@ -15,6 +15,9 @@ repository.
   structured candidate extraction stage reference.
 - [design/graph-memory-resolution.md](design/graph-memory-resolution.md): graph memory
   deterministic resolution and formal graph materialization stage reference.
+- [design/graph-memory-retrieval.md](design/graph-memory-retrieval.md): graph memory
+  graph seed retrieval, Entity-Fact expansion, ContextBundle assembly, and optional
+  MemoryManager search graph channel reference.
 - [design/sqlite-hybrid-search.md](design/sqlite-hybrid-search.md): SQLite storage and
   dense/BM25/hybrid retrieval reference.
 - [design/memory-cases-storage-split.md](design/memory-cases-storage-split.md): `memory-cases`

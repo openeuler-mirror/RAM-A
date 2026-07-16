@@ -86,6 +86,7 @@ pub struct SearchMemoryRequest {
     pub query: String,
     pub top_k: usize,
     pub filter: Option<serde_json::Value>,
+    pub graph_memory_space_id: Option<String>,
 }
 ```
 
