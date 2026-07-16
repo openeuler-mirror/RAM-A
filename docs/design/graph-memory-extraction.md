@@ -35,11 +35,36 @@ pub trait GraphExtractor: Send + Sync {
 }
 ```
 
-`GraphExtractionExecutor` 不绑定具体 LLM provider。测试中使用 deterministic extractor；
-真实 LLM adapter 可以在该 trait 后面接入。
+`GraphExtractionExecutor` 不绑定具体 LLM provider。当前代码提供两类接入方式：
+
+- 测试或离线验证可以直接实现 `GraphExtractor`，返回 deterministic
+  `GraphExtractionOutput`；
+- 真实模型调用可以使用 `LlmGraphExtractor` + `GraphLlmClient`。当前内置实现是
+  `OpenAiCompatibleGraphLlmClient`，默认 base URL 为 OpenRouter 的
+  `https://openrouter.ai/api/v1`，也可以传入其他 OpenAI-compatible base URL。
+
+真实 API key 和模型名由调用方在运行时注入；LLM HTTP 请求默认 60 秒超时，调用方
+可以通过 builder 覆盖。本阶段不在仓库内写死 key，也不引入多厂商原生 SDK。
+调用真实 LLM adapter 时，原文和 metadata 会发送给配置的 LLM provider；调用方需要
+确认该 provider 的数据处理和隐私策略符合使用场景要求。
 
 当前 `context_record_ids` 只包含当前 `memory_record_id`。跨 record 的上下文选择需要
 单独的 retrieval / context selection 步骤，本阶段不做。
+
+## 2.1 LLM adapter 行为
+
+`LlmGraphExtractor` 会把单条 memory record、`GraphTypeRegistry`、输出 JSON 形状
+和 evidence 约束放入 prompt，并要求模型只返回 JSON。模型输出会被解析为
+`GraphExtractionOutput`，随后仍然经过第 4 节的候选校验。因此 LLM 只负责“提出候选”，
+不能绕过 entity type、predicate、evidence grounding 和时间区间校验。
+
+`OpenAiCompatibleGraphLlmClient` 调用 `/chat/completions`，设置
+`response_format={"type":"json_object"}`，并记录 provider 返回的 token usage。若模型
+偶尔返回以 `json` 标记的 Markdown 代码块，解析层会先剥离 fence 再解析。HTTP 429
+和 5xx 等临时失败会按现有 embedding / rerank 风格进行有限重试。
+
+该 adapter 的目标是把真实 LLM 接口接入候选抽取边界，不负责 prompt 评测、模型选择、
+benchmark 对比或正式图写入。
 
 ## 3. 候选输出结构
 
@@ -140,3 +165,12 @@ store 错误。
   `EXTRACTION_STORE_FAILED`；
 - 缺失 evidence、空 evidence、脱离原文的 evidence 会被拒绝；
 - 失败路径会同步标记 ingestion run 为 failed。
+
+LLM adapter 行为由 `graph_llm_extraction.rs` 覆盖：
+
+- fake LLM client 返回候选 JSON 后，executor 能持久化候选和 token usage；
+- prompt 会包含原文和 byte offset 约束，并要求 JSON response format；
+- fenced JSON 可以被解析；
+- 非 JSON 输出会被拒绝；
+- LLM 输出仍然必须通过候选校验，无 evidence 的 fact 会进入
+  `INVALID_EXTRACTION_OUTPUT` 失败路径。
