@@ -16,6 +16,32 @@ pub struct AddMemoryResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GraphAddMemoryRequest {
+    pub memory_space_id: String,
+    pub owner_id: String,
+    pub idempotency_key: String,
+    pub text: String,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+    pub session_id: Option<String>,
+    pub session_sequence: Option<i64>,
+    pub source_kind: String,
+    pub source_ref: Option<String>,
+    pub content_role: String,
+    pub created_by_agent_id: Option<String>,
+    pub observed_at_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GraphAddMemoryResponse {
+    pub memory_record_id: String,
+    pub ingestion_run_id: String,
+    pub status: String,
+    pub vector_ready: bool,
+    pub graph_ready: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SearchMemoryRequest {
     pub query: String,
     pub top_k: usize,
