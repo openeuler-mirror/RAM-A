@@ -41,6 +41,8 @@ fn graph_schema_creates_required_tables_and_indexes() {
         "idx_graph_entities_active_identity",
         "idx_graph_entity_aliases_active_identity",
         "idx_graph_facts_active_dedup",
+        "idx_graph_fact_evidence_groups_fact",
+        "idx_graph_fact_evidence_group",
     ] {
         assert!(
             names.iter().any(|name| name == required),

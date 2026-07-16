@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -6,14 +6,20 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use uuid::Uuid;
 
 use crate::graph::{
-    normalize_graph_text, stable_input_hash, ExtractedEntityCandidate, ExtractedFactCandidate,
-    ExtractionRun, GraphExtractionOutput, GraphInputHashFields, GraphMemoryRecord, IngestionRun,
+    normalize_graph_text, stable_input_hash, ContextBundle, Entity, ExtractedEntityCandidate,
+    ExtractedFactCandidate, ExtractionRun, Fact, FactContextUnit, FactLink, FactStatus,
+    GraphExtractionOutput, GraphInputHashFields, GraphMemoryRecord, IngestionRun,
 };
-use crate::{GraphAddMemoryRequest, GraphAddMemoryResponse, MemoryError, MemoryResult};
+use crate::{
+    GraphAddMemoryRequest, GraphAddMemoryResponse, GraphRetrieveContextRequest, MemoryError,
+    MemoryResult,
+};
 
 const GRAPH_PIPELINE_VERSION: &str = "graph-pipeline-v1";
 const FACT_EVIDENCE_KIND_SUPPORT: &str = "support";
 const RESOLUTION_METHOD_DETERMINISTIC: &str = "deterministic";
+const MAX_GRAPH_RETRIEVAL_QUERY_BYTES: usize = 4 * 1024;
+const MAX_GRAPH_FTS_QUERY_TERMS: usize = 256;
 
 #[derive(Clone, Debug)]
 pub struct GraphRepository {
@@ -120,6 +126,36 @@ pub struct ResolutionPublishResult {
     pub evidence_inserted: usize,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum GraphSeedKind {
+    Entity,
+    Fact,
+}
+
+#[derive(Clone, Debug)]
+struct GraphSeed {
+    kind: GraphSeedKind,
+    id: String,
+    score: f32,
+}
+
+#[derive(Clone, Debug)]
+struct FactCandidate {
+    fact_id: String,
+    score: f32,
+    path: Vec<String>,
+    recorded_at_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+struct BundleMembers {
+    records: Vec<GraphMemoryRecord>,
+    entities: Vec<Entity>,
+    facts: Vec<Fact>,
+    fact_links: Vec<FactLink>,
+    paths: Vec<Vec<String>>,
+}
+
 impl GraphRepository {
     pub fn open(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
@@ -191,6 +227,14 @@ impl GraphRepository {
     ) -> MemoryResult<ResolutionPublishResult> {
         let path = self.path.clone();
         run_sqlite_operation(move || publish_resolution_sync(&path, &request)).await
+    }
+
+    pub async fn retrieve_context(
+        &self,
+        request: GraphRetrieveContextRequest,
+    ) -> MemoryResult<ContextBundle> {
+        let path = self.path.clone();
+        run_sqlite_operation(move || retrieve_context_sync(&path, &request)).await
     }
 
     pub async fn mark_run_failed_if_current_attempt(
@@ -461,6 +505,783 @@ fn current_time_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn retrieve_context_sync(
+    path: &Path,
+    request: &GraphRetrieveContextRequest,
+) -> MemoryResult<ContextBundle> {
+    let query = request.query.trim();
+    if query.is_empty() {
+        return Err(MemoryError::InvalidInput {
+            message: "graph retrieval query must not be empty".to_string(),
+        });
+    }
+    if query.len() > MAX_GRAPH_RETRIEVAL_QUERY_BYTES {
+        return Err(MemoryError::InvalidInput {
+            message: format!(
+                "graph retrieval query must be at most {MAX_GRAPH_RETRIEVAL_QUERY_BYTES} bytes"
+            ),
+        });
+    }
+
+    let connection = open_graph_connection(path)?;
+    let Some(fts_query) = graph_fts_query(query) else {
+        return Ok(ContextBundle {
+            query: request.query.clone(),
+            memory_space_id: request.memory_space_id.clone(),
+            reference_time_ms: request.reference_time_ms.unwrap_or_else(current_time_ms),
+            fact_context_units: Vec::new(),
+            records: Vec::new(),
+            entities: Vec::new(),
+            facts: Vec::new(),
+            fact_links: Vec::new(),
+            paths: Vec::new(),
+            truncation: None,
+            degraded_reason: Some("query produced no graph retrieval terms".to_string()),
+        });
+    };
+
+    let seeds = collect_graph_seeds(
+        &connection,
+        &request.memory_space_id,
+        &fts_query,
+        request.seed_limit(),
+    )?;
+    let fact_candidates =
+        expand_seed_facts(&connection, &request.memory_space_id, &seeds, request.top_k)?;
+    let (fact_context_units, loaded_facts) =
+        load_fact_context_units(&connection, request, &fact_candidates)?;
+    let bundle_members = collect_bundle_members(&fact_context_units, loaded_facts);
+
+    Ok(ContextBundle {
+        query: request.query.clone(),
+        memory_space_id: request.memory_space_id.clone(),
+        reference_time_ms: request.reference_time_ms.unwrap_or_else(current_time_ms),
+        fact_context_units,
+        records: bundle_members.records,
+        entities: bundle_members.entities,
+        facts: bundle_members.facts,
+        fact_links: bundle_members.fact_links,
+        paths: bundle_members.paths,
+        truncation: None,
+        degraded_reason: None,
+    })
+}
+
+fn graph_fts_query(query: &str) -> Option<String> {
+    let terms = query
+        .split_whitespace()
+        .filter_map(|term| {
+            let trimmed = term.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(format!("\"{}\"", trimmed.replace('"', "\"\"")))
+            }
+        })
+        .take(MAX_GRAPH_FTS_QUERY_TERMS)
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" OR "))
+    }
+}
+
+fn collect_graph_seeds(
+    connection: &Connection,
+    memory_space_id: &str,
+    fts_query: &str,
+    limit: usize,
+) -> MemoryResult<Vec<GraphSeed>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut seeds = Vec::new();
+    collect_entity_name_seeds(connection, memory_space_id, fts_query, limit, &mut seeds)?;
+    collect_entity_alias_seeds(connection, memory_space_id, fts_query, limit, &mut seeds)?;
+    collect_fact_text_seeds(connection, memory_space_id, fts_query, limit, &mut seeds)?;
+    collect_record_evidence_fact_seeds(connection, memory_space_id, fts_query, limit, &mut seeds)?;
+
+    let mut best_by_key: HashMap<(GraphSeedKind, String), f32> = HashMap::new();
+    for seed in seeds {
+        let key = (seed.kind, seed.id);
+        best_by_key
+            .entry(key)
+            .and_modify(|score| *score = score.max(seed.score))
+            .or_insert(seed.score);
+    }
+
+    let mut merged = best_by_key
+        .into_iter()
+        .map(|((kind, id), score)| GraphSeed { kind, id, score })
+        .collect::<Vec<_>>();
+    merged.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    merged.truncate(limit);
+    Ok(merged)
+}
+
+fn collect_entity_name_seeds(
+    connection: &Connection,
+    memory_space_id: &str,
+    fts_query: &str,
+    limit: usize,
+    seeds: &mut Vec<GraphSeed>,
+) -> MemoryResult<()> {
+    let mut statement = connection.prepare(
+        "SELECT entities.id
+         FROM graph_entity_fts
+         JOIN graph_entities entities
+           ON entities.id = graph_entity_fts.id
+          AND entities.memory_space_id = graph_entity_fts.memory_space_id
+         WHERE graph_entity_fts MATCH ?1
+           AND graph_entity_fts.memory_space_id = ?2
+           AND entities.status = 'active'
+           AND entities.deleted_at_ms IS NULL
+         ORDER BY bm25(graph_entity_fts), entities.created_at_ms, entities.id
+         LIMIT ?3",
+    )?;
+    collect_seed_rows(
+        &mut statement,
+        params![fts_query, memory_space_id, limit as i64],
+        GraphSeedKind::Entity,
+        seeds,
+    )
+}
+
+fn collect_entity_alias_seeds(
+    connection: &Connection,
+    memory_space_id: &str,
+    fts_query: &str,
+    limit: usize,
+    seeds: &mut Vec<GraphSeed>,
+) -> MemoryResult<()> {
+    let mut statement = connection.prepare(
+        "SELECT entities.id
+         FROM graph_entity_alias_fts
+         JOIN graph_entity_aliases aliases
+           ON aliases.id = graph_entity_alias_fts.id
+          AND aliases.memory_space_id = graph_entity_alias_fts.memory_space_id
+         JOIN graph_entities entities
+           ON entities.id = aliases.entity_id
+          AND entities.memory_space_id = aliases.memory_space_id
+         WHERE graph_entity_alias_fts MATCH ?1
+           AND graph_entity_alias_fts.memory_space_id = ?2
+           AND aliases.deleted_at_ms IS NULL
+           AND entities.status = 'active'
+           AND entities.deleted_at_ms IS NULL
+         GROUP BY entities.id
+         ORDER BY MIN(aliases.created_at_ms), entities.id
+         LIMIT ?3",
+    )?;
+    collect_seed_rows(
+        &mut statement,
+        params![fts_query, memory_space_id, limit as i64],
+        GraphSeedKind::Entity,
+        seeds,
+    )
+}
+
+fn collect_fact_text_seeds(
+    connection: &Connection,
+    memory_space_id: &str,
+    fts_query: &str,
+    limit: usize,
+    seeds: &mut Vec<GraphSeed>,
+) -> MemoryResult<()> {
+    let mut statement = connection.prepare(
+        "SELECT facts.id
+         FROM graph_fact_fts
+         JOIN graph_facts facts
+           ON facts.id = graph_fact_fts.id
+          AND facts.memory_space_id = graph_fact_fts.memory_space_id
+         WHERE graph_fact_fts MATCH ?1
+           AND graph_fact_fts.memory_space_id = ?2
+           AND facts.status = 'active'
+           AND facts.retired_at_ms IS NULL
+         ORDER BY bm25(graph_fact_fts), facts.recorded_at_ms, facts.id
+         LIMIT ?3",
+    )?;
+    collect_seed_rows(
+        &mut statement,
+        params![fts_query, memory_space_id, limit as i64],
+        GraphSeedKind::Fact,
+        seeds,
+    )
+}
+
+fn collect_record_evidence_fact_seeds(
+    connection: &Connection,
+    memory_space_id: &str,
+    fts_query: &str,
+    limit: usize,
+    seeds: &mut Vec<GraphSeed>,
+) -> MemoryResult<()> {
+    let mut statement = connection.prepare(
+        "SELECT facts.id
+         FROM graph_memory_record_fts
+         JOIN graph_memory_records records
+           ON records.id = graph_memory_record_fts.id
+          AND records.memory_space_id = graph_memory_record_fts.memory_space_id
+         JOIN graph_fact_evidence evidence
+           ON evidence.memory_record_id = records.id
+          AND evidence.memory_space_id = records.memory_space_id
+          AND evidence.deleted_at_ms IS NULL
+         JOIN graph_fact_evidence_groups groups
+           ON groups.id = evidence.evidence_group_id
+          AND groups.memory_space_id = evidence.memory_space_id
+          AND groups.deleted_at_ms IS NULL
+         JOIN graph_facts facts
+           ON facts.id = groups.fact_id
+          AND facts.memory_space_id = groups.memory_space_id
+         WHERE graph_memory_record_fts MATCH ?1
+           AND graph_memory_record_fts.memory_space_id = ?2
+           AND records.deleted_at_ms IS NULL
+           AND facts.status = 'active'
+           AND facts.retired_at_ms IS NULL
+         GROUP BY facts.id
+         ORDER BY MIN(facts.recorded_at_ms), facts.id
+         LIMIT ?3",
+    )?;
+    collect_seed_rows(
+        &mut statement,
+        params![fts_query, memory_space_id, limit as i64],
+        GraphSeedKind::Fact,
+        seeds,
+    )
+}
+
+fn collect_seed_rows<P>(
+    statement: &mut rusqlite::Statement<'_>,
+    params: P,
+    kind: GraphSeedKind,
+    seeds: &mut Vec<GraphSeed>,
+) -> MemoryResult<()>
+where
+    P: rusqlite::Params,
+{
+    let rows = statement.query_map(params, |row| row.get::<_, String>(0))?;
+    let mut raw_rows = Vec::new();
+    for row in rows {
+        raw_rows.push(row?);
+    }
+    append_ranked_seeds(kind, raw_rows, seeds);
+    Ok(())
+}
+
+fn append_ranked_seeds(kind: GraphSeedKind, raw_rows: Vec<String>, seeds: &mut Vec<GraphSeed>) {
+    for (index, id) in raw_rows.into_iter().enumerate() {
+        seeds.push(GraphSeed {
+            kind: kind.clone(),
+            id,
+            score: 1.0 / (index as f32 + 1.0),
+        });
+    }
+}
+
+fn expand_seed_facts(
+    connection: &Connection,
+    memory_space_id: &str,
+    seeds: &[GraphSeed],
+    limit: usize,
+) -> MemoryResult<Vec<FactCandidate>> {
+    if limit == 0 || seeds.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut candidates_by_fact: HashMap<String, FactCandidate> = HashMap::new();
+    for seed in seeds {
+        match seed.kind {
+            GraphSeedKind::Fact => {
+                if let Some(recorded_at_ms) =
+                    active_fact_recorded_at(connection, memory_space_id, &seed.id)?
+                {
+                    upsert_fact_candidate(
+                        &mut candidates_by_fact,
+                        FactCandidate {
+                            fact_id: seed.id.clone(),
+                            score: seed.score,
+                            path: vec![format!("fact:{}", seed.id)],
+                            recorded_at_ms,
+                        },
+                    );
+                }
+            }
+            GraphSeedKind::Entity => {
+                for (fact_id, recorded_at_ms) in
+                    active_facts_for_entity(connection, memory_space_id, &seed.id, limit)?
+                {
+                    upsert_fact_candidate(
+                        &mut candidates_by_fact,
+                        FactCandidate {
+                            fact_id: fact_id.clone(),
+                            score: seed.score,
+                            path: vec![format!("entity:{}", seed.id), format!("fact:{fact_id}")],
+                            recorded_at_ms,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    let mut candidates = candidates_by_fact.into_values().collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.recorded_at_ms.cmp(&right.recorded_at_ms))
+            .then_with(|| left.fact_id.cmp(&right.fact_id))
+    });
+    candidates.truncate(limit);
+    Ok(candidates)
+}
+
+fn upsert_fact_candidate(
+    candidates_by_fact: &mut HashMap<String, FactCandidate>,
+    candidate: FactCandidate,
+) {
+    candidates_by_fact
+        .entry(candidate.fact_id.clone())
+        .and_modify(|existing| {
+            if is_better_fact_candidate(&candidate, existing) {
+                *existing = candidate.clone();
+            }
+        })
+        .or_insert(candidate);
+}
+
+fn is_better_fact_candidate(candidate: &FactCandidate, existing: &FactCandidate) -> bool {
+    if candidate.score > existing.score {
+        return true;
+    }
+    if (candidate.score - existing.score).abs() > f32::EPSILON {
+        return false;
+    }
+    let candidate_rank = fact_candidate_path_rank(&candidate.path);
+    let existing_rank = fact_candidate_path_rank(&existing.path);
+    candidate_rank < existing_rank
+        || (candidate_rank == existing_rank && candidate.path < existing.path)
+}
+
+fn fact_candidate_path_rank(path: &[String]) -> usize {
+    match path.first() {
+        Some(first) if first.starts_with("fact:") => 0,
+        Some(first) if first.starts_with("entity:") => 1,
+        _ => 2,
+    }
+}
+
+fn active_fact_recorded_at(
+    connection: &Connection,
+    memory_space_id: &str,
+    fact_id: &str,
+) -> MemoryResult<Option<u64>> {
+    connection
+        .query_row(
+            "SELECT recorded_at_ms
+             FROM graph_facts
+             WHERE id = ?1
+               AND memory_space_id = ?2
+               AND status = 'active'
+               AND retired_at_ms IS NULL",
+            params![fact_id, memory_space_id],
+            |row| Ok(row.get::<_, i64>(0)? as u64),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn active_facts_for_entity(
+    connection: &Connection,
+    memory_space_id: &str,
+    entity_id: &str,
+    limit: usize,
+) -> MemoryResult<Vec<(String, u64)>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT id, recorded_at_ms
+         FROM graph_facts
+         WHERE memory_space_id = ?1
+           AND (subject_entity_id = ?2 OR object_entity_id = ?2)
+           AND status = 'active'
+           AND retired_at_ms IS NULL
+         ORDER BY recorded_at_ms, id
+         LIMIT ?3",
+    )?;
+    let rows = statement.query_map(params![memory_space_id, entity_id, limit as i64], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn load_fact_context_units(
+    connection: &Connection,
+    request: &GraphRetrieveContextRequest,
+    fact_candidates: &[FactCandidate],
+) -> MemoryResult<(Vec<FactContextUnit>, Vec<Fact>)> {
+    let mut units = Vec::with_capacity(fact_candidates.len());
+    let mut loaded_facts = Vec::with_capacity(fact_candidates.len());
+    for candidate in fact_candidates {
+        let fact = load_active_fact(connection, &request.memory_space_id, &candidate.fact_id)?;
+        let subject_entity = load_entity(
+            connection,
+            &request.memory_space_id,
+            &fact.subject_entity_id,
+        )?;
+        let object_entity =
+            load_entity(connection, &request.memory_space_id, &fact.object_entity_id)?;
+        let evidence_records = load_evidence_records_for_fact(
+            connection,
+            &request.memory_space_id,
+            &fact.id,
+            request.max_evidence_records_per_fact(),
+        )?;
+        let mut path = candidate.path.clone();
+        for record in &evidence_records {
+            let record_path = format!("record:{}", record.id);
+            if !path.contains(&record_path) {
+                path.push(record_path);
+            }
+        }
+        let valid_time = match (fact.valid_from_ms, fact.valid_to_ms) {
+            (Some(valid_from_ms), Some(valid_to_ms)) => Some((valid_from_ms, valid_to_ms)),
+            _ => None,
+        };
+        units.push(FactContextUnit {
+            fact_id: fact.id.clone(),
+            fact_text: fact.fact_text.clone(),
+            subject_entity,
+            object_entity,
+            predicate: fact.predicate.clone(),
+            evidence_records,
+            fact_links: Vec::new(),
+            path,
+            score: candidate.score,
+            status: fact.status.clone(),
+            valid_time,
+        });
+        loaded_facts.push(fact);
+    }
+    Ok((units, loaded_facts))
+}
+
+fn collect_bundle_members(
+    fact_context_units: &[FactContextUnit],
+    loaded_facts: Vec<Fact>,
+) -> BundleMembers {
+    let mut records = Vec::new();
+    let mut record_ids = HashSet::new();
+    let mut entities = Vec::new();
+    let mut entity_ids = HashSet::new();
+    let mut facts = Vec::new();
+    let mut fact_ids = HashSet::new();
+    let mut fact_links = Vec::new();
+    let mut fact_link_ids = HashSet::<String>::new();
+    let mut paths = Vec::new();
+
+    for fact in loaded_facts {
+        if fact_ids.insert(fact.id.clone()) {
+            facts.push(fact);
+        }
+    }
+
+    for unit in fact_context_units {
+        if entity_ids.insert(unit.subject_entity.id.clone()) {
+            entities.push(unit.subject_entity.clone());
+        }
+        if entity_ids.insert(unit.object_entity.id.clone()) {
+            entities.push(unit.object_entity.clone());
+        }
+        for record in &unit.evidence_records {
+            if record_ids.insert(record.id.clone()) {
+                records.push(record.clone());
+            }
+        }
+        for fact_link in &unit.fact_links {
+            if fact_link_ids.insert(fact_link.id.clone()) {
+                fact_links.push(fact_link.clone());
+            }
+        }
+        paths.push(unit.path.clone());
+    }
+
+    BundleMembers {
+        records,
+        entities,
+        facts,
+        fact_links,
+        paths,
+    }
+}
+
+fn load_active_fact(
+    connection: &Connection,
+    memory_space_id: &str,
+    fact_id: &str,
+) -> MemoryResult<Fact> {
+    let (
+        id,
+        memory_space_id,
+        subject_entity_id,
+        predicate,
+        object_entity_id,
+        fact_text,
+        dedup_key,
+        embedding_blob,
+        embedding_dims,
+        embedding_model,
+        embedding_version,
+        status,
+        valid_from_ms,
+        valid_to_ms,
+        recorded_at_ms,
+        retired_at_ms,
+        type_registry_version,
+    ) = connection.query_row(
+        "SELECT id, memory_space_id, subject_entity_id, predicate, object_entity_id,
+                fact_text, dedup_key, embedding, embedding_dims, embedding_model,
+                embedding_version, status, valid_from_ms, valid_to_ms, recorded_at_ms,
+                retired_at_ms, type_registry_version
+         FROM graph_facts
+         WHERE id = ?1
+           AND memory_space_id = ?2
+           AND status = 'active'
+           AND retired_at_ms IS NULL",
+        params![fact_id, memory_space_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<Vec<u8>>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, String>(11)?,
+                row.get::<_, Option<i64>>(12)?,
+                row.get::<_, Option<i64>>(13)?,
+                row.get::<_, i64>(14)?,
+                row.get::<_, Option<i64>>(15)?,
+                row.get::<_, String>(16)?,
+            ))
+        },
+    )?;
+
+    Ok(Fact {
+        id: id.clone(),
+        memory_space_id,
+        subject_entity_id,
+        predicate,
+        object_entity_id,
+        fact_text,
+        dedup_key,
+        embedding: blob_to_embedding(embedding_blob, embedding_dims, &id)?,
+        embedding_model,
+        embedding_version,
+        status: parse_fact_status(&status)?,
+        valid_from_ms: valid_from_ms.map(|value| value as u64),
+        valid_to_ms: valid_to_ms.map(|value| value as u64),
+        recorded_at_ms: recorded_at_ms as u64,
+        retired_at_ms: retired_at_ms.map(|value| value as u64),
+        type_registry_version,
+    })
+}
+
+fn load_entity(
+    connection: &Connection,
+    memory_space_id: &str,
+    entity_id: &str,
+) -> MemoryResult<Entity> {
+    let (
+        id,
+        memory_space_id,
+        canonical_name,
+        normalized_name,
+        entity_type,
+        name_embedding_blob,
+        embedding_dims,
+        embedding_model,
+        embedding_version,
+        status,
+        type_registry_version,
+        created_at_ms,
+        updated_at_ms,
+        deleted_at_ms,
+    ) = connection.query_row(
+        "SELECT id, memory_space_id, canonical_name, normalized_name, entity_type,
+                name_embedding, embedding_dims, embedding_model, embedding_version,
+                status, type_registry_version, created_at_ms, updated_at_ms, deleted_at_ms
+         FROM graph_entities
+         WHERE id = ?1
+           AND memory_space_id = ?2
+           AND status = 'active'
+           AND deleted_at_ms IS NULL",
+        params![entity_id, memory_space_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<Vec<u8>>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, i64>(11)?,
+                row.get::<_, i64>(12)?,
+                row.get::<_, Option<i64>>(13)?,
+            ))
+        },
+    )?;
+
+    Ok(Entity {
+        id: id.clone(),
+        memory_space_id,
+        canonical_name,
+        normalized_name,
+        entity_type,
+        name_embedding: blob_to_embedding(name_embedding_blob, embedding_dims, &id)?,
+        embedding_model,
+        embedding_version,
+        status,
+        type_registry_version,
+        created_at_ms: created_at_ms as u64,
+        updated_at_ms: updated_at_ms as u64,
+        deleted_at_ms: deleted_at_ms.map(|value| value as u64),
+    })
+}
+
+fn load_evidence_records_for_fact(
+    connection: &Connection,
+    memory_space_id: &str,
+    fact_id: &str,
+    limit: usize,
+) -> MemoryResult<Vec<GraphMemoryRecord>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut statement = connection.prepare(
+        "SELECT DISTINCT records.id, records.memory_space_id, records.session_id,
+                records.ingestion_sequence, records.session_sequence, records.text,
+                records.metadata_json, records.source_kind, records.source_ref,
+                records.content_role, records.created_by_agent_id, records.observed_at_ms,
+                records.embedding, records.embedding_dims, records.embedding_model,
+                records.embedding_version, records.created_at_ms, records.updated_at_ms,
+                records.deleted_at_ms
+         FROM graph_fact_evidence_groups groups
+         JOIN graph_fact_evidence evidence
+           ON evidence.evidence_group_id = groups.id
+          AND evidence.memory_space_id = groups.memory_space_id
+          AND evidence.deleted_at_ms IS NULL
+         JOIN graph_memory_records records
+           ON records.id = evidence.memory_record_id
+          AND records.memory_space_id = evidence.memory_space_id
+         WHERE groups.fact_id = ?1
+           AND groups.memory_space_id = ?2
+           AND groups.deleted_at_ms IS NULL
+           AND records.deleted_at_ms IS NULL
+         ORDER BY groups.created_at_ms, evidence.created_at_ms, records.id
+         LIMIT ?3",
+    )?;
+    let rows = statement.query_map(params![fact_id, memory_space_id, limit as i64], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, Option<i64>>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, Option<String>>(8)?,
+            row.get::<_, String>(9)?,
+            row.get::<_, Option<String>>(10)?,
+            row.get::<_, Option<i64>>(11)?,
+            row.get::<_, Option<Vec<u8>>>(12)?,
+            row.get::<_, Option<i64>>(13)?,
+            row.get::<_, Option<String>>(14)?,
+            row.get::<_, Option<String>>(15)?,
+            row.get::<_, i64>(16)?,
+            row.get::<_, i64>(17)?,
+            row.get::<_, Option<i64>>(18)?,
+        ))
+    })?;
+
+    let mut records = Vec::new();
+    for row in rows {
+        let (
+            id,
+            memory_space_id,
+            session_id,
+            ingestion_sequence,
+            session_sequence,
+            text,
+            metadata_json,
+            source_kind,
+            source_ref,
+            content_role,
+            created_by_agent_id,
+            observed_at_ms,
+            embedding_blob,
+            embedding_dims,
+            embedding_model,
+            embedding_version,
+            created_at_ms,
+            updated_at_ms,
+            deleted_at_ms,
+        ) = row?;
+        records.push(GraphMemoryRecord {
+            id: id.clone(),
+            memory_space_id,
+            session_id,
+            ingestion_sequence,
+            session_sequence,
+            text,
+            metadata: serde_json::from_str(&metadata_json)?,
+            source_kind,
+            source_ref,
+            content_role,
+            created_by_agent_id,
+            observed_at_ms: observed_at_ms.map(|value| value as u64),
+            embedding: blob_to_embedding(embedding_blob, embedding_dims, &id)?,
+            embedding_model,
+            embedding_version,
+            created_at_ms: created_at_ms as u64,
+            updated_at_ms: updated_at_ms as u64,
+            deleted_at_ms: deleted_at_ms.map(|value| value as u64),
+        });
+    }
+    Ok(records)
+}
+
+fn parse_fact_status(status: &str) -> MemoryResult<FactStatus> {
+    match status {
+        "active" => Ok(FactStatus::Active),
+        "superseded" => Ok(FactStatus::Superseded),
+        "retracted" => Ok(FactStatus::Retracted),
+        "unsupported" => Ok(FactStatus::Unsupported),
+        _ => Err(MemoryError::StoreBackend {
+            message: format!("unknown graph fact status '{status}'"),
+        }),
+    }
 }
 
 fn claim_pending_run_sync(
@@ -1780,7 +2601,11 @@ fn blob_to_embedding(
 
 #[cfg(test)]
 mod tests {
-    use super::{fact_dedup_key, open_graph_connection};
+    use super::{
+        active_facts_for_entity, collect_graph_seeds, fact_dedup_key, graph_fts_query,
+        open_graph_connection,
+    };
+    use rusqlite::params;
     use std::path::Path;
 
     #[test]
@@ -1835,5 +2660,174 @@ mod tests {
             fact_dedup_key("subject", "predicate", "object\u{1f}left", "right");
 
         assert_ne!(key_with_control_in_text, key_with_control_in_object);
+    }
+
+    #[test]
+    fn graph_fts_query_quotes_terms_and_drops_blank_input() {
+        assert_eq!(super::graph_fts_query("   "), None);
+        assert_eq!(
+            super::graph_fts_query("Alice Shanghai").as_deref(),
+            Some("\"Alice\" OR \"Shanghai\"")
+        );
+        assert_eq!(
+            super::graph_fts_query("Alice \"quoted\"").as_deref(),
+            Some("\"Alice\" OR \"\"\"quoted\"\"\"")
+        );
+    }
+
+    #[test]
+    fn graph_fts_query_limits_terms() {
+        let query = std::iter::repeat_n("Alice", super::MAX_GRAPH_FTS_QUERY_TERMS + 1)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let fts_query = super::graph_fts_query(&query).unwrap();
+
+        assert_eq!(
+            fts_query.matches("\"Alice\"").count(),
+            super::MAX_GRAPH_FTS_QUERY_TERMS
+        );
+    }
+
+    #[test]
+    fn retrieve_context_rejects_oversized_query() {
+        let query = "a".repeat(super::MAX_GRAPH_RETRIEVAL_QUERY_BYTES + 1);
+        let error = super::retrieve_context_sync(
+            Path::new(":memory:"),
+            &crate::GraphRetrieveContextRequest {
+                memory_space_id: "space-1".to_string(),
+                query,
+                top_k: 5,
+                reference_time_ms: None,
+                seed_limit: None,
+                max_evidence_records_per_fact: None,
+            },
+        )
+        .expect_err("oversized graph retrieval query should fail");
+
+        assert!(format!("{error}").contains("graph retrieval query must be at most"));
+    }
+
+    #[test]
+    fn alias_seed_limit_applies_after_unique_entity_deduplication() {
+        let connection = open_graph_connection(Path::new(":memory:")).unwrap();
+        seed_graph_space(&connection);
+        insert_test_entity(&connection, "entity-a", "Person A", "person-a");
+        insert_test_entity(&connection, "entity-b", "Person B", "person-b");
+        insert_test_alias(&connection, "alias-a-1", "entity-a", "Alice first", 1);
+        insert_test_alias(&connection, "alias-a-2", "entity-a", "Alice second", 2);
+        insert_test_alias(&connection, "alias-b-1", "entity-b", "Alice third", 3);
+
+        let fts_query = graph_fts_query("Alice").unwrap();
+        let seeds = collect_graph_seeds(&connection, "space-1", &fts_query, 2).unwrap();
+        let seed_ids = seeds
+            .into_iter()
+            .map(|seed| seed.id)
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(seed_ids.len(), 2);
+        assert!(seed_ids.contains("entity-a"));
+        assert!(seed_ids.contains("entity-b"));
+    }
+
+    #[test]
+    fn active_facts_for_entity_honors_limit() {
+        let connection = open_graph_connection(Path::new(":memory:")).unwrap();
+        seed_graph_space(&connection);
+        insert_test_entity(&connection, "entity-a", "Person A", "person-a");
+        insert_test_entity(&connection, "entity-b", "Person B", "person-b");
+        for index in 0..5 {
+            insert_test_fact(
+                &connection,
+                &format!("fact-{index}"),
+                "entity-a",
+                "entity-b",
+                index + 1,
+            );
+        }
+
+        let facts = active_facts_for_entity(&connection, "space-1", "entity-a", 2).unwrap();
+
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0].0, "fact-0");
+        assert_eq!(facts[1].0, "fact-1");
+    }
+
+    fn seed_graph_space(connection: &rusqlite::Connection) {
+        connection
+            .execute(
+                "INSERT INTO graph_memory_spaces (id, owner_id, status, created_at_ms)
+                 VALUES ('space-1', 'owner-1', 'active', 1)",
+                [],
+            )
+            .unwrap();
+    }
+
+    fn insert_test_entity(
+        connection: &rusqlite::Connection,
+        id: &str,
+        canonical_name: &str,
+        normalized_name: &str,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO graph_entities (
+                    id, memory_space_id, canonical_name, normalized_name, entity_type,
+                    status, type_registry_version, created_at_ms, updated_at_ms
+                 )
+                 VALUES (?1, 'space-1', ?2, ?3, 'PERSON', 'active', 'registry-v1', 1, 1)",
+                params![id, canonical_name, normalized_name],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO graph_entity_fts (id, memory_space_id, canonical_name)
+                 VALUES (?1, 'space-1', ?2)",
+                params![id, canonical_name],
+            )
+            .unwrap();
+    }
+
+    fn insert_test_alias(
+        connection: &rusqlite::Connection,
+        id: &str,
+        entity_id: &str,
+        display_alias: &str,
+        created_at_ms: i64,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO graph_entity_aliases (
+                    id, memory_space_id, entity_id, display_alias, normalized_alias, created_at_ms
+                 )
+                 VALUES (?1, 'space-1', ?2, ?3, ?3, ?4)",
+                params![id, entity_id, display_alias, created_at_ms],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO graph_entity_alias_fts (id, memory_space_id, display_alias)
+                 VALUES (?1, 'space-1', ?2)",
+                params![id, display_alias],
+            )
+            .unwrap();
+    }
+
+    fn insert_test_fact(
+        connection: &rusqlite::Connection,
+        id: &str,
+        subject_entity_id: &str,
+        object_entity_id: &str,
+        recorded_at_ms: i64,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO graph_facts (
+                    id, memory_space_id, subject_entity_id, predicate, object_entity_id,
+                    fact_text, status, recorded_at_ms, type_registry_version
+                 )
+                 VALUES (?1, 'space-1', ?2, 'RELATED_TO', ?3, ?1, 'active', ?4, 'registry-v1')",
+                params![id, subject_entity_id, object_entity_id, recorded_at_ms],
+            )
+            .unwrap();
     }
 }

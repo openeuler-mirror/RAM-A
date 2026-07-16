@@ -12,7 +12,8 @@ pub mod vector;
 
 pub use api::{
     AddMemoryRequest, AddMemoryResponse, GraphAddMemoryRequest, GraphAddMemoryResponse,
-    RerankConfig, RerankProvider, RetrievalConfig, ScoredMemory, SearchMemoryRequest, SearchMode,
+    GraphRetrievalConfig, GraphRetrieveContextRequest, RerankConfig, RerankProvider,
+    RetrievalConfig, ScoredMemory, SearchMemoryRequest, SearchMode,
 };
 pub use embedding::{EmbeddingProvider, HashEmbedding, OpenRouterEmbedding};
 pub use error::{MemoryError, MemoryResult};

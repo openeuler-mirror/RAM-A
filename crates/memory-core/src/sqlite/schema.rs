@@ -175,6 +175,14 @@ fn initialize_evidence_and_run_schema(connection: &Connection) -> MemoryResult<(
                 REFERENCES graph_memory_records(id, memory_space_id)
         );
 
+        CREATE INDEX IF NOT EXISTS idx_graph_fact_evidence_groups_fact
+        ON graph_fact_evidence_groups(memory_space_id, fact_id)
+        WHERE deleted_at_ms IS NULL;
+
+        CREATE INDEX IF NOT EXISTS idx_graph_fact_evidence_group
+        ON graph_fact_evidence(memory_space_id, evidence_group_id)
+        WHERE deleted_at_ms IS NULL;
+
         CREATE TABLE IF NOT EXISTS graph_fact_links (
             id TEXT NOT NULL,
             memory_space_id TEXT NOT NULL,

@@ -6,10 +6,11 @@ use uuid::Uuid;
 
 use crate::record::{extract_scope_id, extract_scope_id_from_filter, metadata_matches};
 use crate::{
-    cosine_similarity, AddMemoryRequest, AddMemoryResponse, EmbeddingProvider, MemoryError,
-    MemoryRecord, MemoryResult, MemoryStore, Reranker, RetrievalConfig, ScoredMemory,
-    SearchMemoryRequest, SearchMode, SqliteMemoryStore,
+    cosine_similarity, AddMemoryRequest, AddMemoryResponse, EmbeddingProvider,
+    GraphRetrieveContextRequest, MemoryError, MemoryRecord, MemoryResult, MemoryStore, Reranker,
+    RetrievalConfig, ScoredMemory, SearchMemoryRequest, SearchMode, SqliteMemoryStore,
 };
+use crate::{graph::GraphMemoryRecord, sqlite::GraphRepository};
 
 const DEFAULT_EMBEDDING_BATCH_SIZE: usize = 64;
 const EMBEDDING_PROFILE_METADATA_KEY: &str = "memory_core_embedding_profile";
@@ -266,8 +267,11 @@ impl MemoryManager {
                 continue;
             }
 
+            let candidates = self
+                .dense_candidates(&query_embedding, request.filter.as_ref(), request.top_k)
+                .await?;
             all_results.push(
-                self.dense_candidates(&query_embedding, request.filter.as_ref(), request.top_k)
+                self.fuse_optional_graph_channel(&request, candidates, request.top_k)
                     .await?,
             );
         }
@@ -303,8 +307,10 @@ impl MemoryManager {
         }
 
         let sqlite_store = self.sqlite_store_for_mode(SearchMode::Bm25)?;
-        sqlite_store
+        let candidates = sqlite_store
             .bm25_candidates(query, request.filter.as_ref(), request.top_k)
+            .await?;
+        self.fuse_optional_graph_channel(&request, candidates, request.top_k)
             .await
     }
 
@@ -372,6 +378,9 @@ impl MemoryManager {
             self.retrieval_config.embedding_weight,
             self.retrieval_config.bm25_weight,
         );
+        let candidates = self
+            .fuse_optional_graph_channel(&request, candidates, result_limit)
+            .await?;
 
         if self.retrieval_config.rerank.enabled {
             self.rerank_candidates(query, candidates, request.top_k)
@@ -448,6 +457,109 @@ impl MemoryManager {
         sort_scored_desc(&mut results);
         results.truncate(limit);
         Ok(results)
+    }
+
+    async fn fuse_optional_graph_channel(
+        &self,
+        request: &SearchMemoryRequest,
+        base_candidates: Vec<ScoredMemory>,
+        limit: usize,
+    ) -> MemoryResult<Vec<ScoredMemory>> {
+        if !self.retrieval_config.graph.enabled {
+            return Ok(base_candidates);
+        }
+
+        let graph_candidates = self.graph_candidates(request, limit).await?;
+        Ok(fuse_graph_candidates(
+            base_candidates,
+            graph_candidates,
+            limit,
+            self.retrieval_config.graph.weight,
+        ))
+    }
+
+    async fn graph_candidates(
+        &self,
+        request: &SearchMemoryRequest,
+        limit: usize,
+    ) -> MemoryResult<Vec<ScoredMemory>> {
+        if !self.retrieval_config.graph.enabled || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let query = request.query.trim();
+        if query.is_empty() {
+            return Err(MemoryError::InvalidInput {
+                message: "search query must not be empty".to_string(),
+            });
+        }
+
+        let Some(memory_space_id) = request
+            .graph_memory_space_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            if self.retrieval_config.graph.fail_open {
+                return Ok(Vec::new());
+            }
+            return Err(MemoryError::InvalidInput {
+                message: "graph retrieval is enabled but graph_memory_space_id is missing"
+                    .to_string(),
+            });
+        };
+
+        let Some(sqlite_store) = self.store.as_any().downcast_ref::<SqliteMemoryStore>() else {
+            if self.retrieval_config.graph.fail_open {
+                return Ok(Vec::new());
+            }
+            return Err(MemoryError::StoreBackend {
+                message: "graph retrieval requires sqlite store backend".to_string(),
+            });
+        };
+
+        let repository = GraphRepository::open(sqlite_store.path());
+        let graph_request = GraphRetrieveContextRequest {
+            memory_space_id: memory_space_id.to_string(),
+            query: query.to_string(),
+            top_k: limit,
+            reference_time_ms: None,
+            seed_limit: self.retrieval_config.graph.seed_limit,
+            max_evidence_records_per_fact: self
+                .retrieval_config
+                .graph
+                .max_evidence_records_per_fact,
+        };
+
+        match repository.retrieve_context(graph_request).await {
+            Ok(bundle) => {
+                let mut candidates = HashMap::new();
+                for unit in bundle.fact_context_units {
+                    for record in unit.evidence_records {
+                        if !metadata_matches(&record.metadata, request.filter.as_ref()) {
+                            continue;
+                        }
+                        let score = unit.score;
+                        let memory_record = graph_record_to_memory_record(record);
+                        candidates
+                            .entry(memory_record.id.clone())
+                            .and_modify(|existing: &mut ScoredMemory| {
+                                existing.score = existing.score.max(score);
+                            })
+                            .or_insert(ScoredMemory {
+                                record: memory_record,
+                                score,
+                            });
+                    }
+                }
+                let mut results = candidates.into_values().collect::<Vec<_>>();
+                sort_scored_desc(&mut results);
+                results.truncate(limit);
+                Ok(results)
+            }
+            Err(_error) if self.retrieval_config.graph.fail_open => Ok(Vec::new()),
+            Err(error) => Err(error),
+        }
     }
 
     fn sqlite_store_for_mode(&self, mode: SearchMode) -> MemoryResult<&SqliteMemoryStore> {
@@ -581,10 +693,27 @@ fn embedding_profile_mismatch_error(
     }
 }
 
+fn graph_record_to_memory_record(record: GraphMemoryRecord) -> MemoryRecord {
+    MemoryRecord {
+        id: record.id,
+        text: record.text,
+        metadata: record.metadata,
+        embedding: record.embedding.unwrap_or_default(),
+        created_at_ms: record.created_at_ms,
+        updated_at_ms: record.updated_at_ms,
+    }
+}
+
 struct HybridCandidate {
     record: MemoryRecord,
     dense_score: Option<f32>,
     bm25_score: Option<f32>,
+}
+
+struct GraphFusionCandidate {
+    record: MemoryRecord,
+    base_score: Option<f32>,
+    graph_score: Option<f32>,
 }
 
 fn fuse_hybrid_candidates(
@@ -638,6 +767,78 @@ fn fuse_hybrid_candidates(
             ScoredMemory {
                 record: candidate.record,
                 score: embedding_weight * dense_norm + bm25_weight * bm25_norm,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    sort_scored_desc(&mut results);
+    results.truncate(top_k);
+    results
+}
+
+fn fuse_graph_candidates(
+    base_candidates: Vec<ScoredMemory>,
+    graph_candidates: Vec<ScoredMemory>,
+    top_k: usize,
+    graph_weight: f32,
+) -> Vec<ScoredMemory> {
+    if graph_candidates.is_empty() {
+        let mut results = base_candidates;
+        sort_scored_desc(&mut results);
+        results.truncate(top_k);
+        return results;
+    }
+
+    let mut candidates = HashMap::new();
+    for candidate in base_candidates {
+        candidates.insert(
+            candidate.record.id.clone(),
+            GraphFusionCandidate {
+                record: candidate.record,
+                base_score: Some(candidate.score),
+                graph_score: None,
+            },
+        );
+    }
+
+    for candidate in graph_candidates {
+        candidates
+            .entry(candidate.record.id.clone())
+            .and_modify(|existing| {
+                existing.graph_score = Some(candidate.score);
+            })
+            .or_insert_with(|| GraphFusionCandidate {
+                record: candidate.record,
+                base_score: None,
+                graph_score: Some(candidate.score),
+            });
+    }
+
+    let base_range = score_range(
+        candidates
+            .values()
+            .filter_map(|candidate| candidate.base_score),
+    );
+    let graph_range = score_range(
+        candidates
+            .values()
+            .filter_map(|candidate| candidate.graph_score),
+    );
+    let graph_weight = if graph_weight.is_finite() {
+        graph_weight.max(0.0)
+    } else {
+        0.0
+    };
+    let total_weight = 1.0 + graph_weight;
+
+    let mut results = candidates
+        .into_values()
+        .map(|candidate| {
+            let base_norm = normalize_present_score(candidate.base_score, base_range);
+            let graph_norm = normalize_present_score(candidate.graph_score, graph_range);
+            ScoredMemory {
+                record: candidate.record,
+                score: (base_norm + graph_weight * graph_norm) / total_weight,
             }
         })
         .collect::<Vec<_>>();
@@ -739,7 +940,10 @@ impl LongTermMemory for MemoryManager {
         }
 
         let query_embedding = self.embedder.embed_one(query).await?;
-        self.dense_candidates(&query_embedding, request.filter.as_ref(), request.top_k)
+        let candidates = self
+            .dense_candidates(&query_embedding, request.filter.as_ref(), request.top_k)
+            .await?;
+        self.fuse_optional_graph_channel(&request, candidates, request.top_k)
             .await
     }
 }
@@ -914,12 +1118,82 @@ mod tests {
             embedding_weight: 0.7,
             bm25_weight: 0.3,
             candidate_k: Some(3),
+            graph: Default::default(),
             rerank: RerankConfig {
                 enabled: true,
                 input_k,
                 fail_open,
                 ..RerankConfig::default()
             },
+        }
+    }
+
+    #[test]
+    fn graph_fusion_scores_are_bounded() {
+        let results = fuse_graph_candidates(
+            vec![ScoredMemory {
+                record: MemoryRecord {
+                    id: "base".to_string(),
+                    text: "base".to_string(),
+                    metadata: serde_json::json!({}),
+                    embedding: vec![1.0],
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                },
+                score: 1.0,
+            }],
+            vec![ScoredMemory {
+                record: MemoryRecord {
+                    id: "graph".to_string(),
+                    text: "graph".to_string(),
+                    metadata: serde_json::json!({}),
+                    embedding: vec![1.0],
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                },
+                score: 1.0,
+            }],
+            2,
+            0.2,
+        );
+
+        assert!(results.iter().all(|result| result.score <= 1.0));
+    }
+
+    #[test]
+    fn graph_fusion_sanitizes_non_finite_graph_weight() {
+        for graph_weight in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let results = fuse_graph_candidates(
+                vec![ScoredMemory {
+                    record: MemoryRecord {
+                        id: "base".to_string(),
+                        text: "base".to_string(),
+                        metadata: serde_json::json!({}),
+                        embedding: vec![1.0],
+                        created_at_ms: 1,
+                        updated_at_ms: 1,
+                    },
+                    score: 1.0,
+                }],
+                vec![ScoredMemory {
+                    record: MemoryRecord {
+                        id: "graph".to_string(),
+                        text: "graph".to_string(),
+                        metadata: serde_json::json!({}),
+                        embedding: vec![1.0],
+                        created_at_ms: 1,
+                        updated_at_ms: 1,
+                    },
+                    score: 1.0,
+                }],
+                2,
+                graph_weight,
+            );
+
+            assert!(
+                results.iter().all(|result| result.score.is_finite()),
+                "graph_weight {graph_weight:?} produced non-finite score: {results:?}"
+            );
         }
     }
 
@@ -978,6 +1252,7 @@ mod tests {
                 query: "health endpoint".to_string(),
                 top_k: 1,
                 filter: None,
+                graph_memory_space_id: None,
             })
             .await
             .expect("search memory");
@@ -1333,11 +1608,13 @@ mod tests {
                 query: "green tea".to_string(),
                 top_k: 2,
                 filter: None,
+                graph_memory_space_id: None,
             },
             SearchMemoryRequest {
                 query: "health endpoint".to_string(),
                 top_k: 2,
                 filter: Some(serde_json::json!({"kind": "work"})),
+                graph_memory_space_id: None,
             },
         ];
 
@@ -1420,6 +1697,7 @@ mod tests {
             query: "green tea".to_string(),
             top_k: 2,
             filter: Some(serde_json::json!({"kind": "drink"})),
+            graph_memory_space_id: None,
         };
         let file_ids = file_manager
             .search(search_request.clone())
@@ -1476,6 +1754,7 @@ mod tests {
                 query: "Pacific melodies".to_string(),
                 top_k: 5,
                 filter: Some(serde_json::json!({"scope_id": "scope-a"})),
+                graph_memory_space_id: None,
             })
             .await
             .expect("bm25 search");
@@ -1537,6 +1816,7 @@ mod tests {
                 query: "Pacific melodies".to_string(),
                 top_k: 2,
                 filter: Some(serde_json::json!({"scope_id": "scope-a"})),
+                graph_memory_space_id: None,
             })
             .await
             .expect("hybrid search");
@@ -1591,6 +1871,7 @@ mod tests {
                 query: "Pacific melodies".to_string(),
                 top_k: 2,
                 filter: Some(serde_json::json!({"scope_id": "scope-a"})),
+                graph_memory_space_id: None,
             })
             .await
             .expect("hybrid search");
@@ -1625,6 +1906,7 @@ mod tests {
                 query: "Pacific melodies".to_string(),
                 top_k: 1,
                 filter: Some(serde_json::json!({"scope_id": "scope-a"})),
+                graph_memory_space_id: None,
             })
             .await
             .expect("reranked hybrid search");
@@ -1658,6 +1940,7 @@ mod tests {
                 query: "Pacific melodies".to_string(),
                 top_k: 1,
                 filter: Some(serde_json::json!({"scope_id": "scope-a"})),
+                graph_memory_space_id: None,
             })
             .await
             .expect("reranked hybrid search");
@@ -1686,6 +1969,7 @@ mod tests {
                 query: "Pacific melodies".to_string(),
                 top_k: 1,
                 filter: Some(serde_json::json!({"scope_id": "scope-a"})),
+                graph_memory_space_id: None,
             })
             .await
             .expect_err("fail closed rerank should fail search");
@@ -1711,6 +1995,7 @@ mod tests {
                 query: "Pacific melodies".to_string(),
                 top_k: 1,
                 filter: Some(serde_json::json!({"scope_id": "scope-a"})),
+                graph_memory_space_id: None,
             })
             .await
             .expect("fail open should return hybrid results");
@@ -1747,6 +2032,7 @@ mod tests {
                 query: "hello".to_string(),
                 top_k: 5,
                 filter: None,
+                graph_memory_space_id: None,
             })
             .await
             .expect_err("should fail on dimension mismatch");

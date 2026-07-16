@@ -213,6 +213,7 @@ fn build_runtime(cli: &Cli) -> Result<BenchRuntime> {
         embedding_weight: cli.embedding_weight,
         bm25_weight: cli.bm25_weight,
         candidate_k: cli.candidate_k,
+        graph: Default::default(),
         rerank: rerank_config,
     };
     let manager = if let Some(reranker) = reranker {
@@ -486,6 +487,7 @@ async fn run_search(
                 query: item.text.clone(),
                 top_k: options.top_k,
                 filter: cli_filter.clone(),
+                graph_memory_space_id: None,
             })
             .await
             .with_context(|| format!("failed to search query at {}", item.path))?;
@@ -513,6 +515,7 @@ async fn run_search(
                 query: item.text.clone(),
                 top_k: options.top_k,
                 filter: cli_filter.clone(),
+                graph_memory_space_id: None,
             })
             .collect();
         let mut progress = ProgressReporter::new("Searching queries", search_requests.len());
@@ -606,6 +609,7 @@ async fn run_search_prepared_queries(
             query: query_text.to_string(),
             top_k,
             filter: effective_filter.clone(),
+            graph_memory_space_id: None,
         });
         output_templates.push(QueryOutput {
             query_path: format!("$.queries[{index}].text"),

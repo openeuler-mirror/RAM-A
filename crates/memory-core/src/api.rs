@@ -2,6 +2,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::record::MemoryRecord;
 
+const GRAPH_SEED_LIMIT_MULTIPLIER: usize = 10;
+const MIN_GRAPH_SEED_LIMIT: usize = 30;
+const DEFAULT_MAX_EVIDENCE_RECORDS_PER_FACT: usize = 3;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AddMemoryRequest {
     pub id: Option<String>,
@@ -42,11 +46,40 @@ pub struct GraphAddMemoryResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GraphRetrieveContextRequest {
+    pub memory_space_id: String,
+    pub query: String,
+    pub top_k: usize,
+    pub reference_time_ms: Option<u64>,
+    #[serde(default)]
+    pub seed_limit: Option<usize>,
+    #[serde(default)]
+    pub max_evidence_records_per_fact: Option<usize>,
+}
+
+impl GraphRetrieveContextRequest {
+    pub fn seed_limit(&self) -> usize {
+        self.seed_limit.unwrap_or_else(|| {
+            self.top_k
+                .saturating_mul(GRAPH_SEED_LIMIT_MULTIPLIER)
+                .max(MIN_GRAPH_SEED_LIMIT)
+        })
+    }
+
+    pub fn max_evidence_records_per_fact(&self) -> usize {
+        self.max_evidence_records_per_fact
+            .unwrap_or(DEFAULT_MAX_EVIDENCE_RECORDS_PER_FACT)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SearchMemoryRequest {
     pub query: String,
     pub top_k: usize,
     #[serde(default)]
     pub filter: Option<serde_json::Value>,
+    #[serde(default)]
+    pub graph_memory_space_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -69,6 +102,8 @@ pub struct RetrievalConfig {
     #[serde(default)]
     pub candidate_k: Option<usize>,
     #[serde(default)]
+    pub graph: GraphRetrievalConfig,
+    #[serde(default)]
     pub rerank: RerankConfig,
 }
 
@@ -86,7 +121,34 @@ impl Default for RetrievalConfig {
             embedding_weight: default_embedding_weight(),
             bm25_weight: default_bm25_weight(),
             candidate_k: None,
+            graph: GraphRetrievalConfig::default(),
             rerank: RerankConfig::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GraphRetrievalConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_graph_weight")]
+    pub weight: f32,
+    #[serde(default)]
+    pub seed_limit: Option<usize>,
+    #[serde(default)]
+    pub max_evidence_records_per_fact: Option<usize>,
+    #[serde(default)]
+    pub fail_open: bool,
+}
+
+impl Default for GraphRetrievalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            weight: default_graph_weight(),
+            seed_limit: None,
+            max_evidence_records_per_fact: None,
+            fail_open: false,
         }
     }
 }
@@ -148,6 +210,10 @@ fn default_bm25_weight() -> f32 {
     0.3
 }
 
+fn default_graph_weight() -> f32 {
+    0.2
+}
+
 fn default_rerank_model() -> String {
     "cohere/rerank-v3.5".to_string()
 }
@@ -182,6 +248,11 @@ mod tests {
         assert_eq!(config.embedding_weight, 0.7);
         assert_eq!(config.bm25_weight, 0.3);
         assert_eq!(config.candidate_k, None);
+        assert!(!config.graph.enabled);
+        assert_eq!(config.graph.weight, 0.2);
+        assert_eq!(config.graph.seed_limit, None);
+        assert_eq!(config.graph.max_evidence_records_per_fact, None);
+        assert!(!config.graph.fail_open);
         assert!(!config.rerank.enabled);
         assert_eq!(config.rerank.provider, RerankProvider::OpenRouter);
         assert_eq!(config.rerank.model, "cohere/rerank-v3.5");
@@ -216,5 +287,20 @@ mod tests {
         let provider: RerankProvider =
             serde_json::from_str("\"openrouter\"").expect("deserialize provider");
         assert_eq!(provider, RerankProvider::OpenRouter);
+    }
+
+    #[test]
+    fn graph_retrieve_context_request_defaults_are_bounded() {
+        let request = GraphRetrieveContextRequest {
+            memory_space_id: "space-1".to_string(),
+            query: "Where does Alice live?".to_string(),
+            top_k: 3,
+            reference_time_ms: None,
+            seed_limit: None,
+            max_evidence_records_per_fact: None,
+        };
+
+        assert_eq!(request.seed_limit(), 30);
+        assert_eq!(request.max_evidence_records_per_fact(), 3);
     }
 }
