@@ -9,6 +9,10 @@ use crate::{MemoryError, MemoryResult};
 
 use super::{ExtractionRun, GraphTypeRegistry};
 
+pub const EXTRACTION_FAILED_ERROR_CODE: &str = "EXTRACTION_FAILED";
+pub const INVALID_EXTRACTION_OUTPUT_ERROR_CODE: &str = "INVALID_EXTRACTION_OUTPUT";
+pub const EXTRACTION_STORE_FAILED_ERROR_CODE: &str = "EXTRACTION_STORE_FAILED";
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GraphExtractionInput {
     pub memory_space_id: String,
@@ -182,7 +186,11 @@ fn validate_confidence(field: &str, confidence: Option<f32>) -> MemoryResult<()>
 
 fn invalid_output<T>(message: impl Into<String>) -> MemoryResult<T> {
     Err(MemoryError::InvalidInput {
-        message: format!("INVALID_EXTRACTION_OUTPUT: {}", message.into()),
+        message: format!(
+            "{}: {}",
+            INVALID_EXTRACTION_OUTPUT_ERROR_CODE,
+            message.into()
+        ),
     })
 }
 
@@ -250,7 +258,7 @@ impl GraphExtractionExecutor {
                         type_registry_version: self.type_registry.version.clone(),
                         context_record_ids: claim.context_record_ids,
                         latency_ms: Some(started.elapsed().as_millis() as i64),
-                        error_code: "EXTRACTION_FAILED".to_string(),
+                        error_code: EXTRACTION_FAILED_ERROR_CODE.to_string(),
                         error_message,
                     })
                     .await;
@@ -274,7 +282,7 @@ impl GraphExtractionExecutor {
                     type_registry_version: self.type_registry.version.clone(),
                     context_record_ids: claim.context_record_ids,
                     latency_ms: Some(started.elapsed().as_millis() as i64),
-                    error_code: "INVALID_EXTRACTION_OUTPUT".to_string(),
+                    error_code: INVALID_EXTRACTION_OUTPUT_ERROR_CODE.to_string(),
                     error_message,
                 })
                 .await;
@@ -319,7 +327,7 @@ impl GraphExtractionExecutor {
                         type_registry_version: self.type_registry.version.clone(),
                         context_record_ids: claim.context_record_ids,
                         latency_ms: Some(started.elapsed().as_millis() as i64),
-                        error_code: "EXTRACTION_STORE_FAILED".to_string(),
+                        error_code: EXTRACTION_STORE_FAILED_ERROR_CODE.to_string(),
                         error_message,
                     })
                     .await;

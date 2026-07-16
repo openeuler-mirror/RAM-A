@@ -8,6 +8,8 @@ pub enum MemoryError {
     Embedding { message: String },
     #[error("rerank error: {message}")]
     Rerank { message: String },
+    #[error("extraction error: {message}")]
+    Extraction { message: String },
     #[error("store error: {0}")]
     Store(#[from] std::io::Error),
     #[error("sqlite error: {0}")]
