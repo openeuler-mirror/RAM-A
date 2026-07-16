@@ -2,6 +2,7 @@ pub mod graph_repository;
 pub mod schema;
 
 pub use graph_repository::{
-    ExtractionRunCompletion, ExtractionRunFailure, GraphRepository, RecordEmbeddingUpdate,
+    ClaimedResolutionRun, ExtractionRunCompletion, ExtractionRunFailure, GraphRepository,
+    RecordEmbeddingUpdate, ResolutionPublishRequest, ResolutionPublishResult,
 };
 pub use schema::initialize_schema;

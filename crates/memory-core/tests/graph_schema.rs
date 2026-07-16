@@ -38,6 +38,9 @@ fn graph_schema_creates_required_tables_and_indexes() {
         "graph_fact_fts",
         "graph_entity_fts",
         "graph_entity_alias_fts",
+        "idx_graph_entities_active_identity",
+        "idx_graph_entity_aliases_active_identity",
+        "idx_graph_facts_active_dedup",
     ] {
         assert!(
             names.iter().any(|name| name == required),
@@ -158,6 +161,83 @@ fn graph_schema_rejects_duplicate_extraction_attempt_numbers() {
     );
 
     assert!(duplicate.is_err());
+}
+
+#[test]
+fn graph_schema_rejects_duplicate_active_graph_identity() {
+    let connection = Connection::open_in_memory().unwrap();
+    initialize_schema(&connection).unwrap();
+
+    connection
+        .execute_batch(
+            r#"
+            INSERT INTO graph_memory_spaces (
+                id, owner_id, status, next_ingestion_sequence, created_at_ms
+            ) VALUES ('space-a', 'user-a', 'active', 1, 1);
+
+            INSERT INTO graph_entities (
+                id, memory_space_id, canonical_name, normalized_name, entity_type,
+                status, type_registry_version, created_at_ms, updated_at_ms
+            ) VALUES
+                ('entity-alice', 'space-a', 'Alice', 'alice', 'PERSON',
+                 'active', 'graph-type-registry-v1', 1, 1),
+                ('entity-shanghai', 'space-a', 'Shanghai', 'shanghai', 'LOCATION',
+                 'active', 'graph-type-registry-v1', 1, 1);
+
+            INSERT INTO graph_entity_aliases (
+                id, memory_space_id, entity_id, display_alias, normalized_alias, created_at_ms
+            ) VALUES (
+                'alias-alice', 'space-a', 'entity-alice', 'Alice', 'alice', 1
+            );
+
+            INSERT INTO graph_facts (
+                id, memory_space_id, subject_entity_id, predicate, object_entity_id,
+                fact_text, dedup_key, status, recorded_at_ms, type_registry_version
+            ) VALUES (
+                'fact-alice-shanghai', 'space-a', 'entity-alice', 'LIVES_IN',
+                'entity-shanghai', 'Alice lives in Shanghai.',
+                'entity-alice|LIVES_IN|entity-shanghai|alice lives in shanghai.',
+                'active', 1, 'graph-type-registry-v1'
+            );
+            "#,
+        )
+        .unwrap();
+
+    let duplicate_entity = connection.execute(
+        "INSERT INTO graph_entities (
+            id, memory_space_id, canonical_name, normalized_name, entity_type,
+            status, type_registry_version, created_at_ms, updated_at_ms
+         ) VALUES (
+            'entity-alice-duplicate', 'space-a', 'Alice', 'alice', 'PERSON',
+            'active', 'graph-type-registry-v1', 2, 2
+         )",
+        [],
+    );
+    assert!(duplicate_entity.is_err());
+
+    let duplicate_alias = connection.execute(
+        "INSERT INTO graph_entity_aliases (
+            id, memory_space_id, entity_id, display_alias, normalized_alias, created_at_ms
+         ) VALUES (
+            'alias-alice-duplicate', 'space-a', 'entity-alice', 'Alice', 'alice', 2
+         )",
+        [],
+    );
+    assert!(duplicate_alias.is_err());
+
+    let duplicate_fact = connection.execute(
+        "INSERT INTO graph_facts (
+            id, memory_space_id, subject_entity_id, predicate, object_entity_id,
+            fact_text, dedup_key, status, recorded_at_ms, type_registry_version
+         ) VALUES (
+            'fact-alice-shanghai-duplicate', 'space-a', 'entity-alice', 'LIVES_IN',
+            'entity-shanghai', 'Alice lives in Shanghai.',
+            'entity-alice|LIVES_IN|entity-shanghai|alice lives in shanghai.',
+            'active', 2, 'graph-type-registry-v1'
+         )",
+        [],
+    );
+    assert!(duplicate_fact.is_err());
 }
 
 fn foreign_key_columns_to_table(

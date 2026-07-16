@@ -3,6 +3,7 @@ pub mod ingestion;
 pub mod llm;
 pub mod normalize;
 pub mod registry;
+pub mod resolution;
 pub mod types;
 
 pub use extraction::{
@@ -17,6 +18,11 @@ pub use llm::{
     GRAPH_EXTRACTION_PROMPT_VERSION, GRAPH_EXTRACTION_SCHEMA_VERSION, LLM_GRAPH_EXTRACTOR_NAME,
     OPENAI_COMPATIBLE_CLIENT_NAME,
 };
+pub(crate) use normalize::normalize_graph_text;
 pub use normalize::{stable_input_hash, GraphInputHashFields};
 pub use registry::{GraphPredicate, GraphTypeRegistry};
+pub use resolution::{
+    GraphResolutionExecutor, GraphResolutionResult, GRAPH_RESOLVER_VERSION,
+    RESOLUTION_FAILED_ERROR_CODE, RESOLUTION_STORE_FAILED_ERROR_CODE,
+};
 pub use types::*;

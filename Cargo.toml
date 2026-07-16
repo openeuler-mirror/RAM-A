@@ -26,6 +26,7 @@ tokio = { version = "1.35", features = ["fs", "macros", "net", "rt-multi-thread"
 tiktoken-rs = "0.9.1"
 tokio-util = "0.7"
 url = "2.5"
+unicode-normalization = "0.1"
 uuid = { version = "1.6", features = ["v4", "v5", "serde"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 sqlite-vec = "=0.1.7-alpha.10"

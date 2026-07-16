@@ -68,6 +68,10 @@ pub fn initialize_schema(connection: &Connection) -> MemoryResult<()> {
         CREATE INDEX IF NOT EXISTS idx_graph_entities_space_name
         ON graph_entities(memory_space_id, normalized_name, status);
 
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_entities_active_identity
+        ON graph_entities(memory_space_id, entity_type, normalized_name)
+        WHERE status = 'active' AND deleted_at_ms IS NULL;
+
         CREATE VIRTUAL TABLE IF NOT EXISTS graph_entity_fts
         USING fts5(id UNINDEXED, memory_space_id UNINDEXED, canonical_name);
 
@@ -87,6 +91,10 @@ pub fn initialize_schema(connection: &Connection) -> MemoryResult<()> {
 
         CREATE VIRTUAL TABLE IF NOT EXISTS graph_entity_alias_fts
         USING fts5(id UNINDEXED, memory_space_id UNINDEXED, display_alias);
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_entity_aliases_active_identity
+        ON graph_entity_aliases(memory_space_id, entity_id, normalized_alias)
+        WHERE deleted_at_ms IS NULL;
 
         CREATE TABLE IF NOT EXISTS graph_facts (
             id TEXT NOT NULL,
@@ -119,6 +127,10 @@ pub fn initialize_schema(connection: &Connection) -> MemoryResult<()> {
 
         CREATE INDEX IF NOT EXISTS idx_graph_facts_object_status
         ON graph_facts(memory_space_id, object_entity_id, status);
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_facts_active_dedup
+        ON graph_facts(memory_space_id, dedup_key)
+        WHERE status = 'active' AND retired_at_ms IS NULL AND dedup_key IS NOT NULL;
 
         CREATE VIRTUAL TABLE IF NOT EXISTS graph_fact_fts
         USING fts5(id UNINDEXED, memory_space_id UNINDEXED, fact_text);

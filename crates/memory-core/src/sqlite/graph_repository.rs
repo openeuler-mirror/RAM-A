@@ -1,15 +1,19 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use uuid::Uuid;
 
 use crate::graph::{
-    stable_input_hash, ExtractionRun, GraphInputHashFields, GraphMemoryRecord, IngestionRun,
+    normalize_graph_text, stable_input_hash, ExtractedEntityCandidate, ExtractedFactCandidate,
+    ExtractionRun, GraphExtractionOutput, GraphInputHashFields, GraphMemoryRecord, IngestionRun,
 };
 use crate::{GraphAddMemoryRequest, GraphAddMemoryResponse, MemoryError, MemoryResult};
 
 const GRAPH_PIPELINE_VERSION: &str = "graph-pipeline-v1";
+const FACT_EVIDENCE_KIND_SUPPORT: &str = "support";
+const RESOLUTION_METHOD_DETERMINISTIC: &str = "deterministic";
 
 #[derive(Clone, Debug)]
 pub struct GraphRepository {
@@ -83,6 +87,39 @@ pub struct ExtractionRunFailure {
     pub error_message: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct ClaimedResolutionRun {
+    pub ingestion_run_id: String,
+    pub memory_space_id: String,
+    pub memory_record_id: String,
+    pub text: String,
+    pub attempt_count: i64,
+    pub extraction_run_id: String,
+    pub extraction_output: GraphExtractionOutput,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResolutionPublishRequest {
+    pub ingestion_run_id: String,
+    pub memory_space_id: String,
+    pub memory_record_id: String,
+    pub extraction_run_id: String,
+    pub attempt_count: i64,
+    pub extraction_output: GraphExtractionOutput,
+    pub type_registry_version: String,
+    pub resolver_version: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolutionPublishResult {
+    pub ingestion_run: IngestionRun,
+    pub entities_created: usize,
+    pub entities_reused: usize,
+    pub facts_created: usize,
+    pub facts_reused: usize,
+    pub evidence_inserted: usize,
+}
+
 impl GraphRepository {
     pub fn open(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
@@ -137,6 +174,23 @@ impl GraphRepository {
     ) -> MemoryResult<ExtractionRun> {
         let path = self.path.clone();
         run_sqlite_operation(move || store_extraction_failure_sync(&path, &failure)).await
+    }
+
+    pub async fn claim_resolution_run(
+        &self,
+        ingestion_run_id: &str,
+    ) -> MemoryResult<ClaimedResolutionRun> {
+        let path = self.path.clone();
+        let ingestion_run_id = ingestion_run_id.to_string();
+        run_sqlite_operation(move || claim_resolution_run_sync(&path, &ingestion_run_id)).await
+    }
+
+    pub async fn publish_resolution(
+        &self,
+        request: ResolutionPublishRequest,
+    ) -> MemoryResult<ResolutionPublishResult> {
+        let path = self.path.clone();
+        run_sqlite_operation(move || publish_resolution_sync(&path, &request)).await
     }
 
     pub async fn mark_run_failed_if_current_attempt(
@@ -780,6 +834,661 @@ fn store_extraction_failure_sync(
     })
 }
 
+fn claim_resolution_run_sync(
+    path: &Path,
+    ingestion_run_id: &str,
+) -> MemoryResult<ClaimedResolutionRun> {
+    let mut connection = open_graph_connection(path)?;
+    let transaction = connection.transaction()?;
+    let (
+        memory_space_id,
+        memory_record_id,
+        text,
+        status,
+        stage,
+        attempt_count,
+        extraction_run_id,
+        structured_output_json,
+    ) = transaction.query_row(
+        "SELECT runs.memory_space_id,
+                runs.memory_record_id,
+                records.text,
+                runs.status,
+                runs.stage,
+                runs.attempt_count,
+                extraction.id,
+                extraction.structured_output_json
+         FROM graph_ingestion_runs runs
+         JOIN graph_memory_records records
+           ON records.id = runs.memory_record_id
+          AND records.memory_space_id = runs.memory_space_id
+         JOIN graph_extraction_runs extraction
+           ON extraction.ingestion_run_id = runs.id
+          AND extraction.memory_space_id = runs.memory_space_id
+         WHERE runs.id = ?1
+           AND extraction.status = 'completed'
+         ORDER BY extraction.attempt_number DESC
+         LIMIT 1",
+        params![ingestion_run_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+            ))
+        },
+    )?;
+
+    if status != "running" || stage != "resolution" {
+        return Err(MemoryError::InvalidInput {
+            message: format!("ingestion run is not ready for resolution: {status}/{stage}"),
+        });
+    }
+
+    let structured_output_json =
+        structured_output_json.ok_or_else(|| MemoryError::StoreBackend {
+            message: "completed extraction run has no structured output".to_string(),
+        })?;
+    let extraction_output = serde_json::from_str(&structured_output_json)?;
+    let now = current_time_ms() as i64;
+    let updated = transaction.execute(
+        "UPDATE graph_ingestion_runs
+         SET stage = 'resolving',
+             updated_at_ms = ?1
+         WHERE id = ?2
+           AND memory_space_id = ?3
+           AND status = 'running'
+           AND stage = 'resolution'
+           AND attempt_count = ?4",
+        params![now, ingestion_run_id, &memory_space_id, attempt_count],
+    )?;
+    if updated != 1 {
+        return Err(MemoryError::StoreBackend {
+            message: "failed to claim resolution run".to_string(),
+        });
+    }
+
+    transaction.commit()?;
+    Ok(ClaimedResolutionRun {
+        ingestion_run_id: ingestion_run_id.to_string(),
+        memory_space_id,
+        memory_record_id,
+        text,
+        attempt_count,
+        extraction_run_id,
+        extraction_output,
+    })
+}
+
+fn publish_resolution_sync(
+    path: &Path,
+    request: &ResolutionPublishRequest,
+) -> MemoryResult<ResolutionPublishResult> {
+    let mut connection = open_graph_connection(path)?;
+    let transaction = connection.transaction()?;
+    let now = current_time_ms() as i64;
+    let mut entity_map = HashMap::new();
+    let mut entities_created = 0;
+    let mut entities_reused = 0;
+    let mut facts_created = 0;
+    let mut facts_reused = 0;
+    let mut evidence_inserted = 0;
+
+    for entity in &request.extraction_output.entities {
+        let resolved = resolve_entity_candidate(&transaction, request, entity, now)?;
+        if resolved.created {
+            entities_created += 1;
+        } else {
+            entities_reused += 1;
+        }
+        entity_map.insert(entity.local_id.clone(), resolved.entity_id);
+    }
+
+    for fact in &request.extraction_output.facts {
+        let subject_entity_id =
+            entity_map
+                .get(&fact.subject_ref)
+                .ok_or_else(|| MemoryError::StoreBackend {
+                    message: format!(
+                        "resolved subject entity missing for fact '{}'",
+                        fact.local_id
+                    ),
+                })?;
+        let object_entity_id =
+            entity_map
+                .get(&fact.object_ref)
+                .ok_or_else(|| MemoryError::StoreBackend {
+                    message: format!(
+                        "resolved object entity missing for fact '{}'",
+                        fact.local_id
+                    ),
+                })?;
+        let resolved = resolve_fact_candidate(
+            &transaction,
+            request,
+            fact,
+            subject_entity_id,
+            object_entity_id,
+            now,
+        )?;
+        if resolved.created {
+            facts_created += 1;
+        } else {
+            facts_reused += 1;
+        }
+        evidence_inserted +=
+            insert_fact_evidence_group(&transaction, request, &resolved.fact_id, fact, now)?;
+    }
+
+    let updated = transaction.execute(
+        "UPDATE graph_ingestion_runs
+         SET status = 'completed',
+             stage = 'completed',
+             updated_at_ms = ?1,
+             completed_at_ms = ?1
+         WHERE id = ?2
+           AND memory_space_id = ?3
+           AND status = 'running'
+           AND stage = 'resolving'
+           AND attempt_count = ?4",
+        params![
+            now,
+            &request.ingestion_run_id,
+            &request.memory_space_id,
+            request.attempt_count
+        ],
+    )?;
+    if updated != 1 {
+        return Err(MemoryError::StoreBackend {
+            message: "ingestion run is no longer current for resolution completion".to_string(),
+        });
+    }
+
+    let ingestion_run = get_run_in_transaction(
+        &transaction,
+        &request.ingestion_run_id,
+        &request.memory_space_id,
+    )?;
+    transaction.commit()?;
+    Ok(ResolutionPublishResult {
+        ingestion_run,
+        entities_created,
+        entities_reused,
+        facts_created,
+        facts_reused,
+        evidence_inserted,
+    })
+}
+
+fn get_run_in_transaction(
+    transaction: &Transaction<'_>,
+    ingestion_run_id: &str,
+    memory_space_id: &str,
+) -> MemoryResult<IngestionRun> {
+    transaction
+        .query_row(
+            "SELECT id, memory_space_id, memory_record_id, idempotency_key, input_hash,
+                    status, stage, attempt_count, pipeline_version, error_code, error_message,
+                    created_at_ms, started_at_ms, updated_at_ms, completed_at_ms
+             FROM graph_ingestion_runs
+             WHERE id = ?1
+               AND memory_space_id = ?2",
+            params![ingestion_run_id, memory_space_id],
+            |row| {
+                Ok(IngestionRun {
+                    id: row.get(0)?,
+                    memory_space_id: row.get(1)?,
+                    memory_record_id: row.get(2)?,
+                    idempotency_key: row.get(3)?,
+                    input_hash: row.get(4)?,
+                    status: row.get(5)?,
+                    stage: row.get(6)?,
+                    attempt_count: row.get(7)?,
+                    pipeline_version: row.get(8)?,
+                    error_code: row.get(9)?,
+                    error_message: row.get(10)?,
+                    created_at_ms: row.get::<_, i64>(11)? as u64,
+                    started_at_ms: row.get::<_, Option<i64>>(12)?.map(|value| value as u64),
+                    updated_at_ms: row.get::<_, i64>(13)? as u64,
+                    completed_at_ms: row.get::<_, Option<i64>>(14)?.map(|value| value as u64),
+                })
+            },
+        )
+        .map_err(Into::into)
+}
+
+struct ResolvedEntity {
+    entity_id: String,
+    created: bool,
+}
+
+struct ResolvedFact {
+    fact_id: String,
+    created: bool,
+}
+
+fn resolve_entity_candidate(
+    transaction: &Transaction<'_>,
+    request: &ResolutionPublishRequest,
+    candidate: &ExtractedEntityCandidate,
+    now: i64,
+) -> MemoryResult<ResolvedEntity> {
+    let normalized_name = normalize_graph_text(&candidate.name);
+    if let Some(entity_id) = find_entity_by_normalized_name(
+        transaction,
+        &request.memory_space_id,
+        &candidate.entity_type,
+        &normalized_name,
+    )? {
+        ensure_entity_alias(
+            transaction,
+            &request.memory_space_id,
+            &entity_id,
+            &candidate.name,
+            &normalized_name,
+            now,
+        )?;
+        insert_resolution_decision(
+            transaction,
+            request,
+            ResolutionDecisionInsert {
+                decision_kind: "entity_resolution",
+                input_key: &candidate.local_id,
+                candidate_ids: std::slice::from_ref(&entity_id),
+                selected_id: Some(&entity_id),
+                action: "reuse",
+                now,
+            },
+        )?;
+        return Ok(ResolvedEntity {
+            entity_id,
+            created: false,
+        });
+    }
+    if let Some(entity_id) = find_unique_entity_by_alias(
+        transaction,
+        &request.memory_space_id,
+        &candidate.entity_type,
+        &normalized_name,
+    )? {
+        ensure_entity_alias(
+            transaction,
+            &request.memory_space_id,
+            &entity_id,
+            &candidate.name,
+            &normalized_name,
+            now,
+        )?;
+        insert_resolution_decision(
+            transaction,
+            request,
+            ResolutionDecisionInsert {
+                decision_kind: "entity_resolution",
+                input_key: &candidate.local_id,
+                candidate_ids: std::slice::from_ref(&entity_id),
+                selected_id: Some(&entity_id),
+                action: "reuse",
+                now,
+            },
+        )?;
+        return Ok(ResolvedEntity {
+            entity_id,
+            created: false,
+        });
+    }
+
+    let entity_id = Uuid::new_v4().to_string();
+    transaction.execute(
+        "INSERT INTO graph_entities (
+            id, memory_space_id, canonical_name, normalized_name, entity_type, status,
+            type_registry_version, created_at_ms, updated_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7, ?7)",
+        params![
+            &entity_id,
+            &request.memory_space_id,
+            &candidate.name,
+            &normalized_name,
+            &candidate.entity_type,
+            &request.type_registry_version,
+            now,
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO graph_entity_fts (id, memory_space_id, canonical_name)
+         VALUES (?1, ?2, ?3)",
+        params![&entity_id, &request.memory_space_id, &candidate.name],
+    )?;
+    ensure_entity_alias(
+        transaction,
+        &request.memory_space_id,
+        &entity_id,
+        &candidate.name,
+        &normalized_name,
+        now,
+    )?;
+    insert_resolution_decision(
+        transaction,
+        request,
+        ResolutionDecisionInsert {
+            decision_kind: "entity_resolution",
+            input_key: &candidate.local_id,
+            candidate_ids: &[],
+            selected_id: Some(&entity_id),
+            action: "create",
+            now,
+        },
+    )?;
+    Ok(ResolvedEntity {
+        entity_id,
+        created: true,
+    })
+}
+
+fn find_entity_by_normalized_name(
+    transaction: &Transaction<'_>,
+    memory_space_id: &str,
+    entity_type: &str,
+    normalized_name: &str,
+) -> MemoryResult<Option<String>> {
+    transaction
+        .query_row(
+            "SELECT id
+             FROM graph_entities
+             WHERE memory_space_id = ?1
+               AND entity_type = ?2
+               AND normalized_name = ?3
+               AND status = 'active'
+               AND deleted_at_ms IS NULL
+             ORDER BY created_at_ms, id
+             LIMIT 1",
+            params![memory_space_id, entity_type, normalized_name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn find_unique_entity_by_alias(
+    transaction: &Transaction<'_>,
+    memory_space_id: &str,
+    entity_type: &str,
+    normalized_alias: &str,
+) -> MemoryResult<Option<String>> {
+    let mut statement = transaction.prepare(
+        "SELECT entities.id
+         FROM graph_entity_aliases aliases
+         JOIN graph_entities entities
+           ON entities.id = aliases.entity_id
+          AND entities.memory_space_id = aliases.memory_space_id
+         WHERE aliases.memory_space_id = ?1
+           AND aliases.normalized_alias = ?2
+           AND aliases.deleted_at_ms IS NULL
+           AND entities.entity_type = ?3
+           AND entities.status = 'active'
+           AND entities.deleted_at_ms IS NULL
+         ORDER BY entities.created_at_ms, entities.id
+         LIMIT 2",
+    )?;
+    let rows = statement
+        .query_map(
+            params![memory_space_id, normalized_alias, entity_type],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(if rows.len() == 1 {
+        Some(rows[0].clone())
+    } else {
+        None
+    })
+}
+
+fn ensure_entity_alias(
+    transaction: &Transaction<'_>,
+    memory_space_id: &str,
+    entity_id: &str,
+    display_alias: &str,
+    normalized_alias: &str,
+    now: i64,
+) -> MemoryResult<()> {
+    let alias_id = Uuid::new_v4().to_string();
+    let inserted = transaction.execute(
+        "INSERT OR IGNORE INTO graph_entity_aliases (
+            id, memory_space_id, entity_id, display_alias, normalized_alias, created_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            &alias_id,
+            memory_space_id,
+            entity_id,
+            display_alias,
+            normalized_alias,
+            now,
+        ],
+    )?;
+    if inserted == 1 {
+        transaction.execute(
+            "INSERT INTO graph_entity_alias_fts (id, memory_space_id, display_alias)
+             VALUES (?1, ?2, ?3)",
+            params![&alias_id, memory_space_id, display_alias],
+        )?;
+    }
+    Ok(())
+}
+
+fn resolve_fact_candidate(
+    transaction: &Transaction<'_>,
+    request: &ResolutionPublishRequest,
+    candidate: &ExtractedFactCandidate,
+    subject_entity_id: &str,
+    object_entity_id: &str,
+    now: i64,
+) -> MemoryResult<ResolvedFact> {
+    let normalized_fact_text = normalize_graph_text(&candidate.fact_text);
+    let dedup_key = fact_dedup_key(
+        subject_entity_id,
+        &candidate.predicate,
+        object_entity_id,
+        &normalized_fact_text,
+    );
+    if let Some(fact_id) =
+        find_fact_by_dedup_key(transaction, &request.memory_space_id, &dedup_key)?
+    {
+        insert_resolution_decision(
+            transaction,
+            request,
+            ResolutionDecisionInsert {
+                decision_kind: "fact_resolution",
+                input_key: &candidate.local_id,
+                candidate_ids: std::slice::from_ref(&fact_id),
+                selected_id: Some(&fact_id),
+                action: "reuse",
+                now,
+            },
+        )?;
+        return Ok(ResolvedFact {
+            fact_id,
+            created: false,
+        });
+    }
+
+    let fact_id = Uuid::new_v4().to_string();
+    transaction.execute(
+        "INSERT INTO graph_facts (
+            id, memory_space_id, subject_entity_id, predicate, object_entity_id,
+            fact_text, dedup_key, status, valid_from_ms, valid_to_ms, recorded_at_ms,
+            type_registry_version
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?9, ?10, ?11)",
+        params![
+            &fact_id,
+            &request.memory_space_id,
+            subject_entity_id,
+            &candidate.predicate,
+            object_entity_id,
+            &candidate.fact_text,
+            &dedup_key,
+            candidate.valid_from_ms.map(|value| value as i64),
+            candidate.valid_to_ms.map(|value| value as i64),
+            now,
+            &request.type_registry_version,
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO graph_fact_fts (id, memory_space_id, fact_text)
+         VALUES (?1, ?2, ?3)",
+        params![&fact_id, &request.memory_space_id, &candidate.fact_text],
+    )?;
+    transaction.execute(
+        "INSERT INTO graph_fact_status_history (
+            id, memory_space_id, fact_id, old_status, new_status, reason_code,
+            trigger_record_id, created_at_ms
+         ) VALUES (?1, ?2, ?3, NULL, 'active', 'created_from_extraction', ?4, ?5)",
+        params![
+            Uuid::new_v4().to_string(),
+            &request.memory_space_id,
+            &fact_id,
+            &request.memory_record_id,
+            now,
+        ],
+    )?;
+    insert_resolution_decision(
+        transaction,
+        request,
+        ResolutionDecisionInsert {
+            decision_kind: "fact_resolution",
+            input_key: &candidate.local_id,
+            candidate_ids: &[],
+            selected_id: Some(&fact_id),
+            action: "create",
+            now,
+        },
+    )?;
+    Ok(ResolvedFact {
+        fact_id,
+        created: true,
+    })
+}
+
+fn find_fact_by_dedup_key(
+    transaction: &Transaction<'_>,
+    memory_space_id: &str,
+    dedup_key: &str,
+) -> MemoryResult<Option<String>> {
+    transaction
+        .query_row(
+            "SELECT id
+             FROM graph_facts
+             WHERE memory_space_id = ?1
+               AND dedup_key = ?2
+               AND status = 'active'
+               AND retired_at_ms IS NULL
+             ORDER BY recorded_at_ms, id
+             LIMIT 1",
+            params![memory_space_id, dedup_key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn insert_fact_evidence_group(
+    transaction: &Transaction<'_>,
+    request: &ResolutionPublishRequest,
+    fact_id: &str,
+    candidate: &ExtractedFactCandidate,
+    now: i64,
+) -> MemoryResult<usize> {
+    let evidence_group_id = Uuid::new_v4().to_string();
+    transaction.execute(
+        "INSERT INTO graph_fact_evidence_groups (
+            id, memory_space_id, fact_id, evidence_kind, extraction_run_id, created_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            &evidence_group_id,
+            &request.memory_space_id,
+            fact_id,
+            FACT_EVIDENCE_KIND_SUPPORT,
+            &request.extraction_run_id,
+            now,
+        ],
+    )?;
+
+    for evidence in &candidate.evidence {
+        transaction.execute(
+            "INSERT INTO graph_fact_evidence (
+                id, memory_space_id, evidence_group_id, memory_record_id,
+                evidence_text, start_byte, end_byte, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                Uuid::new_v4().to_string(),
+                &request.memory_space_id,
+                &evidence_group_id,
+                &request.memory_record_id,
+                evidence.text.as_deref(),
+                evidence.start_byte.map(|value| value as i64),
+                evidence.end_byte.map(|value| value as i64),
+                now,
+            ],
+        )?;
+    }
+    Ok(candidate.evidence.len())
+}
+
+struct ResolutionDecisionInsert<'a> {
+    decision_kind: &'a str,
+    input_key: &'a str,
+    candidate_ids: &'a [String],
+    selected_id: Option<&'a str>,
+    action: &'a str,
+    now: i64,
+}
+
+fn insert_resolution_decision(
+    transaction: &Transaction<'_>,
+    request: &ResolutionPublishRequest,
+    decision: ResolutionDecisionInsert<'_>,
+) -> MemoryResult<()> {
+    let candidate_ids_json = serde_json::to_string(decision.candidate_ids)?;
+    transaction.execute(
+        "INSERT INTO graph_resolution_decisions (
+            id, memory_space_id, ingestion_run_id, decision_kind, input_key,
+            candidate_ids_json, selected_id, action, method, resolver_version, created_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            Uuid::new_v4().to_string(),
+            &request.memory_space_id,
+            &request.ingestion_run_id,
+            decision.decision_kind,
+            decision.input_key,
+            &candidate_ids_json,
+            decision.selected_id,
+            decision.action,
+            RESOLUTION_METHOD_DETERMINISTIC,
+            &request.resolver_version,
+            decision.now,
+        ],
+    )?;
+    Ok(())
+}
+
+fn fact_dedup_key(
+    subject_entity_id: &str,
+    predicate: &str,
+    object_entity_id: &str,
+    normalized_fact_text: &str,
+) -> String {
+    serde_json::to_string(&[
+        subject_entity_id,
+        predicate,
+        object_entity_id,
+        normalized_fact_text,
+    ])
+    .expect("fact dedup key fields must serialize to JSON")
+}
+
 fn mark_run_failed_if_current_attempt_sync(
     path: &Path,
     ingestion_run_id: &str,
@@ -791,6 +1500,8 @@ fn mark_run_failed_if_current_attempt_sync(
     let mut connection = open_graph_connection(path)?;
     let transaction = connection.transaction()?;
     let now = current_time_ms() as i64;
+    // This helper is used before a stage commits completion. The stage predicate is
+    // intentionally both a guard and the value preserved on the failed run.
     let updated = transaction.execute(
         "UPDATE graph_ingestion_runs
          SET status = 'failed',
@@ -1069,7 +1780,7 @@ fn blob_to_embedding(
 
 #[cfg(test)]
 mod tests {
-    use super::open_graph_connection;
+    use super::{fact_dedup_key, open_graph_connection};
     use std::path::Path;
 
     #[test]
@@ -1114,5 +1825,15 @@ mod tests {
             super::parent_dir_to_create(Path::new("data/graph.sqlite")),
             Some(Path::new("data"))
         );
+    }
+
+    #[test]
+    fn fact_dedup_key_does_not_collide_when_text_contains_separator_like_control_characters() {
+        let key_with_control_in_text =
+            fact_dedup_key("subject", "predicate", "object", "left\u{1f}right");
+        let key_with_control_in_object =
+            fact_dedup_key("subject", "predicate", "object\u{1f}left", "right");
+
+        assert_ne!(key_with_control_in_text, key_with_control_in_object);
     }
 }
