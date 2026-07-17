@@ -49,6 +49,28 @@ struct Cli {
     rerank_timeout_ms: Option<u64>,
     #[arg(long)]
     rerank_fail_open: bool,
+    #[arg(long)]
+    graph_build: bool,
+    #[arg(long)]
+    graph: bool,
+    #[arg(long, default_value_t = 0.2)]
+    graph_weight: f32,
+    #[arg(long)]
+    graph_fail_open: bool,
+    #[arg(long, value_enum, default_value_t = GraphMemorySpaceMode::Auto)]
+    graph_memory_space_mode: GraphMemorySpaceMode,
+    #[arg(long, default_value = "scope_id")]
+    graph_memory_space_field: String,
+    #[arg(long, default_value = "benchmark")]
+    graph_owner_id: String,
+    #[arg(long, default_value = "OPENROUTER_API_KEY")]
+    graph_llm_api_key_env: String,
+    #[arg(long, default_value = "openai/gpt-4o-mini")]
+    graph_llm_model: String,
+    #[arg(long, default_value = "https://openrouter.ai/api/v1")]
+    graph_llm_base_url: String,
+    #[arg(long)]
+    graph_llm_timeout_ms: Option<u64>,
     #[arg(long, default_value = "OPENROUTER_API_KEY")]
     api_key_env: String,
     #[arg(long, default_value = "baai/bge-m3")]
@@ -83,6 +105,13 @@ enum SearchModeKind {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum RerankProviderKind {
     Openrouter,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum GraphMemorySpaceMode {
+    Auto,
+    MetadataField,
+    PathPrefix,
 }
 
 impl From<SearchModeKind> for SearchMode {
@@ -898,6 +927,81 @@ fn parse_filter(raw: Option<String>) -> Result<Option<serde_json::Value>> {
     Ok(Some(filter))
 }
 
+fn graph_memory_space_for_memory(
+    path: &str,
+    metadata: &serde_json::Value,
+    is_prepared: bool,
+    cli: &Cli,
+) -> Result<Option<String>> {
+    match cli.graph_memory_space_mode {
+        GraphMemorySpaceMode::MetadataField => {
+            metadata_string_field(metadata, &cli.graph_memory_space_field)
+        }
+        GraphMemorySpaceMode::PathPrefix => Ok(top_level_array_space(path)),
+        GraphMemorySpaceMode::Auto => {
+            if is_prepared {
+                metadata_string_field(metadata, &cli.graph_memory_space_field)
+            } else {
+                Ok(top_level_array_space(path))
+            }
+        }
+    }
+}
+
+fn graph_memory_space_for_query(
+    path: &str,
+    filter: Option<&serde_json::Value>,
+    is_prepared: bool,
+    cli: &Cli,
+) -> Result<Option<String>> {
+    match cli.graph_memory_space_mode {
+        GraphMemorySpaceMode::MetadataField => filter
+            .map(|value| metadata_string_field(value, &cli.graph_memory_space_field))
+            .unwrap_or(Ok(None)),
+        GraphMemorySpaceMode::PathPrefix => Ok(top_level_array_space(path)),
+        GraphMemorySpaceMode::Auto => {
+            if is_prepared {
+                filter
+                    .map(|value| metadata_string_field(value, &cli.graph_memory_space_field))
+                    .unwrap_or(Ok(None))
+            } else {
+                Ok(top_level_array_space(path))
+            }
+        }
+    }
+}
+
+fn metadata_string_field(value: &serde_json::Value, field: &str) -> Result<Option<String>> {
+    let Some(raw) = value.get(field) else {
+        return Ok(None);
+    };
+    let Some(text) = raw.as_str() else {
+        bail!("graph memory space field `{field}` must be a string");
+    };
+    let text = text.trim();
+    Ok((!text.is_empty()).then(|| text.to_string()))
+}
+
+fn top_level_array_space(path: &str) -> Option<String> {
+    let rest = path.strip_prefix("$[")?;
+    let end = rest.find(']')?;
+    let index = &rest[..end];
+    if index.parse::<usize>().is_ok() {
+        Some(format!("path:$[{index}]"))
+    } else {
+        None
+    }
+}
+
+fn search_output_id(record_id: &str, metadata: &serde_json::Value) -> String {
+    metadata
+        .get("benchmark_memory_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| record_id.to_string())
+}
+
 fn is_prepared_schema_v1(json: &serde_json::Value) -> bool {
     json.get("schema_version").and_then(|value| value.as_str()) == Some(PREPARED_SCHEMA_VERSION)
 }
@@ -1154,6 +1258,108 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_graph_options() {
+        let cli = Cli::try_parse_from([
+            "memory-bench",
+            "--embedding",
+            "hash",
+            "--graph-build",
+            "--graph",
+            "--graph-weight",
+            "0.4",
+            "--graph-fail-open",
+            "--graph-memory-space-mode",
+            "path-prefix",
+            "--graph-memory-space-field",
+            "tenant",
+            "--graph-owner-id",
+            "bench-owner",
+            "--graph-llm-api-key-env",
+            "GRAPH_KEY",
+            "--graph-llm-model",
+            "openai/gpt-4o-mini",
+            "--graph-llm-base-url",
+            "https://openrouter.ai/api/v1",
+            "--graph-llm-timeout-ms",
+            "1000",
+            "search",
+            "--query",
+            "Where does Alice live?",
+            "--output",
+            "outputs/search.json",
+        ])
+        .expect("parse graph CLI");
+
+        assert!(cli.graph_build);
+        assert!(cli.graph);
+        assert_eq!(cli.graph_weight, 0.4);
+        assert!(cli.graph_fail_open);
+        assert!(matches!(
+            cli.graph_memory_space_mode,
+            GraphMemorySpaceMode::PathPrefix
+        ));
+        assert_eq!(cli.graph_memory_space_field, "tenant");
+        assert_eq!(cli.graph_owner_id, "bench-owner");
+        assert_eq!(cli.graph_llm_api_key_env, "GRAPH_KEY");
+        assert_eq!(cli.graph_llm_model, "openai/gpt-4o-mini");
+        assert_eq!(cli.graph_llm_base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(cli.graph_llm_timeout_ms, Some(1000));
+    }
+
+    #[test]
+    fn graph_memory_space_auto_uses_prepared_scope_id() {
+        let cli = graph_test_cli();
+        let metadata = serde_json::json!({"scope_id": "scope-a"});
+        let filter = serde_json::json!({"scope_id": "scope-a"});
+
+        assert_eq!(
+            graph_memory_space_for_memory("$.memories[0].text", &metadata, true, &cli)
+                .expect("memory space"),
+            Some("scope-a".to_string())
+        );
+        assert_eq!(
+            graph_memory_space_for_query("$.queries[0].text", Some(&filter), true, &cli)
+                .expect("query space"),
+            Some("scope-a".to_string())
+        );
+    }
+
+    #[test]
+    fn graph_memory_space_auto_uses_top_level_path_for_raw_locomo_shape() {
+        let cli = graph_test_cli();
+        assert_eq!(
+            graph_memory_space_for_memory(
+                "$[12].conversation.session_1[0].text",
+                &serde_json::json!({}),
+                false,
+                &cli,
+            )
+            .expect("memory space"),
+            Some("path:$[12]".to_string())
+        );
+        assert_eq!(
+            graph_memory_space_for_query("$[12].qa[0].question", None, false, &cli)
+                .expect("query space"),
+            Some("path:$[12]".to_string())
+        );
+    }
+
+    #[test]
+    fn search_output_id_prefers_benchmark_memory_id() {
+        assert_eq!(
+            search_output_id(
+                "graph-record-id",
+                &serde_json::json!({"benchmark_memory_id": "turn-1"})
+            ),
+            "turn-1"
+        );
+        assert_eq!(
+            search_output_id("record-id", &serde_json::json!({})),
+            "record-id"
+        );
+    }
+
+    #[test]
     fn build_runtime_does_not_require_rerank_api_key_when_rerank_is_disabled() {
         let cli = Cli::try_parse_from([
             "memory-bench",
@@ -1326,5 +1532,19 @@ mod tests {
         let completed = resume_completed_indexes(&templates, &existing);
 
         assert_eq!(completed, vec![0]);
+    }
+
+    fn graph_test_cli() -> Cli {
+        Cli::try_parse_from([
+            "memory-bench",
+            "--embedding",
+            "hash",
+            "search",
+            "--query",
+            "Where?",
+            "--output",
+            "outputs/search.json",
+        ])
+        .expect("parse graph test CLI")
     }
 }
