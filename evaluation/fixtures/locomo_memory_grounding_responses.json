@@ -1,0 +1,10 @@
+{
+  "candidate-7c6987a55ec84aec1207a5f0": {
+    "reason": "The exact source turn states the notebook and its location.",
+    "status": "SUPPORTED"
+  },
+  "candidate-7fae7c2f518023e63d809f88": {
+    "reason": "The exact source turn states the planned meeting, person, and place.",
+    "status": "SUPPORTED"
+  }
+}

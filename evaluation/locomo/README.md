@@ -94,6 +94,62 @@ Outputs are written to repository-root `outputs/locomo/<RUN_ID>/<backend>/`.
 
 The optional mem0 comparison implementation lives under `evaluation/locomo/backends/mem0/`.
 
+## Grounded Atomic-Memory A/B
+
+`run_locomo_memory_ab.sh` evaluates memory features 2 and 4 without changing the
+answer prompt. The paired arms are:
+
+```text
+raw:       LoCoMo turns -> prepared-v1 -> index raw turns -> answer
+extracted: LoCoMo turns -> episode/window -> grounded atomic memories
+           -> index atomic memories -> expand evidence_refs to exact source turns -> answer
+```
+
+Raw source turns are never co-indexed with atomic memories in the treatment arm.
+They remain in `raw_prepared.json` only so a retrieved atomic claim can be rendered
+with its original speaker, timestamp, quote, and full source text.
+
+Use a newly rotated OpenRouter key and never put a real key in a command, README,
+artifact, or commit:
+
+```bash
+cd evaluation
+export OPENROUTER_API_KEY="<new-rotated-key>"
+
+PYTHON_BIN=../.venv/bin/python \
+PHASE=pilot RUN_DIR=outputs/locomo-memory-ab/pilot \
+./run_locomo_memory_ab.sh
+
+PYTHON_BIN=../.venv/bin/python \
+PHASE=full \
+FROZEN_CONFIG=outputs/locomo-memory-ab/pilot/frozen_config.json \
+RUN_DIR=outputs/locomo-memory-ab/full \
+./run_locomo_memory_ab.sh
+```
+
+Pilot is fixed to conversation index 0. A passing pilot freezes the model,
+window, retrieval, and rerank configuration in `frozen_config.json`; full runs
+reject any mismatch before a model call. The fixed models are
+`openai/gpt-4o-mini` for extraction, grounding, answer, and judge;
+`baai/bge-m3` (1,024 dimensions) for embeddings; and
+`cohere/rerank-v3.5` for reranking. Hybrid weights are 0.7/0.3, candidate K is
+150, rerank input K is 40, and final Top K is 30.
+
+Each arm contains `config.json`, prepared input, SQLite store, search results,
+retrieval diagnostics, responses, judge results, QA metrics, HTML reports,
+versioned per-query caches, and `stages/*.complete.json`. The treatment also
+contains normalized messages, episodes, windows, accepted/rejected/quarantined
+memories, and extraction health statistics under `artifacts/`. Resume occurs
+only when the source, configuration, command, and output hashes still match.
+
+The historical v3 gate is 0.4065 overall, with category floors 0.1999,
+0.4161, 0.2717, and 0.4509 for categories 1–4. A promotable full treatment must
+score strictly above both 0.4065 and its fresh paired raw arm, contain exactly
+1,540 scored questions, meet every category floor, and pass the complete Python,
+Rust, shell, and offline smoke regression suite. If any check fails, keep the
+integration code uncommitted and use `comparison.html` plus pipeline artifacts
+for diagnosis; do not record the run as a new baseline.
+
 ## Pipeline Stages
 
 ```
@@ -159,6 +215,7 @@ ram-a/  (or mem0/)
 - Category 5 (adversarial/unanswerable) questions are excluded from the main QA score; evaluate them separately with an abstention/unanswerable rubric if needed
 - mem0 retrieval produces a stub report (no turn-path evidence)
 - Shell script cleans previous outputs; use different `RUN_ID` to preserve
+- The atomic-memory runner does not clean outputs; it resumes only hash-matching stages
 
 ## Reference
 

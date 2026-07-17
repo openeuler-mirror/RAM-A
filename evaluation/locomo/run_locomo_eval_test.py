@@ -1,4 +1,8 @@
 from pathlib import Path
+import subprocess
+import sys
+
+import pytest
 
 
 EVALUATION_ROOT = Path(__file__).resolve().parents[1]
@@ -55,3 +59,38 @@ def test_run_locomo_eval_uses_locomo_entrypoints():
     assert "scripts/locomo" not in content
     assert 'MEMORY_BENCH_DIR="${RUN_DIR}/ram-a"' in content
     assert 'write_meta "RAM-A" "all"' in content
+
+
+def test_memory_ab_runner_has_paired_modes_and_frozen_config_contract():
+    script = EVALUATION_ROOT / "run_locomo_memory_ab.sh"
+    content = script.read_text(encoding="utf-8")
+
+    assert 'PHASE="${PHASE:-pilot}"' in content
+    assert 'MEMORY_MODE=raw "$PYTHON_BIN" locomo/locomo_run.py' in content
+    assert 'MEMORY_MODE=extracted "$PYTHON_BIN" locomo/locomo_run.py' in content
+    assert 'locomo/locomo_compare.py' in content
+    assert 'OPENROUTER_API_KEY' in content
+    assert 'FROZEN_CONFIG' in content
+    assert 'locomo/locomo_preflight.py' in content
+    assert 'export PREFLIGHT_PATH' in content
+    assert '. ./.env' in content
+
+
+@pytest.mark.parametrize(
+    "script",
+    (
+        "locomo/locomo_compare.py",
+        "locomo/locomo_responses.py",
+        "locomo/locomo_preflight.py",
+    ),
+)
+def test_memory_ab_python_entrypoints_start_from_evaluation_directory(script):
+    completed = subprocess.run(
+        [sys.executable, script, "--help"],
+        cwd=EVALUATION_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
