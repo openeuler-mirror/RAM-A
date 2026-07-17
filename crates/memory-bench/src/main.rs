@@ -1,6 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,7 +11,7 @@ use memory_core::{
     MemoryManager, MemoryStore, OpenRouterEmbedding, OpenRouterReranker, RerankConfig,
     RerankProvider, Reranker, RetrievalConfig, SearchMemoryRequest, SearchMode, SqliteMemoryStore,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 const PREPARED_SCHEMA_VERSION: &str = "benchmark-prepared-v1";
 
@@ -130,6 +130,8 @@ enum Command {
         query_fields: Vec<String>,
         #[arg(long)]
         filter: Option<String>,
+        #[arg(long)]
+        resume: bool,
     },
 }
 
@@ -161,6 +163,7 @@ async fn main() -> Result<()> {
             top_k,
             query_fields,
             filter,
+            resume,
         } => {
             let options = SearchRunOptions {
                 output,
@@ -168,6 +171,7 @@ async fn main() -> Result<()> {
                 query_fields: &query_fields,
                 filter,
                 batch_size: cli.batch_size,
+                resume,
             };
             run_search(runtime.manager, dataset, query, options).await
         }
@@ -435,6 +439,7 @@ struct SearchRunOptions<'a> {
     query_fields: &'a [String],
     filter: Option<String>,
     batch_size: usize,
+    resume: bool,
 }
 
 async fn run_search(
@@ -463,6 +468,7 @@ async fn run_search(
                 options.top_k,
                 cli_filter,
                 options.batch_size,
+                options.resume,
             )
             .await;
         }
@@ -544,10 +550,7 @@ async fn run_search(
             .collect();
     }
 
-    if let Some(parent) = options.output.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    tokio::fs::write(&options.output, serde_json::to_vec_pretty(&outputs)?).await?;
+    write_atomic_json(&options.output, &outputs).await?;
     println!("wrote search results to {}", options.output.display());
     Ok(())
 }
@@ -559,6 +562,7 @@ async fn run_search_prepared_queries(
     top_k: usize,
     cli_filter: Option<serde_json::Value>,
     batch_size: usize,
+    resume: bool,
 ) -> Result<()> {
     let queries = json
         .get("queries")
@@ -614,19 +618,45 @@ async fn run_search_prepared_queries(
         });
     }
 
-    let mut progress = ProgressReporter::new("Searching prepared queries", search_requests.len());
-    let search_results = manager
-        .search_many_with_batch_size_and_progress(search_requests, batch_size, |count| {
-            progress.inc(count);
-        })
-        .await
-        .with_context(|| "failed to search prepared queries in batch")?;
-    progress.finish();
-    let outputs = output_templates
-        .into_iter()
-        .zip(search_results)
-        .map(|(mut output, results)| {
-            output.results = results
+    let mut outputs = output_templates.clone();
+    let mut completed: Vec<usize> = Vec::new();
+    if resume {
+        if let Some(existing) = load_existing_outputs(&output) {
+            completed = resume_completed_indexes(&outputs, &existing);
+            for index in &completed {
+                if let Some(row) = existing.get(*index) {
+                    outputs[*index] = row.clone();
+                }
+            }
+            if !completed.is_empty() {
+                println!(
+                    "search --resume recovered {} of {} completed queries",
+                    completed.len(),
+                    outputs.len()
+                );
+            }
+        }
+    }
+
+    let pending: Vec<usize> = (0..outputs.len())
+        .filter(|index| !completed.contains(index))
+        .collect();
+    let mut progress = ProgressReporter::new("Searching prepared queries", pending.len());
+    let batch_size = batch_size.max(1);
+    for chunk in pending.chunks(batch_size) {
+        let chunk_requests: Vec<SearchMemoryRequest> = chunk
+            .iter()
+            .map(|index| search_requests[*index].clone())
+            .collect();
+        let chunk_results = manager
+            .search_many_with_batch_size_and_progress(chunk_requests, batch_size, |count| {
+                progress.inc(count);
+            })
+            .await
+            .with_context(|| "failed to search prepared queries in batch")?;
+        for (offset, results) in chunk_results.into_iter().enumerate() {
+            let index = chunk[offset];
+            outputs[index].results = results
                 .into_iter()
                 .map(|result| SearchOutput {
                     id: result.record.id,
@@ -635,15 +665,67 @@ async fn run_search_prepared_queries(
                     score: result.score,
                 })
                 .collect();
-            output
-        })
-        .collect::<Vec<_>>();
+        }
+        write_atomic_json(&output, &outputs).await?;
+    }
+    progress.finish();
+    write_atomic_json(&output, &outputs).await?;
+    println!("wrote search results to {}", output.display());
+    Ok(())
+}
 
+/// Load previously written search outputs for `--resume`. Returns `None` when the
+/// output file is absent or cannot be parsed: a half-written file from a killed
+/// process must not abort the run, it simply restarts search from scratch.
+fn load_existing_outputs(output: &Path) -> Option<Vec<QueryOutput>> {
+    let bytes = std::fs::read(output).ok()?;
+    serde_json::from_slice::<Vec<QueryOutput>>(&bytes).ok()
+}
+
+/// Indexes of queries already present in `existing`, matched by `query_id` when
+/// both sides have one, otherwise by the `$.queries[i].text` path embedded in
+/// `query_path`. A query counts as completed only when its existing row has at
+/// least one result, so an empty (interrupted) row is re-searched.
+fn resume_completed_indexes(
+    templates: &[QueryOutput],
+    existing: &[QueryOutput],
+) -> Vec<usize> {
+    let by_query_id: HashMap<String, usize> = existing
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| row.query_id.as_ref().map(|id| (id.clone(), index)))
+        .collect();
+    let by_path: HashMap<String, usize> = existing
+        .iter()
+        .enumerate()
+        .map(|(index, row)| (row.query_path.clone(), index))
+        .collect();
+    let mut completed = Vec::new();
+    for (index, template) in templates.iter().enumerate() {
+        let matched = template
+            .query_id
+            .as_ref()
+            .and_then(|id| by_query_id.get(id).copied())
+            .or_else(|| by_path.get(&template.query_path).copied());
+        if let Some(existing_index) = matched {
+            if !existing[existing_index].results.is_empty() {
+                completed.push(index);
+            }
+        }
+    }
+    completed
+}
+
+/// Write `outputs` to `output` atomically: serialize to a `.tmp` sibling then
+/// rename over the target, so a crash mid-write cannot leave a truncated file.
+async fn write_atomic_json(output: &Path, outputs: &[QueryOutput]) -> Result<()> {
     if let Some(parent) = output.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    tokio::fs::write(&output, serde_json::to_vec_pretty(&outputs)?).await?;
-    println!("wrote search results to {}", output.display());
+    let bytes = serde_json::to_vec_pretty(outputs)?;
+    let temporary = output.with_extension("tmp");
+    tokio::fs::write(&temporary, &bytes).await?;
+    tokio::fs::rename(&temporary, output).await?;
     Ok(())
 }
 
@@ -920,7 +1002,7 @@ fn insert_default_metadata(target: &mut serde_json::Value, key: &str, value: ser
     target_object.entry(key.to_string()).or_insert(value);
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct QueryOutput {
     query_path: String,
     query: String,
@@ -935,7 +1017,7 @@ struct QueryOutput {
     results: Vec<SearchOutput>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct SearchOutput {
     id: String,
     text: String,
@@ -1106,5 +1188,139 @@ mod tests {
 
         assert!(format!("{error}")
             .contains("missing rerank API key env RAM_A_TEST_MISSING_RERANK_KEY_ENABLED"));
+    }
+
+    #[test]
+    fn cli_parses_search_resume() {
+        let cli = Cli::try_parse_from([
+            "memory-bench",
+            "--embedding",
+            "hash",
+            "search",
+            "--dataset",
+            "data/test.json",
+            "--output",
+            "outputs/search.json",
+            "--resume",
+        ])
+        .expect("parse search --resume");
+
+        match cli.command {
+            Command::Search { resume, .. } => assert!(resume),
+            _ => panic!("expected Search command"),
+        }
+    }
+
+    #[test]
+    fn search_resume_defaults_to_false() {
+        let cli = Cli::try_parse_from([
+            "memory-bench",
+            "--embedding",
+            "hash",
+            "search",
+            "--query",
+            "q",
+            "--output",
+            "outputs/search.json",
+        ])
+        .expect("parse search without --resume");
+
+        match cli.command {
+            Command::Search { resume, .. } => assert!(!resume),
+            _ => panic!("expected Search command"),
+        }
+    }
+
+    #[test]
+    fn resume_completed_indexes_skip_queries_with_matching_ids() {
+        let templates = vec![
+            QueryOutput {
+                query_path: "$.queries[0].text".to_string(),
+                query: "q0".to_string(),
+                query_id: Some("Q0".to_string()),
+                filter: None,
+                metadata: None,
+                task: None,
+                results: Vec::new(),
+            },
+            QueryOutput {
+                query_path: "$.queries[1].text".to_string(),
+                query: "q1".to_string(),
+                query_id: Some("Q1".to_string()),
+                filter: None,
+                metadata: None,
+                task: None,
+                results: Vec::new(),
+            },
+            QueryOutput {
+                query_path: "$.queries[2].text".to_string(),
+                query: "q2".to_string(),
+                query_id: Some("Q2".to_string()),
+                filter: None,
+                metadata: None,
+                task: None,
+                results: Vec::new(),
+            },
+        ];
+        let existing = vec![QueryOutput {
+            query_path: "$.queries[0].text".to_string(),
+            query: "q0".to_string(),
+            query_id: Some("Q0".to_string()),
+            filter: None,
+            metadata: None,
+            task: None,
+            results: vec![SearchOutput {
+                id: "m0".to_string(),
+                text: "hit".to_string(),
+                metadata: serde_json::Value::Null,
+                score: 0.9,
+            }],
+        }];
+
+        let completed = resume_completed_indexes(&templates, &existing);
+
+        assert_eq!(completed, vec![0]);
+    }
+
+    #[test]
+    fn resume_completed_indexes_falls_back_to_path_index_without_query_id() {
+        let templates = vec![
+            QueryOutput {
+                query_path: "$.queries[0].text".to_string(),
+                query: "q0".to_string(),
+                query_id: None,
+                filter: None,
+                metadata: None,
+                task: None,
+                results: Vec::new(),
+            },
+            QueryOutput {
+                query_path: "$.queries[1].text".to_string(),
+                query: "q1".to_string(),
+                query_id: None,
+                filter: None,
+                metadata: None,
+                task: None,
+                results: Vec::new(),
+            },
+        ];
+        let existing = vec![QueryOutput {
+            query_path: "$.queries[0].text".to_string(),
+            query: "q0".to_string(),
+            query_id: None,
+            filter: None,
+            metadata: None,
+            task: None,
+            results: vec![SearchOutput {
+                id: "m0".to_string(),
+                text: "hit".to_string(),
+                metadata: serde_json::Value::Null,
+                score: 0.9,
+            }],
+        }];
+
+        let completed = resume_completed_indexes(&templates, &existing);
+
+        assert_eq!(completed, vec![0]);
     }
 }
