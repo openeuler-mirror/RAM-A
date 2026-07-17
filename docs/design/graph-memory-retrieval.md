@@ -35,8 +35,9 @@ GraphRetrieveContextRequest
 因此 graph retrieval 不是替代现有 MemoryRecord 检索，而是作为可开关的增强召回通道接入
 统一 search 入口。
 
-本阶段不做 benchmark graph mode、LLM query rewrite、rerank、Neo4j 后端、community /
-clustering、复杂时间推理、FactLink 发布，也不生成 entity / fact embedding。
+本阶段不做 LLM query rewrite、Neo4j 后端、community / clustering、复杂时间推理、
+FactLink 发布，也不生成 entity / fact embedding。`memory-bench` 可以通过显式开关调用
+graph build 和 graph retrieval；数据集 wrapper 的参数透传属于 benchmark runner 集成层。
 
 ## 2. 请求结构
 
@@ -171,7 +172,26 @@ GraphRetrieveContextRequest
 如果 hybrid rerank 开启，graph channel 会先参与候选融合，再交给 reranker。这样 reranker
 可以看到 graph evidence record，而不是只看到 dense/BM25 候选。
 
-## 7. 边界和限制
+## 7. memory-bench 使用方式
+
+`memory-bench` 的 graph 模式是显式 opt-in：
+
+- `--graph-build`：add 阶段在普通 MemoryRecord 写入成功后，继续执行
+  accept -> record embedding -> LLM extraction -> resolution，生成正式图；
+- `--graph`：search 阶段开启 `RetrievalConfig.graph.enabled`，把 graph evidence record
+  作为增强召回通道并入原有检索结果；
+- `--graph-weight`：控制 graph channel 的融合权重，默认 0.2；
+- `--graph-fail-open`：graph channel 出错时退化为只返回基础检索结果，默认关闭；
+- `--graph-memory-space-mode auto`：prepared schema 使用 `scope_id`，raw top-level-array
+  数据使用 `path:$[N]` 作为 graph memory space。
+
+graph build 需要真实 LLM key。默认读取 `OPENROUTER_API_KEY`，默认 base URL 是
+`https://openrouter.ai/api/v1`，默认模型是 `openai/gpt-4o-mini`。可以用
+`--graph-llm-api-key-env`、`--graph-llm-base-url` 和 `--graph-llm-model` 覆盖。
+
+建议 baseline 和 graph run 使用不同 SQLite 文件，避免对比时混用已经构建过图的状态。
+
+## 8. 边界和限制
 
 - 本阶段只做图上下文检索，不直接生成自然语言答案。
 - 本阶段 graph seed 只用 FTS，不使用 query embedding。
@@ -189,7 +209,7 @@ GraphRetrieveContextRequest
   `graph_fact_evidence(memory_space_id, evidence_group_id)` 建有 partial index，用于避免
   retrieval 热路径加载 evidence 时全表扫描。
 
-## 8. 测试覆盖
+## 9. 测试覆盖
 
 当前行为由 `graph_retrieval_context.rs` 覆盖：
 

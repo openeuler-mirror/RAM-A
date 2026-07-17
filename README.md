@@ -162,6 +162,43 @@ cargo run -p memory-bench -- `
   --output outputs/bge_m3_top10.json
 ```
 
+Graph memory benchmark mode is opt-in. `--graph-build` builds the graph during `add`;
+`--graph` enables the graph retrieval channel during `search`. Graph extraction uses an
+OpenAI-compatible chat-completions endpoint; by default it reads the same
+`OPENROUTER_API_KEY` environment variable and uses OpenRouter.
+
+```powershell
+$env:OPENROUTER_API_KEY="your_openrouter_key"
+
+cargo run -p memory-bench -- `
+  --store data/locomo_graph.sqlite `
+  --embedding openrouter `
+  --model baai/bge-m3 `
+  --dimensions 1024 `
+  --graph-build `
+  --graph-llm-model openai/gpt-4o-mini `
+  add `
+  --dataset data/locomo/locomo10.json `
+  --text-fields text,content,message,memory
+
+cargo run -p memory-bench -- `
+  --store data/locomo_graph.sqlite `
+  --embedding openrouter `
+  --model baai/bge-m3 `
+  --dimensions 1024 `
+  --graph `
+  --graph-weight 0.2 `
+  search `
+  --dataset data/locomo/locomo10.json `
+  --query-fields question,query `
+  --top-k 10 `
+  --output outputs/locomo_graph_top10.json
+```
+
+In graph `auto` memory-space mode, prepared-schema datasets use `scope_id`, while raw
+top-level-array datasets use the top-level JSON path such as `path:$[0]`. Keep graph and
+baseline runs in separate SQLite files when comparing scores.
+
 Do not commit API keys, local stores, downloaded datasets, or generated reports.
 
 ## RAM-A memory MCP service

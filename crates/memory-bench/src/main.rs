@@ -6,10 +6,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use memory_core::graph::{
+    GraphBuildPipeline, GraphTypeRegistry, LlmGraphExtractor, OpenAiCompatibleGraphLlmClient,
+};
 use memory_core::{
-    AddMemoryRequest, EmbeddingProvider, FileMemoryStore, HashEmbedding, LongTermMemory,
-    MemoryManager, MemoryStore, OpenRouterEmbedding, OpenRouterReranker, RerankConfig,
-    RerankProvider, Reranker, RetrievalConfig, SearchMemoryRequest, SearchMode, SqliteMemoryStore,
+    AddMemoryRequest, EmbeddingProvider, FileMemoryStore, GraphAddMemoryRequest,
+    GraphRetrievalConfig, HashEmbedding, LongTermMemory, MemoryManager, MemoryStore,
+    OpenRouterEmbedding, OpenRouterReranker, RerankConfig, RerankProvider, Reranker,
+    RetrievalConfig, SearchMemoryRequest, SearchMode, SqliteMemoryStore,
 };
 use serde::{Deserialize, Serialize};
 
@@ -169,19 +173,24 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let runtime = build_runtime(&cli)?;
 
-    match cli.command {
+    match &cli.command {
         Command::Add {
             dataset,
             text_fields,
             resume,
         } => {
+            let options = AddRunOptions {
+                dataset: dataset.clone(),
+                text_fields: text_fields.as_slice(),
+                batch_size: cli.batch_size,
+                resume: *resume,
+                cli: &cli,
+            };
             run_add(
                 runtime.manager,
                 runtime.store,
-                dataset,
-                &text_fields,
-                cli.batch_size,
-                resume,
+                runtime.graph_pipeline,
+                options,
             )
             .await
         }
@@ -195,14 +204,21 @@ async fn main() -> Result<()> {
             resume,
         } => {
             let options = SearchRunOptions {
-                output,
-                top_k,
-                query_fields: &query_fields,
-                filter,
+                output: output.clone(),
+                top_k: *top_k,
+                query_fields: query_fields.as_slice(),
+                filter: filter.clone(),
                 batch_size: cli.batch_size,
-                resume,
+                resume: *resume,
             };
-            run_search(runtime.manager, dataset, query, options).await
+            run_search(
+                runtime.manager,
+                dataset.clone(),
+                query.clone(),
+                options,
+                &cli,
+            )
+            .await
         }
     }
 }
@@ -210,9 +226,21 @@ async fn main() -> Result<()> {
 struct BenchRuntime {
     manager: MemoryManager,
     store: Arc<dyn MemoryStore>,
+    graph_pipeline: Option<GraphBuildPipeline>,
+}
+
+struct AddRunOptions<'a> {
+    dataset: PathBuf,
+    text_fields: &'a [String],
+    batch_size: usize,
+    resume: bool,
+    cli: &'a Cli,
 }
 
 fn build_runtime(cli: &Cli) -> Result<BenchRuntime> {
+    if matches!(cli.search_mode, SearchModeKind::Graph) && !cli.graph {
+        bail!("--search-mode graph requires --graph");
+    }
     let store = build_store(cli);
     let embedder: Arc<dyn EmbeddingProvider> = match cli.embedding {
         EmbeddingKind::Openrouter => {
@@ -237,12 +265,19 @@ fn build_runtime(cli: &Cli) -> Result<BenchRuntime> {
         fail_open: cli.rerank_fail_open,
     };
     let reranker = build_reranker(cli, &rerank_config)?;
+    let graph_pipeline = build_graph_pipeline(cli, &store, embedder.clone())?;
     let retrieval_config = RetrievalConfig {
         mode: cli.search_mode.into(),
         embedding_weight: cli.embedding_weight,
         bm25_weight: cli.bm25_weight,
         candidate_k: cli.candidate_k,
-        graph: Default::default(),
+        graph: GraphRetrievalConfig {
+            enabled: cli.graph,
+            weight: cli.graph_weight,
+            seed_limit: None,
+            max_evidence_records_per_fact: None,
+            fail_open: cli.graph_fail_open,
+        },
         rerank: rerank_config,
     };
     let manager = if let Some(reranker) = reranker {
@@ -255,7 +290,42 @@ fn build_runtime(cli: &Cli) -> Result<BenchRuntime> {
     } else {
         MemoryManager::with_retrieval_config(store.clone(), embedder, retrieval_config)
     };
-    Ok(BenchRuntime { manager, store })
+    Ok(BenchRuntime {
+        manager,
+        store,
+        graph_pipeline,
+    })
+}
+
+fn build_graph_pipeline(
+    cli: &Cli,
+    store: &Arc<dyn MemoryStore>,
+    embedder: Arc<dyn EmbeddingProvider>,
+) -> Result<Option<GraphBuildPipeline>> {
+    if !cli.graph_build {
+        return Ok(None);
+    }
+    let Some(sqlite_store) = store.as_any().downcast_ref::<SqliteMemoryStore>() else {
+        bail!("--graph-build requires --store-backend sqlite");
+    };
+    let api_key = std::env::var(&cli.graph_llm_api_key_env).with_context(|| {
+        format!(
+            "missing graph LLM API key env {}",
+            cli.graph_llm_api_key_env
+        )
+    })?;
+    let repository = memory_core::sqlite::GraphRepository::open(sqlite_store.path());
+    let registry = GraphTypeRegistry::new_default();
+    let client = OpenAiCompatibleGraphLlmClient::with_base_url(
+        api_key,
+        cli.graph_llm_base_url.clone(),
+        cli.graph_llm_model.clone(),
+    )
+    .with_timeout_ms(cli.graph_llm_timeout_ms);
+    let extractor = Arc::new(LlmGraphExtractor::new(Arc::new(client), registry.clone()));
+    Ok(Some(GraphBuildPipeline::new(
+        repository, embedder, extractor, registry,
+    )))
 }
 
 fn build_reranker(cli: &Cli, rerank_config: &RerankConfig) -> Result<Option<Arc<dyn Reranker>>> {
@@ -286,33 +356,32 @@ fn build_store(cli: &Cli) -> Arc<dyn MemoryStore> {
 async fn run_add(
     manager: MemoryManager,
     store: Arc<dyn MemoryStore>,
-    dataset: PathBuf,
-    text_fields: &[String],
-    batch_size: usize,
-    resume: bool,
+    graph_pipeline: Option<GraphBuildPipeline>,
+    options: AddRunOptions<'_>,
 ) -> Result<()> {
-    let json = load_json(&dataset)?;
+    let json = load_json(&options.dataset)?;
     if is_prepared_schema_v1(&json) && json.get("memories").is_some() {
-        return run_add_prepared_memories(manager, store, dataset, &json, batch_size, resume).await;
+        return run_add_prepared_memories(manager, store, graph_pipeline, &json, options).await;
     }
 
     let mut texts = Vec::new();
-    collect_field_texts(&json, "$", text_fields, &mut texts);
+    collect_field_texts(&json, "$", options.text_fields, &mut texts);
 
     if texts.is_empty() {
         bail!(
             "no memory texts found in {} using fields {:?}",
-            dataset.display(),
-            text_fields
+            options.dataset.display(),
+            options.text_fields
         );
     }
 
-    let existing_ids = existing_ids_for_resume(&store, resume).await?;
+    let existing_ids = existing_ids_for_resume(&store, options.resume).await?;
     let mut summary = AddSummary {
         total: texts.len(),
         ..Default::default()
     };
     let mut requests = Vec::with_capacity(texts.len());
+    let mut graph_requests = Vec::new();
     for (index, item) in texts.iter().enumerate() {
         let id = format!("{}:{}", item.path, index);
         if should_skip_existing(&existing_ids, &id) {
@@ -321,36 +390,53 @@ async fn run_add(
         }
 
         let mut metadata = serde_json::json!({
-            "dataset": dataset.display().to_string(),
+            "dataset": options.dataset.display().to_string(),
             "path": item.path,
             "field": item.field,
         });
         merge_metadata(&mut metadata, &item.metadata);
 
         requests.push(AddMemoryRequest {
-            id: Some(id),
+            id: Some(id.clone()),
             text: item.text.clone(),
-            metadata,
+            metadata: metadata.clone(),
         });
+        if graph_pipeline.is_some() {
+            graph_requests.push(build_graph_add_request(
+                options.cli,
+                &id,
+                &item.text,
+                metadata,
+                &item.path,
+                false,
+            )?);
+        }
     }
 
     if !requests.is_empty() {
         let mut progress = ProgressReporter::new("Adding memories", requests.len());
         manager
-            .add_many_with_batch_size_and_progress(requests, batch_size, |count| {
+            .add_many_with_batch_size_and_progress(requests, options.batch_size, |count| {
                 progress.inc(count);
             })
             .await
-            .with_context(|| format!("failed to add memories from {}", dataset.display()))
+            .with_context(|| format!("failed to add memories from {}", options.dataset.display()))
             .inspect_err(|_| {
                 summary.failed += 1;
                 print_add_summary(&summary);
             })?;
         progress.finish();
     }
+    if let Some(graph_pipeline) = graph_pipeline.as_ref() {
+        build_graph_memories(graph_pipeline, graph_requests).await?;
+    }
     summary.added = summary.total - summary.skipped_existing;
 
-    println!("added {} memories from {}", texts.len(), dataset.display());
+    println!(
+        "added {} memories from {}",
+        texts.len(),
+        options.dataset.display()
+    );
     print_add_summary(&summary);
     Ok(())
 }
@@ -358,10 +444,9 @@ async fn run_add(
 async fn run_add_prepared_memories(
     manager: MemoryManager,
     store: Arc<dyn MemoryStore>,
-    dataset: PathBuf,
+    graph_pipeline: Option<GraphBuildPipeline>,
     json: &serde_json::Value,
-    batch_size: usize,
-    resume: bool,
+    options: AddRunOptions<'_>,
 ) -> Result<()> {
     let memories = json
         .get("memories")
@@ -372,12 +457,13 @@ async fn run_add_prepared_memories(
         bail!("prepared schema v1 field `memories` must contain at least one memory");
     }
 
-    let existing_ids = existing_ids_for_resume(&store, resume).await?;
+    let existing_ids = existing_ids_for_resume(&store, options.resume).await?;
     let mut summary = AddSummary {
         total: memories.len(),
         ..Default::default()
     };
     let mut requests = Vec::with_capacity(memories.len());
+    let mut graph_requests = Vec::new();
     for (index, memory) in memories.iter().enumerate() {
         let object = memory
             .as_object()
@@ -406,7 +492,7 @@ async fn run_add_prepared_memories(
             continue;
         }
 
-        let mut metadata = match object.get("metadata") {
+        let metadata = match object.get("metadata") {
             Some(value) => {
                 if !value.is_object() {
                     bail!("memories[{index}].metadata must be a JSON object when present");
@@ -415,33 +501,36 @@ async fn run_add_prepared_memories(
             }
             None => serde_json::Value::Object(Default::default()),
         };
-        insert_default_metadata(
-            &mut metadata,
-            "dataset",
-            serde_json::Value::String(dataset.display().to_string()),
-        );
-        insert_default_metadata(
-            &mut metadata,
-            "path",
-            serde_json::Value::String(format!("$.memories[{index}].text")),
-        );
-        insert_default_metadata(
-            &mut metadata,
-            "field",
-            serde_json::Value::String("text".to_string()),
+        let path = format!("$.memories[{index}].text");
+        let metadata = prepared_memory_metadata(
+            metadata,
+            &id,
+            &options.dataset.display().to_string(),
+            &path,
+            "text",
         );
 
         requests.push(AddMemoryRequest {
-            id: Some(id),
+            id: Some(id.clone()),
             text: text.to_string(),
-            metadata,
+            metadata: metadata.clone(),
         });
+        if graph_pipeline.is_some() {
+            graph_requests.push(build_graph_add_request(
+                options.cli,
+                &id,
+                text,
+                metadata,
+                &path,
+                true,
+            )?);
+        }
     }
 
     if !requests.is_empty() {
         let mut progress = ProgressReporter::new("Adding prepared memories", requests.len());
         manager
-            .add_many_with_batch_size_and_progress(requests, batch_size, |count| {
+            .add_many_with_batch_size_and_progress(requests, options.batch_size, |count| {
                 progress.inc(count);
             })
             .await
@@ -452,12 +541,15 @@ async fn run_add_prepared_memories(
             })?;
         progress.finish();
     }
+    if let Some(graph_pipeline) = graph_pipeline.as_ref() {
+        build_graph_memories(graph_pipeline, graph_requests).await?;
+    }
     summary.added = summary.total - summary.skipped_existing;
 
     println!(
         "added {} prepared memories from {}",
         memories.len(),
-        dataset.display()
+        options.dataset.display()
     );
     print_add_summary(&summary);
     Ok(())
@@ -477,8 +569,9 @@ async fn run_search(
     dataset: Option<PathBuf>,
     query: Option<String>,
     options: SearchRunOptions<'_>,
+    cli: &Cli,
 ) -> Result<()> {
-    let cli_filter = parse_filter(options.filter)?;
+    let cli_filter = parse_filter(options.filter.clone())?;
     let mut queries = Vec::new();
     if let Some(query) = query {
         queries.push(TextItem {
@@ -491,16 +584,7 @@ async fn run_search(
     if let Some(dataset) = dataset.as_ref() {
         let json = load_json(dataset)?;
         if is_prepared_schema_v1(&json) && json.get("queries").is_some() {
-            return run_search_prepared_queries(
-                manager,
-                &json,
-                options.output,
-                options.top_k,
-                cli_filter,
-                options.batch_size,
-                options.resume,
-            )
-            .await;
+            return run_search_prepared_queries(manager, &json, options, cli_filter, cli).await;
         }
         collect_field_texts(&json, "$", options.query_fields, &mut queries);
     }
@@ -511,12 +595,17 @@ async fn run_search(
     let mut outputs = Vec::new();
     if queries.len() == 1 {
         let item = queries.into_iter().next().unwrap();
+        let graph_memory_space_id = if cli.graph {
+            graph_memory_space_for_query(&item.path, cli_filter.as_ref(), false, cli)?
+        } else {
+            None
+        };
         let results = manager
             .search(SearchMemoryRequest {
                 query: item.text.clone(),
                 top_k: options.top_k,
                 filter: cli_filter.clone(),
-                graph_memory_space_id: None,
+                graph_memory_space_id,
             })
             .await
             .with_context(|| format!("failed to search query at {}", item.path))?;
@@ -527,10 +616,11 @@ async fn run_search(
             filter: cli_filter.clone(),
             metadata: None,
             task: None,
+            completed: true,
             results: results
                 .into_iter()
                 .map(|result| SearchOutput {
-                    id: result.record.id,
+                    id: search_output_id(&result.record.id, &result.record.metadata),
                     text: result.record.text,
                     metadata: result.record.metadata,
                     score: result.score,
@@ -540,13 +630,19 @@ async fn run_search(
     } else if !queries.is_empty() {
         let search_requests: Vec<SearchMemoryRequest> = queries
             .iter()
-            .map(|item| SearchMemoryRequest {
-                query: item.text.clone(),
-                top_k: options.top_k,
-                filter: cli_filter.clone(),
-                graph_memory_space_id: None,
+            .map(|item| {
+                Ok(SearchMemoryRequest {
+                    query: item.text.clone(),
+                    top_k: options.top_k,
+                    filter: cli_filter.clone(),
+                    graph_memory_space_id: if cli.graph {
+                        graph_memory_space_for_query(&item.path, cli_filter.as_ref(), false, cli)?
+                    } else {
+                        None
+                    },
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let mut progress = ProgressReporter::new("Searching queries", search_requests.len());
         let batch_results = manager
             .search_many_with_batch_size_and_progress(
@@ -569,10 +665,11 @@ async fn run_search(
                 filter: cli_filter.clone(),
                 metadata: None,
                 task: None,
+                completed: true,
                 results: results
                     .into_iter()
                     .map(|result| SearchOutput {
-                        id: result.record.id,
+                        id: search_output_id(&result.record.id, &result.record.metadata),
                         text: result.record.text,
                         metadata: result.record.metadata,
                         score: result.score,
@@ -590,11 +687,9 @@ async fn run_search(
 async fn run_search_prepared_queries(
     manager: MemoryManager,
     json: &serde_json::Value,
-    output: PathBuf,
-    top_k: usize,
+    options: SearchRunOptions<'_>,
     cli_filter: Option<serde_json::Value>,
-    batch_size: usize,
-    resume: bool,
+    cli: &Cli,
 ) -> Result<()> {
     let queries = json
         .get("queries")
@@ -636,9 +731,18 @@ async fn run_search_prepared_queries(
 
         search_requests.push(SearchMemoryRequest {
             query: query_text.to_string(),
-            top_k,
+            top_k: options.top_k,
             filter: effective_filter.clone(),
-            graph_memory_space_id: None,
+            graph_memory_space_id: if cli.graph {
+                graph_memory_space_for_query(
+                    &format!("$.queries[{index}].text"),
+                    effective_filter.as_ref(),
+                    true,
+                    cli,
+                )?
+            } else {
+                None
+            },
         });
         output_templates.push(QueryOutput {
             query_path: format!("$.queries[{index}].text"),
@@ -647,14 +751,15 @@ async fn run_search_prepared_queries(
             filter: effective_filter,
             metadata,
             task,
+            completed: false,
             results: Vec::new(),
         });
     }
 
     let mut outputs = output_templates.clone();
     let mut completed: Vec<usize> = Vec::new();
-    if resume {
-        if let Some(existing) = load_existing_outputs(&output) {
+    if options.resume {
+        if let Some(existing) = load_existing_outputs(&options.output) {
             completed = resume_completed_indexes(&outputs, &existing);
             for index in &completed {
                 if let Some(row) = existing.get(*index) {
@@ -675,7 +780,7 @@ async fn run_search_prepared_queries(
         .filter(|index| !completed.contains(index))
         .collect();
     let mut progress = ProgressReporter::new("Searching prepared queries", pending.len());
-    let batch_size = batch_size.max(1);
+    let batch_size = options.batch_size.max(1);
     for chunk in pending.chunks(batch_size) {
         let chunk_requests: Vec<SearchMemoryRequest> = chunk
             .iter()
@@ -692,18 +797,19 @@ async fn run_search_prepared_queries(
             outputs[index].results = results
                 .into_iter()
                 .map(|result| SearchOutput {
-                    id: result.record.id,
+                    id: search_output_id(&result.record.id, &result.record.metadata),
                     text: result.record.text,
                     metadata: result.record.metadata,
                     score: result.score,
                 })
                 .collect();
+            outputs[index].completed = true;
         }
-        write_atomic_json(&output, &outputs).await?;
+        write_atomic_json(&options.output, &outputs).await?;
     }
     progress.finish();
-    write_atomic_json(&output, &outputs).await?;
-    println!("wrote search results to {}", output.display());
+    write_atomic_json(&options.output, &outputs).await?;
+    println!("wrote search results to {}", options.output.display());
     Ok(())
 }
 
@@ -741,7 +847,7 @@ fn resume_completed_indexes(
             .and_then(|id| by_query_id.get(id).copied())
             .or_else(|| by_path.get(&template.query_path).copied());
         if let Some(existing_index) = matched {
-            if !existing[existing_index].results.is_empty() {
+            if existing[existing_index].completed || !existing[existing_index].results.is_empty() {
                 completed.push(index);
             }
         }
@@ -915,6 +1021,60 @@ fn print_add_summary(summary: &AddSummary) {
     );
 }
 
+async fn build_graph_memories(
+    graph_pipeline: &GraphBuildPipeline,
+    requests: Vec<GraphAddMemoryRequest>,
+) -> Result<()> {
+    if requests.is_empty() {
+        return Ok(());
+    }
+    let mut progress = ProgressReporter::new("Building graph memories", requests.len());
+    for request in requests {
+        let source_ref = request.source_ref.clone();
+        graph_pipeline
+            .build_memory(request)
+            .await
+            .with_context(|| format!("failed to build graph memory for {source_ref:?}"))?;
+        progress.inc(1);
+    }
+    progress.finish();
+    Ok(())
+}
+
+fn build_graph_add_request(
+    cli: &Cli,
+    id: &str,
+    text: &str,
+    metadata: serde_json::Value,
+    path: &str,
+    is_prepared: bool,
+) -> Result<GraphAddMemoryRequest> {
+    let memory_space_id = graph_memory_space_for_memory(path, &metadata, is_prepared, cli)?
+        .with_context(|| {
+            format!(
+                "graph memory space could not be derived for memory `{id}` at `{path}`; \
+                 set --graph-memory-space-mode/--graph-memory-space-field explicitly"
+            )
+        })?;
+    Ok(GraphAddMemoryRequest {
+        memory_space_id,
+        owner_id: cli.graph_owner_id.clone(),
+        idempotency_key: id.to_string(),
+        text: text.to_string(),
+        metadata: metadata.clone(),
+        session_id: metadata
+            .get("session_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        session_sequence: metadata.get("turn_index").and_then(|value| value.as_i64()),
+        source_kind: "benchmark".to_string(),
+        source_ref: Some(id.to_string()),
+        content_role: "message".to_string(),
+        created_by_agent_id: None,
+        observed_at_ms: None,
+    })
+}
+
 fn parse_filter(raw: Option<String>) -> Result<Option<serde_json::Value>> {
     let Some(raw) = raw else {
         return Ok(None);
@@ -1000,6 +1160,36 @@ fn search_output_id(record_id: &str, metadata: &serde_json::Value) -> String {
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| record_id.to_string())
+}
+
+fn prepared_memory_metadata(
+    mut metadata: serde_json::Value,
+    memory_id: &str,
+    dataset: &str,
+    path: &str,
+    field: &str,
+) -> serde_json::Value {
+    insert_default_metadata(
+        &mut metadata,
+        "benchmark_memory_id",
+        serde_json::Value::String(memory_id.to_string()),
+    );
+    insert_default_metadata(
+        &mut metadata,
+        "dataset",
+        serde_json::Value::String(dataset.to_string()),
+    );
+    insert_default_metadata(
+        &mut metadata,
+        "path",
+        serde_json::Value::String(path.to_string()),
+    );
+    insert_default_metadata(
+        &mut metadata,
+        "field",
+        serde_json::Value::String(field.to_string()),
+    );
+    metadata
 }
 
 fn is_prepared_schema_v1(json: &serde_json::Value) -> bool {
@@ -1122,6 +1312,8 @@ struct QueryOutput {
     metadata: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     task: Option<serde_json::Value>,
+    #[serde(default)]
+    completed: bool,
     results: Vec<SearchOutput>,
 }
 
@@ -1360,6 +1552,35 @@ mod tests {
     }
 
     #[test]
+    fn prepared_memory_metadata_preserves_benchmark_memory_id() {
+        let metadata = prepared_memory_metadata(
+            serde_json::json!({"scope_id": "scope-a"}),
+            "turn-1",
+            "data/prepared.json",
+            "$.memories[0].text",
+            "text",
+        );
+
+        assert_eq!(metadata["benchmark_memory_id"], "turn-1");
+        assert_eq!(metadata["scope_id"], "scope-a");
+        assert_eq!(metadata["dataset"], "data/prepared.json");
+        assert_eq!(metadata["path"], "$.memories[0].text");
+        assert_eq!(metadata["field"], "text");
+    }
+
+    #[test]
+    fn graph_search_request_uses_scope_id_for_prepared_query() {
+        let cli = graph_enabled_test_cli();
+        let filter = serde_json::json!({"scope_id": "scope-a"});
+
+        assert_eq!(
+            graph_memory_space_for_query("$.queries[0].text", Some(&filter), true, &cli)
+                .expect("graph space"),
+            Some("scope-a".to_string())
+        );
+    }
+
+    #[test]
     fn build_runtime_does_not_require_rerank_api_key_when_rerank_is_disabled() {
         let cli = Cli::try_parse_from([
             "memory-bench",
@@ -1451,6 +1672,7 @@ mod tests {
                 filter: None,
                 metadata: None,
                 task: None,
+                completed: false,
                 results: Vec::new(),
             },
             QueryOutput {
@@ -1460,6 +1682,7 @@ mod tests {
                 filter: None,
                 metadata: None,
                 task: None,
+                completed: false,
                 results: Vec::new(),
             },
             QueryOutput {
@@ -1469,6 +1692,7 @@ mod tests {
                 filter: None,
                 metadata: None,
                 task: None,
+                completed: false,
                 results: Vec::new(),
             },
         ];
@@ -1479,6 +1703,7 @@ mod tests {
             filter: None,
             metadata: None,
             task: None,
+            completed: true,
             results: vec![SearchOutput {
                 id: "m0".to_string(),
                 text: "hit".to_string(),
@@ -1502,6 +1727,7 @@ mod tests {
                 filter: None,
                 metadata: None,
                 task: None,
+                completed: false,
                 results: Vec::new(),
             },
             QueryOutput {
@@ -1511,6 +1737,7 @@ mod tests {
                 filter: None,
                 metadata: None,
                 task: None,
+                completed: false,
                 results: Vec::new(),
             },
         ];
@@ -1521,6 +1748,7 @@ mod tests {
             filter: None,
             metadata: None,
             task: None,
+            completed: true,
             results: vec![SearchOutput {
                 id: "m0".to_string(),
                 text: "hit".to_string(),
@@ -1532,6 +1760,100 @@ mod tests {
         let completed = resume_completed_indexes(&templates, &existing);
 
         assert_eq!(completed, vec![0]);
+    }
+
+    #[test]
+    fn resume_completed_indexes_keeps_completed_empty_results() {
+        let templates = vec![QueryOutput {
+            query_path: "$.queries[0].text".to_string(),
+            query: "q0".to_string(),
+            query_id: Some("Q0".to_string()),
+            filter: None,
+            metadata: None,
+            task: None,
+            completed: false,
+            results: Vec::new(),
+        }];
+        let existing = vec![QueryOutput {
+            query_path: "$.queries[0].text".to_string(),
+            query: "q0".to_string(),
+            query_id: Some("Q0".to_string()),
+            filter: None,
+            metadata: None,
+            task: None,
+            completed: true,
+            results: Vec::new(),
+        }];
+
+        assert_eq!(resume_completed_indexes(&templates, &existing), vec![0]);
+    }
+
+    #[test]
+    fn build_runtime_does_not_require_graph_llm_api_key_when_only_graph_search_is_enabled() {
+        let cli = Cli::try_parse_from([
+            "memory-bench",
+            "--embedding",
+            "hash",
+            "--graph",
+            "--graph-llm-api-key-env",
+            "RAM_A_TEST_MISSING_GRAPH_KEY_SEARCH_ONLY",
+            "search",
+            "--query",
+            "Where?",
+            "--output",
+            "outputs/search.json",
+        ])
+        .expect("parse CLI");
+
+        let _runtime = build_runtime(&cli).expect("runtime without graph build API key");
+    }
+
+    #[test]
+    fn build_runtime_rejects_graph_search_without_graph_retrieval() {
+        let cli = Cli::try_parse_from([
+            "memory-bench",
+            "--embedding",
+            "hash",
+            "--search-mode",
+            "graph",
+            "search",
+            "--query",
+            "Where?",
+            "--output",
+            "outputs/search.json",
+        ])
+        .expect("parse graph search CLI");
+
+        let error = match build_runtime(&cli) {
+            Ok(_) => panic!("graph search should require --graph"),
+            Err(error) => error,
+        };
+
+        assert!(format!("{error}").contains("--search-mode graph requires --graph"));
+    }
+
+    #[test]
+    fn build_runtime_requires_graph_llm_api_key_when_graph_build_is_enabled() {
+        let cli = Cli::try_parse_from([
+            "memory-bench",
+            "--embedding",
+            "hash",
+            "--graph-build",
+            "--graph-llm-api-key-env",
+            "RAM_A_TEST_MISSING_GRAPH_KEY_BUILD",
+            "add",
+            "--dataset",
+            "data/test.json",
+        ])
+        .expect("parse CLI");
+
+        let error = match build_runtime(&cli) {
+            Ok(_) => panic!("missing graph LLM API key should fail"),
+            Err(error) => error,
+        };
+
+        assert!(format!("{error}")
+            .contains("missing graph LLM API key env RAM_A_TEST_MISSING_GRAPH_KEY_BUILD"));
     }
 
     fn graph_test_cli() -> Cli {
@@ -1546,5 +1868,20 @@ mod tests {
             "outputs/search.json",
         ])
         .expect("parse graph test CLI")
+    }
+
+    fn graph_enabled_test_cli() -> Cli {
+        Cli::try_parse_from([
+            "memory-bench",
+            "--embedding",
+            "hash",
+            "--graph",
+            "search",
+            "--query",
+            "Where?",
+            "--output",
+            "outputs/search.json",
+        ])
+        .expect("parse graph search CLI")
     }
 }

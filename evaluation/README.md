@@ -146,6 +146,51 @@ Both files are required: the CLI never promotes unverified memories. Live mode m
 one extraction call per uncached window and one verification call per window containing
 valid candidates; inspect `extraction_stats.json` before estimating or comparing cost.
 
+## Graph Memory Mode
+
+`memory-bench` can run graph-enabled add/search directly:
+
+- add: pass `--graph-build` to build graph memory after the normal MemoryRecord add succeeds;
+- search: pass `--graph` to enable the graph retrieval channel in `MemoryManager::search(...)`;
+- graph extraction uses an OpenAI-compatible chat-completions endpoint. Defaults:
+  `--graph-llm-api-key-env OPENROUTER_API_KEY`,
+  `--graph-llm-base-url https://openrouter.ai/api/v1`,
+  `--graph-llm-model openai/gpt-4o-mini`.
+
+Example:
+
+```bash
+export OPENROUTER_API_KEY="..."
+
+cargo run -p memory-bench -- \
+  --store data/locomo_graph.sqlite \
+  --embedding openrouter \
+  --model baai/bge-m3 \
+  --dimensions 1024 \
+  --graph-build \
+  add \
+  --dataset data/locomo/locomo10.json \
+  --text-fields text,content,message,memory
+
+cargo run -p memory-bench -- \
+  --store data/locomo_graph.sqlite \
+  --embedding openrouter \
+  --model baai/bge-m3 \
+  --dimensions 1024 \
+  --graph \
+  --graph-weight 0.2 \
+  search \
+  --dataset data/locomo/locomo10.json \
+  --query-fields question,query \
+  --top-k 10 \
+  --output outputs/locomo_graph_top10.json
+```
+
+Use separate stores for baseline and graph runs. LoCoMo is the primary graph-memory
+analysis dataset, but LongMemEval and PersonaMem should also be run end-to-end before
+reporting final benchmark conclusions. Dataset wrapper flags are documented in each
+dataset README when wrapper passthrough is enabled.
+
 ## Output
 
 All evaluation runs write to repository-root `outputs/<dataset>/<timestamp>/` by default, containing:

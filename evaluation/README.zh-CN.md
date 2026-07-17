@@ -140,6 +140,50 @@ cargo run --quiet --manifest-path Cargo.toml -p memory-pipeline -- \
 抽取模型，并为含有合法候选记忆的 window 调用一次验证模型；评估成本前应先查看
 `extraction_stats.json`。
 
+## 图记忆模式
+
+`memory-bench` 当前可以直接运行 graph-enabled add/search：
+
+- add：传入 `--graph-build`，在普通 MemoryRecord add 成功后继续构建图记忆；
+- search：传入 `--graph`，在 `MemoryManager::search(...)` 中开启 graph retrieval channel；
+- 图候选抽取使用 OpenAI-compatible chat-completions 端点。默认配置为
+  `--graph-llm-api-key-env OPENROUTER_API_KEY`、
+  `--graph-llm-base-url https://openrouter.ai/api/v1`、
+  `--graph-llm-model openai/gpt-4o-mini`。
+
+示例：
+
+```bash
+export OPENROUTER_API_KEY="..."
+
+cargo run -p memory-bench -- \
+  --store data/locomo_graph.sqlite \
+  --embedding openrouter \
+  --model baai/bge-m3 \
+  --dimensions 1024 \
+  --graph-build \
+  add \
+  --dataset data/locomo/locomo10.json \
+  --text-fields text,content,message,memory
+
+cargo run -p memory-bench -- \
+  --store data/locomo_graph.sqlite \
+  --embedding openrouter \
+  --model baai/bge-m3 \
+  --dimensions 1024 \
+  --graph \
+  --graph-weight 0.2 \
+  search \
+  --dataset data/locomo/locomo10.json \
+  --query-fields question,query \
+  --top-k 10 \
+  --output outputs/locomo_graph_top10.json
+```
+
+对比分数时建议 baseline 和 graph 使用不同 SQLite 文件。LoCoMo 是图记忆效果分析的重点数据集，
+但最终报告前 LongMemEval 和 PersonaMem 也需要做全量端到端验证。各数据集 wrapper 的 graph
+参数透传会在启用后写入对应数据集 README。
+
 ## 输出说明
 
 所有评估默认写入仓库根目录下的 `outputs/<数据集>/<时间戳>/`，包含：
