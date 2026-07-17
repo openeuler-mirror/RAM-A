@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use crate::{MemoryError, MemoryResult};
 
+const EMBEDDING_MAX_ATTEMPTS: usize = 8;
+
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
     fn dimensions(&self) -> usize;
@@ -134,15 +136,13 @@ impl EmbeddingProvider for OpenRouterEmbedding {
             return Ok(Vec::new());
         }
 
-        const MAX_ATTEMPTS: usize = 5;
-
-        for attempt in 1..=MAX_ATTEMPTS {
+        for attempt in 1..=EMBEDDING_MAX_ATTEMPTS {
             match self.embed_once(texts).await {
                 Ok(embeddings) => return Ok(embeddings),
-                Err(error) if error.retryable && attempt < MAX_ATTEMPTS => {
+                Err(error) if error.retryable && attempt < EMBEDDING_MAX_ATTEMPTS => {
                     let backoff = retry_backoff(attempt);
                     eprintln!(
-                        "OpenRouter embedding attempt {attempt}/{MAX_ATTEMPTS} failed: {}; retrying in {}s",
+                        "OpenRouter embedding attempt {attempt}/{EMBEDDING_MAX_ATTEMPTS} failed: {}; retrying in {}s",
                         error.summary(),
                         backoff.as_secs()
                     );
@@ -289,6 +289,12 @@ fn hash_embed(text: &str, dimensions: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_budget_covers_extended_network_outages() {
+        assert_eq!(EMBEDDING_MAX_ATTEMPTS, 8);
+        assert_eq!(retry_backoff(7), Duration::from_secs(64));
+    }
 
     #[test]
     fn ordered_embeddings_sorts_by_provider_index() {

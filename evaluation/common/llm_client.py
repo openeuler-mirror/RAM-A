@@ -10,6 +10,9 @@ import urllib.request
 from dataclasses import dataclass
 
 
+RETRYABLE_HTTP_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
+
+
 @dataclass
 class ChatResult:
     content: str
@@ -28,7 +31,7 @@ class OpenAICompatibleClient:
         api_key_env: str,
         base_url: str = "https://openrouter.ai/api/v1",
         timeout_s: int = 120,
-        max_retries: int = 3,
+        max_retries: int = 8,
         thinking: str | None = None,
     ) -> None:
         api_key = os.getenv(api_key_env)
@@ -95,18 +98,27 @@ class OpenAICompatibleClient:
                     total_tokens=int(total_tokens),
                     raw=raw,
                 )
+            except urllib.error.HTTPError as error:
+                last_error = error
+                if (
+                    error.code not in RETRYABLE_HTTP_STATUS_CODES
+                    or attempt + 1 == self.max_retries
+                ):
+                    break
+                time.sleep(min(2**attempt, 64))
             except (
-                urllib.error.HTTPError,
                 urllib.error.URLError,
                 TimeoutError,
+                http.client.IncompleteRead,
                 http.client.RemoteDisconnected,
                 ConnectionResetError,
                 socket.timeout,
+                json.JSONDecodeError,
             ) as error:
                 last_error = error
                 if attempt + 1 == self.max_retries:
                     break
-                time.sleep(2**attempt)
+                time.sleep(min(2**attempt, 64))
 
         raise RuntimeError(f"chat completion failed after retries: {last_error}")
 
