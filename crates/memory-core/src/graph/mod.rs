@@ -2,6 +2,7 @@ pub mod extraction;
 pub mod ingestion;
 pub mod llm;
 pub mod normalize;
+pub mod pipeline;
 pub mod registry;
 pub mod resolution;
 pub mod types;
@@ -20,6 +21,7 @@ pub use llm::{
 };
 pub(crate) use normalize::normalize_graph_text;
 pub use normalize::{stable_input_hash, GraphInputHashFields};
+pub use pipeline::{GraphBuildPipeline, GraphBuildResult};
 pub use registry::{GraphPredicate, GraphTypeRegistry};
 pub use resolution::{
     GraphResolutionExecutor, GraphResolutionResult, GRAPH_RESOLVER_VERSION,

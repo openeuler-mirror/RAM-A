@@ -17,6 +17,7 @@ pub use api::{
 };
 pub use embedding::{EmbeddingProvider, HashEmbedding, OpenRouterEmbedding};
 pub use error::{MemoryError, MemoryResult};
+pub use graph::{GraphBuildPipeline, GraphBuildResult};
 pub use manager::{LongTermMemory, MemoryManager};
 pub use record::MemoryRecord;
 pub use rerank::{OpenRouterReranker, Reranker};
