@@ -16,6 +16,17 @@ class BackendConfig:
     api_key_env: str
     batch_size: int
     top_k: int
+    graph: bool = False
+    graph_build: bool = False
+    graph_weight: float = 0.2
+    graph_fail_open: bool = False
+    graph_memory_space_mode: str = "auto"
+    graph_memory_space_field: str = "scope_id"
+    graph_owner_id: str = "benchmark"
+    graph_llm_api_key_env: str = "OPENROUTER_API_KEY"
+    graph_llm_model: str = "openai/gpt-4o-mini"
+    graph_llm_base_url: str = "https://openrouter.ai/api/v1"
+    graph_llm_timeout_ms: int | None = None
 
 
 class MemoryBackend:

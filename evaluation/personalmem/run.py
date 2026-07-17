@@ -274,6 +274,21 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--embedding-weight", default=0.7, type=float)
     parser.add_argument("--bm25-weight", default=0.3, type=float)
     parser.add_argument("--candidate-k", type=int)
+    parser.add_argument("--graph", action="store_true")
+    parser.add_argument("--graph-build", action="store_true")
+    parser.add_argument("--graph-weight", default=0.2, type=float)
+    parser.add_argument("--graph-fail-open", action="store_true")
+    parser.add_argument(
+        "--graph-memory-space-mode",
+        default="auto",
+        choices=("auto", "metadata-field", "path-prefix"),
+    )
+    parser.add_argument("--graph-memory-space-field", default="scope_id")
+    parser.add_argument("--graph-owner-id", default="benchmark")
+    parser.add_argument("--graph-llm-api-key-env", default="OPENROUTER_API_KEY")
+    parser.add_argument("--graph-llm-model", default="openai/gpt-4o-mini")
+    parser.add_argument("--graph-llm-base-url", default="https://openrouter.ai/api/v1")
+    parser.add_argument("--graph-llm-timeout-ms", type=int)
     parser.add_argument("--model", default="baai/bge-m3")
     parser.add_argument("--dimensions", default=1024, type=int)
     parser.add_argument("--text-fields", default=DEFAULT_TEXT_FIELDS)
@@ -671,7 +686,10 @@ def run_add(args: argparse.Namespace) -> int:
     if args.dataset is None:
         print("--dataset is required for add", file=sys.stderr)
         return 2
-    command = bench_base_command(args) + [
+    command = bench_base_command(args)
+    if args.graph_build:
+        command.append("--graph-build")
+    command += [
         "add",
         "--dataset",
         str(args.dataset),
@@ -1358,6 +1376,17 @@ def write_personamem_run_meta(args: argparse.Namespace, phase: str) -> dict[str,
         candidate_k=args.candidate_k,
         dimensions=args.dimensions,
         top_k=args.top_k,
+        graph=getattr(args, "graph", False),
+        graph_build=getattr(args, "graph_build", False),
+        graph_weight=getattr(args, "graph_weight", 0.2),
+        graph_fail_open=getattr(args, "graph_fail_open", False),
+        graph_memory_space_mode=getattr(args, "graph_memory_space_mode", "auto"),
+        graph_memory_space_field=getattr(args, "graph_memory_space_field", "scope_id"),
+        graph_owner_id=getattr(args, "graph_owner_id", "benchmark"),
+        graph_llm_api_key_env=getattr(args, "graph_llm_api_key_env", "OPENROUTER_API_KEY"),
+        graph_llm_model=getattr(args, "graph_llm_model", "openai/gpt-4o-mini"),
+        graph_llm_base_url=getattr(args, "graph_llm_base_url", "https://openrouter.ai/api/v1"),
+        graph_llm_timeout_ms=getattr(args, "graph_llm_timeout_ms", None),
         answer_model=args.answer_model,
         context_token_budget=args.context_token_budget,
         memory_mode=getattr(args, "memory_mode", None),
@@ -1423,6 +1452,29 @@ def bench_base_command(args: argparse.Namespace) -> list[str]:
     ]
     if args.candidate_k is not None:
         command.extend(["--candidate-k", str(args.candidate_k)])
+    if args.graph:
+        command.append("--graph")
+        if args.graph_fail_open:
+            command.append("--graph-fail-open")
+    if args.graph or args.graph_build:
+        command.extend([
+            "--graph-weight",
+            str(args.graph_weight),
+            "--graph-memory-space-mode",
+            args.graph_memory_space_mode,
+            "--graph-memory-space-field",
+            args.graph_memory_space_field,
+            "--graph-owner-id",
+            args.graph_owner_id,
+            "--graph-llm-api-key-env",
+            args.graph_llm_api_key_env,
+            "--graph-llm-model",
+            args.graph_llm_model,
+            "--graph-llm-base-url",
+            args.graph_llm_base_url,
+        ])
+        if args.graph_llm_timeout_ms is not None:
+            command.extend(["--graph-llm-timeout-ms", str(args.graph_llm_timeout_ms)])
     return command
 
 

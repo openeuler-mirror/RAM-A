@@ -611,3 +611,46 @@ def test_offline_extracted_arm_recovers_gold_source_turn_and_session(
         search_results[0],
         source_metadata,
     )
+
+
+def test_parser_accepts_graph_flags(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run.py",
+            "--graph",
+            "--graph-build",
+            "--graph-weight",
+            "0.4",
+            "--graph-fail-open",
+            "--graph-memory-space-mode",
+            "metadata-field",
+            "--graph-memory-space-field",
+            "tenant_id",
+            "--graph-owner-id",
+            "bench-owner",
+            "--graph-llm-api-key-env",
+            "GRAPH_KEY",
+            "--graph-llm-model",
+            "openai/gpt-4o-mini",
+            "--graph-llm-base-url",
+            "https://openrouter.ai/api/v1",
+            "--graph-llm-timeout-ms",
+            "60000",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.graph is True
+    assert args.graph_build is True
+    assert args.graph_weight == 0.4
+    assert args.graph_fail_open is True
+    assert args.graph_memory_space_mode == "metadata-field"
+    assert args.graph_memory_space_field == "tenant_id"
+    assert args.graph_owner_id == "bench-owner"
+    assert args.graph_llm_api_key_env == "GRAPH_KEY"
+    assert args.graph_llm_model == "openai/gpt-4o-mini"
+    assert args.graph_llm_base_url == "https://openrouter.ai/api/v1"
+    assert args.graph_llm_timeout_ms == 60000

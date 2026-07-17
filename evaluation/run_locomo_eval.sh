@@ -25,6 +25,16 @@ RERANK_BASE_URL="${RERANK_BASE_URL:-https://openrouter.ai/api/v1}"
 RERANK_INPUT_K="${RERANK_INPUT_K:-40}"
 RERANK_TIMEOUT_MS="${RERANK_TIMEOUT_MS:-}"
 RERANK_FAIL_OPEN="${RERANK_FAIL_OPEN:-0}"
+MEMORY_BENCH_GRAPH="${MEMORY_BENCH_GRAPH:-0}"
+GRAPH_WEIGHT="${GRAPH_WEIGHT:-0.2}"
+GRAPH_FAIL_OPEN="${GRAPH_FAIL_OPEN:-0}"
+GRAPH_MEMORY_SPACE_MODE="${GRAPH_MEMORY_SPACE_MODE:-auto}"
+GRAPH_MEMORY_SPACE_FIELD="${GRAPH_MEMORY_SPACE_FIELD:-scope_id}"
+GRAPH_OWNER_ID="${GRAPH_OWNER_ID:-benchmark}"
+GRAPH_LLM_API_KEY_ENV="${GRAPH_LLM_API_KEY_ENV:-OPENROUTER_API_KEY}"
+GRAPH_LLM_MODEL="${GRAPH_LLM_MODEL:-openai/gpt-4o-mini}"
+GRAPH_LLM_BASE_URL="${GRAPH_LLM_BASE_URL:-https://openrouter.ai/api/v1}"
+GRAPH_LLM_TIMEOUT_MS="${GRAPH_LLM_TIMEOUT_MS:-60000}"
 RUN_ID="${RUN_ID:-$(date +%Y-%m-%dT%H%M%S)}"
 if [ "${RUN_DIR:-}" ]; then
     case "$RUN_DIR" in
@@ -73,6 +83,21 @@ case "$RERANK" in
         case "$RERANK_FAIL_OPEN" in
             1|true|TRUE|yes|YES)
                 MEMORY_BENCH_RERANK_ARGS="$MEMORY_BENCH_RERANK_ARGS --rerank-fail-open"
+                ;;
+        esac
+        ;;
+esac
+
+MEMORY_BENCH_GRAPH_ADD_ARGS=""
+MEMORY_BENCH_GRAPH_SEARCH_ARGS=""
+case "$MEMORY_BENCH_GRAPH" in
+    1|true|TRUE|yes|YES)
+        MEMORY_BENCH_GRAPH_COMMON_ARGS="--graph-weight $GRAPH_WEIGHT --graph-memory-space-mode $GRAPH_MEMORY_SPACE_MODE --graph-memory-space-field $GRAPH_MEMORY_SPACE_FIELD --graph-owner-id $GRAPH_OWNER_ID --graph-llm-api-key-env $GRAPH_LLM_API_KEY_ENV --graph-llm-model $GRAPH_LLM_MODEL --graph-llm-base-url $GRAPH_LLM_BASE_URL --graph-llm-timeout-ms $GRAPH_LLM_TIMEOUT_MS"
+        MEMORY_BENCH_GRAPH_ADD_ARGS="--graph-build $MEMORY_BENCH_GRAPH_COMMON_ARGS"
+        MEMORY_BENCH_GRAPH_SEARCH_ARGS="--graph $MEMORY_BENCH_GRAPH_COMMON_ARGS"
+        case "$GRAPH_FAIL_OPEN" in
+            1|true|TRUE|yes|YES)
+                MEMORY_BENCH_GRAPH_SEARCH_ARGS="$MEMORY_BENCH_GRAPH_SEARCH_ARGS --graph-fail-open"
                 ;;
         esac
         ;;
@@ -193,6 +218,7 @@ run_memory_bench() {
         --store "$MEMORY_BENCH_STORE" \
         --store-backend sqlite \
         --search-mode hybrid \
+        $MEMORY_BENCH_GRAPH_ADD_ARGS \
         add --dataset "$DATASET" --text-fields text
     stage_done 1 7 "RAM-A add"
 
@@ -202,6 +228,7 @@ run_memory_bench() {
         --store-backend sqlite \
         --search-mode hybrid \
         $MEMORY_BENCH_RERANK_ARGS \
+        $MEMORY_BENCH_GRAPH_SEARCH_ARGS \
         search --dataset "$DATASET" --query-fields question --top-k "$TOP_K" \
         --output "$MEMORY_BENCH_RETRIEVAL"
     stage_done 2 7 "RAM-A search"

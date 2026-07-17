@@ -42,10 +42,24 @@ def test_run_locomo_eval_uses_locomo_entrypoints():
     assert 'RERANK_API_KEY_ENV="${RERANK_API_KEY_ENV:-OPENROUTER_API_KEY}"' in content
     assert 'RERANK_BASE_URL="${RERANK_BASE_URL:-https://openrouter.ai/api/v1}"' in content
     assert 'RERANK_INPUT_K="${RERANK_INPUT_K:-40}"' in content
+    assert 'MEMORY_BENCH_GRAPH="${MEMORY_BENCH_GRAPH:-0}"' in content
+    assert 'GRAPH_WEIGHT="${GRAPH_WEIGHT:-0.2}"' in content
+    assert 'GRAPH_FAIL_OPEN="${GRAPH_FAIL_OPEN:-0}"' in content
+    assert 'GRAPH_MEMORY_SPACE_MODE="${GRAPH_MEMORY_SPACE_MODE:-auto}"' in content
+    assert 'GRAPH_MEMORY_SPACE_FIELD="${GRAPH_MEMORY_SPACE_FIELD:-scope_id}"' in content
+    assert 'GRAPH_OWNER_ID="${GRAPH_OWNER_ID:-benchmark}"' in content
+    assert 'GRAPH_LLM_API_KEY_ENV="${GRAPH_LLM_API_KEY_ENV:-OPENROUTER_API_KEY}"' in content
+    assert 'GRAPH_LLM_MODEL="${GRAPH_LLM_MODEL:-openai/gpt-4o-mini}"' in content
+    assert 'GRAPH_LLM_BASE_URL="${GRAPH_LLM_BASE_URL:-https://openrouter.ai/api/v1}"' in content
+    assert 'GRAPH_LLM_TIMEOUT_MS="${GRAPH_LLM_TIMEOUT_MS:-60000}"' in content
     assert 'MEMORY_BENCH_RERANK_ARGS="' in content
+    assert 'MEMORY_BENCH_GRAPH_ADD_ARGS="' in content
+    assert 'MEMORY_BENCH_GRAPH_SEARCH_ARGS="' in content
     assert '--rerank --rerank-provider $RERANK_PROVIDER' in content
     assert '--rerank-api-key-env $RERANK_API_KEY_ENV' in content
     assert '$MEMORY_BENCH_RERANK_ARGS \\' in content
+    assert '$MEMORY_BENCH_GRAPH_ADD_ARGS \\' in content
+    assert '$MEMORY_BENCH_GRAPH_SEARCH_ARGS \\' in content
     assert '--judge-model "$JUDGE_MODEL"' in content
     assert '--llm-api-key-env "$LLM_API_KEY_ENV"' in content
     assert '--llm-base-url "$LLM_BASE_URL"' in content

@@ -132,6 +132,64 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Number of texts per embedding batch for add/search (default: 64)",
     )
     parser.add_argument(
+        "--graph",
+        action="store_true",
+        help="Enable graph retrieval channel for memory-bench search",
+    )
+    parser.add_argument(
+        "--graph-build",
+        action="store_true",
+        help="Build graph memory during memory-bench add",
+    )
+    parser.add_argument(
+        "--graph-weight",
+        type=float,
+        default=0.2,
+        help="Graph retrieval fusion weight for memory-bench search (default: 0.2)",
+    )
+    parser.add_argument(
+        "--graph-fail-open",
+        action="store_true",
+        help="Fall back to non-graph search if graph retrieval fails",
+    )
+    parser.add_argument(
+        "--graph-memory-space-mode",
+        choices=["auto", "metadata-field", "path-prefix"],
+        default="auto",
+        help="How memory-bench derives graph memory_space_id (default: auto)",
+    )
+    parser.add_argument(
+        "--graph-memory-space-field",
+        default="scope_id",
+        help="Metadata/filter field used as graph memory space in metadata-field mode",
+    )
+    parser.add_argument(
+        "--graph-owner-id",
+        default="benchmark",
+        help="Graph memory owner_id for memory-bench graph build",
+    )
+    parser.add_argument(
+        "--graph-llm-api-key-env",
+        default="OPENROUTER_API_KEY",
+        help="Environment variable holding the graph extraction LLM API key",
+    )
+    parser.add_argument(
+        "--graph-llm-model",
+        default="openai/gpt-4o-mini",
+        help="OpenAI-compatible chat model used for graph extraction",
+    )
+    parser.add_argument(
+        "--graph-llm-base-url",
+        default="https://openrouter.ai/api/v1",
+        help="OpenAI-compatible graph extraction base URL",
+    )
+    parser.add_argument(
+        "--graph-llm-timeout-ms",
+        type=int,
+        default=None,
+        help="Optional graph extraction LLM timeout in milliseconds",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Skip steps whose output files already exist",
@@ -663,6 +721,17 @@ def main() -> None:
             api_key_env=args.api_key_env,
             batch_size=args.embedding_batch_size,
             top_k=retrieval_top_k,
+            graph=args.graph,
+            graph_build=args.graph_build,
+            graph_weight=args.graph_weight,
+            graph_fail_open=args.graph_fail_open,
+            graph_memory_space_mode=args.graph_memory_space_mode,
+            graph_memory_space_field=args.graph_memory_space_field,
+            graph_owner_id=args.graph_owner_id,
+            graph_llm_api_key_env=args.graph_llm_api_key_env,
+            graph_llm_model=args.graph_llm_model,
+            graph_llm_base_url=args.graph_llm_base_url,
+            graph_llm_timeout_ms=args.graph_llm_timeout_ms,
         ))
 
         # --- Step 2: Add memories to store ---
@@ -810,6 +879,17 @@ def main() -> None:
         "dimensions": args.dimensions,
         "embedding_type": args.embedding,
         "embedding_batch_size": args.embedding_batch_size,
+        "graph": args.graph,
+        "graph_build": args.graph_build,
+        "graph_weight": args.graph_weight,
+        "graph_fail_open": args.graph_fail_open,
+        "graph_memory_space_mode": args.graph_memory_space_mode,
+        "graph_memory_space_field": args.graph_memory_space_field,
+        "graph_owner_id": args.graph_owner_id,
+        "graph_llm_api_key_env": args.graph_llm_api_key_env,
+        "graph_llm_model": args.graph_llm_model,
+        "graph_llm_base_url": args.graph_llm_base_url,
+        "graph_llm_timeout_ms": args.graph_llm_timeout_ms,
         "retrieval_top_k": retrieval_top_k,
         "timestamp": timestamp,
         "max_questions": args.max_questions,

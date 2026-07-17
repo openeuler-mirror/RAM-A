@@ -809,3 +809,73 @@ def test_raw_run_meta_records_raw_dataset_as_indexed_dataset(tmp_path):
 
     assert meta["source_path"] == str(raw_dataset)
     assert meta["indexed_dataset"] == str(raw_dataset)
+
+
+def test_parser_accepts_graph_flags():
+    parser = personalmem_run.build_parser()
+
+    args = parser.parse_args([
+        "search",
+        "--dataset",
+        "data.json",
+        "--graph",
+        "--graph-build",
+        "--graph-weight",
+        "0.4",
+        "--graph-fail-open",
+        "--graph-memory-space-mode",
+        "metadata-field",
+        "--graph-memory-space-field",
+        "tenant_id",
+        "--graph-owner-id",
+        "bench-owner",
+        "--graph-llm-api-key-env",
+        "GRAPH_KEY",
+        "--graph-llm-model",
+        "openai/gpt-4o-mini",
+        "--graph-llm-base-url",
+        "https://openrouter.ai/api/v1",
+        "--graph-llm-timeout-ms",
+        "60000",
+    ])
+
+    assert args.graph is True
+    assert args.graph_build is True
+    assert args.graph_weight == 0.4
+    assert args.graph_fail_open is True
+    assert args.graph_memory_space_mode == "metadata-field"
+    assert args.graph_memory_space_field == "tenant_id"
+    assert args.graph_owner_id == "bench-owner"
+    assert args.graph_llm_api_key_env == "GRAPH_KEY"
+    assert args.graph_llm_model == "openai/gpt-4o-mini"
+    assert args.graph_llm_base_url == "https://openrouter.ai/api/v1"
+    assert args.graph_llm_timeout_ms == 60000
+
+
+def test_bench_base_command_includes_graph_search_flags(tmp_path):
+    parser = personalmem_run.build_parser()
+    args = parser.parse_args([
+        "search",
+        "--dataset",
+        str(tmp_path / "data.json"),
+        "--graph",
+        "--graph-weight",
+        "0.4",
+        "--graph-fail-open",
+        "--graph-memory-space-mode",
+        "metadata-field",
+        "--graph-memory-space-field",
+        "tenant_id",
+    ])
+    personalmem_run.apply_default_paths(args)
+
+    command = personalmem_run.bench_base_command(args)
+
+    assert "--graph" in command
+    assert "--graph-fail-open" in command
+    assert "--graph-weight" in command
+    assert "0.4" in command
+    assert "--graph-memory-space-mode" in command
+    assert "metadata-field" in command
+    assert "--graph-memory-space-field" in command
+    assert "tenant_id" in command
