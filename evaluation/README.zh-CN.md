@@ -84,6 +84,62 @@ python3 evaluation/longmemeval/run.py \
 cd evaluation && ./run_locomo_eval.sh memory_bench
 ```
 
+## 有证据约束的记忆预处理（特性 2 和 4）
+
+数据集 adapter 先生成包含原始对话记录的 `benchmark-prepared-v1` 文件。记忆流水线
+再把消息组织成 episode，构建“候选区唯一归属、上下文允许重叠”的 extraction window，
+抽取原子记忆，校验精确原文引用，并且只写入 grounding 结果为 `SUPPORTED` 的记忆。
+
+先用已有 adapter 生成 raw prepared 文件，例如：
+
+```bash
+# PersonaMem（先下载官方数据）
+python evaluation/personalmem/run.py prepare \
+  --size 32k \
+  --schema-version benchmark-prepared-v1 \
+  --prepared-dataset outputs/personalmem/raw-prepared.json
+
+# LongMemEval
+PYTHONPATH=evaluation python -c \
+  'from longmemeval.preprocess import preprocess; preprocess("data/longmemeval/longmemeval_oracle.json", "outputs/longmemeval/raw-prepared.json")'
+```
+
+使用任意 OpenAI-compatible chat 端点执行抽取和独立的 grounding 验证：
+
+```bash
+PYTHONPATH=evaluation python -m common.memory_pipeline.cli \
+  --input outputs/longmemeval/raw-prepared.json \
+  --output outputs/longmemeval/extracted-prepared.json \
+  --artifacts-dir outputs/longmemeval/memory-pipeline \
+  --model openai/gpt-4o-mini \
+  --verifier-model openai/gpt-4o-mini \
+  --api-key-env OPENROUTER_API_KEY \
+  --cache-dir outputs/longmemeval/memory-pipeline-cache
+```
+
+后续把 `extracted-prepared.json` 交给现有 add/search 链路即可。输出记录统一使用
+`metadata.memory_kind=extracted_memory`，无需修改 Rust 记忆结构或检索逻辑。制品目录
+包含标准化消息、episode、extraction window、原始候选记忆、已接收记忆、拒绝/隔离记录、
+token/cache 统计和确定性的运行元数据。episode 与 window 只是组织上下文和审计的单元，
+不会直接 embedding 或入库；真正进入索引的只有输出 prepared 文件里的已接收记忆。
+
+离线 fixture 模式用两个 JSON 映射替代模型调用：
+
+```bash
+PYTHONPATH=evaluation python -m common.memory_pipeline.cli \
+  --input outputs/longmemeval/raw-prepared.json \
+  --output /tmp/extracted-prepared.json \
+  --artifacts-dir /tmp/memory-pipeline \
+  --extractor-responses /tmp/extraction-responses.json \
+  --grounding-responses /tmp/grounding-responses.json
+```
+
+抽取响应映射以确定性的 window ID 为 key，value 是 `atomic_memory_v1` 响应对象；grounding
+映射以确定性的候选记忆 ID 为 key，value 是状态字符串或 `{status, reason}` 对象。两个文件
+必须同时提供，CLI 不会写入未经验证的记忆。在线模式会为每个未命中缓存的 window 调用一次
+抽取模型，并为含有合法候选记忆的 window 调用一次验证模型；评估成本前应先查看
+`extraction_stats.json`。
+
 ## 输出说明
 
 所有评估默认写入仓库根目录下的 `outputs/<数据集>/<时间戳>/`，包含：
