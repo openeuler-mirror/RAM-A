@@ -85,6 +85,13 @@ cd evaluation
 # 下载 data/locomo/locomo10.json 后运行完整 LoCoMo
 DATASET=../data/locomo/locomo10.json ./run_locomo_eval.sh memory_bench
 
+# 图记忆模式：add 阶段构图，search 阶段开启 graph retrieval。
+# 需要 OPENROUTER_API_KEY 用于嵌入和图候选抽取。
+MEMORY_BENCH_GRAPH=1 \
+GRAPH_LLM_MODEL=openai/gpt-4o-mini \
+DATASET=../data/locomo/locomo10.json \
+./run_locomo_eval.sh memory_bench
+
 # mem0 后端
 ./run_locomo_eval.sh mem0
 ```
@@ -167,6 +174,25 @@ normalized message、episode、window、accepted/rejected/quarantined memory 和
 raw，包含恰好 1,540 个计分问题，满足全部 category 下限，并通过完整 Python、Rust、
 shell 和离线 smoke 回归。如果任一检查失败，接入代码必须保持未提交，通过
 `comparison.html` 和 pipeline artifact 诊断，也不能把该结果登记为新 baseline。
+
+图记忆相关环境变量：
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `MEMORY_BENCH_GRAPH` | `0` | 设为 `1` 后给 RAM-A add/search 传入 graph 参数 |
+| `GRAPH_WEIGHT` | `0.2` | graph retrieval 融合权重 |
+| `GRAPH_FAIL_OPEN` | `0` | 设为 `1` 后 graph search 失败时退化为非 graph 检索 |
+| `GRAPH_MEMORY_SPACE_MODE` | `auto` | `memory-bench` 推导 memory space 的方式 |
+| `GRAPH_MEMORY_SPACE_FIELD` | `scope_id` | `metadata-field` 模式使用的 metadata/filter 字段 |
+| `GRAPH_OWNER_ID` | `benchmark` | graph memory owner id |
+| `GRAPH_LLM_API_KEY_ENV` | `OPENROUTER_API_KEY` | 图候选抽取 API key 所在环境变量 |
+| `GRAPH_LLM_MODEL` | `openai/gpt-4o-mini` | 图候选抽取模型 |
+| `GRAPH_LLM_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible 图候选抽取 base URL |
+| `GRAPH_LLM_TIMEOUT_MS` | `60000` | 图候选抽取超时 |
+
+当 `MEMORY_BENCH_GRAPH=1` 时，shell wrapper 会给 `memory-bench add` 传入
+`--graph-build`，给 `memory-bench search` 传入 `--graph`。`GRAPH_LLM_MODEL`
+会映射为 `memory-bench` 的 `--graph-llm-model`。
 
 ## 流水线阶段
 

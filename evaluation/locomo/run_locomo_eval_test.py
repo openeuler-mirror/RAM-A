@@ -108,3 +108,12 @@ def test_memory_ab_python_entrypoints_start_from_evaluation_directory(script):
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def test_locomo_readme_documents_graph_mode():
+    readme = (EVALUATION_ROOT / "locomo" / "README.md").read_text(encoding="utf-8")
+
+    assert "MEMORY_BENCH_GRAPH=1" in readme
+    assert "GRAPH_LLM_MODEL" in readme
+    assert "--graph-build" in readme
+    assert "--graph" in readme

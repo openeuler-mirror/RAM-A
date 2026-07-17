@@ -100,6 +100,15 @@ python3 evaluation/longmemeval/run.py [options]
 | `--context-before-messages` | 2 | Previous messages included as context |
 | `--context-after-messages` | 0 | Following messages included as context |
 | `--extractor-responses` / `--grounding-responses` | *(none)* | Paired response maps for fully offline extraction |
+| **Graph memory** | | |
+| `--graph-build` | false | Build graph memory during add |
+| `--graph` | false | Enable graph retrieval during search |
+| `--graph-weight` | 0.2 | Graph retrieval fusion weight |
+| `--graph-fail-open` | false | Fall back to non-graph retrieval if graph search fails |
+| `--graph-memory-space-mode` | `auto` | Memory-space derivation mode |
+| `--graph-llm-api-key-env` | `OPENROUTER_API_KEY` | Env var for graph extraction API key |
+| `--graph-llm-model` | `openai/gpt-4o-mini` | Graph extraction model |
+| `--graph-llm-base-url` | `https://openrouter.ai/api/v1` | OpenAI-compatible graph extraction base URL |
 | **QA stage** | | |
 | `--answerer-model` | `openai/gpt-4o-mini` | Answer generation model |
 | `--judge-model` | `openai/gpt-4o-mini` | LLM-as-judge model |
@@ -139,6 +148,12 @@ python3 evaluation/longmemeval/run.py --phase pilot --pipeline-phase all \
   --judge-model openai/gpt-4o-mini \
   --llm-api-key-env OPENROUTER_API_KEY \
   --llm-base-url https://openrouter.ai/api/v1
+
+# Graph memory retrieval
+python3 evaluation/longmemeval/run.py \
+  --graph-build \
+  --graph \
+  --graph-llm-model openai/gpt-4o-mini
 ```
 
 A governed `--phase full` run additionally requires both `--frozen-config` and

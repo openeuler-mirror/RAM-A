@@ -85,6 +85,13 @@ cd evaluation
 # Full LoCoMo benchmark after downloading data/locomo/locomo10.json
 DATASET=../data/locomo/locomo10.json ./run_locomo_eval.sh memory_bench
 
+# Graph memory mode. This builds graph memory during add and enables graph retrieval
+# during search. It needs OPENROUTER_API_KEY for embeddings and graph extraction.
+MEMORY_BENCH_GRAPH=1 \
+GRAPH_LLM_MODEL=openai/gpt-4o-mini \
+DATASET=../data/locomo/locomo10.json \
+./run_locomo_eval.sh memory_bench
+
 # mem0 backend
 ./run_locomo_eval.sh mem0
 ```
@@ -174,6 +181,25 @@ score strictly above both 0.4065 and its fresh paired raw arm, contain exactly
 Rust, shell, and offline smoke regression suite. If any check fails, keep the
 integration code uncommitted and use `comparison.html` plus pipeline artifacts
 for diagnosis; do not record the run as a new baseline.
+
+Graph-specific environment variables:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `MEMORY_BENCH_GRAPH` | `0` | Set to `1` to pass graph flags to RAM-A add/search |
+| `GRAPH_WEIGHT` | `0.2` | Graph retrieval fusion weight |
+| `GRAPH_FAIL_OPEN` | `0` | Set to `1` to fall back to non-graph retrieval if graph search fails |
+| `GRAPH_MEMORY_SPACE_MODE` | `auto` | Memory-space derivation mode for `memory-bench` |
+| `GRAPH_MEMORY_SPACE_FIELD` | `scope_id` | Metadata/filter field used when mode is `metadata-field` |
+| `GRAPH_OWNER_ID` | `benchmark` | Graph memory owner id |
+| `GRAPH_LLM_API_KEY_ENV` | `OPENROUTER_API_KEY` | Env var containing graph extraction API key |
+| `GRAPH_LLM_MODEL` | `openai/gpt-4o-mini` | Graph extraction model |
+| `GRAPH_LLM_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible graph extraction base URL |
+| `GRAPH_LLM_TIMEOUT_MS` | `60000` | Graph extraction timeout |
+
+When `MEMORY_BENCH_GRAPH=1`, the shell wrapper passes `--graph-build` to
+`memory-bench add` and `--graph` to `memory-bench search`. `GRAPH_LLM_MODEL`
+maps to the `memory-bench` `--graph-llm-model` flag.
 
 ## Pipeline Stages
 

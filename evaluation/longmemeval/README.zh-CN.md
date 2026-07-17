@@ -95,6 +95,15 @@ python3 evaluation/longmemeval/run.py [选项]
 | `--context-before-messages` | 2 | 向前包含的上下文消息数 |
 | `--context-after-messages` | 0 | 向后包含的上下文消息数 |
 | `--extractor-responses` / `--grounding-responses` | *（无）* | 完全离线抽取使用的成对响应 maps |
+| **图记忆** | | |
+| `--graph-build` | false | add 阶段构建图记忆 |
+| `--graph` | false | search 阶段开启 graph retrieval |
+| `--graph-weight` | 0.2 | graph retrieval 融合权重 |
+| `--graph-fail-open` | false | graph search 失败时退化为非 graph 检索 |
+| `--graph-memory-space-mode` | `auto` | memory space 推导方式 |
+| `--graph-llm-api-key-env` | `OPENROUTER_API_KEY` | 图候选抽取 API key 环境变量 |
+| `--graph-llm-model` | `openai/gpt-4o-mini` | 图候选抽取模型 |
+| `--graph-llm-base-url` | `https://openrouter.ai/api/v1` | OpenAI 兼容图候选抽取 base URL |
 | **QA 阶段** | | |
 | `--answerer-model` | `openai/gpt-4o-mini` | 回答生成模型 |
 | `--judge-model` | `openai/gpt-4o-mini` | LLM 评判模型 |
@@ -133,6 +142,12 @@ python3 evaluation/longmemeval/run.py --phase pilot --pipeline-phase all \
   --judge-model openai/gpt-4o-mini \
   --llm-api-key-env OPENROUTER_API_KEY \
   --llm-base-url https://openrouter.ai/api/v1
+
+# 图记忆检索
+python3 evaluation/longmemeval/run.py \
+  --graph-build \
+  --graph \
+  --graph-llm-model openai/gpt-4o-mini
 ```
 
 受治理的 `--phase full` 还必须提供 `--frozen-config` 和
