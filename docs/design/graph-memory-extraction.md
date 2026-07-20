@@ -58,6 +58,17 @@ pub trait GraphExtractor: Send + Sync {
 `GraphExtractionOutput`，随后仍然经过第 4 节的候选校验。因此 LLM 只负责“提出候选”，
 不能绕过 entity type、predicate、evidence grounding 和时间区间校验。
 
+LLM 生成的 evidence byte offset 不作为可信来源。若 evidence 提供了 exact text，
+adapter 会在校验前从原文中重新计算 `start_byte` / `end_byte`；如果某条 fact 的
+evidence 不能定位到原文，adapter 会在校验前丢弃该 fact，而不是让整条 record 的
+抽取失败。非 LLM adapter 直接产出的候选仍会被第 4 节严格校验。
+
+LLM 生成的 fact endpoint 也不作为可信来源。如果某个 fact 的 `subject_ref` /
+`object_ref` 没有指向本次输出中的 entity，或 predicate 不在当前 registry 中，adapter
+会在校验前丢弃该 fact，而不是合成缺失 entity。这样可以避免把类型不确定的实体写入图，
+同时保留同一 record 中其它可物化的候选。被丢弃的 fact 数量会写入 stderr，便于
+benchmark 跑批时观察 LLM 输出质量。
+
 `OpenAiCompatibleGraphLlmClient` 调用 `/chat/completions`，设置
 `response_format={"type":"json_object"}`，并记录 provider 返回的 token usage。若模型
 偶尔返回以 `json` 标记的 Markdown 代码块，解析层会先剥离 fence 再解析。HTTP 429
@@ -170,6 +181,9 @@ LLM adapter 行为由 `graph_llm_extraction.rs` 覆盖：
 
 - fake LLM client 返回候选 JSON 后，executor 能持久化候选和 token usage；
 - prompt 会包含原文和 byte offset 约束，并要求 JSON response format；
+- exact evidence text 可以修正模型给错的 byte offset；
+- evidence 无法定位到原文的 fact 会被丢弃；
+- endpoint 不完整或 predicate 不在 registry 中的 fact 会被丢弃；
 - fenced JSON 可以被解析；
 - 非 JSON 输出会被拒绝；
 - LLM 输出仍然必须通过候选校验，无 evidence 的 fact 会进入

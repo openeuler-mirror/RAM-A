@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path
 import subprocess
 import sys
@@ -34,6 +35,8 @@ def test_run_locomo_eval_uses_locomo_entrypoints():
 
     assert "python3 locomo/locomo_eval.py" in content
     assert 'DATASET="${DATASET:-fixtures/locomo_sample.json}"' in content
+    assert 'ANSWER_MODEL="${MODEL:-gpt-4o-mini}"' in content
+    assert 'RESUME="${RESUME:-0}"' in content
     assert 'JUDGE_MODEL="${JUDGE_MODEL:-${MODEL:-gpt-4o-mini}}"' in content
     assert 'LLM_API_KEY_ENV="${LLM_API_KEY_ENV:-OPENAI_API_KEY}"' in content
     assert 'RERANK="${RERANK:-0}"' in content
@@ -43,6 +46,7 @@ def test_run_locomo_eval_uses_locomo_entrypoints():
     assert 'RERANK_BASE_URL="${RERANK_BASE_URL:-https://openrouter.ai/api/v1}"' in content
     assert 'RERANK_INPUT_K="${RERANK_INPUT_K:-40}"' in content
     assert 'MEMORY_BENCH_GRAPH="${MEMORY_BENCH_GRAPH:-0}"' in content
+    assert 'MEMORY_BENCH_SEARCH_MODE="${MEMORY_BENCH_SEARCH_MODE:-hybrid}"' in content
     assert 'GRAPH_WEIGHT="${GRAPH_WEIGHT:-0.2}"' in content
     assert 'GRAPH_FAIL_OPEN="${GRAPH_FAIL_OPEN:-0}"' in content
     assert 'GRAPH_MEMORY_SPACE_MODE="${GRAPH_MEMORY_SPACE_MODE:-auto}"' in content
@@ -53,13 +57,18 @@ def test_run_locomo_eval_uses_locomo_entrypoints():
     assert 'GRAPH_LLM_BASE_URL="${GRAPH_LLM_BASE_URL:-https://openrouter.ai/api/v1}"' in content
     assert 'GRAPH_LLM_TIMEOUT_MS="${GRAPH_LLM_TIMEOUT_MS:-60000}"' in content
     assert 'MEMORY_BENCH_RERANK_ARGS="' in content
+    assert 'MEMORY_BENCH_ADD_RESUME_ARGS="' in content
     assert 'MEMORY_BENCH_GRAPH_ADD_ARGS="' in content
     assert 'MEMORY_BENCH_GRAPH_SEARCH_ARGS="' in content
     assert '--rerank --rerank-provider $RERANK_PROVIDER' in content
     assert '--rerank-api-key-env $RERANK_API_KEY_ENV' in content
     assert '$MEMORY_BENCH_RERANK_ARGS \\' in content
     assert '$MEMORY_BENCH_GRAPH_ADD_ARGS \\' in content
+    assert '--search-mode "$MEMORY_BENCH_SEARCH_MODE" \\' in content
     assert '$MEMORY_BENCH_GRAPH_SEARCH_ARGS \\' in content
+    assert 'MEMORY_BENCH_ADD_RESUME_ARGS="--resume"' in content
+    assert 'if [ -z "$MEMORY_BENCH_ADD_RESUME_ARGS" ]; then' in content
+    assert 'rm -f "$MEMORY_BENCH_STORE"' in content
     assert '--judge-model "$JUDGE_MODEL"' in content
     assert '--llm-api-key-env "$LLM_API_KEY_ENV"' in content
     assert '--llm-base-url "$LLM_BASE_URL"' in content
@@ -69,10 +78,27 @@ def test_run_locomo_eval_uses_locomo_entrypoints():
     assert "python3 locomo/locomo_report.py" in content
     assert "python3 locomo/locomo_experiments.py" in content
     assert "python3 locomo/locomo_retrieval.py" in content
+    assert "run_locomo_responses" in content
+    assert 'response_api_key="$(printenv "$LLM_API_KEY_ENV" || true)"' in content
+    assert 'OPENAI_API_KEY="$response_api_key" OPENAI_BASE_URL="$LLM_BASE_URL" MODEL="$ANSWER_MODEL"' in content
     assert "python3 locomo/locomo_responses.py" in content
     assert "scripts/locomo" not in content
     assert 'MEMORY_BENCH_DIR="${RUN_DIR}/ram-a"' in content
+    assert 'MEMORY_BENCH_DATASET="${MEMORY_BENCH_DIR}/prepared.json"' in content
+    assert 'python3 locomo/prepare_memory_bench.py \\' in content
+    assert '--dataset "$DATASET" \\' in content
+    assert '--output "$MEMORY_BENCH_DATASET"' in content
     assert 'write_meta "RAM-A" "all"' in content
+    assert 'add --dataset "$MEMORY_BENCH_DATASET" $MEMORY_BENCH_ADD_RESUME_ARGS' in content
+    assert '--dataset "$MEMORY_BENCH_DATASET" --top-k "$TOP_K" \\' in content
+    assert 'add --dataset "$DATASET" --text-fields text $MEMORY_BENCH_ADD_RESUME_ARGS' not in content
+    assert 'search --dataset "$DATASET" --query-fields question --top-k "$TOP_K"' not in content
+
+
+def test_run_locomo_eval_shell_syntax_is_valid():
+    script = EVALUATION_ROOT / "run_locomo_eval.sh"
+
+    subprocess.run(["bash", "-n", str(script)], check=True)
 
 
 def test_memory_ab_runner_has_paired_modes_and_frozen_config_contract():

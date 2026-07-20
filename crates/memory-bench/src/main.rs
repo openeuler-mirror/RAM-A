@@ -384,11 +384,6 @@ async fn run_add(
     let mut graph_requests = Vec::new();
     for (index, item) in texts.iter().enumerate() {
         let id = format!("{}:{}", item.path, index);
-        if should_skip_existing(&existing_ids, &id) {
-            summary.skipped_existing += 1;
-            continue;
-        }
-
         let mut metadata = serde_json::json!({
             "dataset": options.dataset.display().to_string(),
             "path": item.path,
@@ -396,21 +391,27 @@ async fn run_add(
         });
         merge_metadata(&mut metadata, &item.metadata);
 
-        requests.push(AddMemoryRequest {
-            id: Some(id.clone()),
-            text: item.text.clone(),
-            metadata: metadata.clone(),
-        });
         if graph_pipeline.is_some() {
             graph_requests.push(build_graph_add_request(
                 options.cli,
                 &id,
                 &item.text,
-                metadata,
+                metadata.clone(),
                 &item.path,
                 false,
             )?);
         }
+
+        if should_skip_existing(&existing_ids, &id) {
+            summary.skipped_existing += 1;
+            continue;
+        }
+
+        requests.push(AddMemoryRequest {
+            id: Some(id.clone()),
+            text: item.text.clone(),
+            metadata: metadata.clone(),
+        });
     }
 
     if !requests.is_empty() {
@@ -487,11 +488,6 @@ async fn run_add_prepared_memories(
             })
             .transpose()?
             .unwrap_or_else(|| format!("$.memories[{index}].text:{index}"));
-        if should_skip_existing(&existing_ids, &id) {
-            summary.skipped_existing += 1;
-            continue;
-        }
-
         let metadata = match object.get("metadata") {
             Some(value) => {
                 if !value.is_object() {
@@ -510,21 +506,27 @@ async fn run_add_prepared_memories(
             "text",
         );
 
-        requests.push(AddMemoryRequest {
-            id: Some(id.clone()),
-            text: text.to_string(),
-            metadata: metadata.clone(),
-        });
         if graph_pipeline.is_some() {
             graph_requests.push(build_graph_add_request(
                 options.cli,
                 &id,
                 text,
-                metadata,
+                metadata.clone(),
                 &path,
                 true,
             )?);
         }
+
+        if should_skip_existing(&existing_ids, &id) {
+            summary.skipped_existing += 1;
+            continue;
+        }
+
+        requests.push(AddMemoryRequest {
+            id: Some(id.clone()),
+            text: text.to_string(),
+            metadata: metadata.clone(),
+        });
     }
 
     if !requests.is_empty() {
@@ -1032,7 +1034,7 @@ async fn build_graph_memories(
     for request in requests {
         let source_ref = request.source_ref.clone();
         graph_pipeline
-            .build_memory(request)
+            .build_memory_if_needed(request)
             .await
             .with_context(|| format!("failed to build graph memory for {source_ref:?}"))?;
         progress.inc(1);
@@ -1124,8 +1126,12 @@ fn graph_memory_space_for_query(
                 filter
                     .map(|value| metadata_string_field(value, &cli.graph_memory_space_field))
                     .unwrap_or(Ok(None))
+            } else if let Some(memory_space_id) = top_level_array_space(path) {
+                Ok(Some(memory_space_id))
             } else {
-                Ok(top_level_array_space(path))
+                filter
+                    .map(|value| metadata_string_field(value, &cli.graph_memory_space_field))
+                    .unwrap_or(Ok(None))
             }
         }
     }
@@ -1327,7 +1333,75 @@ struct SearchOutput {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use memory_core::graph::{
+        ExtractedEntityCandidate, ExtractedFactCandidate, GraphEvidenceSpan, GraphExtractionInput,
+        GraphExtractionOutput, GraphExtractor,
+    };
+
     use super::*;
+
+    #[derive(Debug)]
+    struct BenchGraphExtractor;
+
+    #[async_trait::async_trait]
+    impl GraphExtractor for BenchGraphExtractor {
+        fn extractor_name(&self) -> &str {
+            "bench-test-extractor"
+        }
+
+        fn model_name(&self) -> &str {
+            "bench-test-model"
+        }
+
+        fn prompt_version(&self) -> &str {
+            "bench-test-prompt-v1"
+        }
+
+        fn schema_version(&self) -> &str {
+            "bench-test-schema-v1"
+        }
+
+        async fn extract(
+            &self,
+            input: GraphExtractionInput,
+        ) -> memory_core::MemoryResult<GraphExtractionOutput> {
+            Ok(GraphExtractionOutput {
+                entities: vec![
+                    ExtractedEntityCandidate {
+                        local_id: "entity:alice".to_string(),
+                        name: "Alice".to_string(),
+                        entity_type: "PERSON".to_string(),
+                        confidence: Some(1.0),
+                    },
+                    ExtractedEntityCandidate {
+                        local_id: "entity:shanghai".to_string(),
+                        name: "Shanghai".to_string(),
+                        entity_type: "LOCATION".to_string(),
+                        confidence: Some(1.0),
+                    },
+                ],
+                facts: vec![ExtractedFactCandidate {
+                    local_id: "fact:alice-shanghai".to_string(),
+                    subject_ref: "entity:alice".to_string(),
+                    predicate: "LIVES_IN".to_string(),
+                    object_ref: "entity:shanghai".to_string(),
+                    fact_text: "Alice lives in Shanghai.".to_string(),
+                    evidence: vec![GraphEvidenceSpan {
+                        text: Some(input.text),
+                        start_byte: None,
+                        end_byte: None,
+                    }],
+                    confidence: Some(1.0),
+                    valid_from_ms: None,
+                    valid_to_ms: None,
+                }],
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+            })
+        }
+    }
 
     #[test]
     fn cli_defaults_to_sqlite_hybrid_search() {
@@ -1519,6 +1593,7 @@ mod tests {
     #[test]
     fn graph_memory_space_auto_uses_top_level_path_for_raw_locomo_shape() {
         let cli = graph_test_cli();
+        let filter = serde_json::json!({"scope_id": "scope-a"});
         assert_eq!(
             graph_memory_space_for_memory(
                 "$[12].conversation.session_1[0].text",
@@ -1530,10 +1605,102 @@ mod tests {
             Some("path:$[12]".to_string())
         );
         assert_eq!(
-            graph_memory_space_for_query("$[12].qa[0].question", None, false, &cli)
+            graph_memory_space_for_query("$[12].qa[0].question", Some(&filter), false, &cli)
                 .expect("query space"),
             Some("path:$[12]".to_string())
         );
+    }
+
+    #[test]
+    fn graph_memory_space_auto_uses_filter_for_ad_hoc_query() {
+        let cli = graph_test_cli();
+        let filter = serde_json::json!({"scope_id": "scope-a"});
+
+        assert_eq!(
+            graph_memory_space_for_query("$.query", Some(&filter), false, &cli)
+                .expect("query space"),
+            Some("scope-a".to_string())
+        );
+    }
+
+    #[test]
+    fn graph_memory_space_metadata_field_uses_configured_field() {
+        let cli = Cli::try_parse_from([
+            "memory-bench",
+            "--embedding",
+            "hash",
+            "--graph-memory-space-mode",
+            "metadata-field",
+            "--graph-memory-space-field",
+            "tenant_id",
+            "search",
+            "--query",
+            "Where?",
+            "--output",
+            "outputs/search.json",
+        ])
+        .expect("parse graph memory space CLI");
+        let metadata = serde_json::json!({"tenant_id": "tenant-a"});
+
+        assert_eq!(
+            graph_memory_space_for_memory("$.memory.text", &metadata, false, &cli)
+                .expect("memory space"),
+            Some("tenant-a".to_string())
+        );
+        assert_eq!(
+            graph_memory_space_for_query("$.query", Some(&metadata), false, &cli)
+                .expect("query space"),
+            Some("tenant-a".to_string())
+        );
+    }
+
+    #[test]
+    fn graph_memory_space_path_prefix_ignores_metadata_field() {
+        let cli = Cli::try_parse_from([
+            "memory-bench",
+            "--embedding",
+            "hash",
+            "--graph-memory-space-mode",
+            "path-prefix",
+            "--graph-memory-space-field",
+            "tenant_id",
+            "search",
+            "--query",
+            "Where?",
+            "--output",
+            "outputs/search.json",
+        ])
+        .expect("parse graph memory space CLI");
+        let metadata = serde_json::json!({"tenant_id": "tenant-a"});
+
+        assert_eq!(
+            graph_memory_space_for_memory("$[3].memory.text", &metadata, false, &cli)
+                .expect("memory space"),
+            Some("path:$[3]".to_string())
+        );
+        assert_eq!(
+            graph_memory_space_for_query("$[3].qa[0].question", Some(&metadata), false, &cli)
+                .expect("query space"),
+            Some("path:$[3]".to_string())
+        );
+    }
+
+    #[test]
+    fn build_graph_add_request_requires_memory_space_id() {
+        let cli = graph_test_cli();
+        let error = build_graph_add_request(
+            &cli,
+            "record-1",
+            "Alice lives in Shanghai.",
+            serde_json::json!({}),
+            "$.memory.text",
+            false,
+        )
+        .expect_err("missing graph memory space should fail");
+
+        assert!(format!("{error}").contains(
+            "graph memory space could not be derived for memory `record-1` at `$.memory.text`"
+        ));
     }
 
     #[test]
@@ -1854,6 +2021,104 @@ mod tests {
 
         assert!(format!("{error}")
             .contains("missing graph LLM API key env RAM_A_TEST_MISSING_GRAPH_KEY_BUILD"));
+    }
+
+    #[test]
+    fn build_runtime_rejects_graph_build_with_jsonl_store() {
+        let cli = Cli::try_parse_from([
+            "memory-bench",
+            "--embedding",
+            "hash",
+            "--store-backend",
+            "jsonl",
+            "--graph-build",
+            "add",
+            "--dataset",
+            "data/test.json",
+        ])
+        .expect("parse CLI");
+
+        let error = match build_runtime(&cli) {
+            Ok(_) => panic!("jsonl graph build should fail"),
+            Err(error) => error,
+        };
+
+        assert!(format!("{error}").contains("--graph-build requires --store-backend sqlite"));
+    }
+
+    #[tokio::test]
+    async fn resume_add_builds_graph_for_existing_memory_records() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dataset = temp.path().join("dataset.json");
+        std::fs::write(&dataset, r#"[{"text":"Alice lives in Shanghai."}]"#)
+            .expect("write dataset");
+        let db_path = temp.path().join("memory.sqlite");
+        let store: Arc<dyn MemoryStore> = Arc::new(SqliteMemoryStore::new(&db_path));
+        let text_fields = vec!["text".to_string()];
+        let first_cli = Cli::try_parse_from([
+            "memory-bench",
+            "--embedding",
+            "hash",
+            "add",
+            "--dataset",
+            dataset.to_str().expect("dataset path"),
+        ])
+        .expect("parse first add CLI");
+        let first_manager = MemoryManager::new(store.clone(), Arc::new(HashEmbedding::new(8)));
+
+        run_add(
+            first_manager,
+            store.clone(),
+            None,
+            AddRunOptions {
+                dataset: dataset.clone(),
+                text_fields: &text_fields,
+                batch_size: 1,
+                resume: false,
+                cli: &first_cli,
+            },
+        )
+        .await
+        .expect("baseline add");
+
+        let repository = memory_core::sqlite::GraphRepository::open(&db_path);
+        assert_eq!(repository.count_facts("path:$[0]").await.unwrap(), 0);
+
+        let graph_pipeline = GraphBuildPipeline::new(
+            repository.clone(),
+            Arc::new(HashEmbedding::new(8)),
+            Arc::new(BenchGraphExtractor),
+            GraphTypeRegistry::new_default(),
+        );
+        let resume_cli = Cli::try_parse_from([
+            "memory-bench",
+            "--embedding",
+            "hash",
+            "--graph-build",
+            "add",
+            "--dataset",
+            dataset.to_str().expect("dataset path"),
+            "--resume",
+        ])
+        .expect("parse resume add CLI");
+        let resume_manager = MemoryManager::new(store.clone(), Arc::new(HashEmbedding::new(8)));
+
+        run_add(
+            resume_manager,
+            store,
+            Some(graph_pipeline),
+            AddRunOptions {
+                dataset,
+                text_fields: &text_fields,
+                batch_size: 1,
+                resume: true,
+                cli: &resume_cli,
+            },
+        )
+        .await
+        .expect("resume graph build");
+
+        assert_eq!(repository.count_facts("path:$[0]").await.unwrap(), 1);
     }
 
     fn graph_test_cli() -> Cli {

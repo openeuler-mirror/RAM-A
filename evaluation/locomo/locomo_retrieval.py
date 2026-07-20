@@ -194,7 +194,7 @@ def unsupported_mem0_report(input_path):
 
 
 def evaluate_query(dataset, item):
-    query_match = QUERY_PATH_RE.match(str(item.get("query_path", "")))
+    query_match = QUERY_PATH_RE.match(query_raw_path(item))
     if not query_match:
         return None
     sample_index, question_index = (int(value) for value in query_match.groups())
@@ -207,7 +207,7 @@ def evaluate_query(dataset, item):
     retrieved_ids = []
     retrieved_text_tokens = 0
     for result in item.get("results", []):
-        path = (result.get("metadata") or {}).get("path", "")
+        path = result_raw_path(result)
         evidence_id = evidence_id_from_result_path(path)
         if evidence_id:
             retrieved_ids.append(evidence_id)
@@ -236,6 +236,16 @@ def evaluate_query(dataset, item):
         "retrieved_count": len(retrieved_ids),
         "context_tokens": retrieved_text_tokens,
     }
+
+
+def query_raw_path(item):
+    metadata = item.get("metadata") or {}
+    return str(metadata.get("raw_query_path") or item.get("query_path", ""))
+
+
+def result_raw_path(result):
+    metadata = result.get("metadata") or {}
+    return str(metadata.get("raw_memory_path") or metadata.get("path", ""))
 
 
 def normalize_evidence_id(value, sample_index):

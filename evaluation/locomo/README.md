@@ -98,6 +98,12 @@ DATASET=../data/locomo/locomo10.json \
 
 The shell script runs the full 7-stage pipeline.
 Outputs are written to repository-root `outputs/locomo/<RUN_ID>/<backend>/`.
+For the RAM-A backend, the wrapper first converts the raw LoCoMo file into
+`outputs/locomo/<RUN_ID>/ram-a/prepared.json` using the unified
+`benchmark-prepared-v1` schema. The prepared memories preserve LoCoMo-specific
+fields such as `raw_memory_path`, `session_timestamp`, and `observed_at_ms` in
+metadata so graph extraction can use observation time without adding LoCoMo
+parsing logic to `memory-bench`.
 
 The optional mem0 comparison implementation lives under `evaluation/locomo/backends/mem0/`.
 
@@ -200,6 +206,10 @@ Graph-specific environment variables:
 When `MEMORY_BENCH_GRAPH=1`, the shell wrapper passes `--graph-build` to
 `memory-bench add` and `--graph` to `memory-bench search`. `GRAPH_LLM_MODEL`
 maps to the `memory-bench` `--graph-llm-model` flag.
+In the default `auto` memory-space mode, prepared LoCoMo records use
+`scope_id` values such as `path:$[0]`. If a graph build is resumed, completed
+graph runs are skipped, missing graph runs are built, and failed/running graph
+runs fail explicitly instead of silently producing a partial graph benchmark.
 
 ## Pipeline Stages
 

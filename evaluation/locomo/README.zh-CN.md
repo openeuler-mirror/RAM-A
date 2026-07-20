@@ -98,6 +98,11 @@ DATASET=../data/locomo/locomo10.json \
 
 Shell 脚本自动运行完整 7 阶段流水线。
 输出写入仓库根目录 `outputs/locomo/<RUN_ID>/<backend>/`。
+RAM-A 后端会先把原始 LoCoMo 文件转换为统一的 `benchmark-prepared-v1`
+格式，写到 `outputs/locomo/<RUN_ID>/ram-a/prepared.json`。prepared memory
+会在 metadata 中保留 `raw_memory_path`、`session_timestamp`、`observed_at_ms`
+等 LoCoMo 字段，让图抽取可以拿到观察时间，同时避免在 `memory-bench` 主逻辑中加入
+LoCoMo 专门解析。
 
 可选的 mem0 对比实现位于 `evaluation/locomo/backends/mem0/`。
 
@@ -193,6 +198,10 @@ shell 和离线 smoke 回归。如果任一检查失败，接入代码必须保�
 当 `MEMORY_BENCH_GRAPH=1` 时，shell wrapper 会给 `memory-bench add` 传入
 `--graph-build`，给 `memory-bench search` 传入 `--graph`。`GRAPH_LLM_MODEL`
 会映射为 `memory-bench` 的 `--graph-llm-model`。
+默认 `auto` memory-space 模式下，prepared LoCoMo 记录会使用 `path:$[0]`
+这类 `scope_id`。恢复 graph build 时，已 completed 的 graph run 会跳过，缺失的
+graph run 会补构，failed/running 的 graph run 会明确报错，避免半构图 benchmark
+静默成功。
 
 ## 流水线阶段
 

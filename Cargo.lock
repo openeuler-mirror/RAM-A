@@ -1101,10 +1101,12 @@ name = "memory-bench"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "memory-core",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

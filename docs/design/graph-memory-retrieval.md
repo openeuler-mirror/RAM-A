@@ -183,7 +183,14 @@ GraphRetrieveContextRequest
 - `--graph-weight`：控制 graph channel 的融合权重，默认 0.2；
 - `--graph-fail-open`：graph channel 出错时退化为只返回基础检索结果，默认关闭；
 - `--graph-memory-space-mode auto`：prepared schema 使用 `scope_id`，raw top-level-array
-  数据使用 `path:$[N]` 作为 graph memory space。
+  数据使用 `path:$[N]` 作为 graph memory space；单条 `--query` 没有 top-level-array path，
+  因此需要通过 `--filter '{"scope_id":"..."}'` 提供 graph memory space，或者显式使用
+  `metadata-field` / `path-prefix` 模式。
+
+`--resume --graph-build` 不能只看普通 MemoryRecord 是否已存在。resume 时会继续为已存在
+MemoryRecord 检查 graph build：completed ingestion run 会跳过，缺失的 ingestion run 会补构；
+failed / running ingestion run 不会被自动重置，而是明确报错，避免 benchmark 在半构图状态下
+静默成功。
 
 graph build 需要真实 LLM key。默认读取 `OPENROUTER_API_KEY`，默认 base URL 是
 `https://openrouter.ai/api/v1`，默认模型是 `openai/gpt-4o-mini`。可以用

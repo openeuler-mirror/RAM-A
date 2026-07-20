@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -6,7 +7,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{MemoryError, MemoryResult};
 
-use super::{GraphExtractionInput, GraphExtractionOutput, GraphExtractor, GraphTypeRegistry};
+use super::{
+    GraphEvidenceSpan, GraphExtractionInput, GraphExtractionOutput, GraphExtractor,
+    GraphTypeRegistry,
+};
 
 const LLM_MAX_ATTEMPTS: usize = 5;
 const DEFAULT_LLM_TIMEOUT_SECS: u64 = 60;
@@ -229,6 +233,8 @@ impl GraphExtractor for LlmGraphExtractor {
             .complete_json(build_graph_llm_request(&input, &self.type_registry))
             .await?;
         let mut output = parse_graph_llm_output_text(&response.content)?;
+        repair_evidence_byte_offsets(&mut output, &input.text);
+        drop_unmaterializable_facts(&mut output, &self.type_registry, &input.text);
         if response.input_tokens.is_some() {
             output.input_tokens = response.input_tokens;
         }
@@ -288,6 +294,86 @@ fn parse_graph_llm_output_text(text: &str) -> MemoryResult<GraphExtractionOutput
     })
 }
 
+fn repair_evidence_byte_offsets(output: &mut GraphExtractionOutput, record_text: &str) {
+    for fact in &mut output.facts {
+        for evidence in &mut fact.evidence {
+            let Some(evidence_text) = evidence.text.as_deref() else {
+                continue;
+            };
+            if evidence_byte_range_matches_record(evidence, record_text, evidence_text) {
+                continue;
+            }
+            let Some(start) = record_text.find(evidence_text) else {
+                continue;
+            };
+            evidence.start_byte = Some(start);
+            evidence.end_byte = Some(start + evidence_text.len());
+        }
+    }
+}
+
+fn evidence_byte_range_matches_record(
+    evidence: &GraphEvidenceSpan,
+    record_text: &str,
+    evidence_text: &str,
+) -> bool {
+    let (Some(start), Some(end)) = (evidence.start_byte, evidence.end_byte) else {
+        return false;
+    };
+    start < end
+        && end <= record_text.len()
+        && record_text.is_char_boundary(start)
+        && record_text.is_char_boundary(end)
+        && &record_text[start..end] == evidence_text
+}
+
+fn drop_unmaterializable_facts(
+    output: &mut GraphExtractionOutput,
+    type_registry: &GraphTypeRegistry,
+    record_text: &str,
+) {
+    let entity_ids = output
+        .entities
+        .iter()
+        .map(|entity| entity.local_id.as_str())
+        .collect::<HashSet<_>>();
+    let fact_count_before = output.facts.len();
+    output.facts.retain_mut(|fact| {
+        fact.evidence
+            .retain(|evidence| evidence_is_grounded(evidence, record_text));
+        if fact.evidence.is_empty() {
+            return false;
+        }
+        if !entity_ids.contains(fact.subject_ref.as_str())
+            || !entity_ids.contains(fact.object_ref.as_str())
+        {
+            return false;
+        }
+        type_registry.predicate(&fact.predicate).is_some()
+    });
+    let dropped = fact_count_before - output.facts.len();
+    if dropped > 0 {
+        eprintln!("graph LLM adapter dropped {dropped} unmaterializable facts");
+    }
+}
+
+fn evidence_is_grounded(evidence: &GraphEvidenceSpan, record_text: &str) -> bool {
+    match evidence.text.as_deref() {
+        Some(evidence_text) => {
+            evidence_byte_range_matches_record(evidence, record_text, evidence_text)
+        }
+        None => {
+            let (Some(start), Some(end)) = (evidence.start_byte, evidence.end_byte) else {
+                return false;
+            };
+            start < end
+                && end <= record_text.len()
+                && record_text.is_char_boundary(start)
+                && record_text.is_char_boundary(end)
+        }
+    }
+}
+
 fn build_graph_llm_request(
     input: &GraphExtractionInput,
     type_registry: &GraphTypeRegistry,
@@ -324,8 +410,8 @@ fn build_graph_llm_request(
                 "evidence": [
                     {
                         "text": "<exact substring from record text>",
-                        "start_byte": 0,
-                        "end_byte": 0
+                        "start_byte": null,
+                        "end_byte": null
                     }
                 ],
                 "confidence": 0.0,
@@ -344,7 +430,7 @@ fn build_graph_llm_request(
             GraphLlmMessage {
                 role: "user".to_string(),
                 content: format!(
-                    "Use only the registered entity types and predicates. Every fact must be grounded by evidence from the record text. Evidence start_byte/end_byte are byte offsets in the UTF-8 record text, not character indexes.\n\nType registry:\n{}\n\nMemory record:\n{}\n\nReturn JSON matching this shape. Omit a field only when it is optional. Empty entities/facts arrays are allowed when the record has no graph-relevant content.\n{}",
+                    "Use only the registered entity types and predicates. Every fact must be grounded by evidence from the record text. Every fact subject_ref and object_ref must exactly match a local_id in entities; omit the fact if either endpoint is missing or uncertain. Evidence text must be an exact substring from the record text. Evidence start_byte/end_byte are byte offsets in the UTF-8 record text, not character indexes; set them to null if you are not certain.\n\nType registry:\n{}\n\nMemory record:\n{}\n\nReturn JSON matching this shape. Omit a field only when it is optional. Empty entities/facts arrays are allowed when the record has no graph-relevant content.\n{}",
                     pretty_json(&registry_json),
                     pretty_json(&record_json),
                     pretty_json(&output_schema)

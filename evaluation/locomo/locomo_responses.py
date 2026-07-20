@@ -6,6 +6,7 @@ import statistics
 import sys
 import time
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -28,6 +29,7 @@ RESULT_PATH_RE = re.compile(
 QUERY_PATH_RE = re.compile(r"^\$\[(\d+)\]\.qa\[(\d+)\]\.question$")
 RETRYABLE_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504}
 TOKEN_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens")
+MAX_GRAPH_FACTS_PER_MEMORY = 3
 
 
 def progress_interval(total):
@@ -160,7 +162,7 @@ class MemoryBenchResponses:
         speaker_b = conversation["speaker_b"]
         contexts = {speaker_a: [], speaker_b: []}
         for result in results:
-            path = (result.get("metadata") or {}).get("path", "")
+            path = result_raw_path(result)
             match = RESULT_PATH_RE.match(path)
             if not match:
                 continue
@@ -179,12 +181,13 @@ class MemoryBenchResponses:
                     "memory": f"{message.get('speaker', 'Unknown')}: {memory_text}",
                     "timestamp": timestamp,
                     "score": round(float(result.get("score", 0.0)), 2),
+                    "graph_facts": result_graph_facts(result),
                 }
             )
         return contexts
 
     def answer_question(self, dataset, query_output):
-        match = QUERY_PATH_RE.match(query_output.get("query_path", ""))
+        match = QUERY_PATH_RE.match(query_raw_path(query_output))
         if not match:
             raise ValueError(f"Unsupported memory-bench query path: {query_output.get('query_path')!r}")
         sample_index, question_index = (int(value) for value in match.groups())
@@ -204,8 +207,8 @@ class MemoryBenchResponses:
             response, response_time, token_usage = self.responder.answer(
                 speaker_a,
                 speaker_b,
-                [f"{m['timestamp']}: {m['memory']}" for m in contexts[speaker_a]],
-                [f"{m['timestamp']}: {m['memory']}" for m in contexts[speaker_b]],
+                [format_context_memory(m) for m in contexts[speaker_a]],
+                [format_context_memory(m) for m in contexts[speaker_b]],
                 question_item.get("question", ""),
             )
 
@@ -377,6 +380,94 @@ def _answer_record(
     }
     add_token_usage(answer, token_usage)
     return answer
+
+
+def query_raw_path(query_output):
+    metadata = query_output.get("metadata") or {}
+    return str(metadata.get("raw_query_path") or query_output.get("query_path", ""))
+
+
+def result_raw_path(result):
+    metadata = result.get("metadata") or {}
+    return str(metadata.get("raw_memory_path") or metadata.get("path", ""))
+
+
+def result_graph_facts(result):
+    metadata = result.get("metadata") or {}
+    raw_facts = metadata.get("graph_facts") or []
+    if not isinstance(raw_facts, list):
+        return []
+
+    graph_facts = []
+    seen = set()
+    for raw_fact in raw_facts:
+        if not isinstance(raw_fact, dict):
+            continue
+        fact_text = raw_fact.get("fact_text")
+        if not isinstance(fact_text, str) or not fact_text.strip():
+            continue
+        fact_id = raw_fact.get("fact_id")
+        dedup_key = fact_id if isinstance(fact_id, str) and fact_id else fact_text.strip()
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+        graph_facts.append(
+            {
+                "fact_id": fact_id,
+                "fact_text": fact_text.strip(),
+                "predicate": raw_fact.get("predicate"),
+                "score": raw_fact.get("score"),
+                "subject": raw_fact.get("subject"),
+                "object": raw_fact.get("object"),
+                "valid_from_ms": raw_fact.get("valid_from_ms"),
+                "valid_to_ms": raw_fact.get("valid_to_ms"),
+                "recorded_at_ms": raw_fact.get("recorded_at_ms"),
+            }
+        )
+    return graph_facts
+
+
+def format_timestamp_ms(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        return datetime.fromtimestamp(value / 1000, tz=timezone.utc).isoformat().replace(
+            "+00:00", "Z"
+        )
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def format_graph_fact_validity(graph_fact):
+    valid_from = format_timestamp_ms(graph_fact.get("valid_from_ms"))
+    valid_to = format_timestamp_ms(graph_fact.get("valid_to_ms"))
+    if valid_from is None or valid_to is None:
+        return None
+    if valid_from == valid_to:
+        return f"valid at {valid_from}"
+    return f"valid from {valid_from} to {valid_to}"
+
+
+def format_context_memory(memory):
+    formatted = f"{memory['timestamp']}: {memory['memory']}"
+    graph_facts = memory.get("graph_facts") or []
+    fact_texts = []
+    for graph_fact in graph_facts[:MAX_GRAPH_FACTS_PER_MEMORY]:
+        predicate = graph_fact.get("predicate")
+        fact_text = graph_fact.get("fact_text")
+        if not isinstance(fact_text, str) or not fact_text:
+            continue
+        if isinstance(predicate, str) and predicate:
+            formatted_fact = f"{predicate}: {fact_text}"
+        else:
+            formatted_fact = fact_text
+        validity = format_graph_fact_validity(graph_fact)
+        if validity:
+            formatted_fact += f" [{validity}]"
+        fact_texts.append(formatted_fact)
+    if fact_texts:
+        formatted += "\nMatched graph facts: " + "; ".join(fact_texts)
+    return formatted
 
 
 class Mem0Responses:

@@ -151,6 +151,13 @@ cargo run --quiet --manifest-path Cargo.toml -p memory-pipeline -- \
   `--graph-llm-base-url https://openrouter.ai/api/v1`、
   `--graph-llm-model openai/gpt-4o-mini`。
 
+在 graph `auto` memory-space 模式下，prepared schema 查询使用
+`--graph-memory-space-field` 指定的 filter 字段（默认 `scope_id`），raw top-level-array
+数据使用 `path:$[0]` 这类 path space。单条 `--query` 搜索需要传
+`--filter '{"scope_id":"..."}'`，或者显式指定 memory-space 模式。`--resume --graph-build`
+时，已有 MemoryRecord 不等于 graph 构建完成：已 completed 的 graph run 会跳过，缺失的
+graph run 会补构，failed/running 的 graph run 会明确报错。
+
 示例：
 
 ```bash

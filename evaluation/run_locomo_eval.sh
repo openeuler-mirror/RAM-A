@@ -13,6 +13,8 @@ fi
 
 DATASET="${DATASET:-fixtures/locomo_sample.json}"
 TOP_K="${TOP_K:-30}"
+RESUME="${RESUME:-0}"
+ANSWER_MODEL="${MODEL:-gpt-4o-mini}"
 JUDGE_MODEL="${JUDGE_MODEL:-${MODEL:-gpt-4o-mini}}"
 LLM_API_KEY_ENV="${LLM_API_KEY_ENV:-OPENAI_API_KEY}"
 LLM_BASE_URL="${LLM_BASE_URL:-${OPENAI_BASE_URL:-${OPENAI_API_BASE:-}}}"
@@ -26,6 +28,7 @@ RERANK_INPUT_K="${RERANK_INPUT_K:-40}"
 RERANK_TIMEOUT_MS="${RERANK_TIMEOUT_MS:-}"
 RERANK_FAIL_OPEN="${RERANK_FAIL_OPEN:-0}"
 MEMORY_BENCH_GRAPH="${MEMORY_BENCH_GRAPH:-0}"
+MEMORY_BENCH_SEARCH_MODE="${MEMORY_BENCH_SEARCH_MODE:-hybrid}"
 GRAPH_WEIGHT="${GRAPH_WEIGHT:-0.2}"
 GRAPH_FAIL_OPEN="${GRAPH_FAIL_OPEN:-0}"
 GRAPH_MEMORY_SPACE_MODE="${GRAPH_MEMORY_SPACE_MODE:-auto}"
@@ -61,6 +64,7 @@ MEM0_MAIN_REPORT="${MEM0_DIR}/report.html"
 MEM0_ERROR_REPORT="${MEM0_DIR}/errors.html"
 
 MEMORY_BENCH_STORE="${MEMORY_BENCH_DIR}/store.sqlite"
+MEMORY_BENCH_DATASET="${MEMORY_BENCH_DIR}/prepared.json"
 MEMORY_BENCH_RETRIEVAL="${MEMORY_BENCH_DIR}/search_results.json"
 MEMORY_BENCH_RETRIEVAL_METRICS="${MEMORY_BENCH_DIR}/retrieval_metrics.json"
 MEMORY_BENCH_RETRIEVAL_REPORT="${MEMORY_BENCH_STAGE_REPORT_DIR}/retrieval_report.html"
@@ -85,6 +89,13 @@ case "$RERANK" in
                 MEMORY_BENCH_RERANK_ARGS="$MEMORY_BENCH_RERANK_ARGS --rerank-fail-open"
                 ;;
         esac
+        ;;
+esac
+
+MEMORY_BENCH_ADD_RESUME_ARGS=""
+case "$RESUME" in
+    1|true|TRUE|yes|YES)
+        MEMORY_BENCH_ADD_RESUME_ARGS="--resume"
         ;;
 esac
 
@@ -145,6 +156,27 @@ score_results() {
     stage_done 6 7 "${result_name} metrics"
 }
 
+run_locomo_responses() {
+    case "$LLM_API_KEY_ENV" in
+        ''|*[!A-Za-z0-9_]*)
+            echo "invalid LLM_API_KEY_ENV: $LLM_API_KEY_ENV" >&2
+            exit 1
+            ;;
+    esac
+    response_api_key="$(printenv "$LLM_API_KEY_ENV" || true)"
+    if [ -z "$response_api_key" ]; then
+        echo "missing answer API key: set $LLM_API_KEY_ENV or choose LLM_API_KEY_ENV" >&2
+        exit 1
+    fi
+    if [ -n "$LLM_BASE_URL" ]; then
+        OPENAI_API_KEY="$response_api_key" OPENAI_BASE_URL="$LLM_BASE_URL" MODEL="$ANSWER_MODEL" \
+            python3 locomo/locomo_responses.py "$@"
+    else
+        OPENAI_API_KEY="$response_api_key" MODEL="$ANSWER_MODEL" \
+            python3 locomo/locomo_responses.py "$@"
+    fi
+}
+
 write_meta() {
     backend="$1"
     phase="$2"
@@ -198,7 +230,7 @@ run_mem0() {
     stage_done 3 7 "mem0 retrieval"
 
     stage_start 4 7 "mem0 answer"
-    python3 locomo/locomo_responses.py \
+    run_locomo_responses \
         --technique-type mem0 --input "$MEM0_RETRIEVAL" \
         --output "$MEM0_ANSWERS"
     stage_done 4 7 "mem0 answer"
@@ -211,7 +243,14 @@ run_mem0() {
 }
 
 run_memory_bench() {
-    rm -f "$MEMORY_BENCH_STORE" "$MEMORY_BENCH_RETRIEVAL" "$MEMORY_BENCH_RETRIEVAL_METRICS" "$MEMORY_BENCH_RETRIEVAL_REPORT" "$MEMORY_BENCH_ANSWERS" "$MEMORY_BENCH_SCORES" "$MEMORY_BENCH_METRICS" "$MEMORY_BENCH_REPORT"
+    if [ -z "$MEMORY_BENCH_ADD_RESUME_ARGS" ]; then
+        rm -f "$MEMORY_BENCH_STORE"
+    fi
+    rm -f "$MEMORY_BENCH_RETRIEVAL" "$MEMORY_BENCH_RETRIEVAL_METRICS" "$MEMORY_BENCH_RETRIEVAL_REPORT" "$MEMORY_BENCH_ANSWERS" "$MEMORY_BENCH_SCORES" "$MEMORY_BENCH_METRICS" "$MEMORY_BENCH_REPORT"
+
+    python3 locomo/prepare_memory_bench.py \
+        --dataset "$DATASET" \
+        --output "$MEMORY_BENCH_DATASET"
 
     stage_start 1 7 "RAM-A add"
     cargo run --quiet --manifest-path ../Cargo.toml -p memory-bench -- \
@@ -219,17 +258,17 @@ run_memory_bench() {
         --store-backend sqlite \
         --search-mode hybrid \
         $MEMORY_BENCH_GRAPH_ADD_ARGS \
-        add --dataset "$DATASET" --text-fields text
+        add --dataset "$MEMORY_BENCH_DATASET" $MEMORY_BENCH_ADD_RESUME_ARGS
     stage_done 1 7 "RAM-A add"
 
     stage_start 2 7 "RAM-A search"
     cargo run --quiet --manifest-path ../Cargo.toml -p memory-bench -- \
         --store "$MEMORY_BENCH_STORE" \
         --store-backend sqlite \
-        --search-mode hybrid \
+        --search-mode "$MEMORY_BENCH_SEARCH_MODE" \
         $MEMORY_BENCH_RERANK_ARGS \
         $MEMORY_BENCH_GRAPH_SEARCH_ARGS \
-        search --dataset "$DATASET" --query-fields question --top-k "$TOP_K" \
+        search --dataset "$MEMORY_BENCH_DATASET" --top-k "$TOP_K" \
         --output "$MEMORY_BENCH_RETRIEVAL"
     stage_done 2 7 "RAM-A search"
 
@@ -242,7 +281,7 @@ run_memory_bench() {
     stage_done 3 7 "RAM-A retrieval"
 
     stage_start 4 7 "RAM-A answer"
-    python3 locomo/locomo_responses.py \
+    run_locomo_responses \
         --technique-type memory_bench --dataset "$DATASET" --input "$MEMORY_BENCH_RETRIEVAL" \
         --output "$MEMORY_BENCH_ANSWERS"
     stage_done 4 7 "RAM-A answer"

@@ -216,6 +216,198 @@ async fn llm_graph_extractor_accepts_fenced_json_response() {
 }
 
 #[tokio::test]
+async fn llm_graph_extractor_repairs_evidence_byte_offsets_from_exact_text() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = GraphRepository::open(temp.path().join("graph.sqlite"));
+    let accepted = prepare_record_for_extraction(&repo).await;
+    let invalid_offsets_json = serde_json::json!({
+        "entities": [
+            {
+                "local_id": "entity:alice",
+                "name": "Alice",
+                "entity_type": "PERSON",
+                "confidence": 0.99
+            },
+            {
+                "local_id": "entity:shanghai",
+                "name": "Shanghai",
+                "entity_type": "LOCATION",
+                "confidence": 0.98
+            }
+        ],
+        "facts": [
+            {
+                "local_id": "fact:alice-lives-in-shanghai",
+                "subject_ref": "entity:alice",
+                "predicate": "LIVES_IN",
+                "object_ref": "entity:shanghai",
+                "fact_text": "Alice lives in Shanghai.",
+                "evidence": [
+                    {
+                        "text": "Alice lives in Shanghai.",
+                        "start_byte": 3,
+                        "end_byte": 10
+                    }
+                ],
+                "confidence": 0.97,
+                "valid_from_ms": null,
+                "valid_to_ms": null
+            }
+        ]
+    })
+    .to_string();
+    let extractor = LlmGraphExtractor::new(
+        Arc::new(FakeGraphLlmClient::new(invalid_offsets_json)),
+        GraphTypeRegistry::default(),
+    );
+    let executor = GraphExtractionExecutor::new(
+        repo.clone(),
+        Arc::new(extractor),
+        GraphTypeRegistry::default(),
+    );
+
+    let extraction_run = executor
+        .process_extraction_stage(&accepted.ingestion_run_id)
+        .await
+        .expect("exact evidence text should repair byte offsets");
+
+    let stored = repo
+        .get_extraction_run(&extraction_run.id, "space-a")
+        .await
+        .unwrap();
+    let output = stored.structured_output.unwrap();
+    let evidence = &output["facts"][0]["evidence"][0];
+    assert_eq!(evidence["start_byte"], 0);
+    assert_eq!(evidence["end_byte"], 24);
+}
+
+#[tokio::test]
+async fn llm_graph_extractor_drops_facts_with_missing_entity_refs() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = GraphRepository::open(temp.path().join("graph.sqlite"));
+    let accepted = prepare_record_for_extraction(&repo).await;
+    let missing_ref_json = serde_json::json!({
+        "entities": [
+            {
+                "local_id": "entity:alice",
+                "name": "Alice",
+                "entity_type": "PERSON",
+                "confidence": 0.99
+            }
+        ],
+        "facts": [
+            {
+                "local_id": "fact:alice-lives-in-shanghai",
+                "subject_ref": "entity:alice",
+                "predicate": "LIVES_IN",
+                "object_ref": "entity:shanghai",
+                "fact_text": "Alice lives in Shanghai.",
+                "evidence": [
+                    {
+                        "text": "Alice lives in Shanghai.",
+                        "start_byte": 0,
+                        "end_byte": 24
+                    }
+                ],
+                "confidence": 0.97,
+                "valid_from_ms": null,
+                "valid_to_ms": null
+            }
+        ]
+    })
+    .to_string();
+    let extractor = LlmGraphExtractor::new(
+        Arc::new(FakeGraphLlmClient::new(missing_ref_json)),
+        GraphTypeRegistry::default(),
+    );
+    let executor = GraphExtractionExecutor::new(
+        repo.clone(),
+        Arc::new(extractor),
+        GraphTypeRegistry::default(),
+    );
+
+    let extraction_run = executor
+        .process_extraction_stage(&accepted.ingestion_run_id)
+        .await
+        .expect("missing refs should drop only the invalid fact");
+
+    let stored = repo
+        .get_extraction_run(&extraction_run.id, "space-a")
+        .await
+        .unwrap();
+    assert_eq!(stored.status, "completed");
+    let output = stored.structured_output.unwrap();
+    assert_eq!(output["entities"].as_array().unwrap().len(), 1);
+    assert_eq!(output["facts"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn llm_graph_extractor_drops_facts_with_ungrounded_evidence_text() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = GraphRepository::open(temp.path().join("graph.sqlite"));
+    let accepted = prepare_record_for_extraction(&repo).await;
+    let ungrounded_evidence_json = serde_json::json!({
+        "entities": [
+            {
+                "local_id": "entity:alice",
+                "name": "Alice",
+                "entity_type": "PERSON",
+                "confidence": 0.99
+            },
+            {
+                "local_id": "entity:shanghai",
+                "name": "Shanghai",
+                "entity_type": "LOCATION",
+                "confidence": 0.98
+            }
+        ],
+        "facts": [
+            {
+                "local_id": "fact:alice-lives-in-shanghai",
+                "subject_ref": "entity:alice",
+                "predicate": "LIVES_IN",
+                "object_ref": "entity:shanghai",
+                "fact_text": "Alice lives in Shanghai.",
+                "evidence": [
+                    {
+                        "text": "Alice moved to Shanghai.",
+                        "start_byte": 0,
+                        "end_byte": 24
+                    }
+                ],
+                "confidence": 0.97,
+                "valid_from_ms": null,
+                "valid_to_ms": null
+            }
+        ]
+    })
+    .to_string();
+    let extractor = LlmGraphExtractor::new(
+        Arc::new(FakeGraphLlmClient::new(ungrounded_evidence_json)),
+        GraphTypeRegistry::default(),
+    );
+    let executor = GraphExtractionExecutor::new(
+        repo.clone(),
+        Arc::new(extractor),
+        GraphTypeRegistry::default(),
+    );
+
+    let extraction_run = executor
+        .process_extraction_stage(&accepted.ingestion_run_id)
+        .await
+        .expect("ungrounded evidence should drop only the invalid fact");
+
+    let stored = repo
+        .get_extraction_run(&extraction_run.id, "space-a")
+        .await
+        .unwrap();
+    assert_eq!(stored.status, "completed");
+    let output = stored.structured_output.unwrap();
+    assert_eq!(output["entities"].as_array().unwrap().len(), 2);
+    assert_eq!(output["facts"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
 async fn llm_graph_extractor_rejects_invalid_json_response() {
     let extractor = LlmGraphExtractor::new(
         Arc::new(FakeGraphLlmClient::new("not-json")),
@@ -316,7 +508,7 @@ async fn llm_graph_extractor_output_still_goes_through_candidate_validation() {
             {
                 "local_id": "entity:shanghai",
                 "name": "Shanghai",
-                "entity_type": "LOCATION",
+                "entity_type": "PLANET",
                 "confidence": 0.98
             }
         ],
@@ -327,7 +519,13 @@ async fn llm_graph_extractor_output_still_goes_through_candidate_validation() {
                 "predicate": "LIVES_IN",
                 "object_ref": "entity:shanghai",
                 "fact_text": "Alice lives in Shanghai.",
-                "evidence": [],
+                "evidence": [
+                    {
+                        "text": "Alice lives in Shanghai.",
+                        "start_byte": 0,
+                        "end_byte": 24
+                    }
+                ],
                 "confidence": 0.97
             }
         ]

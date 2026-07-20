@@ -157,6 +157,13 @@ valid candidates; inspect `extraction_stats.json` before estimating or comparing
   `--graph-llm-base-url https://openrouter.ai/api/v1`,
   `--graph-llm-model openai/gpt-4o-mini`.
 
+In graph `auto` memory-space mode, prepared-schema queries use the filter field configured by
+`--graph-memory-space-field` (default `scope_id`), and raw top-level-array datasets use path
+spaces such as `path:$[0]`. For one-off `--query` searches, pass `--filter '{"scope_id":"..."}'`
+or use an explicit memory-space mode. During `--resume --graph-build`, existing MemoryRecords are
+not enough to mark graph build complete: completed graph runs are skipped, missing graph runs are
+built, and failed/running graph runs fail explicitly.
+
 Example:
 
 ```bash

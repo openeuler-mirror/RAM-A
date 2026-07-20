@@ -199,6 +199,12 @@ In graph `auto` memory-space mode, prepared-schema datasets use `scope_id`, whil
 top-level-array datasets use the top-level JSON path such as `path:$[0]`. Keep graph and
 baseline runs in separate SQLite files when comparing scores.
 
+For ad-hoc graph search with `--query`, pass the memory space through `--filter`, for example
+`--filter '{"scope_id":"scope-a"}'`; otherwise no graph memory space can be inferred from the
+single query path. With `--resume --graph-build`, existing MemoryRecords are still checked for
+graph build: completed graph runs are skipped, missing graph runs are built, and failed/running
+graph runs fail explicitly instead of being treated as successful.
+
 Do not commit API keys, local stores, downloaded datasets, or generated reports.
 
 ## RAM-A memory MCP service

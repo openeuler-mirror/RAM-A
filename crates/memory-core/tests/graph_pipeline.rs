@@ -123,3 +123,49 @@ async fn graph_build_pipeline_materializes_queryable_graph() {
         "Alice lives in Shanghai."
     );
 }
+
+#[tokio::test]
+async fn graph_build_pipeline_skips_completed_idempotent_memory() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let db_path = temp.path().join("graph.sqlite");
+    let repository = GraphRepository::open(&db_path);
+    let registry = GraphTypeRegistry::new_default();
+    let pipeline = GraphBuildPipeline::new(
+        repository.clone(),
+        Arc::new(HashEmbedding::new(8)),
+        Arc::new(LivesInExtractor),
+        registry,
+    );
+
+    let request = GraphAddMemoryRequest {
+        memory_space_id: "scope-a".to_string(),
+        owner_id: "benchmark".to_string(),
+        idempotency_key: "record-1".to_string(),
+        text: "Alice lives in Shanghai.".to_string(),
+        metadata: serde_json::json!({
+            "scope_id": "scope-a",
+            "path": "$[0].conversation.session_1[0].text"
+        }),
+        session_id: None,
+        session_sequence: None,
+        source_kind: "benchmark".to_string(),
+        source_ref: Some("record-1".to_string()),
+        content_role: "message".to_string(),
+        created_by_agent_id: None,
+        observed_at_ms: None,
+    };
+
+    pipeline
+        .build_memory(request.clone())
+        .await
+        .expect("first graph build");
+    assert_eq!(repository.count_facts("scope-a").await.unwrap(), 1);
+
+    let repeated = pipeline
+        .build_memory_if_needed(request)
+        .await
+        .expect("repeated graph build should be idempotent");
+
+    assert!(repeated.is_none());
+    assert_eq!(repository.count_facts("scope-a").await.unwrap(), 1);
+}
