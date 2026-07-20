@@ -94,6 +94,56 @@ Shell 脚本自动运行完整 7 阶段流水线。
 
 可选的 mem0 对比实现位于 `evaluation/locomo/backends/mem0/`。
 
+## 有证据约束的原子记忆 A/B
+
+`run_locomo_memory_ab.sh` 用于评估记忆特性 2 和 4，不改变 answer prompt。配对实验包含两个 arm：
+
+```text
+raw：       LoCoMo turn -> prepared-v1 -> 索引原始 turn -> 回答
+extracted： LoCoMo turn -> episode/window -> 有证据约束的原子记忆
+             -> 只索引原子记忆 -> evidence_refs 展开为精确原文 -> 回答
+```
+
+Treatment 不会把原始 turn 和原子记忆共同写入索引。原始 turn 只保存在
+`raw_prepared.json` 中，供命中的 atomic claim 展开 speaker、timestamp、quote
+和完整 source text。
+
+请使用新轮换的 OpenRouter key，不要把真实 key 写入命令、README、artifact 或 commit：
+
+```bash
+cd evaluation
+export OPENROUTER_API_KEY="<new-rotated-key>"
+
+PYTHON_BIN=../.venv/bin/python \
+PHASE=pilot RUN_DIR=outputs/locomo-memory-ab/pilot \
+./run_locomo_memory_ab.sh
+
+PYTHON_BIN=../.venv/bin/python \
+PHASE=full \
+FROZEN_CONFIG=outputs/locomo-memory-ab/pilot/frozen_config.json \
+RUN_DIR=outputs/locomo-memory-ab/full \
+./run_locomo_memory_ab.sh
+```
+
+Pilot 固定使用 conversation index 0。Pilot 通过后会把 model、window、retrieval
+和 rerank 配置冻结到 `frozen_config.json`；full run 会在任何模型调用前拒绝配置
+不一致。固定模型为：extraction、grounding、answer、judge 均使用
+`openai/gpt-4o-mini`；embedding 使用 1,024 维 `baai/bge-m3`；rerank 使用
+`cohere/rerank-v3.5`。Hybrid 权重为 0.7/0.3，candidate K 为 150，rerank input K
+为 40，最终 Top K 为 30。
+
+每个 arm 都保存 `config.json`、prepared input、SQLite store、search result、
+retrieval diagnostics、response、judge result、QA metric、HTML report、逐 query
+版本化 cache，以及 `stages/*.complete.json`。Treatment 还在 `artifacts/` 中保存
+normalized message、episode、window、accepted/rejected/quarantined memory 和 extraction
+健康指标。只有 source、configuration、command 和 output hash 全部匹配才允许 resume。
+
+历史 v3 overall 门槛为 0.4065；category 1–4 的下限依次为 0.1999、0.4161、
+0.2717、0.4509。可晋级的 full treatment 必须同时严格超过 0.4065 和 fresh paired
+raw，包含恰好 1,540 个计分问题，满足全部 category 下限，并通过完整 Python、Rust、
+shell 和离线 smoke 回归。如果任一检查失败，接入代码必须保持未提交，通过
+`comparison.html` 和 pipeline artifact 诊断，也不能把该结果登记为新 baseline。
+
 ## 流水线阶段
 
 ```
@@ -159,6 +209,7 @@ ram-a/  （或 mem0/）
 - 第 5 类（对抗性/不可回答）问题不计入主 QA 分数；如要评估它，需要单独设计拒答/不可回答 rubric
 - mem0 检索产出简化报告（缺少轮次路径，无法计算命中指标）
 - Shell 脚本会清除上一次输出；使用不同 `RUN_ID` 保留历史结果
+- 原子记忆 runner 不会清理输出；它只 resume hash 完全匹配的 stage
 
 ## 参考文献
 

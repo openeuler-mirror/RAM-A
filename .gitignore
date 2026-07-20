@@ -6,6 +6,8 @@
 /dataset/
 /dataset/longmemeval/
 /outputs/
+/evaluation/outputs/
+/history/
 /artifacts/
 /evaluation/results/
 /evaluation/scripts/locomo/src/
@@ -13,6 +15,7 @@
 .env.*
 __pycache__/
 *.pyc
+/.venv/
 evaluation/.venv/
 evaluation/venv/
 /AI_CONTEXT.md

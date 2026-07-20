@@ -85,6 +85,67 @@ python3 evaluation/longmemeval/run.py \
 cd evaluation && ./run_locomo_eval.sh memory_bench
 ```
 
+## Grounded Memory Preparation (Features 2 and 4)
+
+Dataset adapters first produce raw `benchmark-prepared-v1` conversation records. The
+memory pipeline then groups messages into episodes, creates candidate-owned extraction
+windows with optional overlapping context, extracts atomic memories, validates exact
+source quotes, and promotes only memories whose grounding result is `SUPPORTED`.
+
+Create a raw prepared file with an existing adapter. For example:
+
+```bash
+# PersonaMem (after downloading the official files)
+python evaluation/personalmem/run.py prepare \
+  --size 32k \
+  --schema-version benchmark-prepared-v1 \
+  --prepared-dataset outputs/personalmem/raw-prepared.json
+
+# LongMemEval
+PYTHONPATH=evaluation python -c \
+  'from longmemeval.preprocess import preprocess; preprocess("data/longmemeval/longmemeval_oracle.json", "outputs/longmemeval/raw-prepared.json")'
+```
+
+Run extraction and independent grounding verification with any OpenAI-compatible chat
+endpoint:
+
+```bash
+PYTHONPATH=evaluation python -m common.memory_pipeline.cli \
+  --input outputs/longmemeval/raw-prepared.json \
+  --output outputs/longmemeval/extracted-prepared.json \
+  --artifacts-dir outputs/longmemeval/memory-pipeline \
+  --model openai/gpt-4o-mini \
+  --verifier-model openai/gpt-4o-mini \
+  --api-key-env OPENROUTER_API_KEY \
+  --cache-dir outputs/longmemeval/memory-pipeline-cache
+```
+
+Use `extracted-prepared.json` as the input to the existing add/search path. Its records
+use `metadata.memory_kind=extracted_memory`; no Rust memory schema or search behavior
+changes are required. The artifact directory contains normalized messages, episodes,
+extraction windows, raw candidates, accepted memories, rejected/quarantined records,
+token/cache statistics, and deterministic run metadata. Episodes and windows are audit
+and extraction units, not records to embed or index. Only the accepted memories in the
+output prepared file are indexed.
+
+Offline fixture mode replaces both model calls with JSON response maps:
+
+```bash
+PYTHONPATH=evaluation python -m common.memory_pipeline.cli \
+  --input outputs/longmemeval/raw-prepared.json \
+  --output /tmp/extracted-prepared.json \
+  --artifacts-dir /tmp/memory-pipeline \
+  --extractor-responses /tmp/extraction-responses.json \
+  --grounding-responses /tmp/grounding-responses.json
+```
+
+The extraction map is keyed by deterministic window ID and each value is an
+`atomic_memory_v1` response object. The grounding map is keyed by deterministic
+candidate-memory ID and each value is a grounding status or `{status, reason}` object.
+Both files are required: the CLI never promotes unverified memories. Live mode makes
+one extraction call per uncached window and one verification call per window containing
+valid candidates; inspect `extraction_stats.json` before estimating or comparing cost.
+
 ## Output
 
 All evaluation runs write to repository-root `outputs/<dataset>/<timestamp>/` by default, containing:

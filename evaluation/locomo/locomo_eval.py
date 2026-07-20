@@ -17,6 +17,7 @@ EVALUATION_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(EVALUATION_ROOT))
 
 from common.llm_client import OpenAICompatibleClient
+from common.memory_pipeline.cache import JsonCache
 
 try:
     from .prompts import ACCURACY_PROMPT
@@ -36,6 +37,7 @@ DEFAULT_LLM_API_KEY_ENV = "OPENAI_API_KEY"
 DEFAULT_LLM_BASE_URL = "https://api.openai.com/v1"
 MAX_JUDGE_ATTEMPTS = 8
 ANSWER_STAT_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens", "response_time")
+JUDGE_PROMPT_VERSION = "locomo_accuracy_v1"
 
 
 def progress_interval(total):
@@ -166,8 +168,32 @@ def evaluate_llm_judge(
     judge_client,
     judge_model,
     max_judge_attempts=MAX_JUDGE_ATTEMPTS,
+    cache=None,
+    query_id=None,
 ):
     """Evaluate the generated answer against the gold answer using an LLM judge."""
+    return _evaluate_llm_judge_details(
+        question,
+        gold_answer,
+        generated_answer,
+        judge_client,
+        judge_model,
+        max_judge_attempts=max_judge_attempts,
+        cache=cache,
+        query_id=query_id,
+    )["llm_score"]
+
+
+def _evaluate_llm_judge_details(
+    question,
+    gold_answer,
+    generated_answer,
+    judge_client,
+    judge_model,
+    max_judge_attempts=MAX_JUDGE_ATTEMPTS,
+    cache=None,
+    query_id=None,
+):
     messages = [
         {
             "role": "user",
@@ -176,6 +202,18 @@ def evaluate_llm_judge(
             ),
         }
     ]
+    cache_key = [
+        JUDGE_PROMPT_VERSION,
+        query_id,
+        question,
+        gold_answer,
+        generated_answer,
+        judge_model,
+        0.0,
+    ]
+    cached = cache.get("locomo-judge", cache_key) if cache is not None else None
+    if cached is not None:
+        return dict(cached)
 
     for attempt in range(1, max_judge_attempts + 1):
         try:
@@ -185,7 +223,17 @@ def evaluate_llm_judge(
                 temperature=0.0,
             )
             label = _parse_label(_get_response_content(response, judge_model))
-            return 1 if label == "CORRECT" else 0
+            score = 1 if label == "CORRECT" else 0
+            details = {
+                "llm_score": score,
+                "judge_prompt_tokens": int(getattr(response, "prompt_tokens", 0) or 0),
+                "judge_completion_tokens": int(getattr(response, "completion_tokens", 0) or 0),
+                "judge_total_tokens": int(getattr(response, "total_tokens", 0) or 0),
+                "judge_latency_ms": float(getattr(response, "latency_ms", 0.0) or 0.0),
+            }
+            if cache is not None:
+                cache.put("locomo-judge", cache_key, details)
+            return details
         except (RuntimeError, ValueError) as exc:
             if attempt == max_judge_attempts:
                 raise
@@ -199,11 +247,17 @@ def _retry_sleep(attempt, exc, max_judge_attempts):
     time.sleep(retry_delay)
 
 
-def process_item(item_data, judge_client, judge_model, max_judge_attempts=MAX_JUDGE_ATTEMPTS):
+def process_item(
+    item_data,
+    judge_client,
+    judge_model,
+    max_judge_attempts=MAX_JUDGE_ATTEMPTS,
+    cache=None,
+):
     k, v = item_data
     local_results = defaultdict(list)
 
-    for item in v:
+    for item_index, item in enumerate(v):
         gt_answer = str(item["answer"])
         pred_answer = str(item["response"])
         category = str(item["category"])
@@ -217,13 +271,15 @@ def process_item(item_data, judge_client, judge_model, max_judge_attempts=MAX_JU
 
         bleu_score = calculate_bleu_score(pred_answer, gt_answer)
         f1_score = calculate_f1_score(pred_answer, gt_answer)
-        llm_score = evaluate_llm_judge(
+        judge_details = _evaluate_llm_judge_details(
             question,
             gt_answer,
             pred_answer,
             judge_client=judge_client,
             judge_model=judge_model,
             max_judge_attempts=max_judge_attempts,
+            cache=cache,
+            query_id=item.get("query_id") or f"{k}:{item_index}",
         )
 
         result = {
@@ -233,8 +289,10 @@ def process_item(item_data, judge_client, judge_model, max_judge_attempts=MAX_JU
             "category": category,
             "bleu_score": bleu_score,
             "f1_score": f1_score,
-            "llm_score": llm_score,
+            **judge_details,
         }
+        if item.get("query_id") is not None:
+            result["query_id"] = item["query_id"]
         for field in ANSWER_STAT_FIELDS:
             if field in item:
                 result[field] = item[field]
@@ -250,6 +308,7 @@ def evaluate_locomo_judge(
     max_workers=10,
     max_judge_attempts=MAX_JUDGE_ATTEMPTS,
     show_progress=True,
+    cache=None,
 ):
     if max_workers < 1:
         raise ValueError("--max-workers must be at least 1")
@@ -265,6 +324,7 @@ def evaluate_locomo_judge(
                 judge_client,
                 judge_model,
                 max_judge_attempts,
+                cache,
             )
             for item_data in data.items()
         ]
@@ -309,6 +369,7 @@ def load_and_evaluate_locomo(
     max_workers=10,
     max_judge_attempts=MAX_JUDGE_ATTEMPTS,
     show_progress=True,
+    cache=None,
 ):
     with Path(input_path).open("r", encoding="utf-8") as f:
         data = json.load(f)
@@ -320,6 +381,7 @@ def load_and_evaluate_locomo(
         max_workers=max_workers,
         max_judge_attempts=max_judge_attempts,
         show_progress=show_progress,
+        cache=cache,
     )
 
     output_path = Path(output_path)
@@ -367,6 +429,8 @@ def main():
         default="default",
     )
     parser.add_argument("--max-workers", type=int, default=10, help="Maximum number of worker threads")
+    parser.add_argument("--cache-dir", type=Path)
+    parser.add_argument("--cache-version", default="locomo-judge-v1")
 
     args = parser.parse_args()
 
@@ -375,12 +439,18 @@ def main():
         llm_base_url=args.llm_base_url or default_llm_base_url(),
         llm_thinking=None if args.llm_thinking == "default" else args.llm_thinking,
     )
+    cache = (
+        JsonCache(args.cache_dir, version=args.cache_version)
+        if args.cache_dir is not None
+        else None
+    )
     load_and_evaluate_locomo(
         input_path=args.input,
         output_path=args.output,
         judge_client=judge_client,
         judge_model=args.judge_model,
         max_workers=args.max_workers,
+        cache=cache,
     )
 
 

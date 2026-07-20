@@ -7,6 +7,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from common.llm_client import ChatResult
+from common.memory_pipeline.cache import JsonCache
 from locomo.locomo_eval import evaluate_llm_judge, load_and_evaluate_locomo, process_item, _parse_label
 
 
@@ -100,8 +101,14 @@ def test_process_item_preserves_output_schema_and_skips_category_five():
         "completion_tokens",
         "total_tokens",
         "response_time",
+        "judge_prompt_tokens",
+        "judge_completion_tokens",
+        "judge_total_tokens",
+        "judge_latency_ms",
     }
     assert scored[0]["llm_score"] == 0
+    assert scored[0]["judge_total_tokens"] == 12
+    assert scored[0]["judge_latency_ms"] == 5.0
     assert judge_client.calls[0]["model"] == "judge-model"
 
 
@@ -140,3 +147,37 @@ def test_load_and_evaluate_locomo_writes_original_result_shape(tmp_path):
     assert saved["conversation-1"][0]["response"] == "notebooks"
     assert saved["conversation-1"][0]["category"] == "2"
     assert saved["conversation-1"][0]["llm_score"] == 1
+
+
+def test_judge_cache_reuses_completed_query_and_preserves_identity(tmp_path):
+    judge_client = FakeJudgeClient(['{"label": "CORRECT"}'])
+    cache = JsonCache(tmp_path / "cache", version="judge-test-v1")
+    item = (
+        "0",
+        [
+            {
+                "query_id": "S0:Q0",
+                "question": "Where?",
+                "answer": "There",
+                "response": "There",
+                "category": 1,
+            }
+        ],
+    )
+
+    first = process_item(
+        item,
+        judge_client,
+        "openai/gpt-4o-mini",
+        cache=cache,
+    )
+    second = process_item(
+        item,
+        judge_client,
+        "openai/gpt-4o-mini",
+        cache=cache,
+    )
+
+    assert first == second
+    assert len(judge_client.calls) == 1
+    assert first["0"][0]["query_id"] == "S0:Q0"

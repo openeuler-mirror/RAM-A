@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{MemoryError, MemoryResult, RerankConfig, ScoredMemory};
 
-const RERANK_MAX_ATTEMPTS: usize = 5;
+const RERANK_MAX_ATTEMPTS: usize = 8;
 
 fn retry_backoff(attempt: usize) -> Duration {
     Duration::from_secs(1 << (attempt - 1))
@@ -260,6 +260,12 @@ fn preview_body(body: &str) -> String {
 mod tests {
     use super::*;
     use crate::MemoryRecord;
+
+    #[test]
+    fn retry_budget_covers_extended_network_outages() {
+        assert_eq!(RERANK_MAX_ATTEMPTS, 8);
+        assert_eq!(retry_backoff(7), Duration::from_secs(64));
+    }
 
     fn candidate(id: &str) -> ScoredMemory {
         ScoredMemory {

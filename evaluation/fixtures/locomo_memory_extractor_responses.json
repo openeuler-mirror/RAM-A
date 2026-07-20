@@ -1,0 +1,68 @@
+{
+  "window-12ad7eb7a13bd10e8ebbf088": {
+    "memories": [
+      {
+        "attributes": {
+          "location": "library"
+        },
+        "event_time": {
+          "precision": "day",
+          "raw": "Tomorrow morning"
+        },
+        "evidence": [
+          {
+            "evidence_role": "primary",
+            "message_id": "S0:D2:0",
+            "quote": "Tomorrow morning I am meeting Priya at the library"
+          }
+        ],
+        "memory_type": "event",
+        "modality": "planned",
+        "model_confidence": 0.99,
+        "object": {
+          "name": "Priya",
+          "type": "person"
+        },
+        "predicate": "plans_to_meet",
+        "subject": {
+          "name": "Alex",
+          "source_speaker": "Alex"
+        },
+        "text": "Alex plans to meet Priya at the library tomorrow morning."
+      }
+    ],
+    "schema_version": "atomic_memory_v1"
+  },
+  "window-c8db0b25298f8eab243cfded": {
+    "memories": [
+      {
+        "attributes": {
+          "color": "blue",
+          "location": "kitchen table"
+        },
+        "event_time": null,
+        "evidence": [
+          {
+            "evidence_role": "primary",
+            "message_id": "S0:D1:0",
+            "quote": "I left my blue notebook on the kitchen table"
+          }
+        ],
+        "memory_type": "event",
+        "modality": "asserted",
+        "model_confidence": 0.99,
+        "object": {
+          "name": "blue notebook",
+          "type": "object"
+        },
+        "predicate": "left_on_kitchen_table",
+        "subject": {
+          "name": "Alex",
+          "source_speaker": "Alex"
+        },
+        "text": "Alex left a blue notebook on the kitchen table."
+      }
+    ],
+    "schema_version": "atomic_memory_v1"
+  }
+}

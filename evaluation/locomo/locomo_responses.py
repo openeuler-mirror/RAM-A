@@ -14,6 +14,12 @@ from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 from prompts import ANSWER_PROMPT
 from tqdm import tqdm
 
+EVALUATION_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(EVALUATION_ROOT))
+
+from common.memory_pipeline.cache import JsonCache
+from locomo.locomo_provenance import query_ref, render_contexts
+
 load_dotenv(".env")
 
 RESULT_PATH_RE = re.compile(
@@ -103,6 +109,7 @@ class ResponseClient:
         )
         self.model = os.getenv("MODEL", "gpt-4o-mini")
         self.max_attempts = 8
+        self.max_tokens = int(os.getenv("ANSWER_MAX_TOKENS", "512"))
 
     def answer(self, speaker_1_user_id, speaker_2_user_id, speaker_1_memories, speaker_2_memories, question):
         prompt = Template(ANSWER_PROMPT).render(
@@ -119,6 +126,7 @@ class ResponseClient:
                     model=self.model,
                     messages=[{"role": "system", "content": prompt}],
                     temperature=0.0,
+                    max_tokens=self.max_tokens,
                 )
                 return (
                     completion.choices[0].message.content or "",
@@ -236,6 +244,141 @@ class MemoryBenchResponses:
         return answers
 
 
+class PreparedMemoryResponses:
+    """Answer LoCoMo queries from prepared raw or extracted memory results."""
+
+    def __init__(self, mode, responder=None, cache=None):
+        if mode not in {"raw", "extracted"}:
+            raise ValueError(f"unsupported memory mode: {mode}")
+        self.mode = mode
+        self.responder = responder or ResponseClient()
+        self.cache = cache
+
+    def answer_question(self, dataset, prepared_source, query_output):
+        ref = query_ref(query_output)
+        question = dataset[ref.sample_index]["qa"][ref.question_index]
+        conversation = dataset[ref.sample_index]["conversation"]
+        speaker_a = conversation["speaker_a"]
+        speaker_b = conversation["speaker_b"]
+        contexts = render_contexts(
+            dataset,
+            prepared_source,
+            query_output,
+            self.mode,
+        )
+        query_id = query_output["query_id"]
+        response = ""
+        response_time = 0.0
+        token_usage = {}
+
+        if int(question.get("category", -1)) != 5:
+            cache_key = [
+                "locomo_answer_v1",
+                self.mode,
+                query_id,
+                contexts,
+                question.get("question", ""),
+                self.responder.model,
+                0.0,
+            ]
+            cached = (
+                self.cache.get("locomo-answer", cache_key)
+                if self.cache is not None
+                else None
+            )
+            if cached is not None:
+                response = str(cached["response"])
+                response_time = float(cached["response_time"])
+                token_usage = dict(cached["usage"])
+            else:
+                response, response_time, token_usage = self.responder.answer(
+                    speaker_a,
+                    speaker_b,
+                    [
+                        f"{memory['timestamp']}: {memory['memory']}"
+                        for memory in contexts[speaker_a]
+                    ],
+                    [
+                        f"{memory['timestamp']}: {memory['memory']}"
+                        for memory in contexts[speaker_b]
+                    ],
+                    question.get("question", ""),
+                )
+                if self.cache is not None:
+                    self.cache.put(
+                        "locomo-answer",
+                        cache_key,
+                        {
+                            "response": response,
+                            "response_time": response_time,
+                            "usage": token_usage,
+                        },
+                    )
+
+        answer = _answer_record(
+            query_id,
+            question,
+            contexts,
+            speaker_a,
+            speaker_b,
+            response,
+            response_time,
+            token_usage,
+        )
+        return ref.sample_index, answer
+
+    def generate(self, dataset, prepared_source, search_results):
+        answers = defaultdict(list)
+        total = len(search_results)
+        interval = progress_interval(total)
+        started = time.monotonic()
+        print(f"[answer] started | total={total}")
+        iterator = progress_iter(search_results, total, "Answering LoCoMo queries")
+        for index, query_output in enumerate(iterator, start=1):
+            sample_index, answer = self.answer_question(
+                dataset,
+                prepared_source,
+                query_output,
+            )
+            answers[str(sample_index)].append(answer)
+            if not sys.stderr.isatty() and should_log_progress(index, total, interval):
+                print(
+                    f"[answer] {index}/{total} done | "
+                    f"elapsed={elapsed_seconds(started):.1f}s",
+                    flush=True,
+                )
+        return answers
+
+
+def _answer_record(
+    query_id,
+    question,
+    contexts,
+    speaker_a,
+    speaker_b,
+    response,
+    response_time,
+    token_usage,
+):
+    answer = {
+        "query_id": query_id,
+        "question": question.get("question", ""),
+        "answer": question.get("answer", ""),
+        "category": question.get("category", -1),
+        "evidence": question.get("evidence", []),
+        "response": response,
+        "speaker_1_memories": contexts[speaker_a],
+        "speaker_2_memories": contexts[speaker_b],
+        "num_speaker_1_memories": len(contexts[speaker_a]),
+        "num_speaker_2_memories": len(contexts[speaker_b]),
+        "speaker_1_graph_memories": None,
+        "speaker_2_graph_memories": None,
+        "response_time": response_time,
+    }
+    add_token_usage(answer, token_usage)
+    return answer
+
+
 class Mem0Responses:
     def __init__(self):
         self.responder = ResponseClient()
@@ -272,11 +415,19 @@ def main():
     parser = argparse.ArgumentParser(description="Generate responses from LoCoMo retrieval results.")
     parser.add_argument(
         "--technique-type",
-        choices=("memory_bench", "mem0"),
+        choices=("memory_bench", "mem0", "prepared_memory"),
         required=True,
         help="Retrieval result format to process.",
     )
     parser.add_argument("--dataset", type=Path, help="LoCoMo dataset file.")
+    parser.add_argument(
+        "--prepared-source",
+        type=Path,
+        help="Raw benchmark-prepared-v1 source used for provenance expansion.",
+    )
+    parser.add_argument("--memory-mode", choices=("raw", "extracted"))
+    parser.add_argument("--cache-dir", type=Path)
+    parser.add_argument("--cache-version", default="locomo-answer-v1")
     parser.add_argument(
         "--input",
         type=Path,
@@ -291,14 +442,34 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.technique_type == "memory_bench" and args.dataset is None:
-        parser.error("--dataset is required when --technique-type memory_bench")
+    if args.technique_type in {"memory_bench", "prepared_memory"} and args.dataset is None:
+        parser.error(f"--dataset is required when --technique-type {args.technique_type}")
+    if args.technique_type == "prepared_memory":
+        if args.prepared_source is None or args.memory_mode is None:
+            parser.error(
+                "--prepared-source and --memory-mode are required when "
+                "--technique-type prepared_memory"
+            )
 
     with args.input.open("r", encoding="utf-8") as source:
         search_results = json.load(source)
 
     if args.technique_type == "mem0":
         answers = Mem0Responses().generate(search_results)
+    elif args.technique_type == "prepared_memory":
+        dataset = json.loads(args.dataset.read_text(encoding="utf-8"))
+        prepared_source = json.loads(
+            args.prepared_source.read_text(encoding="utf-8")
+        )
+        cache = (
+            JsonCache(args.cache_dir, version=args.cache_version)
+            if args.cache_dir is not None
+            else None
+        )
+        answers = PreparedMemoryResponses(
+            args.memory_mode,
+            cache=cache,
+        ).generate(dataset, prepared_source, search_results)
     elif args.technique_type == "memory_bench":
         answers = MemoryBenchResponses().generate(args.dataset, search_results)
     else:
