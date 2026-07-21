@@ -83,6 +83,7 @@ impl GraphExtractor for FixedExtractor {
                     end_byte: Some(end),
                 }],
                 confidence: Some(0.97),
+                temporal_expression: None,
                 valid_from_ms: None,
                 valid_to_ms: None,
             }],
@@ -163,6 +164,7 @@ impl GraphExtractor for InvalidExtractor {
                 fact_text: "Alice lives in Shanghai.".to_string(),
                 evidence: vec![],
                 confidence: Some(0.97),
+                temporal_expression: None,
                 valid_from_ms: None,
                 valid_to_ms: None,
             }],
@@ -266,6 +268,7 @@ fn valid_output_with_evidence(evidence: Vec<GraphEvidenceSpan>) -> GraphExtracti
             fact_text: "Alice lives in Shanghai.".to_string(),
             evidence,
             confidence: Some(0.97),
+            temporal_expression: None,
             valid_from_ms: None,
             valid_to_ms: None,
         }],
@@ -520,7 +523,7 @@ fn extraction_validation_rejects_invalid_candidate_structure() {
     assert_invalid_output(duplicate_fact, record_text, "duplicate fact local_id");
 
     let mut unknown_predicate = valid_output_with_evidence(grounded_evidence.clone());
-    unknown_predicate.facts[0].predicate = "WORKS_AT".to_string();
+    unknown_predicate.facts[0].predicate = "UNKNOWN_PREDICATE".to_string();
     assert_invalid_output(unknown_predicate, record_text, "unknown predicate");
 
     let mut invalid_validity = valid_output_with_evidence(grounded_evidence.clone());

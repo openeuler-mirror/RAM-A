@@ -84,6 +84,7 @@ impl GraphExtractor for FixedExtractor {
                     end_byte: Some(end),
                 }],
                 confidence: Some(0.97),
+                temporal_expression: None,
                 valid_from_ms: None,
                 valid_to_ms: None,
             }],

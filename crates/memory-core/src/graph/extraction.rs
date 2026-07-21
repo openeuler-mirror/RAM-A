@@ -47,6 +47,8 @@ pub struct ExtractedFactCandidate {
     pub fact_text: String,
     pub evidence: Vec<GraphEvidenceSpan>,
     pub confidence: Option<f32>,
+    #[serde(default)]
+    pub temporal_expression: Option<String>,
     pub valid_from_ms: Option<u64>,
     pub valid_to_ms: Option<u64>,
 }
@@ -115,6 +117,15 @@ impl GraphExtractionOutput {
                     "fact '{}' must include at least one evidence",
                     fact.local_id
                 ));
+            }
+            if let Some(temporal_expression) = fact.temporal_expression.as_deref() {
+                validate_non_empty("fact.temporal_expression", temporal_expression)?;
+                if !record_text.contains(temporal_expression) {
+                    return invalid_output(format!(
+                        "fact '{}' temporal_expression is not grounded in record text",
+                        fact.local_id
+                    ));
+                }
             }
             if let (Some(valid_from), Some(valid_to)) = (fact.valid_from_ms, fact.valid_to_ms) {
                 if valid_from > valid_to {

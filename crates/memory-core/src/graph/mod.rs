@@ -22,7 +22,7 @@ pub use llm::{
 pub(crate) use normalize::normalize_graph_text;
 pub use normalize::{stable_input_hash, GraphInputHashFields};
 pub use pipeline::{GraphBuildPipeline, GraphBuildResult};
-pub use registry::{GraphPredicate, GraphTypeRegistry};
+pub use registry::{GraphPredicate, GraphTypeRegistry, GRAPH_FALLBACK_PREDICATE};
 pub use resolution::{
     GraphResolutionExecutor, GraphResolutionResult, GRAPH_RESOLVER_VERSION,
     RESOLUTION_FAILED_ERROR_CODE, RESOLUTION_STORE_FAILED_ERROR_CODE,

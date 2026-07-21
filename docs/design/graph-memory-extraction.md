@@ -64,10 +64,15 @@ evidence 不能定位到原文，adapter 会在校验前丢弃该 fact，而不�
 抽取失败。非 LLM adapter 直接产出的候选仍会被第 4 节严格校验。
 
 LLM 生成的 fact endpoint 也不作为可信来源。如果某个 fact 的 `subject_ref` /
-`object_ref` 没有指向本次输出中的 entity，或 predicate 不在当前 registry 中，adapter
-会在校验前丢弃该 fact，而不是合成缺失 entity。这样可以避免把类型不确定的实体写入图，
-同时保留同一 record 中其它可物化的候选。被丢弃的 fact 数量会写入 stderr，便于
-benchmark 跑批时观察 LLM 输出质量。
+`object_ref` 没有指向本次输出中的 entity，adapter 会在校验前丢弃该 fact，而不是
+合成缺失 entity。这样可以避免把类型不确定的实体写入图，同时保留同一 record 中其它
+可物化的候选。被丢弃的 fact 数量会写入 stderr，便于 benchmark 跑批时观察 LLM
+输出质量。
+
+如果 fact 的端点完整、evidence grounded，但 predicate 不在当前 registry 中，adapter
+会把 predicate 降级为 fallback `RELATED_TO`，而不是直接丢弃该 fact。这样默认 registry
+没有完全覆盖某个领域时，系统仍能保留有证据的图关系；后续可以通过更具体的 domain
+registry 或 resolution 策略再精化。
 
 `OpenAiCompatibleGraphLlmClient` 调用 `/chat/completions`，设置
 `response_format={"type":"json_object"}`，并记录 provider 返回的 token usage。若模型
@@ -100,14 +105,19 @@ benchmark 对比或正式图写入。
 | --- | --- |
 | `local_id` | 本次抽取输出内的局部事实 ID。 |
 | `subject_ref` / `object_ref` | 指向本次输出中的实体 `local_id`。 |
-| `predicate` | 来自 `GraphTypeRegistry` 的 predicate。 |
+| `predicate` | 来自 `GraphTypeRegistry` 的 predicate；未知 predicate 会在 LLM adapter 层降级为 `RELATED_TO`。 |
 | `fact_text` | 事实文本。 |
 | `evidence` | 指向原文的证据 span。`start_byte` / `end_byte` 是 UTF-8 字节偏移，不是字符索引。 |
 | `confidence` | 可选置信度，范围为 0 到 1。 |
+| `temporal_expression` | 可选的原文时间表达式，必须是 record text 的精确子串。 |
 | `valid_from_ms` / `valid_to_ms` | 可选有效时间区间。 |
 
 `entities` / `facts` 允许为空，表示抽取器判断当前 record 没有可发布给后续
 resolution 的图语义候选。
+
+默认 `GraphTypeRegistry` 覆盖通用长期记忆关系，包括居住、工作、学习、家庭/朋友关系、
+偏好、访问、参加活动、属性和泛化 `RELATED_TO`。它是通用默认值，不是业务完整本体；
+领域系统可以在后续通过配置化 registry 扩展更具体的 entity type / predicate。
 
 ## 4. 候选校验
 
@@ -119,6 +129,7 @@ resolution 的图语义候选。
 - fact 的 `subject_ref` 和 `object_ref` 必须指向本次输出中的 entity；
 - predicate 必须存在于 `GraphTypeRegistry`；
 - confidence 必须在 0 到 1 之间；
+- `temporal_expression` 如果存在，必须能在原文中精确定位；
 - `valid_from_ms` 不能晚于 `valid_to_ms`；
 - 每个 fact 必须至少包含一个 evidence span；
 - evidence span 必须包含 `text` 或成对的 `start_byte` / `end_byte`；
@@ -128,6 +139,10 @@ resolution 的图语义候选。
 
 校验失败时，executor 返回 `INVALID_EXTRACTION_OUTPUT`，并 best-effort 保存 failed
 extraction run。
+
+LLM adapter 只发布可定位的 `temporal_expression`，不发布其生成的数值有效时间。自然语言
+日期计算必须由后续的可信时间解析组件完成，不能仅因为 record 在某时被观测，就把该时间
+当成事件发生时间。`valid_from_ms` / `valid_to_ms` 保留给确定性或其他受信任 extractor 使用。
 
 ## 5. 状态流转
 
@@ -183,7 +198,8 @@ LLM adapter 行为由 `graph_llm_extraction.rs` 覆盖：
 - prompt 会包含原文和 byte offset 约束，并要求 JSON response format；
 - exact evidence text 可以修正模型给错的 byte offset；
 - evidence 无法定位到原文的 fact 会被丢弃；
-- endpoint 不完整或 predicate 不在 registry 中的 fact 会被丢弃；
+- endpoint 不完整的 fact 会被丢弃；
+- 未知 predicate 会降级为 `RELATED_TO`，但仍必须通过候选校验；
 - fenced JSON 可以被解析；
 - 非 JSON 输出会被拒绝；
 - LLM 输出仍然必须通过候选校验，无 evidence 的 fact 会进入
