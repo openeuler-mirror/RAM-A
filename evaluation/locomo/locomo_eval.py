@@ -17,7 +17,7 @@ EVALUATION_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(EVALUATION_ROOT))
 
 from common.llm_client import OpenAICompatibleClient
-from common.memory_pipeline.cache import JsonCache
+from common.json_cache import JsonCache
 
 try:
     from .prompts import ACCURACY_PROMPT

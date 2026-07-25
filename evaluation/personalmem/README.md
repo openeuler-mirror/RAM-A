@@ -120,7 +120,9 @@ paired files for each context length:
 - `questions_1M.csv` + `shared_contexts_1M.jsonl`
 
 The current adapter supports downloading and preparing these files from
-`bowen-upenn/PersonaMem`.
+`bowen-upenn/PersonaMem`. `prepare` always writes
+`schema_version=benchmark-prepared-v1`; `--schema-version` remains only as a
+deprecated compatibility option and does not select a legacy output.
 
 Run a small official-data smoke test:
 
@@ -156,6 +158,61 @@ python evaluation/personalmem/run.py official-pipeline \
 
 `32k` is the recommended first full run because the official dataset is much
 smaller than `128k` and `1M`.
+
+## Raw/Extracted Memory A/B
+
+`pipeline` and `official-pipeline` support paired `raw` and `extracted` arms.
+Both arms preserve the same prepared queries and immutable retrieval/answer
+settings. Use a different `--run-dir` for each arm; each run directory owns its
+store and cannot be reused by the other memory mode.
+
+An existing store without a memory-mode marker is treated as a legacy raw
+store: run it explicitly with `--memory-mode raw` once to claim it. The
+extracted arm rejects such a store; use a new store path for extracted memory.
+
+Prepare the shared raw input once, then run a pilot pair:
+
+```bash
+python evaluation/personalmem/run.py prepare \
+  --size 32k \
+  --prepared-dataset outputs/personalmem/pair-001/raw_prepared.json
+
+python evaluation/personalmem/run.py pipeline \
+  --dataset outputs/personalmem/pair-001/raw_prepared.json \
+  --memory-mode raw --phase pilot --pair-id pair-001 \
+  --run-dir outputs/personalmem/pair-001/raw
+
+python evaluation/personalmem/run.py pipeline \
+  --dataset outputs/personalmem/pair-001/raw_prepared.json \
+  --indexed-dataset outputs/personalmem/pair-001/extracted/extracted_prepared.json \
+  --memory-mode extracted --phase pilot --pair-id pair-001 \
+  --run-dir outputs/personalmem/pair-001/extracted \
+  --extraction-model openai/gpt-4o-mini \
+  --verifier-model openai/gpt-4o-mini
+```
+
+The extracted arm delegates normalization, windowing, extraction, grounding,
+aggregation, and prepared output to the shared Rust `memory-pipeline`. Python
+only adapts PersonaMem data and orchestrates the existing add/search/eval/
+answer/grade stages.
+
+A governed full run additionally requires both flags below:
+
+```text
+--phase full --frozen-config path/to/frozen-config.json \
+--promotion-policy path/to/promotion-policy.json
+```
+
+The runner validates the frozen immutable fields and promotion-policy hash
+before dataset/extraction stages, provider clients, or run-directory writes.
+Use the same `--memory-mode`, `--dataset`, `--indexed-dataset`, extraction
+settings, and `--run-dir` again for later `answer` and `grade` commands.
+
+The deterministic CI path uses the two
+`evaluation/fixtures/personalmem_memory_*_responses.json` maps, hash embedding,
+and the small PersonaMem fixture through `evaluation/personalmem/run_test.py`.
+It makes no network calls. These fixtures validate orchestration only: no live
+PersonaMem score, treatment improvement, or promotion is claimed here.
 
 ## Commands
 
@@ -194,10 +251,16 @@ python evaluation/personalmem/run.py add \
 | `--answer-base-url` | `https://openrouter.ai/api/v1` | OpenAI-compatible base URL |
 | `--answer-api-key-env` | `OPENROUTER_API_KEY` | Env var for answer API key |
 | `--context-token-budget` | 2000 | Max tokens of context in answer prompts (0 = unlimited) |
-| `--run-dir` | *(auto)* | Output to `outputs/personalmem/<timestamp>/` |
+| `--run-dir` | *(auto)* | Output to `outputs/personalmem/<timestamp>_<memory-mode>/` |
 | `--resume` | false | Skip steps whose output already exists |
 | `--size` | `32k` | Official split (`32k`, `128k`, `1M`) |
 | `--limit-questions` | 0 | Cap questions for smoke tests |
+| `--memory-mode` | `raw` | Index raw turns or Rust-produced extracted memories |
+| `--phase` | `pilot` | Experiment governance phase: `pilot` or `full` |
+| `--pair-id` | `standalone` | Identity shared by the paired arms |
+| `--indexed-dataset` | `outputs/personalmem_extracted_prepared.json` | Rust prepared output for the extracted arm |
+| `--frozen-config` | *(none)* | Frozen immutable manifest; required for `full` |
+| `--promotion-policy` | *(none)* | Policy whose hash is frozen; required for `full` |
 
 Full list: `python evaluation/personalmem/run.py <command> --help`
 
@@ -271,8 +334,12 @@ matching inside longer gold answers.
 ## Output Files
 
 ```
-outputs/personalmem/<timestamp>/
+outputs/personalmem/<timestamp>_<memory-mode>/
   store.sqlite             # SQLite hybrid store
+  extracted_prepared.json  # extracted arm only
+  artifacts/               # Rust extraction audit bundle
+  cache/memory-pipeline/   # extraction/grounding cache
+  stages/                  # resumable stage completion manifests
   search_results.json      # raw top-k results
   retrieval_metrics.json   # hit@k, MRR, per-query breakdown
   responses.json           # generated answers

@@ -69,6 +69,61 @@ python evaluation/personalmem/run.py <命令> [选项]
 | `pipeline` | 运行 add → search → eval |
 | `official-pipeline` | 运行 download → prepare → add → search → eval |
 
+`prepare` 始终输出 `schema_version=benchmark-prepared-v1`；
+`--schema-version` 仅保留为已弃用的兼容参数，不会再选择 legacy 输出。
+
+## Raw/Extracted 记忆 A/B
+
+`pipeline` 和 `official-pipeline` 支持配对的 `raw` 与 `extracted` arm。两个 arm
+保留完全相同的 prepared queries 和不可变检索/回答设置。每个 arm 必须使用不同的
+`--run-dir`；各自的 store 独立，同一目录不能跨 memory mode 复用。
+
+没有 memory-mode marker 的既有 store 会被视为 legacy raw store：先显式使用
+`--memory-mode raw` 运行一次以完成认领。extracted arm 会拒绝这类 store；请为
+extracted memory 使用新的 store 路径。
+
+先准备一次共享 raw 输入，再运行 pilot pair：
+
+```bash
+python evaluation/personalmem/run.py prepare \
+  --size 32k \
+  --prepared-dataset outputs/personalmem/pair-001/raw_prepared.json
+
+python evaluation/personalmem/run.py pipeline \
+  --dataset outputs/personalmem/pair-001/raw_prepared.json \
+  --memory-mode raw --phase pilot --pair-id pair-001 \
+  --run-dir outputs/personalmem/pair-001/raw
+
+python evaluation/personalmem/run.py pipeline \
+  --dataset outputs/personalmem/pair-001/raw_prepared.json \
+  --indexed-dataset outputs/personalmem/pair-001/extracted/extracted_prepared.json \
+  --memory-mode extracted --phase pilot --pair-id pair-001 \
+  --run-dir outputs/personalmem/pair-001/extracted \
+  --extraction-model openai/gpt-4o-mini \
+  --verifier-model openai/gpt-4o-mini
+```
+
+extracted arm 将 normalization、window、extraction、grounding、aggregation 和
+prepared output 全部交给共享 Rust `memory-pipeline`。Python 只负责 PersonaMem
+数据适配与编排，并复用现有 add/search/eval/answer/grade 阶段。
+
+受治理的 full run 还必须同时提供：
+
+```text
+--phase full --frozen-config path/to/frozen-config.json \
+--promotion-policy path/to/promotion-policy.json
+```
+
+runner 会在数据集/提取阶段、provider client 构造或 run-dir 写入之前校验冻结的
+immutable fields 与 promotion-policy hash。后续执行 `answer` 和 `grade` 时，应继续
+传入相同的 `--memory-mode`、`--dataset`、`--indexed-dataset`、提取设置和
+`--run-dir`。
+
+确定性 CI 路径通过 `evaluation/personalmem/run_test.py` 使用
+`evaluation/fixtures/personalmem_memory_*_responses.json` 两个静态响应表、hash
+embedding 和小型 PersonaMem fixture，全程不访问网络。这些 fixture 只验证编排；
+这里没有运行 live PersonaMem benchmark，也不声称分数提升或晋级。
+
 ## 主要参数
 
 | 参数 | 默认值 | 说明 |
@@ -81,10 +136,16 @@ python evaluation/personalmem/run.py <命令> [选项]
 | `--answer-base-url` | `https://openrouter.ai/api/v1` | OpenAI 兼容 chat completions 地址 |
 | `--answer-api-key-env` | `OPENROUTER_API_KEY` | 回答模型 API key 环境变量 |
 | `--context-token-budget` | 2000 | 回答 prompt 中检索上下文的最大 token 数（0 = 不限） |
-| `--run-dir` | *（自动）* | 输出到 `outputs/personalmem/<时间戳>/` |
+| `--run-dir` | *（自动）* | 输出到 `outputs/personalmem/<时间戳>_<memory-mode>/` |
 | `--resume` | false | 跳过已有输出的步骤 |
 | `--size` | `32k` | 官方切分（`32k`、`128k`、`1M`） |
 | `--limit-questions` | 0 | 限制问题数量用于冒烟测试 |
+| `--memory-mode` | `raw` | 索引 raw turn 或 Rust 生成的 extracted memory |
+| `--phase` | `pilot` | 实验治理阶段：`pilot` 或 `full` |
+| `--pair-id` | `standalone` | 两个配对 arm 共用的标识 |
+| `--indexed-dataset` | `outputs/personalmem_extracted_prepared.json` | extracted arm 的 Rust prepared 输出 |
+| `--frozen-config` | *（无）* | 冻结 immutable manifest；`full` 必需 |
+| `--promotion-policy` | *（无）* | hash 被冻结的晋级策略；`full` 必需 |
 
 完整参数列表：`python evaluation/personalmem/run.py <命令> --help`
 
@@ -150,8 +211,12 @@ outputs/personalmem/personalmem_<size>_v1_<backend>_top<k>_<context>_<answer-mod
 ## 输出文件
 
 ```
-outputs/personalmem/<时间戳>/
+outputs/personalmem/<时间戳>_<memory-mode>/
   store.sqlite             # SQLite hybrid 存储
+  extracted_prepared.json  # 仅 extracted arm
+  artifacts/               # Rust 提取审计产物
+  cache/memory-pipeline/   # extraction/grounding 缓存
+  stages/                  # 可恢复 stage 完成清单
   search_results.json      # 原始 top-k 结果
   retrieval_metrics.json   # hit@k、MRR、逐题明细
   responses.json           # 生成的回答

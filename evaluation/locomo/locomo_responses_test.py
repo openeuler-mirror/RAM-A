@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-from common.memory_pipeline.cache import JsonCache
+from common.json_cache import JsonCache
 from locomo.locomo_adapter import prepare_locomo
 import locomo.locomo_responses as responses_module
 from locomo.locomo_responses import PreparedMemoryResponses, ResponseClient

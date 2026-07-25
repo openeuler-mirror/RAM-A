@@ -10,10 +10,12 @@ from __future__ import annotations
 import argparse
 import ast
 import csv
+import hashlib
 import http.client
 import json
 import os
 import re
+import shlex
 import ssl
 import subprocess
 import sys
@@ -32,7 +34,25 @@ from tqdm import tqdm
 EVALUATION_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(EVALUATION_ROOT))
 
-from common.run_artifacts import default_run_dir, ensure_dir, write_run_meta  # noqa: E402
+from common.run_artifacts import (  # noqa: E402
+    default_run_dir,
+    ensure_dir,
+    timestamp_run_id,
+    write_run_meta,
+)
+from common.memory_ab import (  # noqa: E402
+    canonical_sha256,
+    ensure_run_mode,
+    ensure_store_mode,
+    file_sha256,
+    validate_frozen_manifest,
+    validate_memory_ab_preflight,
+)
+from common.memory_ab_stage import run_stage  # noqa: E402
+from common.rust_memory_pipeline import (  # noqa: E402
+    MemoryPipelineCommandConfig,
+    build_memory_pipeline_command,
+)
 
 
 DEFAULT_TEXT_FIELDS = "text,content,message,memory"
@@ -44,6 +64,9 @@ DEFAULT_REPORT = Path("outputs/personalmem_report.json")
 DEFAULT_RESPONSES = Path("outputs/personalmem_responses.json")
 DEFAULT_GRADES = Path("outputs/personalmem_grades.json")
 DEFAULT_CSV = Path("outputs/personalmem_results.csv")
+DEFAULT_INDEXED_DATASET = Path("outputs/personalmem_extracted_prepared.json")
+DEFAULT_EXTRACTION_MODEL = "openai/gpt-4o-mini"
+DEFAULT_EXTRACTION_BASE_URL = "https://openrouter.ai/api/v1"
 HF_REPO = "https://huggingface.co/datasets/bowen-upenn/PersonaMem/resolve/main"
 RETRYABLE_HTTP_STATUS = {429, 500, 502, 503, 504}
 RETRYABLE_API_EXCEPTIONS = (
@@ -100,23 +123,73 @@ class ChatCompletionError(RuntimeError):
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    governed_commands = {
+        "add",
+        "search",
+        "eval",
+        "answer",
+        "grade",
+        "pipeline",
+        "official-pipeline",
+        "memory-ab-pipeline",
+    }
+    if args.command in governed_commands:
+        validate_experiment_args(args)
+        implementation_digest = implementation_hash()
+        promotion_policy_digest = (
+            file_sha256(args.promotion_policy)
+            if args.promotion_policy is not None
+            else None
+        )
+        immutable = immutable_experiment_manifest(
+            args,
+            implementation_digest,
+            promotion_policy_digest,
+        )
+        if args.phase == "full":
+            validate_frozen_manifest(immutable, args.frozen_config)
+        preflight_digest = (
+            validate_memory_ab_preflight(
+                args.preflight,
+                "personalmem",
+                implementation_digest,
+            )
+            if args.preflight is not None
+            else None
+        )
+        args.implementation_hash = implementation_digest
+        args.promotion_policy_hash = promotion_policy_digest
+        args.configuration_hash = canonical_sha256(immutable)
+        args.preflight_hash = preflight_digest
     apply_default_paths(args)
+    if args.command in governed_commands and args.run_dir is not None:
+        ensure_run_mode(args.run_dir, args.memory_mode)
+    if args.command in governed_commands:
+        ensure_store_mode(args.store, args.memory_mode)
+    if args.command == "memory-ab-pipeline" and args.run_dir is not None:
+        write_personalmem_arm_contract(args, immutable)
 
     if args.command == "download":
         return run_download(args)
     if args.command == "prepare":
         return run_prepare(args)
     if args.command == "add":
+        args.dataset = resolve_indexed_dataset(args)
         return run_add(args)
     if args.command == "search":
+        args.dataset = resolve_indexed_dataset(args)
         return run_search(args)
     if args.command == "eval":
+        args.dataset = resolve_indexed_dataset(args)
         return run_eval(args)
     if args.command == "answer":
+        args.dataset = resolve_indexed_dataset(args)
         return run_answer(args)
     if args.command == "grade":
+        args.dataset = resolve_indexed_dataset(args)
         return run_grade(args)
     if args.command == "pipeline":
+        args.dataset = resolve_indexed_dataset(args)
         add_code = run_add(args)
         if add_code != 0:
             return add_code
@@ -132,6 +205,7 @@ def main() -> int:
         if prepare_code != 0:
             return prepare_code
         args.dataset = args.prepared_dataset
+        args.dataset = resolve_indexed_dataset(args)
         add_code = run_add(args)
         if add_code != 0:
             return add_code
@@ -139,6 +213,16 @@ def main() -> int:
         if search_code != 0:
             return search_code
         return run_eval(args)
+    if args.command == "memory-ab-pipeline":
+        args.dataset = resolve_indexed_dataset(args)
+        stages = [run_add, run_search, run_eval]
+        if args.pipeline_phase == "all":
+            stages.extend((run_answer, run_grade))
+        for stage in stages:
+            code = stage(args)
+            if code != 0:
+                return code
+        return 0
 
     parser.print_help()
     return 2
@@ -150,7 +234,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    for name in ("download", "prepare", "add", "search", "eval", "answer", "grade", "pipeline", "official-pipeline"):
+    for name in ("download", "prepare", "add", "search", "eval", "answer", "grade", "pipeline", "official-pipeline", "memory-ab-pipeline"):
         subparser = subparsers.add_parser(name)
         add_common_args(subparser)
 
@@ -215,9 +299,9 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--schema-version",
-        default="legacy",
+        default="benchmark-prepared-v1",
         choices=("legacy", "benchmark-prepared-v1"),
-        help="Prepared output schema for the prepare command.",
+        help="Deprecated compatibility option; prepare always writes benchmark-prepared-v1.",
     )
     parser.add_argument(
         "--limit-questions",
@@ -242,6 +326,191 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         type=Path,
         help="RAM-A repository root.",
     )
+    parser.add_argument(
+        "--memory-mode",
+        choices=("raw", "extracted"),
+        default="raw",
+        help="Memory representation indexed by this experiment arm.",
+    )
+    parser.add_argument(
+        "--phase",
+        choices=("pilot", "full"),
+        default="pilot",
+        help="Experiment governance phase.",
+    )
+    parser.add_argument(
+        "--pipeline-phase",
+        choices=("retrieval", "all"),
+        default="all",
+        help=(
+            "Stages run by memory-ab-pipeline. retrieval omits live answer and "
+            "grade stages; all preserves the default governed pair behavior."
+        ),
+    )
+    parser.add_argument("--pair-id", default="standalone")
+    parser.add_argument(
+        "--indexed-dataset",
+        default=DEFAULT_INDEXED_DATASET,
+        type=Path,
+        help="Prepared dataset produced and indexed by the extracted arm.",
+    )
+    parser.add_argument("--frozen-config", type=Path)
+    parser.add_argument("--promotion-policy", type=Path)
+    parser.add_argument("--preflight", type=Path)
+    parser.add_argument("--extraction-model", default=DEFAULT_EXTRACTION_MODEL)
+    parser.add_argument("--verifier-model", default=DEFAULT_EXTRACTION_MODEL)
+    parser.add_argument("--extraction-api-key-env", default="OPENROUTER_API_KEY")
+    parser.add_argument("--extraction-base-url", default=DEFAULT_EXTRACTION_BASE_URL)
+    parser.add_argument("--extraction-cache-dir", type=Path)
+    parser.add_argument("--extraction-cache-version")
+    parser.add_argument("--max-candidate-tokens", type=int, default=320)
+    parser.add_argument("--max-window-tokens", type=int, default=640)
+    parser.add_argument("--context-before-messages", type=int, default=2)
+    parser.add_argument("--context-after-messages", type=int, default=0)
+    parser.add_argument("--extractor-responses", type=Path)
+    parser.add_argument("--grounding-responses", type=Path)
+
+
+def validate_experiment_args(args: argparse.Namespace) -> None:
+    if args.phase == "full" and args.frozen_config is None:
+        raise ValueError("--frozen-config is required for full runs")
+    if args.phase == "full" and args.promotion_policy is None:
+        raise ValueError("--promotion-policy is required for full runs")
+    fixtures = (args.extractor_responses, args.grounding_responses)
+    if any(value is not None for value in fixtures) and not all(
+        value is not None for value in fixtures
+    ):
+        raise ValueError(
+            "both --extractor-responses and --grounding-responses are required "
+            "for offline fixture mode"
+        )
+
+
+def immutable_experiment_manifest(
+    args: argparse.Namespace,
+    implementation_digest: str,
+    promotion_policy_digest: str | None,
+) -> dict[str, Any]:
+    """Return settings that must match across the paired memory arms."""
+    return {
+        "backend": args.backend,
+        "store_backend": args.store_backend,
+        "embedding": args.embedding,
+        "embedding_model": args.model,
+        "embedding_dimensions": args.dimensions,
+        "search_mode": args.search_mode,
+        "embedding_weight": args.embedding_weight,
+        "bm25_weight": args.bm25_weight,
+        "candidate_k": args.candidate_k,
+        "top_k": args.top_k,
+        "answer_model": args.answer_model,
+        "answer_base_url": args.answer_base_url,
+        "context_token_budget": args.context_token_budget,
+        "max_retries": args.max_retries,
+        "retry_backoff_seconds": args.retry_backoff_seconds,
+        "text_fields": args.text_fields,
+        "query_fields": args.query_fields,
+        "gold_fields": args.gold_fields,
+        "extraction_model": args.extraction_model,
+        "verifier_model": args.verifier_model,
+        "extraction_base_url": args.extraction_base_url,
+        "max_candidate_tokens": args.max_candidate_tokens,
+        "max_window_tokens": args.max_window_tokens,
+        "context_before_messages": args.context_before_messages,
+        "context_after_messages": args.context_after_messages,
+        "pipeline_phase": args.pipeline_phase,
+        "implementation_hash": implementation_digest,
+        "promotion_policy_hash": promotion_policy_digest,
+    }
+
+
+def implementation_hash() -> str:
+    """Hash the shared and PersonaMem implementation used by both arms."""
+    project_root = EVALUATION_ROOT.parent
+    roots = (
+        EVALUATION_ROOT / "common",
+        EVALUATION_ROOT / "personalmem",
+        project_root / "crates" / "memory-bench" / "src",
+        project_root / "crates" / "memory-core" / "src",
+        project_root / "crates" / "memory-pipeline" / "src",
+    )
+    paths: list[Path] = []
+    for root in roots:
+        suffix = "*.rs" if root.name == "src" else "*.py"
+        paths.extend(
+            path
+            for path in root.rglob(suffix)
+            if not path.name.endswith("_test.py")
+        )
+    for manifest in (
+        project_root / "Cargo.toml",
+        project_root / "Cargo.lock",
+        project_root / "crates" / "memory-pipeline" / "Cargo.toml",
+    ):
+        if manifest.is_file():
+            paths.append(manifest)
+    orchestrator = EVALUATION_ROOT / "scripts" / "run_memory_ab.py"
+    if orchestrator.is_file():
+        paths.append(orchestrator)
+    binary_override = os.getenv("MEMORY_PIPELINE_BIN")
+    if binary_override:
+        binary_path = Path(shlex.split(binary_override)[0]).resolve()
+        if binary_path.is_file():
+            paths.append(binary_path)
+
+    digest = hashlib.sha256()
+    for path in sorted(paths):
+        try:
+            identity = str(path.relative_to(project_root))
+        except ValueError:
+            identity = f"MEMORY_PIPELINE_BIN:{path}"
+        digest.update(identity.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def write_personalmem_arm_contract(
+    args: argparse.Namespace,
+    immutable: dict[str, Any],
+) -> None:
+    """Persist the auditable config and shared raw prepared input before stages."""
+    source_path = Path(args.dataset)
+    prepared = load_json(source_path)
+    if not isinstance(prepared, dict) or prepared.get("schema_version") != "benchmark-prepared-v1":
+        raise ValueError(
+            "memory A/B runs require a benchmark-prepared-v1 PersonaMem dataset"
+        )
+    config = {
+        "dataset": "personalmem",
+        "source_path": str(source_path),
+        "run_dir": str(args.run_dir),
+        "run_id": Path(args.run_dir).name,
+        "artifact_path": str(args.run_dir),
+        "phase": args.phase,
+        "memory_mode": args.memory_mode,
+        "pair_id": args.pair_id,
+        "source_hash": file_sha256(source_path),
+        "configuration_hash": args.configuration_hash,
+        "implementation_hash": args.implementation_hash,
+        "promotion_policy_hash": args.promotion_policy_hash,
+        "preflight_path": str(args.preflight) if args.preflight is not None else None,
+        "preflight_hash": args.preflight_hash,
+        **immutable,
+    }
+    _write_json_atomic(Path(args.run_dir) / "config.json", config)
+    _write_json_atomic(Path(args.run_dir) / "raw_prepared.json", prepared)
+
+
+def _write_json_atomic(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
 
 
 def apply_default_paths(args: argparse.Namespace) -> None:
@@ -251,7 +520,10 @@ def apply_default_paths(args: argparse.Namespace) -> None:
 
     run_dir = args.run_dir
     if run_dir is None and has_all_default_artifact_paths(args):
-        run_dir = default_run_dir("personalmem")
+        run_dir = default_run_dir(
+            "personalmem",
+            f"{timestamp_run_id()}_{args.memory_mode}",
+        )
     if run_dir is None:
         return
 
@@ -268,6 +540,8 @@ def apply_default_paths(args: argparse.Namespace) -> None:
         args.grades = args.run_dir / "grade_metrics.json"
     if args.csv == DEFAULT_CSV:
         args.csv = args.run_dir / "grade_results.csv"
+    if args.indexed_dataset == DEFAULT_INDEXED_DATASET:
+        args.indexed_dataset = args.run_dir / "extracted_prepared.json"
 
 
 def has_all_default_artifact_paths(args: argparse.Namespace) -> bool:
@@ -309,8 +583,7 @@ def run_prepare(args: argparse.Namespace) -> int:
     contexts = load_jsonl_contexts(contexts_path)
     questions = load_personamem_questions(questions_path, args.limit_questions)
     prepared = build_prepared_dataset(questions, contexts, args.max_context_messages)
-    if args.schema_version == "benchmark-prepared-v1":
-        prepared = build_prepared_schema_v1(prepared, args.size)
+    prepared = build_prepared_schema_v1(prepared, args.size)
 
     args.prepared_dataset.parent.mkdir(parents=True, exist_ok=True)
     args.prepared_dataset.write_text(
@@ -321,6 +594,77 @@ def run_prepare(args: argparse.Namespace) -> int:
     query_count = len(prepared.get("queries", prepared.get("questions", [])))
     print(f"wrote prepared PersonaMem dataset to {args.prepared_dataset} ({memory_count} memories, {query_count} questions)")
     return 0
+
+
+def resolve_indexed_dataset(args: argparse.Namespace) -> Path:
+    """Return the prepared file consumed by the existing benchmark stages."""
+    if args.dataset is None:
+        raise ValueError("--dataset is required for pipeline")
+    raw_dataset = Path(args.dataset)
+    args.raw_dataset = raw_dataset
+    if args.memory_mode == "raw":
+        return raw_dataset
+
+    prepared = load_json(raw_dataset)
+    if not isinstance(prepared, dict) or prepared.get("schema_version") != "benchmark-prepared-v1":
+        raise ValueError(
+            "extracted memory mode requires a benchmark-prepared-v1 dataset"
+        )
+    indexed_dataset = Path(args.indexed_dataset)
+    run_root = Path(args.run_dir) if getattr(args, "run_dir", None) else indexed_dataset.parent
+    artifacts = run_root / "artifacts"
+    configuration_hash = getattr(args, "configuration_hash", "personalmem-pilot-v1")
+    config = MemoryPipelineCommandConfig(
+        project_root=Path(getattr(args, "repo_root", find_repo_root())),
+        cache_dir=(
+            getattr(args, "extraction_cache_dir", None)
+            or run_root / "cache" / "memory-pipeline"
+        ),
+        cache_version=(
+            getattr(args, "extraction_cache_version", None)
+            or configuration_hash
+        ),
+        model=getattr(args, "extraction_model", DEFAULT_EXTRACTION_MODEL),
+        verifier_model=getattr(args, "verifier_model", DEFAULT_EXTRACTION_MODEL),
+        api_key_env=getattr(args, "extraction_api_key_env", "OPENROUTER_API_KEY"),
+        base_url=getattr(args, "extraction_base_url", DEFAULT_EXTRACTION_BASE_URL),
+        extractor_responses=getattr(args, "extractor_responses", None),
+        grounding_responses=getattr(args, "grounding_responses", None),
+        max_candidate_tokens=getattr(args, "max_candidate_tokens", 320),
+        max_window_tokens=getattr(args, "max_window_tokens", 640),
+        context_before_messages=getattr(args, "context_before_messages", 2),
+        context_after_messages=getattr(args, "context_after_messages", 0),
+        episode_boundary_fields=("shared_context_id",),
+        fail_fast=False,
+    )
+    command = build_memory_pipeline_command(
+        config,
+        raw_dataset,
+        indexed_dataset,
+        artifacts,
+    )
+    extraction_inputs = [raw_dataset]
+    if config.extractor_responses is not None:
+        extraction_inputs.extend(
+            (config.extractor_responses, config.grounding_responses)
+        )
+    run_stage(
+        "extract",
+        command,
+        (
+            indexed_dataset,
+            artifacts / "extraction_stats.json",
+            artifacts / "run_metadata.json",
+            artifacts / "prepared.json",
+        ),
+        {
+            "configuration_hash": configuration_hash,
+            "memory_mode": args.memory_mode,
+            "pair_id": getattr(args, "pair_id", "standalone"),
+        },
+        inputs=tuple(extraction_inputs),
+    )
+    return indexed_dataset
 
 
 def run_add(args: argparse.Namespace) -> int:
@@ -1016,6 +1360,23 @@ def write_personamem_run_meta(args: argparse.Namespace, phase: str) -> dict[str,
         top_k=args.top_k,
         answer_model=args.answer_model,
         context_token_budget=args.context_token_budget,
+        memory_mode=getattr(args, "memory_mode", None),
+        experiment_phase=getattr(args, "phase", None),
+        pair_id=getattr(args, "pair_id", None),
+        source_path=(
+            str(args.raw_dataset)
+            if getattr(args, "raw_dataset", None) is not None
+            else None
+        ),
+        indexed_dataset=(
+            str(args.dataset)
+            if getattr(args, "dataset", None) is not None
+            else None
+        ),
+        configuration_hash=getattr(args, "configuration_hash", None),
+        implementation_hash=getattr(args, "implementation_hash", None),
+        promotion_policy_hash=getattr(args, "promotion_policy_hash", None),
+        preflight_hash=getattr(args, "preflight_hash", None),
     )
 
 

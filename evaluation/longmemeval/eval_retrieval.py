@@ -25,6 +25,11 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from common.metrics import mrr, ndcg_at_k, recall_at_k
+from longmemeval.provenance import (
+    build_source_turn_metadata,
+    retrieved_source_session_ids,
+    retrieved_source_turn_ids,
+)
 
 # Default K values for recall and nDCG
 _DEFAULT_RECALL_KS = [1, 3, 5, 10]
@@ -55,19 +60,6 @@ def _collect_metrics(
 def _build_results_by_id(search_results: list[dict]) -> dict[str, dict]:
     """Index search results by query_id."""
     return {r["query_id"]: r for r in search_results}
-
-
-def _extract_session_ids(result: dict) -> list[str]:
-    """Extract deduplicated session_ids from search result metadata, preserving order."""
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for item in result.get("results", []):
-        meta = item.get("metadata") or {}
-        sid = meta.get("session_id")
-        if sid and sid not in seen:
-            seen.add(sid)
-            ordered.append(sid)
-    return ordered
 
 
 def _extract_answer_turn_ids_from_result(result: dict) -> list[str]:
@@ -114,6 +106,7 @@ def _gold_turn_ids(search_result: dict | None, lme_item: dict) -> list[str]:
 def evaluate_retrieval(
     search_results: list[dict],
     lme_data: list[dict],
+    source_turn_metadata: dict[str, dict],
     ks: list[int] | None = None,
     expected_query_ids: list[str] | None = None,
 ) -> dict:
@@ -129,6 +122,9 @@ def evaluate_retrieval(
     lme_data : list[dict]
         Each element has ``question_id``, ``question_type``, and
         ``answer_session_ids``.
+    source_turn_metadata : dict[str, dict]
+        Raw prepared-memory metadata keyed by source turn ID. Session scoring
+        never trusts metadata copied onto retrieved or extracted records.
     ks : list[int] | None
         Recall@K cutoffs.  Defaults to [1, 3, 5, 10].
 
@@ -176,7 +172,7 @@ def evaluate_retrieval(
         )
 
         # --- Session-level ---
-        retrieved_sessions = _extract_session_ids(sr)
+        retrieved_sessions = retrieved_source_session_ids(sr, source_turn_metadata)
         answer_sessions = _gold_session_ids(sr, lme_item)
         s_metrics = _collect_metrics(retrieved_sessions, answer_sessions, ks, ndcg_ks)
 
@@ -185,7 +181,7 @@ def evaluate_retrieval(
             session_by_type.setdefault(qtype, {}).setdefault(metric_name, []).append(value)
 
         # --- Turn-level ---
-        retrieved_turn_ids = [item["id"] for item in sr.get("results", [])]
+        retrieved_turn_ids = retrieved_source_turn_ids(sr)
         relevant_turn_ids = _gold_turn_ids(sr, lme_item)
         t_metrics = _collect_metrics(retrieved_turn_ids, relevant_turn_ids, ks, ndcg_ks)
 
@@ -220,17 +216,23 @@ def load_and_evaluate(
         search_results = json.load(f)
     with open(lme_data_path, "r", encoding="utf-8") as f:
         lme_data = json.load(f)
-    expected_query_ids = None
-    if prepared_path is not None:
-        with open(prepared_path, "r", encoding="utf-8") as f:
-            prepared = json.load(f)
-        expected_query_ids = [
-            query["id"]
-            for query in prepared.get("queries", [])
-            if isinstance(query, dict) and "id" in query
-        ]
+    if prepared_path is None:
+        raise ValueError("prepared_path is required for raw source-turn metadata")
+    with open(prepared_path, "r", encoding="utf-8") as f:
+        prepared = json.load(f)
+    expected_query_ids = [
+        query["id"]
+        for query in prepared.get("queries", [])
+        if isinstance(query, dict) and "id" in query
+    ]
+    source_turn_metadata = build_source_turn_metadata(prepared)
 
-    report = evaluate_retrieval(search_results, lme_data, expected_query_ids=expected_query_ids)
+    report = evaluate_retrieval(
+        search_results,
+        lme_data,
+        source_turn_metadata,
+        expected_query_ids=expected_query_ids,
+    )
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:

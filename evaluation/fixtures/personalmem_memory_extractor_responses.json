@@ -1,0 +1,55 @@
+{
+  "window-de6964d45f3753d5c5173252": {
+    "schema_version": "atomic_memory_v1",
+    "memories": [
+      {
+        "text": "Alice requires checking the health endpoint before deployment.",
+        "memory_type": "fact",
+        "subject": {
+          "name": "Alice",
+          "source_speaker": "alice"
+        },
+        "predicate": "requires_predeployment_check",
+        "object": {
+          "name": "health endpoint",
+          "type": "system_check"
+        },
+        "modality": "asserted",
+        "event_time": null,
+        "attributes": {},
+        "evidence": [
+          {
+            "message_id": "personalmem-sample:0",
+            "quote": "部署前必须检查 health endpoint。",
+            "evidence_role": "primary"
+          }
+        ],
+        "model_confidence": 0.99
+      },
+      {
+        "text": "Alice prefers concise status updates.",
+        "memory_type": "preference",
+        "subject": {
+          "name": "Alice",
+          "source_speaker": "bob"
+        },
+        "predicate": "prefers",
+        "object": {
+          "name": "concise status updates",
+          "type": "communication_style"
+        },
+        "modality": "asserted",
+        "event_time": null,
+        "attributes": {},
+        "evidence": [
+          {
+            "message_id": "personalmem-sample:1",
+            "quote": "Alice 喜欢简洁的状态更新。",
+            "evidence_role": "primary"
+          }
+        ],
+        "model_confidence": 0.99
+      }
+    ]
+  }
+}

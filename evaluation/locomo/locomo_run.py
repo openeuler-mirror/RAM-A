@@ -9,13 +9,26 @@ import json
 import os
 from pathlib import Path
 import shlex
-import subprocess
 import sys
-from typing import Any, Callable, Mapping, Sequence
-
+from typing import Any, Mapping, Sequence
 
 EVALUATION_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = EVALUATION_ROOT.parent
+sys.path.insert(0, str(EVALUATION_ROOT))
+
+from common.memory_ab import (
+    ensure_run_mode,
+    file_sha256,
+    validate_frozen_manifest,
+    validate_memory_ab_preflight,
+)
+from common.memory_ab_stage import run_stage
+from common.rust_memory_pipeline import (
+    MemoryPipelineCommandConfig,
+    build_memory_pipeline_command,
+)
+
+
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 PROMPT_VERSIONS = {
     "extraction": "extract_v2",
@@ -39,6 +52,8 @@ class RunConfig:
     phase: str
     dataset: Path
     run_dir: Path
+    pair_id: str = "standalone"
+    promotion_policy_hash: str | None = None
     chat_model: str = "openai/gpt-4o-mini"
     embedding_model: str = "baai/bge-m3"
     embedding_dimensions: int = 1024
@@ -78,11 +93,16 @@ class RunConfig:
                 str(EVALUATION_ROOT / "outputs" / "locomo-memory-ab" / phase / memory_mode),
             )
         ).resolve()
+        policy_path = values.get("PROMOTION_POLICY")
         return cls(
             memory_mode=memory_mode,
             phase=phase,
             dataset=dataset,
             run_dir=run_dir,
+            pair_id=values.get("PAIR_ID", "standalone"),
+            promotion_policy_hash=(
+                file_sha256(Path(policy_path).resolve()) if policy_path else None
+            ),
         )
 
     def public_manifest(self) -> dict[str, Any]:
@@ -97,7 +117,7 @@ class RunConfig:
 
     def immutable_manifest(self) -> dict[str, Any]:
         value = self.public_manifest()
-        for key in ("memory_mode", "phase", "dataset", "run_dir"):
+        for key in ("memory_mode", "phase", "dataset", "run_dir", "pair_id"):
             value.pop(key, None)
         return value
 
@@ -114,80 +134,19 @@ def stage_manifest(name: str, source_hash: str, config_hash: str) -> dict[str, s
     }
 
 
-def run_stage(
-    name: str,
-    command: list[str],
-    outputs: tuple[Path, ...],
-    manifest: dict[str, Any],
-    env_overrides: dict[str, str] | None = None,
-    inputs: tuple[Path, ...] = (),
-    clean_outputs_on_rerun: bool = False,
-    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
-) -> None:
-    if not outputs:
-        raise ValueError(f"stage {name} must declare at least one output")
-    outputs = tuple(Path(path) for path in outputs)
-    complete_path = outputs[0].parent / "stages" / f"{name}.complete.json"
-    expected = dict(manifest)
-    expected["stage"] = name
-    expected["command_hash"] = _json_hash(command)
-    missing_inputs = [str(path) for path in inputs if not Path(path).is_file()]
-    if missing_inputs:
-        raise ValueError(f"stage {name} is missing inputs: {missing_inputs}")
-    expected["inputs"] = {
-        str(path): _file_hash(Path(path))
-        for path in inputs
-    }
-    if _stage_is_complete(complete_path, expected, outputs):
-        print(f"[stage {name}] resume hit")
-        return
-
-    complete_path.unlink(missing_ok=True)
-    if clean_outputs_on_rerun:
-        for output in outputs:
-            output.unlink(missing_ok=True)
-            Path(str(output) + "-shm").unlink(missing_ok=True)
-            Path(str(output) + "-wal").unlink(missing_ok=True)
-    for output in outputs:
-        output.parent.mkdir(parents=True, exist_ok=True)
-    child_env = dict(os.environ)
-    if env_overrides:
-        child_env.update(env_overrides)
-    print(f"[stage {name}] running: {shlex.join(command)}")
-    runner(
-        command,
-        cwd=EVALUATION_ROOT,
-        env=child_env,
-        check=True,
-    )
-    missing = [str(path) for path in outputs if not path.is_file()]
-    if missing:
-        raise RuntimeError(f"stage {name} did not produce outputs: {missing}")
-    completed = dict(expected)
-    completed["outputs"] = {
-        str(path): _file_hash(path)
-        for path in outputs
-    }
-    _write_json_atomic(complete_path, completed)
-
-
 def validate_frozen_config(config: RunConfig, frozen_path: Path) -> None:
-    frozen = json.loads(Path(frozen_path).read_text(encoding="utf-8"))
-    expected = config.immutable_manifest()
-    actual = {
-        key: frozen.get(key)
-        for key in expected
-    }
-    if actual != expected:
-        differing = sorted(key for key in expected if actual.get(key) != expected[key])
-        raise ValueError(
-            "frozen configuration mismatch for fields: " + ", ".join(differing)
-        )
+    validate_frozen_manifest(config.immutable_manifest(), frozen_path)
 
 
 def validate_preflight(config: RunConfig, preflight_path: Path) -> str:
     preflight_path = Path(preflight_path)
     report = json.loads(preflight_path.read_text(encoding="utf-8"))
+    if report.get("schema_version") == "memory-ab-preflight-v1":
+        return validate_memory_ab_preflight(
+            preflight_path,
+            "locomo",
+            config.immutable_manifest()["implementation_hash"],
+        )
     if report.get("schema_version") != "locomo-preflight-v1":
         raise ValueError("preflight has unsupported schema version")
     if not report.get("passed"):
@@ -202,24 +161,7 @@ def validate_preflight(config: RunConfig, preflight_path: Path) -> str:
         for name in REQUIRED_PREFLIGHT_SUITES
     ):
         raise ValueError("preflight required suites are incomplete or failed")
-    return _file_hash(preflight_path)
-
-
-def ensure_run_mode(run_dir: Path, memory_mode: str) -> None:
-    run_dir = Path(run_dir)
-    run_dir.mkdir(parents=True, exist_ok=True)
-    sentinel = run_dir / ".memory_mode"
-    if sentinel.is_file():
-        existing = sentinel.read_text(encoding="utf-8").strip()
-        if existing != memory_mode:
-            raise ValueError(
-                f"run directory already belongs to memory mode {existing}; "
-                f"cannot reuse it for {memory_mode}"
-            )
-        return
-    temporary = sentinel.with_suffix(".tmp")
-    temporary.write_text(memory_mode + "\n", encoding="utf-8")
-    temporary.replace(sentinel)
+    return file_sha256(preflight_path)
 
 
 def memory_bench_base_command(config: RunConfig, store: Path) -> list[str]:
@@ -268,40 +210,27 @@ def build_extraction_command(
     grounding verdict the verifier omits) from aborting the whole arm: the
     pipeline quarantines that window's candidates and continues.
     """
-    return [
-        sys.executable,
-        "-m",
-        "common.memory_pipeline.cli",
-        "--input",
-        str(raw_prepared),
-        "--output",
-        str(indexed_prepared),
-        "--artifacts-dir",
-        str(artifacts),
-        "--model",
-        config.chat_model,
-        "--verifier-model",
-        config.chat_model,
-        "--api-key-env",
-        config.credential_env,
-        "--base-url",
-        config.base_url,
-        "--cache-dir",
-        str(config.run_dir / "cache" / "memory-pipeline"),
-        "--cache-version",
-        configuration_digest,
-        "--episode-boundary-field",
-        "session_id",
-        "--max-candidate-tokens",
-        str(config.max_candidate_tokens),
-        "--max-window-tokens",
-        str(config.max_window_tokens),
-        "--context-before-messages",
-        str(config.context_before_messages),
-        "--context-after-messages",
-        str(config.context_after_messages),
-        "--no-fail-fast",
-    ]
+    command_config = MemoryPipelineCommandConfig(
+        project_root=PROJECT_ROOT,
+        cache_dir=config.run_dir / "cache" / "memory-pipeline",
+        cache_version=configuration_digest,
+        model=config.chat_model,
+        verifier_model=config.chat_model,
+        api_key_env=config.credential_env,
+        base_url=config.base_url,
+        max_candidate_tokens=config.max_candidate_tokens,
+        max_window_tokens=config.max_window_tokens,
+        context_before_messages=config.context_before_messages,
+        context_after_messages=config.context_after_messages,
+        episode_boundary_fields=("session_id",),
+        fail_fast=False,
+    )
+    return build_memory_pipeline_command(
+        command_config,
+        raw_prepared,
+        indexed_prepared,
+        artifacts,
+    )
 
 
 def build_search_command(
@@ -341,11 +270,6 @@ def build_search_command(
 
 
 def run_arm(config: RunConfig) -> None:
-    if not config.dataset.is_file():
-        raise ValueError(f"LoCoMo dataset does not exist: {config.dataset}")
-    api_key = os.getenv(config.credential_env)
-    if not api_key:
-        raise RuntimeError(f"missing API key env {config.credential_env}")
     if config.phase == "full":
         frozen_path = os.getenv("FROZEN_CONFIG")
         if not frozen_path:
@@ -358,8 +282,14 @@ def run_arm(config: RunConfig) -> None:
     preflight_path = Path(preflight_path_value).resolve()
     preflight_hash = validate_preflight(config, preflight_path)
 
+    if not config.dataset.is_file():
+        raise ValueError(f"LoCoMo dataset does not exist: {config.dataset}")
+    api_key = os.getenv(config.credential_env)
+    if not api_key:
+        raise RuntimeError(f"missing API key env {config.credential_env}")
+
     ensure_run_mode(config.run_dir, config.memory_mode)
-    source_digest = _file_hash(config.dataset)
+    source_digest = file_sha256(config.dataset)
     configuration_digest = config_hash(config)
     public_config = config.public_manifest()
     public_config.update(
@@ -553,38 +483,13 @@ def run_arm(config: RunConfig) -> None:
     )
 
 
-def _stage_is_complete(
-    path: Path,
-    expected: dict[str, Any],
-    outputs: tuple[Path, ...],
-) -> bool:
-    if not path.is_file() or not all(output.is_file() for output in outputs):
-        return False
-    try:
-        completed = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    for key, value in expected.items():
-        if completed.get(key) != value:
-            return False
-    hashes = completed.get("outputs") or {}
-    return all(hashes.get(str(output)) == _file_hash(output) for output in outputs)
-
-
-def _file_hash(path: Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def implementation_hash() -> str:
     roots = (
         EVALUATION_ROOT / "common",
         EVALUATION_ROOT / "locomo",
         PROJECT_ROOT / "crates" / "memory-bench" / "src",
         PROJECT_ROOT / "crates" / "memory-core" / "src",
+        PROJECT_ROOT / "crates" / "memory-pipeline" / "src",
     )
     paths = []
     for root in roots:
@@ -594,12 +499,28 @@ def implementation_hash() -> str:
             for path in root.rglob(suffix)
             if not path.name.endswith("_test.py")
         )
-    cargo_lock = PROJECT_ROOT / "Cargo.lock"
-    if cargo_lock.is_file():
-        paths.append(cargo_lock)
+    for manifest in (
+        PROJECT_ROOT / "Cargo.toml",
+        PROJECT_ROOT / "Cargo.lock",
+        PROJECT_ROOT / "crates" / "memory-pipeline" / "Cargo.toml",
+    ):
+        if manifest.is_file():
+            paths.append(manifest)
+    orchestrator = EVALUATION_ROOT / "scripts" / "run_memory_ab.py"
+    if orchestrator.is_file():
+        paths.append(orchestrator)
+    binary_override = os.getenv("MEMORY_PIPELINE_BIN")
+    if binary_override:
+        binary_path = Path(shlex.split(binary_override)[0]).resolve()
+        if binary_path.is_file():
+            paths.append(binary_path)
     digest = hashlib.sha256()
     for path in sorted(paths):
-        digest.update(str(path.relative_to(PROJECT_ROOT)).encode("utf-8"))
+        try:
+            identity = str(path.relative_to(PROJECT_ROOT))
+        except ValueError:
+            identity = f"MEMORY_PIPELINE_BIN:{path}"
+        digest.update(identity.encode("utf-8"))
         digest.update(b"\0")
         digest.update(path.read_bytes())
         digest.update(b"\0")

@@ -96,6 +96,31 @@ The optional mem0 comparison implementation lives under `evaluation/locomo/backe
 
 ## Grounded Atomic-Memory A/B
 
+The governed entrypoint supersedes the shell wrapper for new paired runs. Save
+this exact frozen LoCoMo policy before the pilot:
+
+```json
+{"schema_version":"locomo-promotion-v1","historical_overall":{"operator":">","threshold":0.4065},"fresh_raw_overall":{"operator":">"},"scored_count":1540,"category_floors":{"1":0.1999,"2":0.4161,"3":0.2717,"4":0.4509},"regression_suite_required":true}
+```
+
+```bash
+PYTHONPATH=evaluation evaluation/.venv/bin/python evaluation/scripts/run_memory_ab.py \
+  --dataset locomo --phase pilot --pair-id locomo-v4 \
+  --dataset-file data/locomo/locomo10.json \
+  --promotion-policy /absolute/path/locomo-policy.json
+
+PYTHONPATH=evaluation evaluation/.venv/bin/python evaluation/scripts/run_memory_ab.py \
+  --dataset locomo --phase full --pair-id locomo-v4 \
+  --dataset-file data/locomo/locomo10.json \
+  --promotion-policy /absolute/path/locomo-policy.json \
+  --frozen-config evaluation/outputs/memory-ab/locomo/pilot/locomo-v4/frozen_config.json
+```
+
+The policy bytes are hashed into both arm configs and the frozen manifest.
+Pilot produces no history. A complete full pair is recorded even if promotion
+fails, while only a passing treatment can become a baseline. The commands above
+describe the live protocol; they do not claim a live result until run manually.
+
 `run_locomo_memory_ab.sh` evaluates memory features 2 and 4 without changing the
 answer prompt. The paired arms are:
 

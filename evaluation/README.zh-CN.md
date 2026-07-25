@@ -107,7 +107,7 @@ PYTHONPATH=evaluation python -c \
 使用任意 OpenAI-compatible chat 端点执行抽取和独立的 grounding 验证：
 
 ```bash
-PYTHONPATH=evaluation python -m common.memory_pipeline.cli \
+cargo run --quiet --manifest-path Cargo.toml -p memory-pipeline -- \
   --input outputs/longmemeval/raw-prepared.json \
   --output outputs/longmemeval/extracted-prepared.json \
   --artifacts-dir outputs/longmemeval/memory-pipeline \
@@ -126,7 +126,7 @@ token/cache 统计和确定性的运行元数据。episode 与 window 只是组�
 离线 fixture 模式用两个 JSON 映射替代模型调用：
 
 ```bash
-PYTHONPATH=evaluation python -m common.memory_pipeline.cli \
+cargo run --quiet --manifest-path Cargo.toml -p memory-pipeline -- \
   --input outputs/longmemeval/raw-prepared.json \
   --output /tmp/extracted-prepared.json \
   --artifacts-dir /tmp/memory-pipeline \
@@ -150,6 +150,41 @@ PYTHONPATH=evaluation python -m common.memory_pipeline.cli \
 
 大型原始结果不要提交到 Git。用于版本对比的精简记录放在
 `evaluation/baselines/`，完整 raw artifact 上传到对象存储、Release 资产或其他制品系统。
+
+## 受治理的 raw/extracted 配对实验
+
+PersonaMem、LongMemEval、LoCoMo 的晋级实验统一使用下面的入口。Pilot 前必须先写好显式
+policy JSON；PersonaMem 和 LongMemEval 使用 `memory-ab-promotion-v1`，指标路径必须是
+dotted path，并在 `completeness_counts` 中提前写入所选 full 数据集的权威计数。只有两臂
+和 comparison 都成功且 pilot 检查通过后，才会写 frozen manifest。
+
+```bash
+cargo build -p memory-pipeline
+export MEMORY_PIPELINE_BIN="$PWD/target/debug/memory-pipeline"
+
+PYTHONPATH=evaluation evaluation/.venv/bin/python evaluation/scripts/run_memory_ab.py \
+  --dataset personalmem --phase pilot --pair-id personalmem-32k-v1 \
+  --dataset-file data/personalmem/prepared/personalmem_32k.json \
+  --promotion-policy /absolute/path/personalmem-policy.json
+
+PYTHONPATH=evaluation evaluation/.venv/bin/python evaluation/scripts/run_memory_ab.py \
+  --dataset personalmem --phase full --pair-id personalmem-32k-v1 \
+  --dataset-file data/personalmem/prepared/personalmem_32k.json \
+  --promotion-policy /absolute/path/personalmem-policy.json \
+  --frozen-config evaluation/outputs/memory-ab/personalmem/pilot/personalmem-32k-v1/frozen_config.json
+```
+
+运行其他 registry 时替换 `--dataset` 和数据文件即可；`--` 后面的参数会原样传给两臂。
+任何 arm 启动前，入口会运行并记录 Python suite、Rust workspace test、Clippy 和
+`git diff --check`。每个 arm 会自行验证 dataset-bound preflight，并在 `config.json`
+中写入其真实 SHA-256。
+
+制品位于 `evaluation/outputs/memory-ab/<dataset>/<phase>/<pair-id>/`，`raw/` 与
+`extracted/` 使用独立 store，目录还包含 `preflight.json`、`comparison.json` 和
+`comparison.html`。Pilot 和不完整 pair 永不写 history；完整 full pair 才按 raw、
+extracted 顺序追加到 `history/records/<dataset>.jsonl` 并重新生成 XLSX。晋级失败的完整
+full pair 仍以 failed 状态记录，但不能成为 baseline。在人工用真实 provider 完成受控
+full command 之前，不宣称 live 分数或晋级结果。
 
 ## 测试
 

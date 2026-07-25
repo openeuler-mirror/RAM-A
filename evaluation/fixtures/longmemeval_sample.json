@@ -1,0 +1,46 @@
+[
+  {
+    "question_id": "lme-fixture-1",
+    "question": "Where will Maya meet Omar on Friday?",
+    "answer": "At the riverside cafe.",
+    "question_type": "single-session-user",
+    "question_date": "2026/06/12 (Fri) 12:00",
+    "haystack_session_ids": [
+      "session-alpha",
+      "session-beta"
+    ],
+    "haystack_dates": [
+      "2026/06/10 (Wed) 09:00",
+      "2026/06/11 (Thu) 18:30"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "Maya keeps her red sketchbook in the hall cabinet.",
+          "has_answer": false
+        },
+        {
+          "role": "assistant",
+          "content": "I will remember where the sketchbook is stored.",
+          "has_answer": false
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "On Friday I will meet Omar at the riverside cafe.",
+          "has_answer": true
+        },
+        {
+          "role": "assistant",
+          "content": "That sounds like a pleasant place to meet.",
+          "has_answer": false
+        }
+      ]
+    ],
+    "answer_session_ids": [
+      "session-beta"
+    ]
+  }
+]

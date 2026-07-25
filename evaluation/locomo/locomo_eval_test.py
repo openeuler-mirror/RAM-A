@@ -7,7 +7,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from common.llm_client import ChatResult
-from common.memory_pipeline.cache import JsonCache
+from common.json_cache import JsonCache
 from locomo.locomo_eval import evaluate_llm_judge, load_and_evaluate_locomo, process_item, _parse_label
 
 

@@ -5,35 +5,10 @@ from pathlib import Path
 
 import pytest
 
-from common.memory_pipeline.extraction import ExtractionBatch, ModelUsage
-from common.memory_pipeline.grounding import StaticGroundingVerifier
-from common.memory_pipeline.pipeline import PipelineConfig, run_memory_pipeline
 from locomo.locomo_adapter import prepare_locomo, source_lookup
 
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "locomo_sample.json"
-
-
-class CapturingExtractor:
-    model = "fixture"
-    prompt_version = "capture_v1"
-
-    def __init__(self) -> None:
-        self.seen: list[str] = []
-
-    def extract(self, window, messages_by_id) -> ExtractionBatch:
-        payload = [
-            messages_by_id[message_id].to_dict()
-            for message_id in window.candidate_message_ids
-        ]
-        self.seen.append(json.dumps(payload, sort_keys=True))
-        return ExtractionBatch(
-            window_id=window.id,
-            schema_version="atomic_memory_v1",
-            raw_memories=[],
-            usage=ModelUsage(),
-            raw_response="{}",
-        )
 
 
 def test_prepare_locomo_preserves_turn_and_query_provenance() -> None:
@@ -113,25 +88,3 @@ def test_source_lookup_rejects_duplicate_memory_ids() -> None:
 
     with pytest.raises(ValueError, match="duplicate source memory id: S0:D1:0"):
         source_lookup(prepared)
-
-
-def test_locomo_gold_fields_never_enter_extraction_input() -> None:
-    prepared = prepare_locomo(json.loads(FIXTURE.read_text(encoding="utf-8")))
-    prepared["queries"][0]["text"] = "QUERY_CANARY"
-    prepared["queries"][0]["task"]["answer"] = "ANSWER_CANARY"
-    prepared["queries"][0]["task"]["evidence_ids"] = ["EVIDENCE_CANARY"]
-    original_queries = json.loads(json.dumps(prepared["queries"]))
-    extractor = CapturingExtractor()
-
-    run = run_memory_pipeline(
-        prepared,
-        PipelineConfig(),
-        extractor,
-        StaticGroundingVerifier({}),
-    )
-
-    joined = "\n".join(extractor.seen)
-    assert "QUERY_CANARY" not in joined
-    assert "ANSWER_CANARY" not in joined
-    assert "EVIDENCE_CANARY" not in joined
-    assert run.prepared["queries"] == original_queries

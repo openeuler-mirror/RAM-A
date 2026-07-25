@@ -38,6 +38,7 @@ from longmemeval.prompts import (  # noqa: E402
     validate_answer_prompt_version as _validate_answer_prompt_version,
     validate_memory_format as _validate_memory_format,
 )
+from longmemeval.provenance import retrieved_source_turn_ids  # noqa: E402
 
 
 class IncompleteResultsError(RuntimeError):
@@ -238,10 +239,11 @@ def _attach_retrieval_diagnostics(
     gold_turn_ids = _gold_turn_ids(query)
     gold_turn_id_set = set(gold_turn_ids)
     top_result_ids = [str(item.get("id", "")) for item in retrieved if item.get("id")]
+    source_turn_ids = retrieved_source_turn_ids({"results": retrieved})
     ranks = [
         index + 1
-        for index, item in enumerate(retrieved)
-        if str(item.get("id", "")) in gold_turn_id_set
+        for index, turn_id in enumerate(source_turn_ids)
+        if turn_id in gold_turn_id_set
     ]
     has_gold = bool(gold_turn_ids)
     gold_hit = bool(ranks) if has_gold else None
@@ -249,6 +251,7 @@ def _attach_retrieval_diagnostics(
     result_item["retrieval_diagnostic"] = {
         "gold_turn_ids": gold_turn_ids,
         "top_result_ids": top_result_ids,
+        "retrieved_source_turn_ids": source_turn_ids,
         "gold_turn_retrieved": gold_hit,
         "gold_turn_ranks": ranks,
         "gold_turn_best_rank": min(ranks) if ranks else None,

@@ -1,0 +1,10 @@
+{
+  "candidate-8510a9cc8a1c1c56ae6d38ec": {
+    "status": "SUPPORTED",
+    "reason": "The source message explicitly requires the health endpoint check."
+  },
+  "candidate-b46703ce3b7ab91dae70a400": {
+    "status": "SUPPORTED",
+    "reason": "The source message explicitly states Alice's update preference."
+  }
+}

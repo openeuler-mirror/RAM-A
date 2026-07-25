@@ -96,6 +96,30 @@ Shell 脚本自动运行完整 7 阶段流水线。
 
 ## 有证据约束的原子记忆 A/B
 
+新的配对实验应使用统一受治理入口。Pilot 前先把下面这份固定 LoCoMo policy 保存为
+JSON 文件：
+
+```json
+{"schema_version":"locomo-promotion-v1","historical_overall":{"operator":">","threshold":0.4065},"fresh_raw_overall":{"operator":">"},"scored_count":1540,"category_floors":{"1":0.1999,"2":0.4161,"3":0.2717,"4":0.4509},"regression_suite_required":true}
+```
+
+```bash
+PYTHONPATH=evaluation evaluation/.venv/bin/python evaluation/scripts/run_memory_ab.py \
+  --dataset locomo --phase pilot --pair-id locomo-v4 \
+  --dataset-file data/locomo/locomo10.json \
+  --promotion-policy /absolute/path/locomo-policy.json
+
+PYTHONPATH=evaluation evaluation/.venv/bin/python evaluation/scripts/run_memory_ab.py \
+  --dataset locomo --phase full --pair-id locomo-v4 \
+  --dataset-file data/locomo/locomo10.json \
+  --promotion-policy /absolute/path/locomo-policy.json \
+  --frozen-config evaluation/outputs/memory-ab/locomo/pilot/locomo-v4/frozen_config.json
+```
+
+Policy 文件字节的 hash 会写入两臂 config 和 frozen manifest。Pilot 不写 history；完整
+full pair 即使晋级失败也会记录，但只有通过的 treatment 才能成为 baseline。以上命令
+定义 live 协议；人工实际运行前不宣称任何 live 分数或晋级结果。
+
 `run_locomo_memory_ab.sh` 用于评估记忆特性 2 和 4，不改变 answer prompt。配对实验包含两个 arm：
 
 ```text

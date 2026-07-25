@@ -17,7 +17,7 @@ from tqdm import tqdm
 EVALUATION_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(EVALUATION_ROOT))
 
-from common.memory_pipeline.cache import JsonCache
+from common.json_cache import JsonCache
 from locomo.locomo_provenance import query_ref, render_contexts
 
 load_dotenv(".env")

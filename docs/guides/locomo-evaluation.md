@@ -98,6 +98,17 @@ falling back to hybrid retrieval.
 
 ## Pipeline
 
+For the paired `MEMORY_MODE=extracted` runner, episode construction and
+evidence-grounded memory extraction now execute in the Rust `memory-pipeline`
+crate. Python remains responsible for the LoCoMo adapter, stage orchestration,
+metrics, and reports. By default the runner launches:
+
+```bash
+cargo run --quiet --manifest-path ../Cargo.toml -p memory-pipeline -- ...
+```
+
+Set `MEMORY_PIPELINE_BIN=/path/to/memory-pipeline` to use a prebuilt binary.
+
 `./run_locomo_eval.sh memory_bench` runs:
 
 1. `memory-bench add`: ingest LoCoMo conversation text into a SQLite hybrid store.
