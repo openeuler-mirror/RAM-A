@@ -11,9 +11,6 @@ repository.
   chunking, semantic memory extraction, and timeline-aware memory reasoning.
 - [design/graph-memory-ingestion.md](design/graph-memory-ingestion.md): graph memory
   add, ingestion run, and record embedding stage reference.
-- [design/conversation-chunking-design.md](design/conversation-chunking-design.md):
-  detailed Chinese design for the first conversation chunking phase, including
-  UML/Mermaid diagrams, rationale, evaluation plan, and references.
 - [design/sqlite-hybrid-search.md](design/sqlite-hybrid-search.md): SQLite storage and
   dense/BM25/hybrid retrieval reference.
 - [guides/locomo-evaluation.md](guides/locomo-evaluation.md): LoCoMo execution guide and
