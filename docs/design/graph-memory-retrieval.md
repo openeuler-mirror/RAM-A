@@ -10,9 +10,10 @@ graph channel 接入 `MemoryManager::search(...)` 的方式。
 
 ```text
 GraphRetrieveContextRequest
+  -> 实体锚点 / 关系词查询规划
   -> 参数化 SQLite FTS seed retrieval
   -> Entity / Fact / Evidence-record seed
-  -> Entity -> Fact 或 Fact -> Entity 扩展
+  -> Entity -> Fact 兜底扩展
   -> Evidence -> GraphMemoryRecord
   -> ContextBundle
 ```
@@ -51,6 +52,12 @@ retrieval；数据集 wrapper 的参数透传属于 benchmark runner 集成层�
 - `max_evidence_records_per_fact`：每条 fact 最多附带多少条 evidence record，默认 3。
 - `query_embedding` / `query_embedding_model`：为未来独立的语义图检索提供者预留；当前 SQLite
   图检索不读取这两个字段。
+- `target_subject_entity_name`：可选的结构化查询约束。提供后会解析为同一 memory space
+  中的 active entity，并限制事实 subject；未提供时，图检索会从 query 中出现的 canonical
+  name / alias 自动解析具有 `source_actor` 溯源关系的全部明确实体。自动锚点最多保留 8 个；
+  同一位置名称无法唯一解析时跳过该位置，不强行选择。
+- `target_evidence_speaker`：可选的来源实体覆盖值。它通过图实体 canonical name / alias
+  解析，并以 `source_actor` 关系限制 evidence record，不读取 record 的任意业务 metadata。
 
 空白 query 会返回 `InvalidInput`。
 
@@ -72,8 +79,14 @@ retrieval；数据集 wrapper 的参数透传属于 benchmark runner 集成层�
 
 当前 seed retrieval 使用 SQLite FTS5，不调用 LLM。
 
-查询文本会先被转换为安全 FTS query：按空白拆分 token，每个 token 作为 quoted phrase，
-再用 `OR` 连接。SQL 始终使用参数绑定，不把用户 query 拼入 SQL 字符串。
+查询文本先生成两类安全 FTS query：
+
+1. 实体查询保留完整实义词，用于 canonical name / alias seed；
+2. 事实和 evidence 查询在显式或自动解析出目标主体后移除实体名称，只保留关系、属性和
+   对象词，并使用 FTS prefix term 兼容常见词形变化。
+
+两类查询都按空白拆分 token、删除问题停用词并用 `OR` 连接。SQL 始终使用参数绑定，不把
+用户 query 拼入 SQL 字符串。
 
 当前召回通道：
 
@@ -87,6 +100,11 @@ retrieval；数据集 wrapper 的参数透传属于 benchmark runner 集成层�
 active fact。
 
 Alias seed 和 record-evidence seed 会先按唯一 entity / fact 去重，再应用 `seed_limit`。
+
+自动主体解析只考虑至少作为一条 record 的 `source_actor` 出现过的实体。它先用 entity /
+alias FTS 生成有界候选，再要求名称以完整 token 序列出现在 query 中；查询包含多个明确名称
+时全部作为图锚点，同一位置优先最长名称，等价歧义则跳过该位置。自动锚点数硬限制为 8。
+`source_actor` 只承担主体消歧和证据溯源，不作为独立候选扩张通道。
 这样可以避免同一个 entity 的多个 alias 或同一个 fact 的多条 evidence record 占满
 seed limit，导致其他唯一 seed 被提前截断。
 
@@ -106,8 +124,12 @@ Fact seed
   -> evidence records
 ```
 
-如果同一 fact 被多个 seed 命中，会合并为一条候选。直接 Fact seed 和 Entity seed 分数
-相同时，优先保留 Fact seed 路径，因为它更直接说明 query 命中了哪条事实文本。
+每个自动解析出的实体锚点都会在相同的 `seed_limit` 下执行受 subject 约束的 seed 查询，
+随后按 seed 类型和 id 全局去重，并再次截断到一个 `seed_limit`，所以增加锚点不会放大最终
+seed 或 context 数量。如果同一 fact 被多个 seed 命中，会合并为一条候选。直接 Fact seed 和 Entity seed 分数
+相同时，优先保留 Fact seed 路径，因为它更直接说明 query 命中了哪条事实文本。只要已有
+直接 Fact seed，就不再无差别扩展命中实体的全部邻接事实；Entity -> Fact 仅作为没有直接
+事实匹配时的召回兜底。
 
 Entity seed 的邻接 fact 查询会使用当前 `top_k` 作为每个 entity 的扩展上限，避免高连接
 entity 在小查询里拉出无界 fact 集合。最终结果仍会在全局按候选排序后截断到 `top_k`。
@@ -118,8 +140,9 @@ entity 在小查询里拉出无界 fact 集合。最终结果仍会在全局按�
 2. 分数相同按 fact `recorded_at_ms`；
 3. 再相同按 fact id，保证输出稳定。
 
-最终会返回前 `top_k` 条 fact context，以及前 `top_k` 条直接 evidence-record context。
-候选投影为结果时按 record id 去重并再次截断；直接证据节点不会被转换为或标注为 fact。
+最终会返回前 `top_k` 条 fact context，以及前 `top_k` 条直接 lexical evidence-record
+context。候选投影为结果时按 record id 去重并再次截断；直接证据节点不会被转换为或标注为
+fact。
 
 ## 5. ContextBundle 组装
 
@@ -140,9 +163,8 @@ entity 在小查询里拉出无界 fact 集合。最终结果仍会在全局按�
 或事实时间字段，因为它是可追溯证据节点而非抽取事实。
 
 投影到 `MemoryRecord` 后，事实支持仍写入 `metadata.graph_facts`；直接证据节点写入
-`metadata.graph_matches`，其中 `kind = "evidence_record"`，并以 `match_kind` 区分
-`lexical`。这使评估可以分别统计图事实覆盖和原始证据覆盖，不能把后者误报为
-结构化事实检索能力。
+`metadata.graph_matches`，其中 `kind = "evidence_record"`、`match_kind = "lexical"`。
+这使评估可以分别统计图事实覆盖和原始证据覆盖，不能把后者误报为结构化事实检索能力。
 
 `ContextBundle` 会同时返回去重后的：
 
@@ -224,7 +246,8 @@ graph build 需要真实 LLM key。默认读取 `OPENROUTER_API_KEY`，默认 ba
 ## 8. 边界和限制
 
 - 本阶段只做图上下文检索，不直接生成自然语言答案。
-- 当前图检索只使用 FTS、实体和事实邻接关系，以及 fact 到原始 evidence 的可追溯链路；它不会
+- 当前图检索只使用 FTS、实体和事实邻接关系、entity 到 source-record 的 provenance link，以及
+  fact 到原始 evidence 的可追溯链路；它不会
   扫描或重排原始 record 向量，也不会扫描 fact 向量。未来若接入图语义检索，必须以独立、可测量的
   provider 实现，不能改变 dense / BM25 / hybrid 基线。
 - graph channel 接入现有 search fusion，但不改变 dense / BM25 / hybrid 的默认行为。

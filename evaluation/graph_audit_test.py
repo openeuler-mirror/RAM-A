@@ -95,6 +95,11 @@ def test_build_audit_reports_source_coverage_and_statuses():
         "records_with_fact_evidence": 1,
         "records_without_fact_evidence": 1,
         "record_fact_evidence_coverage": 0.5,
+        "record_entity_links_supported": False,
+        "record_entity_links": 0,
+        "records_with_entity_link": 0,
+        "records_without_entity_link": 2,
+        "record_entity_link_coverage": 0.0,
     }
     assert audit["predicate_distribution"] == [{"predicate": "LIKES", "count": 1}]
     assert audit["entity_type_distribution"] == [{"entity_type": "PERSON", "count": 1}]
@@ -103,6 +108,7 @@ def test_build_audit_reports_source_coverage_and_statuses():
         {"status": "failed", "stage": "extracting", "count": 1},
     ]
     assert audit["extraction_status_distribution"] == [{"status": "completed", "count": 1}]
+    assert audit["record_entity_link_kind_distribution"] == []
 
 
 def test_build_audit_scopes_all_counts_to_requested_memory_space():
@@ -125,3 +131,39 @@ def test_build_audit_scopes_all_counts_to_requested_memory_space():
     assert audit["summary"]["records"] == 1
     assert audit["summary"]["active_facts"] == 1
     assert audit["predicate_distribution"] == [{"predicate": "VISITED", "count": 1}]
+
+
+def test_build_audit_reports_record_entity_link_coverage_when_schema_is_available():
+    connection = sqlite3.connect(":memory:")
+    create_graph_schema(connection)
+    connection.executescript(
+        """
+        CREATE TABLE graph_record_entity_links (
+            id TEXT PRIMARY KEY,
+            memory_space_id TEXT NOT NULL,
+            memory_record_id TEXT NOT NULL,
+            entity_id TEXT NOT NULL,
+            link_kind TEXT NOT NULL
+        );
+        INSERT INTO graph_memory_spaces VALUES ('space-a');
+        INSERT INTO graph_memory_records VALUES ('record-1', 'space-a', NULL);
+        INSERT INTO graph_memory_records VALUES ('record-2', 'space-a', NULL);
+        INSERT INTO graph_entities VALUES ('entity-1', 'space-a', 'PERSON', 'active', NULL);
+        INSERT INTO graph_record_entity_links
+          VALUES ('link-1', 'space-a', 'record-1', 'entity-1', 'source_actor');
+        INSERT INTO graph_record_entity_links
+          VALUES ('link-2', 'space-a', 'record-1', 'entity-1', 'extracted_mention');
+        """
+    )
+
+    audit = build_audit(connection, "space-a")
+
+    assert audit["summary"]["record_entity_links_supported"] is True
+    assert audit["summary"]["record_entity_links"] == 2
+    assert audit["summary"]["records_with_entity_link"] == 1
+    assert audit["summary"]["records_without_entity_link"] == 1
+    assert audit["summary"]["record_entity_link_coverage"] == 0.5
+    assert audit["record_entity_link_kind_distribution"] == [
+        {"link_kind": "extracted_mention", "count": 1},
+        {"link_kind": "source_actor", "count": 1},
+    ]

@@ -4,7 +4,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from locomo.prepare_memory_bench import build_prepared_dataset, infer_target_speaker
+from locomo.prepare_memory_bench import build_prepared_dataset
 from locomo.locomo_retrieval import evaluate_query
 from locomo.locomo_responses import (
     MemoryBenchResponses,
@@ -53,6 +53,10 @@ def test_build_prepared_dataset_preserves_locomo_context_for_graph_ingestion():
     assert memory["metadata"]["scope_id"] == "path:$[0]"
     assert memory["metadata"]["raw_memory_path"] == "$[0].conversation.session_1[0].text"
     assert memory["metadata"]["speaker"] == "Alex"
+    assert memory["metadata"]["graph_source_entity"] == {
+        "name": "Alex",
+        "entity_type": "PERSON",
+    }
     assert memory["metadata"]["dia_id"] == "D1:0"
     assert memory["metadata"]["session_id"] == "session_1"
     assert memory["metadata"]["turn_index"] == 0
@@ -64,28 +68,9 @@ def test_build_prepared_dataset_preserves_locomo_context_for_graph_ingestion():
     assert query["filter"] == {"scope_id": "path:$[0]"}
     assert query["metadata"]["raw_query_path"] == "$[0].qa[0].question"
     assert query["metadata"]["category"] == 1
-    assert query["metadata"]["target_speaker"] == "Alex"
+    assert "target_speaker" not in query["metadata"]
     assert query["task"]["type"] == "open_qa"
     assert query["task"]["correct_answer"] == "On the kitchen table."
-
-
-def test_infer_target_speaker_uses_earliest_speaker_mention():
-    assert (
-        infer_target_speaker(
-            "What does Jamie think about Alex's plan?",
-            ["Alex", "Jamie"],
-        )
-        == "Jamie"
-    )
-    assert (
-        infer_target_speaker(
-            "What did Alex share with Jamie?",
-            ["Alex", "Jamie"],
-        )
-        == "Alex"
-    )
-    assert infer_target_speaker("What happened at the museum?", ["Alex", "Jamie"]) is None
-
 
 def test_graph_fact_validity_formats_open_and_closed_time_bounds():
     assert (

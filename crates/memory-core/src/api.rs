@@ -84,8 +84,12 @@ pub struct GraphRetrieveContextRequest {
     pub query_embedding: Option<Vec<f32>>,
     #[serde(default)]
     pub query_embedding_model: Option<String>,
+    /// Optional application-provided subject override. When absent, graph retrieval
+    /// resolves a source actor mentioned by canonical name or alias in the query.
     #[serde(default)]
     pub target_subject_entity_name: Option<String>,
+    /// Optional application-provided source-actor override for evidence provenance.
+    /// The value resolves through graph entity names and aliases, not record metadata.
     #[serde(default)]
     pub target_evidence_speaker: Option<String>,
     #[serde(default)]

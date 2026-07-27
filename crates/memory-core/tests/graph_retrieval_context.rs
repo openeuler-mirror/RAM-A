@@ -407,7 +407,12 @@ async fn graph_retrieval_returns_direct_evidence_for_a_record_without_facts() {
             "raw-adoption",
             1,
             "Alice is researching adoption agencies.",
-            serde_json::json!({"speaker": "Alice"}),
+            serde_json::json!({
+                "graph_source_entity": {
+                    "name": "Alice",
+                    "entity_type": "PERSON"
+                }
+            }),
         ),
         Arc::new(EmptyExtractor),
     )
@@ -439,6 +444,64 @@ async fn graph_retrieval_returns_direct_evidence_for_a_record_without_facts() {
 }
 
 #[tokio::test]
+async fn graph_source_entity_link_is_provenance_not_a_retrieval_candidate() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let db_path = temp.path().join("graph.sqlite");
+    let repo = GraphRepository::open(&db_path);
+    run_completed_with_extractor(
+        &repo,
+        request_with_metadata(
+            "space-1",
+            "user-1",
+            "alice-adoption",
+            1,
+            "I am researching adoption agencies.",
+            serde_json::json!({
+                "graph_source_entity": {
+                    "name": "Alice",
+                    "entity_type": "PERSON"
+                }
+            }),
+        ),
+        Arc::new(EmptyExtractor),
+    )
+    .await;
+
+    let connection = rusqlite::Connection::open(&db_path).expect("open graph database");
+    let link_count: i64 = connection
+        .query_row(
+            "SELECT count(*)
+             FROM graph_record_entity_links
+             WHERE memory_space_id = 'space-1'
+               AND link_kind = 'source_actor'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count source provenance links");
+    assert_eq!(link_count, 1);
+
+    let bundle = repo
+        .retrieve_context(GraphRetrieveContextRequest {
+            memory_space_id: "space-1".to_string(),
+            query: "Alice".to_string(),
+            top_k: 5,
+            reference_time_ms: None,
+            query_embedding: None,
+            query_embedding_model: None,
+            target_subject_entity_name: None,
+            target_evidence_speaker: None,
+            seed_limit: Some(10),
+            max_evidence_records_per_fact: Some(2),
+        })
+        .await
+        .expect("retrieve graph context");
+
+    assert!(bundle.fact_context_units.is_empty());
+    assert!(bundle.evidence_record_context_units.is_empty());
+    assert!(bundle.records.is_empty());
+}
+
+#[tokio::test]
 async fn graph_retrieval_lexical_evidence_does_not_decode_record_embedding() {
     let temp = tempfile::tempdir().expect("tempdir");
     let db_path = temp.path().join("graph.sqlite");
@@ -451,7 +514,12 @@ async fn graph_retrieval_lexical_evidence_does_not_decode_record_embedding() {
             "raw-adoption",
             1,
             "Alice is researching adoption agencies.",
-            serde_json::json!({"speaker": "Alice"}),
+            serde_json::json!({
+                "graph_source_entity": {
+                    "name": "Alice",
+                    "entity_type": "PERSON"
+                }
+            }),
         ),
         Arc::new(EmptyExtractor),
     )
@@ -494,10 +562,10 @@ async fn graph_retrieval_lexical_evidence_does_not_decode_record_embedding() {
 }
 
 #[tokio::test]
-async fn graph_retrieval_filters_direct_evidence_by_target_speaker() {
+async fn graph_retrieval_filters_direct_evidence_by_source_actor() {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = GraphRepository::open(temp.path().join("graph.sqlite"));
-    for (id, speaker) in [("alice-adoption", "Alice"), ("bob-adoption", "Bob")] {
+    for (id, source_actor) in [("alice-adoption", "Alice"), ("bob-adoption", "Bob")] {
         run_completed_with_extractor(
             &repo,
             request_with_metadata(
@@ -506,7 +574,13 @@ async fn graph_retrieval_filters_direct_evidence_by_target_speaker() {
                 id,
                 1,
                 "Adoption agencies are being discussed.",
-                serde_json::json!({"speaker": speaker}),
+                serde_json::json!({
+                    "speaker": "untrusted-display-metadata",
+                    "graph_source_entity": {
+                        "name": source_actor,
+                        "entity_type": "PERSON"
+                    }
+                }),
             ),
             Arc::new(EmptyExtractor),
         )
@@ -531,8 +605,11 @@ async fn graph_retrieval_filters_direct_evidence_by_target_speaker() {
 
     assert_eq!(bundle.evidence_record_context_units.len(), 1);
     assert_eq!(
-        bundle.evidence_record_context_units[0].record.metadata["speaker"],
-        "Alice"
+        bundle.evidence_record_context_units[0]
+            .record
+            .source_ref
+            .as_deref(),
+        Some("alice-adoption")
     );
 }
 
@@ -697,7 +774,7 @@ async fn graph_retrieval_applies_top_k_and_evidence_limits() {
 }
 
 #[tokio::test]
-async fn graph_retrieval_filters_evidence_records_by_target_speaker() {
+async fn graph_retrieval_infers_subject_and_filters_evidence_by_source_actor() {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = GraphRepository::open(temp.path().join("graph.sqlite"));
 
@@ -709,7 +786,14 @@ async fn graph_retrieval_filters_evidence_records_by_target_speaker() {
             "msg-alice",
             1,
             "Alice lives in Shanghai.",
-            serde_json::json!({"source": "retrieval-test", "speaker": "Alice"}),
+            serde_json::json!({
+                "source": "retrieval-test",
+                "speaker": "wrong-metadata-value",
+                "graph_source_entity": {
+                    "name": "Alice",
+                    "entity_type": "PERSON"
+                }
+            }),
         ),
         Arc::new(SingleFactExtractor),
     )
@@ -722,7 +806,14 @@ async fn graph_retrieval_filters_evidence_records_by_target_speaker() {
             "msg-bob",
             2,
             "Alice lives in Shanghai.",
-            serde_json::json!({"source": "retrieval-test", "speaker": "Bob"}),
+            serde_json::json!({
+                "source": "retrieval-test",
+                "speaker": "Alice",
+                "graph_source_entity": {
+                    "name": "Bob",
+                    "entity_type": "PERSON"
+                }
+            }),
         ),
         Arc::new(SingleFactExtractor),
     )
@@ -736,8 +827,8 @@ async fn graph_retrieval_filters_evidence_records_by_target_speaker() {
             reference_time_ms: Some(1_700_000_000_000),
             query_embedding: None,
             query_embedding_model: None,
-            target_subject_entity_name: Some("Alice".to_string()),
-            target_evidence_speaker: Some("Alice".to_string()),
+            target_subject_entity_name: None,
+            target_evidence_speaker: None,
             seed_limit: Some(10),
             max_evidence_records_per_fact: Some(5),
         })
@@ -745,13 +836,13 @@ async fn graph_retrieval_filters_evidence_records_by_target_speaker() {
         .expect("retrieve graph context");
 
     assert_eq!(bundle.fact_context_units.len(), 1);
-    let speakers = bundle.fact_context_units[0]
+    let source_refs = bundle.fact_context_units[0]
         .evidence_records
         .iter()
-        .map(|record| record.metadata["speaker"].as_str().unwrap())
+        .map(|record| record.source_ref.as_deref().unwrap())
         .collect::<Vec<_>>();
 
-    assert_eq!(speakers, vec!["Alice"]);
+    assert_eq!(source_refs, vec!["msg-alice"]);
 }
 
 #[tokio::test]

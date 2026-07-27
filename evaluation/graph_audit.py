@@ -29,6 +29,15 @@ def rows(connection, query, params=()):
     return [dict(zip(columns, row)) for row in connection.execute(query, params)]
 
 
+def has_table(connection, table_name):
+    return (
+        connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", [table_name]
+        ).fetchone()
+        is not None
+    )
+
+
 def build_audit(connection, memory_space_id=None):
     scope, scope_params = scoped_clause(memory_space_id)
     active_scope, active_scope_params = scoped_and(memory_space_id, "deleted_at_ms IS NULL")
@@ -85,6 +94,33 @@ def build_audit(connection, memory_space_id=None):
         """,
         [memory_space_id, memory_space_id],
     )
+    record_entity_links_supported = has_table(connection, "graph_record_entity_links")
+    if record_entity_links_supported:
+        records_with_entity_link = scalar(
+            connection,
+            """
+            SELECT count(DISTINCT r.id)
+            FROM graph_memory_records r
+            JOIN graph_record_entity_links links
+              ON links.memory_record_id = r.id
+             AND links.memory_space_id = r.memory_space_id
+            WHERE r.deleted_at_ms IS NULL
+              AND (? IS NULL OR r.memory_space_id = ?)
+            """,
+            [memory_space_id, memory_space_id],
+        )
+        record_entity_links = scalar(
+            connection,
+            """
+            SELECT count(*)
+            FROM graph_record_entity_links
+            WHERE ? IS NULL OR memory_space_id = ?
+            """,
+            [memory_space_id, memory_space_id],
+        )
+    else:
+        records_with_entity_link = 0
+        record_entity_links = 0
 
     summary = {
         "memory_spaces": scalar(
@@ -114,6 +150,13 @@ def build_audit(connection, memory_space_id=None):
         "records_with_fact_evidence": records_with_evidence,
         "records_without_fact_evidence": records - records_with_evidence,
         "record_fact_evidence_coverage": round(records_with_evidence / records, 6)
+        if records
+        else 0.0,
+        "record_entity_links_supported": record_entity_links_supported,
+        "record_entity_links": record_entity_links,
+        "records_with_entity_link": records_with_entity_link,
+        "records_without_entity_link": records - records_with_entity_link,
+        "record_entity_link_coverage": round(records_with_entity_link / records, 6)
         if records
         else 0.0,
     }
@@ -160,6 +203,20 @@ def build_audit(connection, memory_space_id=None):
             ORDER BY status ASC
             """,
             scope_params,
+        ),
+        "record_entity_link_kind_distribution": (
+            rows(
+                connection,
+                f"""
+                SELECT link_kind, count(*) AS count
+                FROM graph_record_entity_links{scope}
+                GROUP BY link_kind
+                ORDER BY count DESC, link_kind ASC
+                """,
+                scope_params,
+            )
+            if record_entity_links_supported
+            else []
         ),
     }
 

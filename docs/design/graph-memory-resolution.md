@@ -22,6 +22,7 @@ running / resolution 的 IngestionRun
 
 - `graph_entities`
 - `graph_entity_aliases`
+- `graph_record_entity_links`
 - `graph_facts`
 - `graph_fact_evidence_groups`
 - `graph_fact_evidence`
@@ -43,6 +44,8 @@ Entity(subject) -- Fact(predicate + fact_text + temporal fields) -- Entity(objec
                        |
                        v
                  EvidenceSpan -> GraphMemoryRecord 原文
+
+GraphMemoryRecord -- source_actor / extracted_mention --> Entity
 ```
 
 `Fact` 在当前 schema 中是具有独立 ID、状态、时态字段、证据和来源的一级关系对象。
@@ -85,6 +88,11 @@ alias 同时匹配多个 active entity，本阶段不会强行选择其中一个
 fact。这个规则有意保守：语义相近但文本不同的事实不会在本阶段强行合并，例如
 “Alice lives in Shanghai”和“Alice's home is Shanghai”会先保留为不同 fact，后续再由
 更强的 conflict / equivalence / soft-retire 机制处理。
+
+`graph_record_entity_links` 是另一类 provenance 边：它记录原文由调用方声明的来源实体，或
+由 extraction 输出的 entity candidate 提及了哪些实体。它不表示实体之间存在关系，也不替代
+fact evidence。该边用于来源审计、删除治理和后续溯源，不直接把与实体关联的全部原文扩张为
+检索候选；回答上下文仍应从匹配事实的 evidence 或直接原文匹配取得。
 
 ## 5. Evidence 和决策记录
 

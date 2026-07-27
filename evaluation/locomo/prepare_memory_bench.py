@@ -36,6 +36,12 @@ def build_prepared_dataset(raw: list[dict[str, Any]], source: str) -> dict[str, 
                 }
                 copy_optional(metadata, turn, "speaker")
                 copy_optional(metadata, turn, "dia_id")
+                speaker = metadata.get("speaker")
+                if isinstance(speaker, str) and speaker.strip():
+                    metadata["graph_source_entity"] = {
+                        "name": speaker,
+                        "entity_type": "PERSON",
+                    }
                 if sample.get("sample_id") is not None:
                     metadata["sample_id"] = sample["sample_id"]
                 if session_timestamp:
@@ -67,12 +73,6 @@ def build_prepared_dataset(raw: list[dict[str, Any]], source: str) -> dict[str, 
             }
             if sample.get("sample_id") is not None:
                 metadata["sample_id"] = sample["sample_id"]
-            target_speaker = infer_target_speaker(
-                text,
-                [conversation.get("speaker_a"), conversation.get("speaker_b")],
-            )
-            if target_speaker is not None:
-                metadata["target_speaker"] = target_speaker
             queries.append(
                 {
                     "id": raw_query_path,
@@ -111,19 +111,6 @@ def sorted_session_keys(conversation: dict[str, Any]) -> list[str]:
 def copy_optional(target: dict[str, Any], source: dict[str, Any], key: str) -> None:
     if source.get(key) is not None:
         target[key] = source[key]
-
-
-def infer_target_speaker(question: str, speakers: list[Any]) -> str | None:
-    matches: list[tuple[int, str]] = []
-    for speaker in speakers:
-        if not isinstance(speaker, str) or not speaker.strip():
-            continue
-        match = re.search(rf"\b{re.escape(speaker)}\b", question, flags=re.IGNORECASE)
-        if match:
-            matches.append((match.start(), speaker))
-    if not matches:
-        return None
-    return min(matches, key=lambda item: item[0])[1]
 
 
 def parse_locomo_timestamp_ms(value: Any) -> int | None:

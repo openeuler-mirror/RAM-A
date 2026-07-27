@@ -96,6 +96,27 @@ pub fn initialize_schema(connection: &Connection) -> MemoryResult<()> {
         ON graph_entity_aliases(memory_space_id, entity_id, normalized_alias)
         WHERE deleted_at_ms IS NULL;
 
+        CREATE TABLE IF NOT EXISTS graph_record_entity_links (
+            id TEXT NOT NULL,
+            memory_space_id TEXT NOT NULL,
+            memory_record_id TEXT NOT NULL,
+            entity_id TEXT NOT NULL,
+            link_kind TEXT NOT NULL,
+            extraction_run_id TEXT,
+            created_at_ms INTEGER NOT NULL,
+            PRIMARY KEY (id),
+            UNIQUE (memory_space_id, memory_record_id, entity_id, link_kind),
+            FOREIGN KEY (memory_record_id, memory_space_id)
+                REFERENCES graph_memory_records(id, memory_space_id),
+            FOREIGN KEY (entity_id, memory_space_id)
+                REFERENCES graph_entities(id, memory_space_id),
+            FOREIGN KEY (extraction_run_id)
+                REFERENCES graph_extraction_runs(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_graph_record_entity_links_entity
+        ON graph_record_entity_links(memory_space_id, entity_id, memory_record_id);
+
         CREATE TABLE IF NOT EXISTS graph_facts (
             id TEXT NOT NULL,
             memory_space_id TEXT NOT NULL,

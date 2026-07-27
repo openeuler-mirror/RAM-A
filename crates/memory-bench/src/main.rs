@@ -19,7 +19,6 @@ use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 
 const PREPARED_SCHEMA_VERSION: &str = "benchmark-prepared-v1";
-const TARGET_SPEAKER_METADATA_KEY: &str = "target_speaker";
 
 #[derive(Parser)]
 #[command(name = "memory-bench")]
@@ -783,16 +782,8 @@ async fn run_search_prepared_queries(
             } else {
                 None
             },
-            graph_target_subject: if cli.graph {
-                prepared_target_speaker(metadata.as_ref()).map(str::to_string)
-            } else {
-                None
-            },
-            graph_target_evidence_speaker: if cli.graph {
-                prepared_target_speaker(metadata.as_ref()).map(str::to_string)
-            } else {
-                None
-            },
+            graph_target_subject: None,
+            graph_target_evidence_speaker: None,
         });
         output_templates.push(QueryOutput {
             query_path: format!("$.queries[{index}].text"),
@@ -1387,14 +1378,6 @@ fn insert_default_metadata(target: &mut serde_json::Value, key: &str, value: ser
         return;
     };
     target_object.entry(key.to_string()).or_insert(value);
-}
-
-fn prepared_target_speaker(metadata: Option<&serde_json::Value>) -> Option<&str> {
-    metadata?
-        .get(TARGET_SPEAKER_METADATA_KEY)?
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
 }
 
 #[derive(Clone, Serialize, Deserialize)]

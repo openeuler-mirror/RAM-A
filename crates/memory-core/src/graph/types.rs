@@ -86,6 +86,16 @@ pub struct EntityAlias {
     pub deleted_at_ms: Option<u64>,
 }
 
+/// A caller-declared entity that authored or otherwise originated a source record.
+///
+/// This is provenance, not an extracted fact. Callers may provide it in record
+/// metadata as `graph_source_entity` with `name` and `entity_type` fields.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GraphSourceEntity {
+    pub name: String,
+    pub entity_type: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EntityAliasEvidence {
     pub id: String,

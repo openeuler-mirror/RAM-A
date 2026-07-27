@@ -22,6 +22,8 @@ const GRAPH_PIPELINE_VERSION: &str = "graph-pipeline-v1";
 const FACT_EVIDENCE_KIND_SUPPORT: &str = "support";
 const RESOLUTION_METHOD_DETERMINISTIC: &str = "deterministic";
 const MAX_GRAPH_FTS_QUERY_TERMS: usize = 256;
+const MAX_GRAPH_SOURCE_ACTOR_CANDIDATES: usize = 256;
+const MAX_GRAPH_QUERY_ACTORS: usize = 8;
 // An entity name identifies a neighborhood, not a query-relevant fact. Keep traversal
 // available as a fallback, but never let it outrank lexical fact/evidence matches.
 const ENTITY_EXPANSION_SEED_WEIGHT: f32 = 0.0;
@@ -29,6 +31,8 @@ const FACT_TEXT_SEED_WEIGHT: f32 = 1.0;
 // A direct source-record match is useful when extraction has no fact coverage,
 // but a matching materialized fact is the more specific graph signal.
 const DIRECT_EVIDENCE_RECORD_WEIGHT: f32 = 0.25;
+const RECORD_ENTITY_LINK_KIND_EXTRACTED_MENTION: &str = "extracted_mention";
+const RECORD_ENTITY_LINK_KIND_SOURCE_ACTOR: &str = "source_actor";
 const GRAPH_RETRIEVAL_STOP_WORDS: &[&str] = &[
     "a", "an", "and", "are", "as", "at", "be", "did", "do", "does", "for", "from", "had", "has",
     "have", "how", "in", "is", "of", "on", "or", "the", "to", "was", "were", "what", "when",
@@ -114,6 +118,7 @@ pub struct ClaimedResolutionRun {
     pub memory_space_id: String,
     pub memory_record_id: String,
     pub text: String,
+    pub metadata: serde_json::Value,
     pub attempt_count: i64,
     pub extraction_run_id: String,
     pub extraction_output: GraphExtractionOutput,
@@ -127,6 +132,7 @@ pub struct ResolutionPublishRequest {
     pub extraction_run_id: String,
     pub attempt_count: i64,
     pub extraction_output: GraphExtractionOutput,
+    pub source_entity: Option<GraphSourceEntity>,
     pub type_registry_version: String,
     pub resolver_version: String,
 }
@@ -139,6 +145,7 @@ pub struct ResolutionPublishResult {
     pub facts_created: usize,
     pub facts_reused: usize,
     pub evidence_inserted: usize,
+    pub record_entity_links_inserted: usize,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -152,6 +159,18 @@ struct GraphSeed {
     kind: GraphSeedKind,
     id: String,
     score: f32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GraphFtsQueryPlan {
+    entity_fts_query: Option<String>,
+    relation_fts_query: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolvedGraphSubject {
+    entity_id: String,
+    matched_name: String,
 }
 
 #[derive(Clone, Debug)]
@@ -604,44 +623,125 @@ fn retrieve_context_sync(
     }
 
     let connection = open_graph_connection(path)?;
-    let fts_query = graph_fts_query(query);
-
-    let target_subject_entity_id = if let Some(name) = request.target_subject_entity_name.as_deref()
+    let resolved_target_subjects = if let Some(name) = request.target_subject_entity_name.as_deref()
     {
         find_active_entity_by_normalized_name(
             &connection,
             &request.memory_space_id,
             &normalize_graph_text(name),
         )?
+        .map(|entity_id| {
+            vec![ResolvedGraphSubject {
+                entity_id,
+                matched_name: name.to_string(),
+            }]
+        })
+        .unwrap_or_default()
+    } else {
+        resolve_query_source_actors(
+            &connection,
+            &request.memory_space_id,
+            query,
+            request.seed_limit(),
+        )?
+    };
+    let target_subject_entity_ids = resolved_target_subjects
+        .iter()
+        .map(|subject| subject.entity_id.as_str())
+        .collect::<Vec<_>>();
+    let target_subject_entity_names = resolved_target_subjects
+        .iter()
+        .map(|subject| subject.matched_name.as_str())
+        .collect::<Vec<_>>();
+    let query_plan = graph_fts_query_plan(query, &target_subject_entity_names);
+
+    let has_explicit_evidence_target = request.target_evidence_speaker.is_some();
+    let explicit_evidence_entity_id = if let Some(name) = request.target_evidence_speaker.as_deref()
+    {
+        let resolved = find_active_entity_by_normalized_name(
+            &connection,
+            &request.memory_space_id,
+            &normalize_graph_text(name),
+        )?;
+        match resolved {
+            Some(entity_id)
+                if entity_has_source_actor_link(
+                    &connection,
+                    &request.memory_space_id,
+                    &entity_id,
+                )? =>
+            {
+                Some(entity_id)
+            }
+            _ => None,
+        }
     } else {
         None
     };
 
-    let seeds = fts_query
-        .as_deref()
-        .map(|fts_query| {
-            collect_graph_seeds(
+    let inferred_evidence_entity_ids = if has_explicit_evidence_target {
+        HashSet::new()
+    } else {
+        let mut entity_ids = HashSet::new();
+        for entity_id in &target_subject_entity_ids {
+            if entity_has_source_actor_link(&connection, &request.memory_space_id, entity_id)? {
+                entity_ids.insert((*entity_id).to_string());
+            }
+        }
+        entity_ids
+    };
+
+    let seeds = if target_subject_entity_ids.is_empty() {
+        collect_graph_seeds(
+            &connection,
+            &request.memory_space_id,
+            query_plan.entity_fts_query.as_deref(),
+            query_plan.relation_fts_query.as_deref(),
+            request.seed_limit(),
+            None,
+        )?
+    } else {
+        let mut seeds = Vec::new();
+        for entity_id in &target_subject_entity_ids {
+            seeds.extend(collect_graph_seeds(
                 &connection,
                 &request.memory_space_id,
-                fts_query,
+                query_plan.entity_fts_query.as_deref(),
+                query_plan.relation_fts_query.as_deref(),
                 request.seed_limit(),
-                target_subject_entity_id.as_deref(),
-            )
-        })
-        .transpose()?
-        .unwrap_or_default();
+                Some(entity_id),
+            )?);
+        }
+        merge_graph_seeds(seeds, request.seed_limit())
+    };
     let fact_candidates = expand_seed_facts(
         &connection,
         &request.memory_space_id,
         &seeds,
         request.top_k,
-        target_subject_entity_id.as_deref(),
+        &target_subject_entity_ids,
     )?;
-    let (fact_context_units, loaded_facts) =
-        load_fact_context_units(&connection, request, &fact_candidates)?;
-    let evidence_record_context_units = fts_query
+    let (fact_context_units, loaded_facts) = load_fact_context_units(
+        &connection,
+        request,
+        &fact_candidates,
+        explicit_evidence_entity_id.as_deref(),
+        &inferred_evidence_entity_ids,
+    )?;
+    let evidence_fts_query = query_plan
+        .relation_fts_query
         .as_deref()
-        .map(|fts_query| load_direct_evidence_record_context_units(&connection, request, fts_query))
+        .or(query_plan.entity_fts_query.as_deref());
+    let evidence_record_context_units = evidence_fts_query
+        .map(|fts_query| {
+            load_direct_evidence_record_context_units_for_entities(
+                &connection,
+                request,
+                fts_query,
+                explicit_evidence_entity_id.as_deref(),
+                &inferred_evidence_entity_ids,
+            )
+        })
         .transpose()?
         .unwrap_or_default();
     let bundle_members = collect_bundle_members(
@@ -662,29 +762,313 @@ fn retrieve_context_sync(
         fact_links: bundle_members.fact_links,
         paths: bundle_members.paths,
         truncation: None,
-        degraded_reason: fts_query
+        degraded_reason: query_plan
+            .entity_fts_query
             .is_none()
             .then_some("query produced no graph retrieval terms".to_string()),
     })
 }
 
+#[cfg(test)]
+fn resolve_query_source_actor(
+    connection: &Connection,
+    memory_space_id: &str,
+    query: &str,
+    candidate_limit: usize,
+) -> MemoryResult<Option<ResolvedGraphSubject>> {
+    Ok(
+        resolve_query_source_actors(connection, memory_space_id, query, candidate_limit)?
+            .into_iter()
+            .next(),
+    )
+}
+
+fn resolve_query_source_actors(
+    connection: &Connection,
+    memory_space_id: &str,
+    query: &str,
+    candidate_limit: usize,
+) -> MemoryResult<Vec<ResolvedGraphSubject>> {
+    let query_tokens = graph_match_tokens(query);
+    if query_tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(fts_query) = graph_fts_query_from_terms(
+        query_tokens
+            .iter()
+            .filter(|term| !is_graph_retrieval_stop_word(term))
+            .take(MAX_GRAPH_FTS_QUERY_TERMS)
+            .cloned()
+            .collect(),
+        false,
+    ) else {
+        return Ok(Vec::new());
+    };
+
+    let limit = candidate_limit.clamp(1, MAX_GRAPH_SOURCE_ACTOR_CANDIDATES);
+    let mut matches_by_entity = HashMap::<String, (usize, usize, String)>::new();
+
+    let mut canonical_statement = connection.prepare(
+        "SELECT entities.id, entities.canonical_name
+         FROM graph_entity_fts
+         JOIN graph_entities entities
+           ON entities.id = graph_entity_fts.id
+          AND entities.memory_space_id = graph_entity_fts.memory_space_id
+         WHERE graph_entity_fts MATCH ?1
+           AND graph_entity_fts.memory_space_id = ?2
+           AND entities.status = 'active'
+           AND entities.deleted_at_ms IS NULL
+           AND EXISTS (
+               SELECT 1
+               FROM graph_record_entity_links links
+               WHERE links.memory_space_id = entities.memory_space_id
+                 AND links.entity_id = entities.id
+                 AND links.link_kind = 'source_actor'
+           )
+         ORDER BY bm25(graph_entity_fts), entities.created_at_ms, entities.id
+         LIMIT ?3",
+    )?;
+    let canonical_rows = canonical_statement
+        .query_map(params![fts_query, memory_space_id, limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+    for row in canonical_rows {
+        let (entity_id, display_name) = row?;
+        record_query_actor_match(
+            &mut matches_by_entity,
+            &query_tokens,
+            entity_id,
+            display_name,
+        );
+    }
+
+    let mut alias_statement = connection.prepare(
+        "SELECT entities.id, aliases.display_alias
+         FROM graph_entity_alias_fts
+         JOIN graph_entity_aliases aliases
+           ON aliases.id = graph_entity_alias_fts.id
+          AND aliases.memory_space_id = graph_entity_alias_fts.memory_space_id
+         JOIN graph_entities entities
+           ON entities.id = aliases.entity_id
+          AND entities.memory_space_id = aliases.memory_space_id
+         WHERE graph_entity_alias_fts MATCH ?1
+           AND graph_entity_alias_fts.memory_space_id = ?2
+           AND aliases.deleted_at_ms IS NULL
+           AND entities.status = 'active'
+           AND entities.deleted_at_ms IS NULL
+           AND EXISTS (
+               SELECT 1
+               FROM graph_record_entity_links links
+               WHERE links.memory_space_id = entities.memory_space_id
+                 AND links.entity_id = entities.id
+                 AND links.link_kind = 'source_actor'
+           )
+         ORDER BY bm25(graph_entity_alias_fts), aliases.created_at_ms, entities.id
+         LIMIT ?3",
+    )?;
+    let alias_rows = alias_statement
+        .query_map(params![fts_query, memory_space_id, limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+    for row in alias_rows {
+        let (entity_id, display_name) = row?;
+        record_query_actor_match(
+            &mut matches_by_entity,
+            &query_tokens,
+            entity_id,
+            display_name,
+        );
+    }
+
+    let mut matches = matches_by_entity
+        .into_iter()
+        .map(|(entity_id, (position, token_count, matched_name))| {
+            (position, token_count, entity_id, matched_name)
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+
+    let mut resolved = Vec::new();
+    let mut occupied_query_tokens = HashSet::new();
+    let mut index = 0;
+    while index < matches.len() {
+        let position = matches[index].0;
+        let mut end = index + 1;
+        while end < matches.len() && matches[end].0 == position {
+            end += 1;
+        }
+        let longest_match_len = matches[index].1;
+        let equally_specific_end = matches[index..end]
+            .iter()
+            .position(|matched| matched.1 < longest_match_len)
+            .map(|offset| index + offset)
+            .unwrap_or(end);
+        let overlaps_selected = (position..position + longest_match_len)
+            .any(|token_index| occupied_query_tokens.contains(&token_index));
+        if equally_specific_end - index == 1 && !overlaps_selected {
+            let matched = &matches[index];
+            resolved.push(ResolvedGraphSubject {
+                entity_id: matched.2.clone(),
+                matched_name: matched.3.clone(),
+            });
+            occupied_query_tokens.extend(position..position + longest_match_len);
+        }
+        index = end;
+    }
+    resolved.truncate(MAX_GRAPH_QUERY_ACTORS);
+
+    Ok(resolved)
+}
+
+fn record_query_actor_match(
+    matches_by_entity: &mut HashMap<String, (usize, usize, String)>,
+    query_tokens: &[String],
+    entity_id: String,
+    display_name: String,
+) {
+    let name_tokens = graph_match_tokens(&display_name);
+    let Some(position) = contiguous_token_match_position(query_tokens, &name_tokens) else {
+        return;
+    };
+    let candidate = (position, name_tokens.len(), display_name);
+    matches_by_entity
+        .entry(entity_id)
+        .and_modify(|current| {
+            if candidate.0 < current.0 || (candidate.0 == current.0 && candidate.1 > current.1) {
+                *current = candidate.clone();
+            }
+        })
+        .or_insert(candidate);
+}
+
+fn graph_match_tokens(value: &str) -> Vec<String> {
+    let normalized = normalize_graph_text(value);
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in normalized.chars() {
+        if ch.is_alphanumeric() {
+            current.push(ch);
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn contiguous_token_match_position(
+    query_tokens: &[String],
+    name_tokens: &[String],
+) -> Option<usize> {
+    if name_tokens.is_empty() || name_tokens.len() > query_tokens.len() {
+        return None;
+    }
+    query_tokens
+        .windows(name_tokens.len())
+        .position(|window| window == name_tokens)
+}
+
+fn entity_has_source_actor_link(
+    connection: &Connection,
+    memory_space_id: &str,
+    entity_id: &str,
+) -> MemoryResult<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM graph_record_entity_links
+                 WHERE memory_space_id = ?1
+                   AND entity_id = ?2
+                   AND link_kind = 'source_actor'
+             )",
+            params![memory_space_id, entity_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+#[cfg(test)]
 fn graph_fts_query(query: &str) -> Option<String> {
-    let terms = query
+    graph_fts_query_from_terms(graph_query_terms(query), false)
+}
+
+fn graph_fts_query_plan(query: &str, target_subject_entity_names: &[&str]) -> GraphFtsQueryPlan {
+    let query_terms = graph_query_terms(query);
+    let target_match_terms = target_subject_entity_names
+        .iter()
+        .flat_map(|name| graph_match_tokens(name))
+        .collect::<Vec<_>>();
+    let target_term_set = target_match_terms.iter().cloned().collect::<HashSet<_>>();
+    let target_fts_terms = target_subject_entity_names
+        .iter()
+        .flat_map(|name| graph_query_terms(name))
+        .collect::<Vec<_>>();
+    let relation_terms = query_terms
+        .iter()
+        .filter(|term| {
+            graph_match_tokens(term)
+                .iter()
+                .all(|token| !target_term_set.contains(token))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let entity_terms = if target_fts_terms.is_empty() {
+        query_terms
+    } else {
+        target_fts_terms
+            .into_iter()
+            .chain(relation_terms.iter().cloned())
+            .take(MAX_GRAPH_FTS_QUERY_TERMS)
+            .collect()
+    };
+
+    GraphFtsQueryPlan {
+        entity_fts_query: graph_fts_query_from_terms(entity_terms, false),
+        relation_fts_query: graph_fts_query_from_terms(relation_terms, true),
+    }
+}
+
+fn graph_query_terms(query: &str) -> Vec<String> {
+    query
         .split_whitespace()
         .filter_map(|term| {
             let trimmed = normalize_graph_query_term(term);
             if trimmed.is_empty() || is_graph_retrieval_stop_word(&trimmed) {
                 None
             } else {
-                Some(format!("\"{}\"", trimmed.replace('"', "\"\"")))
+                Some(trimmed)
             }
         })
         .take(MAX_GRAPH_FTS_QUERY_TERMS)
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn graph_fts_query_from_terms(terms: Vec<String>, prefix: bool) -> Option<String> {
     if terms.is_empty() {
         None
     } else {
-        Some(terms.join(" OR "))
+        Some(
+            terms
+                .into_iter()
+                .map(|term| {
+                    let quoted = format!("\"{}\"", term.replace('"', "\"\""));
+                    if prefix {
+                        format!("{quoted}*")
+                    } else {
+                        quoted
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" OR "),
+        )
     }
 }
 
@@ -750,7 +1134,8 @@ fn find_active_entity_by_normalized_name(
 fn collect_graph_seeds(
     connection: &Connection,
     memory_space_id: &str,
-    fts_query: &str,
+    entity_fts_query: Option<&str>,
+    relation_fts_query: Option<&str>,
     limit: usize,
     target_subject_entity_id: Option<&str>,
 ) -> MemoryResult<Vec<GraphSeed>> {
@@ -759,24 +1144,28 @@ fn collect_graph_seeds(
     }
 
     let mut seeds = Vec::new();
-    collect_entity_name_seeds(connection, memory_space_id, fts_query, limit, &mut seeds)?;
-    collect_entity_alias_seeds(connection, memory_space_id, fts_query, limit, &mut seeds)?;
-    collect_fact_text_seeds(
-        connection,
-        memory_space_id,
-        fts_query,
-        limit,
-        target_subject_entity_id,
-        &mut seeds,
-    )?;
-    collect_record_evidence_fact_seeds(
-        connection,
-        memory_space_id,
-        fts_query,
-        limit,
-        target_subject_entity_id,
-        &mut seeds,
-    )?;
+    if let Some(fts_query) = entity_fts_query {
+        collect_entity_name_seeds(connection, memory_space_id, fts_query, limit, &mut seeds)?;
+        collect_entity_alias_seeds(connection, memory_space_id, fts_query, limit, &mut seeds)?;
+    }
+    if let Some(fts_query) = relation_fts_query {
+        collect_fact_text_seeds(
+            connection,
+            memory_space_id,
+            fts_query,
+            limit,
+            target_subject_entity_id,
+            &mut seeds,
+        )?;
+        collect_record_evidence_fact_seeds(
+            connection,
+            memory_space_id,
+            fts_query,
+            limit,
+            target_subject_entity_id,
+            &mut seeds,
+        )?;
+    }
 
     Ok(merge_graph_seeds(seeds, limit))
 }
@@ -1063,22 +1452,37 @@ fn expand_seed_facts(
     memory_space_id: &str,
     seeds: &[GraphSeed],
     limit: usize,
-    target_subject_entity_id: Option<&str>,
+    target_subject_entity_ids: &[&str],
 ) -> MemoryResult<Vec<FactCandidate>> {
     if limit == 0 || seeds.is_empty() {
         return Ok(Vec::new());
     }
 
+    let has_direct_fact_seed = seeds
+        .iter()
+        .any(|seed| seed.kind == GraphSeedKind::Fact && seed.score > 0.0);
     let mut candidates_by_fact: HashMap<String, FactCandidate> = HashMap::new();
     for seed in seeds {
         match seed.kind {
             GraphSeedKind::Fact => {
-                if let Some(recorded_at_ms) = active_fact_recorded_at(
-                    connection,
-                    memory_space_id,
-                    &seed.id,
-                    target_subject_entity_id,
-                )? {
+                let recorded_at_ms = if target_subject_entity_ids.is_empty() {
+                    active_fact_recorded_at(connection, memory_space_id, &seed.id, None)?
+                } else {
+                    let mut recorded_at_ms = None;
+                    for entity_id in target_subject_entity_ids {
+                        recorded_at_ms = active_fact_recorded_at(
+                            connection,
+                            memory_space_id,
+                            &seed.id,
+                            Some(entity_id),
+                        )?;
+                        if recorded_at_ms.is_some() {
+                            break;
+                        }
+                    }
+                    recorded_at_ms
+                };
+                if let Some(recorded_at_ms) = recorded_at_ms {
                     upsert_fact_candidate(
                         &mut candidates_by_fact,
                         FactCandidate {
@@ -1091,22 +1495,52 @@ fn expand_seed_facts(
                 }
             }
             GraphSeedKind::Entity => {
-                for (fact_id, recorded_at_ms) in active_facts_for_entity(
-                    connection,
-                    memory_space_id,
-                    &seed.id,
-                    limit,
-                    target_subject_entity_id,
-                )? {
-                    upsert_fact_candidate(
-                        &mut candidates_by_fact,
-                        FactCandidate {
-                            fact_id: fact_id.clone(),
-                            score: seed.score,
-                            path: vec![format!("entity:{}", seed.id), format!("fact:{fact_id}")],
-                            recorded_at_ms,
-                        },
-                    );
+                // Entity neighborhoods are a recall fallback. Once a relation or evidence
+                // matched a fact directly, expanding every fact for the named entity adds
+                // unrelated context and obscures the stronger graph path.
+                if has_direct_fact_seed {
+                    continue;
+                }
+                if target_subject_entity_ids.is_empty() {
+                    for (fact_id, recorded_at_ms) in
+                        active_facts_for_entity(connection, memory_space_id, &seed.id, limit, None)?
+                    {
+                        upsert_fact_candidate(
+                            &mut candidates_by_fact,
+                            FactCandidate {
+                                fact_id: fact_id.clone(),
+                                score: seed.score,
+                                path: vec![
+                                    format!("entity:{}", seed.id),
+                                    format!("fact:{fact_id}"),
+                                ],
+                                recorded_at_ms,
+                            },
+                        );
+                    }
+                } else {
+                    for entity_id in target_subject_entity_ids {
+                        for (fact_id, recorded_at_ms) in active_facts_for_entity(
+                            connection,
+                            memory_space_id,
+                            &seed.id,
+                            limit,
+                            Some(entity_id),
+                        )? {
+                            upsert_fact_candidate(
+                                &mut candidates_by_fact,
+                                FactCandidate {
+                                    fact_id: fact_id.clone(),
+                                    score: seed.score,
+                                    path: vec![
+                                        format!("entity:{}", seed.id),
+                                        format!("fact:{fact_id}"),
+                                    ],
+                                    recorded_at_ms,
+                                },
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1266,6 +1700,8 @@ fn load_fact_context_units(
     connection: &Connection,
     request: &GraphRetrieveContextRequest,
     fact_candidates: &[FactCandidate],
+    explicit_evidence_entity_id: Option<&str>,
+    inferred_evidence_entity_ids: &HashSet<String>,
 ) -> MemoryResult<(Vec<FactContextUnit>, Vec<Fact>)> {
     let mut units = Vec::with_capacity(fact_candidates.len());
     let mut loaded_facts = Vec::with_capacity(fact_candidates.len());
@@ -1278,12 +1714,17 @@ fn load_fact_context_units(
         )?;
         let object_entity =
             load_entity(connection, &request.memory_space_id, &fact.object_entity_id)?;
+        let target_evidence_entity_id = explicit_evidence_entity_id.or_else(|| {
+            inferred_evidence_entity_ids
+                .contains(&fact.subject_entity_id)
+                .then_some(fact.subject_entity_id.as_str())
+        });
         let evidence_records = load_evidence_records_for_fact(
             connection,
             &request.memory_space_id,
             &fact.id,
             request.max_evidence_records_per_fact(),
-            request.target_evidence_speaker.as_deref(),
+            target_evidence_entity_id,
         )?;
         let mut path = candidate.path.clone();
         for record in &evidence_records {
@@ -1373,13 +1814,12 @@ fn load_direct_evidence_record_context_units(
     connection: &Connection,
     request: &GraphRetrieveContextRequest,
     fts_query: &str,
+    target_evidence_entity_id: Option<&str>,
 ) -> MemoryResult<Vec<EvidenceRecordContextUnit>> {
     if request.top_k == 0 {
         return Ok(Vec::new());
     }
 
-    // Fetch a bounded superset before applying the optional speaker constraint,
-    // since speaker currently lives in metadata JSON rather than an indexed column.
     let fetch_limit = request.seed_limit();
     let mut statement = connection.prepare(
         "SELECT records.id, records.memory_space_id, records.session_id,
@@ -1396,18 +1836,31 @@ fn load_direct_evidence_record_context_units(
          WHERE graph_memory_record_fts MATCH ?1
            AND graph_memory_record_fts.memory_space_id = ?2
            AND records.deleted_at_ms IS NULL
+           AND (
+               ?3 IS NULL
+               OR EXISTS (
+                   SELECT 1
+                   FROM graph_record_entity_links links
+                   WHERE links.memory_space_id = records.memory_space_id
+                     AND links.memory_record_id = records.id
+                     AND links.entity_id = ?3
+                     AND links.link_kind = 'source_actor'
+               )
+           )
          ORDER BY bm25(graph_memory_record_fts), records.ingestion_sequence, records.id
-         LIMIT ?3",
+         LIMIT ?4",
     )?;
     let rows = statement.query_map(
-        params![fts_query, &request.memory_space_id, fetch_limit as i64],
+        params![
+            fts_query,
+            &request.memory_space_id,
+            target_evidence_entity_id,
+            fetch_limit as i64
+        ],
         |row| graph_memory_record_from_row(row, false),
     )?;
 
-    let mut records = rows.collect::<Result<Vec<_>, _>>()?;
-    if let Some(target_evidence_speaker) = request.target_evidence_speaker.as_deref() {
-        records.retain(|record| record_speaker_matches(&record.metadata, target_evidence_speaker));
-    }
+    let records = rows.collect::<Result<Vec<_>, _>>()?;
 
     Ok(records
         .into_iter()
@@ -1420,6 +1873,65 @@ fn load_direct_evidence_record_context_units(
             match_kind: EvidenceRecordMatchKind::Lexical,
         })
         .collect())
+}
+
+fn load_direct_evidence_record_context_units_for_entities(
+    connection: &Connection,
+    request: &GraphRetrieveContextRequest,
+    fts_query: &str,
+    explicit_evidence_entity_id: Option<&str>,
+    inferred_evidence_entity_ids: &HashSet<String>,
+) -> MemoryResult<Vec<EvidenceRecordContextUnit>> {
+    let mut units = Vec::new();
+    if let Some(entity_id) = explicit_evidence_entity_id {
+        units.extend(load_direct_evidence_record_context_units(
+            connection,
+            request,
+            fts_query,
+            Some(entity_id),
+        )?);
+    } else if inferred_evidence_entity_ids.is_empty() {
+        units.extend(load_direct_evidence_record_context_units(
+            connection, request, fts_query, None,
+        )?);
+    } else {
+        let mut entity_ids = inferred_evidence_entity_ids.iter().collect::<Vec<_>>();
+        entity_ids.sort();
+        for entity_id in entity_ids {
+            units.extend(load_direct_evidence_record_context_units(
+                connection,
+                request,
+                fts_query,
+                Some(entity_id),
+            )?);
+        }
+    }
+
+    let mut best_by_record = HashMap::<String, EvidenceRecordContextUnit>::new();
+    for unit in units {
+        best_by_record
+            .entry(unit.record.id.clone())
+            .and_modify(|existing| {
+                if unit.score > existing.score {
+                    *existing = unit.clone();
+                }
+            })
+            .or_insert(unit);
+    }
+    let mut merged = best_by_record.into_values().collect::<Vec<_>>();
+    merged.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| {
+                left.record
+                    .ingestion_sequence
+                    .cmp(&right.record.ingestion_sequence)
+            })
+            .then_with(|| left.record.id.cmp(&right.record.id))
+    });
+    merged.truncate(request.top_k);
+    Ok(merged)
 }
 
 fn graph_memory_record_from_row(
@@ -1613,7 +2125,7 @@ fn load_evidence_records_for_fact(
     memory_space_id: &str,
     fact_id: &str,
     limit: usize,
-    target_evidence_speaker: Option<&str>,
+    target_evidence_entity_id: Option<&str>,
 ) -> MemoryResult<Vec<GraphMemoryRecord>> {
     if limit == 0 {
         return Ok(Vec::new());
@@ -1638,31 +2150,51 @@ fn load_evidence_records_for_fact(
            AND groups.memory_space_id = ?2
            AND groups.deleted_at_ms IS NULL
            AND records.deleted_at_ms IS NULL
-         ORDER BY groups.created_at_ms, evidence.created_at_ms, records.id",
+           AND (
+               ?3 IS NULL
+               OR EXISTS (
+                   SELECT 1
+                   FROM graph_record_entity_links links
+                   WHERE links.memory_space_id = records.memory_space_id
+                     AND links.memory_record_id = records.id
+                     AND links.entity_id = ?3
+                     AND links.link_kind = 'source_actor'
+               )
+           )
+         ORDER BY groups.created_at_ms, evidence.created_at_ms, records.id
+         LIMIT ?4",
     )?;
-    let rows = statement.query_map(params![fact_id, memory_space_id], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, i64>(3)?,
-            row.get::<_, Option<i64>>(4)?,
-            row.get::<_, String>(5)?,
-            row.get::<_, String>(6)?,
-            row.get::<_, String>(7)?,
-            row.get::<_, Option<String>>(8)?,
-            row.get::<_, String>(9)?,
-            row.get::<_, Option<String>>(10)?,
-            row.get::<_, Option<i64>>(11)?,
-            row.get::<_, Option<Vec<u8>>>(12)?,
-            row.get::<_, Option<i64>>(13)?,
-            row.get::<_, Option<String>>(14)?,
-            row.get::<_, Option<String>>(15)?,
-            row.get::<_, i64>(16)?,
-            row.get::<_, i64>(17)?,
-            row.get::<_, Option<i64>>(18)?,
-        ))
-    })?;
+    let rows = statement.query_map(
+        params![
+            fact_id,
+            memory_space_id,
+            target_evidence_entity_id,
+            limit as i64
+        ],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<i64>>(11)?,
+                row.get::<_, Option<Vec<u8>>>(12)?,
+                row.get::<_, Option<i64>>(13)?,
+                row.get::<_, Option<String>>(14)?,
+                row.get::<_, Option<String>>(15)?,
+                row.get::<_, i64>(16)?,
+                row.get::<_, i64>(17)?,
+                row.get::<_, Option<i64>>(18)?,
+            ))
+        },
+    )?;
 
     let mut records = Vec::new();
     for row in rows {
@@ -1709,18 +2241,7 @@ fn load_evidence_records_for_fact(
         });
     }
 
-    if let Some(target_evidence_speaker) = target_evidence_speaker {
-        records.retain(|record| record_speaker_matches(&record.metadata, target_evidence_speaker));
-    }
-    records.truncate(limit);
     Ok(records)
-}
-
-fn record_speaker_matches(metadata: &serde_json::Value, target_speaker: &str) -> bool {
-    metadata
-        .get("speaker")
-        .and_then(|value| value.as_str())
-        .is_some_and(|speaker| speaker.eq_ignore_ascii_case(target_speaker))
 }
 
 fn parse_fact_status(status: &str) -> MemoryResult<FactStatus> {
@@ -2165,6 +2686,7 @@ fn claim_resolution_run_sync(
         memory_space_id,
         memory_record_id,
         text,
+        metadata_json,
         status,
         stage,
         attempt_count,
@@ -2174,6 +2696,7 @@ fn claim_resolution_run_sync(
         "SELECT runs.memory_space_id,
                 runs.memory_record_id,
                 records.text,
+                records.metadata_json,
                 runs.status,
                 runs.stage,
                 runs.attempt_count,
@@ -2198,9 +2721,10 @@ fn claim_resolution_run_sync(
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
-                row.get::<_, i64>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, Option<String>>(7)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(8)?,
             ))
         },
     )?;
@@ -2240,6 +2764,7 @@ fn claim_resolution_run_sync(
         memory_space_id,
         memory_record_id,
         text,
+        metadata: serde_json::from_str(&metadata_json)?,
         attempt_count,
         extraction_run_id,
         extraction_output,
@@ -2259,6 +2784,33 @@ fn publish_resolution_sync(
     let mut facts_created = 0;
     let mut facts_reused = 0;
     let mut evidence_inserted = 0;
+    let mut record_entity_links_inserted = 0;
+
+    if let Some(source_entity) = &request.source_entity {
+        let resolved = resolve_entity_candidate(
+            &transaction,
+            request,
+            &ExtractedEntityCandidate {
+                local_id: "source_entity".to_string(),
+                name: source_entity.name.clone(),
+                entity_type: source_entity.entity_type.clone(),
+                confidence: None,
+            },
+            now,
+        )?;
+        if resolved.created {
+            entities_created += 1;
+        } else {
+            entities_reused += 1;
+        }
+        record_entity_links_inserted += insert_record_entity_link(
+            &transaction,
+            request,
+            &resolved.entity_id,
+            RECORD_ENTITY_LINK_KIND_SOURCE_ACTOR,
+            now,
+        )?;
+    }
 
     for entity in &request.extraction_output.entities {
         let resolved = resolve_entity_candidate(&transaction, request, entity, now)?;
@@ -2268,6 +2820,15 @@ fn publish_resolution_sync(
             entities_reused += 1;
         }
         entity_map.insert(entity.local_id.clone(), resolved.entity_id);
+        record_entity_links_inserted += insert_record_entity_link(
+            &transaction,
+            request,
+            entity_map
+                .get(&entity.local_id)
+                .expect("resolved entity must be present"),
+            RECORD_ENTITY_LINK_KIND_EXTRACTED_MENTION,
+            now,
+        )?;
     }
 
     for fact in &request.extraction_output.facts {
@@ -2343,6 +2904,7 @@ fn publish_resolution_sync(
         facts_created,
         facts_reused,
         evidence_inserted,
+        record_entity_links_inserted,
     })
 }
 
@@ -2758,6 +3320,31 @@ fn insert_fact_evidence_group(
     Ok(candidate.evidence.len())
 }
 
+fn insert_record_entity_link(
+    transaction: &Transaction<'_>,
+    request: &ResolutionPublishRequest,
+    entity_id: &str,
+    link_kind: &str,
+    now: i64,
+) -> MemoryResult<usize> {
+    let inserted = transaction.execute(
+        "INSERT OR IGNORE INTO graph_record_entity_links (
+            id, memory_space_id, memory_record_id, entity_id, link_kind,
+            extraction_run_id, created_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            Uuid::new_v4().to_string(),
+            &request.memory_space_id,
+            &request.memory_record_id,
+            entity_id,
+            link_kind,
+            &request.extraction_run_id,
+            now,
+        ],
+    )?;
+    Ok(inserted)
+}
+
 struct ResolutionDecisionInsert<'a> {
     decision_kind: &'a str,
     input_key: &'a str,
@@ -3103,8 +3690,10 @@ fn blob_to_embedding(
 mod tests {
     use super::{
         active_facts_for_entity, collect_graph_seeds, expand_seed_facts, fact_dedup_key,
-        find_active_entity_by_normalized_name, graph_fts_query, normalize_graph_text,
-        open_graph_connection, GraphSeedKind,
+        find_active_entity_by_normalized_name, graph_fts_query, graph_fts_query_plan,
+        load_direct_evidence_record_context_units_for_entities, normalize_graph_text,
+        open_graph_connection, resolve_query_source_actor, resolve_query_source_actors,
+        GraphSeedKind,
     };
     use rusqlite::params;
     use std::path::Path;
@@ -3182,6 +3771,54 @@ mod tests {
         assert_eq!(
             super::graph_fts_query("When did Alice visit Shanghai?").as_deref(),
             Some("\"Alice\" OR \"visit\" OR \"Shanghai\"")
+        );
+    }
+
+    #[test]
+    fn graph_query_plan_separates_target_entity_from_relation_terms() {
+        let plan = graph_fts_query_plan("What did Caroline research?", &["Caroline"]);
+
+        assert_eq!(
+            plan.entity_fts_query.as_deref(),
+            Some("\"Caroline\" OR \"research\"")
+        );
+        assert_eq!(plan.relation_fts_query.as_deref(), Some("\"research\"*"));
+    }
+
+    #[test]
+    fn graph_query_plan_handles_multi_word_target_and_entity_only_queries() {
+        let plan = graph_fts_query_plan("What does Caroline Smith like?", &["Caroline Smith"]);
+        assert_eq!(plan.relation_fts_query.as_deref(), Some("\"like\"*"));
+
+        let entity_only = graph_fts_query_plan("Caroline Smith", &["Caroline Smith"]);
+        assert_eq!(entity_only.relation_fts_query, None);
+    }
+
+    #[test]
+    fn graph_query_plan_removes_possessive_target_from_relation_terms() {
+        let plan = graph_fts_query_plan("What is Caroline's identity?", &["Caroline"]);
+
+        assert_eq!(
+            plan.entity_fts_query.as_deref(),
+            Some("\"Caroline\" OR \"identity\"")
+        );
+        assert_eq!(plan.relation_fts_query.as_deref(), Some("\"identity\"*"));
+    }
+
+    #[test]
+    fn graph_query_plan_removes_all_resolved_source_actors_from_relation_terms() {
+        let plan = graph_fts_query_plan(
+            "What subject have Caroline and Melanie both painted?",
+            &["Caroline", "Melanie"],
+        );
+
+        assert_eq!(
+            plan.entity_fts_query.as_deref(),
+            Some("\"Caroline\" OR \"Melanie\" OR \"subject\" OR \"both\" OR \"painted\"")
+        );
+        assert_eq!(
+            plan.relation_fts_query.as_deref(),
+            Some("\"subject\"* OR \"both\"* OR \"painted\"*")
         );
     }
 
@@ -3288,7 +3925,15 @@ mod tests {
         insert_test_alias(&connection, "alias-b-1", "entity-b", "Alice third", 3);
 
         let fts_query = graph_fts_query("Alice").unwrap();
-        let seeds = collect_graph_seeds(&connection, "space-1", &fts_query, 2, None).unwrap();
+        let seeds = collect_graph_seeds(
+            &connection,
+            "space-1",
+            Some(&fts_query),
+            Some(&fts_query),
+            2,
+            None,
+        )
+        .unwrap();
         let seed_ids = seeds
             .into_iter()
             .map(|seed| seed.id)
@@ -3310,6 +3955,169 @@ mod tests {
             find_active_entity_by_normalized_name(&connection, "space-1", "mel").unwrap();
 
         assert_eq!(entity_id.as_deref(), Some("entity-a"));
+    }
+
+    #[test]
+    fn query_source_actor_resolution_uses_canonical_names_and_aliases() {
+        let connection = open_graph_connection(Path::new(":memory:")).unwrap();
+        seed_graph_space(&connection);
+        insert_test_entity(&connection, "melanie", "Melanie", "melanie");
+        insert_test_alias(&connection, "alias-mel", "melanie", "Mel", 1);
+        insert_test_source_actor_link(&connection, "record-melanie", "melanie");
+
+        let canonical = resolve_query_source_actor(
+            &connection,
+            "space-1",
+            "What did Melanie's painting show?",
+            10,
+        )
+        .unwrap()
+        .expect("canonical source actor");
+        assert_eq!(canonical.entity_id, "melanie");
+        assert_eq!(canonical.matched_name, "Melanie");
+
+        let alias = resolve_query_source_actor(&connection, "space-1", "What did Mel paint?", 10)
+            .unwrap()
+            .expect("aliased source actor");
+        assert_eq!(alias.entity_id, "melanie");
+        assert_eq!(alias.matched_name, "Mel");
+    }
+
+    #[test]
+    fn query_source_actor_resolution_returns_every_actor_named_in_the_query() {
+        let connection = open_graph_connection(Path::new(":memory:")).unwrap();
+        seed_graph_space(&connection);
+        insert_test_entity(&connection, "caroline", "Caroline", "caroline");
+        insert_test_entity(&connection, "melanie", "Melanie", "melanie");
+        insert_test_alias(&connection, "alias-mel", "melanie", "Mel", 1);
+        insert_test_source_actor_link(&connection, "record-caroline", "caroline");
+        insert_test_source_actor_link(&connection, "record-melanie", "melanie");
+
+        let resolved = resolve_query_source_actors(
+            &connection,
+            "space-1",
+            "What did Caroline recommend to Mel?",
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|subject| (subject.entity_id.as_str(), subject.matched_name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("caroline", "Caroline"), ("melanie", "Mel")]
+        );
+    }
+
+    #[test]
+    fn query_source_actor_resolution_prefers_longest_non_overlapping_name() {
+        let connection = open_graph_connection(Path::new(":memory:")).unwrap();
+        seed_graph_space(&connection);
+        insert_test_entity(&connection, "alice", "Alice", "alice");
+        insert_test_entity(&connection, "alice-smith", "Alice Smith", "alice smith");
+        insert_test_source_actor_link(&connection, "record-alice", "alice");
+        insert_test_source_actor_link(&connection, "record-alice-smith", "alice-smith");
+
+        let resolved =
+            resolve_query_source_actors(&connection, "space-1", "What did Alice Smith paint?", 10)
+                .unwrap();
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].entity_id, "alice-smith");
+    }
+
+    #[test]
+    fn query_source_actor_resolution_limits_automatic_anchors() {
+        let connection = open_graph_connection(Path::new(":memory:")).unwrap();
+        seed_graph_space(&connection);
+        let mut query_names = Vec::new();
+        for index in 0..super::MAX_GRAPH_QUERY_ACTORS + 1 {
+            let entity_id = format!("person-{index}");
+            let name = format!("Person{index}");
+            let record_id = format!("record-{index}");
+            insert_test_entity(&connection, &entity_id, &name, &name.to_lowercase());
+            insert_test_source_actor_link(&connection, &record_id, &entity_id);
+            query_names.push(name);
+        }
+
+        let resolved = resolve_query_source_actors(
+            &connection,
+            "space-1",
+            &format!("What did {} discuss?", query_names.join(" and ")),
+            super::MAX_GRAPH_SOURCE_ACTOR_CANDIDATES,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.len(), super::MAX_GRAPH_QUERY_ACTORS);
+    }
+
+    #[test]
+    fn query_source_actor_resolution_ignores_entities_without_source_provenance() {
+        let connection = open_graph_connection(Path::new(":memory:")).unwrap();
+        seed_graph_space(&connection);
+        insert_test_entity(&connection, "melanie", "Melanie", "melanie");
+
+        let resolved =
+            resolve_query_source_actor(&connection, "space-1", "What did Melanie paint?", 10)
+                .unwrap();
+
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn multi_actor_direct_evidence_keeps_named_actors_and_excludes_others() {
+        let connection = open_graph_connection(Path::new(":memory:")).unwrap();
+        seed_graph_space(&connection);
+        for (entity_id, name, record_id) in [
+            ("alice", "Alice", "record-alice"),
+            ("bob", "Bob", "record-bob"),
+            ("carol", "Carol", "record-carol"),
+        ] {
+            insert_test_entity(&connection, entity_id, name, &name.to_lowercase());
+            insert_test_source_actor_link(&connection, record_id, entity_id);
+            connection
+                .execute(
+                    "INSERT INTO graph_memory_record_fts (
+                        id, memory_space_id, text
+                     )
+                     VALUES (?1, 'space-1', 'shared painting')",
+                    params![record_id],
+                )
+                .unwrap();
+        }
+
+        let request = crate::GraphRetrieveContextRequest {
+            memory_space_id: "space-1".to_string(),
+            query: "What did Alice and Bob paint?".to_string(),
+            top_k: 10,
+            reference_time_ms: None,
+            query_embedding: None,
+            query_embedding_model: None,
+            target_subject_entity_name: None,
+            target_evidence_speaker: None,
+            seed_limit: Some(10),
+            max_evidence_records_per_fact: Some(2),
+        };
+        let units = load_direct_evidence_record_context_units_for_entities(
+            &connection,
+            &request,
+            "\"painting\"",
+            None,
+            &std::collections::HashSet::from(["alice".to_string(), "bob".to_string()]),
+        )
+        .unwrap();
+        let record_ids = units
+            .into_iter()
+            .map(|unit| unit.record.id)
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(
+            record_ids,
+            std::collections::HashSet::from(
+                ["record-alice".to_string(), "record-bob".to_string(),]
+            )
+        );
     }
 
     #[test]
@@ -3397,7 +4205,15 @@ mod tests {
         insert_test_fact_fts(&connection, "fact-self-loop", "self loop attribute");
 
         let fts_query = graph_fts_query("mentioned self").unwrap();
-        let seeds = collect_graph_seeds(&connection, "space-1", &fts_query, 10, None).unwrap();
+        let seeds = collect_graph_seeds(
+            &connection,
+            "space-1",
+            Some(&fts_query),
+            Some(&fts_query),
+            10,
+            None,
+        )
+        .unwrap();
 
         assert!(seeds.is_empty(), "seeds: {seeds:?}");
     }
@@ -3424,7 +4240,15 @@ mod tests {
         );
 
         let fts_query = graph_fts_query("Alice adoption").unwrap();
-        let seeds = collect_graph_seeds(&connection, "space-1", &fts_query, 10, None).unwrap();
+        let seeds = collect_graph_seeds(
+            &connection,
+            "space-1",
+            Some(&fts_query),
+            Some(&fts_query),
+            10,
+            None,
+        )
+        .unwrap();
         let entity_seed = seeds
             .iter()
             .find(|seed| seed.kind == GraphSeedKind::Entity && seed.id == "alice")
@@ -3480,16 +4304,142 @@ mod tests {
         );
 
         let fts_query = graph_fts_query("Caroline adoption").unwrap();
-        let seeds =
-            collect_graph_seeds(&connection, "space-1", &fts_query, 10, Some("caroline")).unwrap();
+        let seeds = collect_graph_seeds(
+            &connection,
+            "space-1",
+            Some(&fts_query),
+            Some(&fts_query),
+            10,
+            Some("caroline"),
+        )
+        .unwrap();
         let candidates =
-            expand_seed_facts(&connection, "space-1", &seeds, 10, Some("caroline")).unwrap();
+            expand_seed_facts(&connection, "space-1", &seeds, 10, &["caroline"]).unwrap();
         let fact_ids = candidates
             .into_iter()
             .map(|candidate| candidate.fact_id)
             .collect::<Vec<_>>();
 
         assert_eq!(fact_ids, vec!["caroline-fact"]);
+    }
+
+    #[test]
+    fn graph_retrieval_multi_subject_includes_each_named_actor_and_excludes_others() {
+        let connection = open_graph_connection(Path::new(":memory:")).unwrap();
+        seed_graph_space(&connection);
+        insert_test_entity(&connection, "caroline", "Caroline", "caroline");
+        insert_test_entity(&connection, "melanie", "Melanie", "melanie");
+        insert_test_entity(&connection, "bob", "Bob", "bob");
+        insert_test_entity(&connection, "painting", "painting", "painting");
+        for (fact_id, subject, text, recorded_at_ms) in [
+            ("caroline-fact", "caroline", "Caroline painted a sunset.", 1),
+            ("melanie-fact", "melanie", "Melanie painted a sunset.", 2),
+            ("bob-fact", "bob", "Bob painted a sunset.", 3),
+        ] {
+            insert_test_fact_with_text(
+                &connection,
+                fact_id,
+                subject,
+                "PARTICIPATED_IN",
+                "painting",
+                text,
+                recorded_at_ms,
+            );
+            insert_test_fact_fts(&connection, fact_id, text);
+        }
+
+        let plan = graph_fts_query_plan(
+            "What did Caroline and Melanie paint?",
+            &["Caroline", "Melanie"],
+        );
+        let seeds = ["caroline", "melanie"]
+            .into_iter()
+            .flat_map(|subject| {
+                collect_graph_seeds(
+                    &connection,
+                    "space-1",
+                    plan.entity_fts_query.as_deref(),
+                    plan.relation_fts_query.as_deref(),
+                    10,
+                    Some(subject),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let candidates =
+            expand_seed_facts(&connection, "space-1", &seeds, 10, &["caroline", "melanie"])
+                .unwrap();
+        let fact_ids = candidates
+            .into_iter()
+            .map(|candidate| candidate.fact_id)
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(
+            fact_ids,
+            std::collections::HashSet::from([
+                "caroline-fact".to_string(),
+                "melanie-fact".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn relation_match_outranks_generic_facts_for_the_same_subject() {
+        let connection = open_graph_connection(Path::new(":memory:")).unwrap();
+        seed_graph_space(&connection);
+        insert_test_entity(&connection, "caroline", "Caroline", "caroline");
+        insert_test_entity(
+            &connection,
+            "adoption",
+            "adoption agencies",
+            "adoption agencies",
+        );
+        insert_test_entity(&connection, "reading", "reading", "reading");
+        insert_test_fact_with_text(
+            &connection,
+            "generic-fact",
+            "caroline",
+            "LIKES",
+            "reading",
+            "Caroline likes reading.",
+            1,
+        );
+        insert_test_fact_with_text(
+            &connection,
+            "research-fact",
+            "caroline",
+            "RELATED_TO",
+            "adoption",
+            "Caroline is researching adoption agencies.",
+            2,
+        );
+        insert_test_fact_fts(&connection, "generic-fact", "Caroline likes reading.");
+        insert_test_fact_fts(
+            &connection,
+            "research-fact",
+            "Caroline is researching adoption agencies.",
+        );
+
+        let plan = graph_fts_query_plan("What did Caroline research?", &["Caroline"]);
+        let seeds = collect_graph_seeds(
+            &connection,
+            "space-1",
+            plan.entity_fts_query.as_deref(),
+            plan.relation_fts_query.as_deref(),
+            10,
+            Some("caroline"),
+        )
+        .unwrap();
+        let candidates =
+            expand_seed_facts(&connection, "space-1", &seeds, 10, &["caroline"]).unwrap();
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.fact_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["research-fact"]
+        );
     }
 
     fn seed_graph_space(connection: &rusqlite::Connection) {
@@ -3555,6 +4505,37 @@ mod tests {
                 "INSERT INTO graph_entity_alias_fts (id, memory_space_id, display_alias)
                  VALUES (?1, 'space-1', ?2)",
                 params![id, display_alias],
+            )
+            .unwrap();
+    }
+
+    fn insert_test_source_actor_link(
+        connection: &rusqlite::Connection,
+        memory_record_id: &str,
+        entity_id: &str,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO graph_memory_records (
+                    id, memory_space_id, ingestion_sequence, text, metadata_json,
+                    source_kind, content_role, created_at_ms, updated_at_ms
+                 )
+                 VALUES (?1, 'space-1', 1, 'source record', '{}',
+                         'conversation', 'user', 1, 1)",
+                params![memory_record_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO graph_record_entity_links (
+                    id, memory_space_id, memory_record_id, entity_id, link_kind, created_at_ms
+                 )
+                 VALUES (?1, 'space-1', ?2, ?3, 'source_actor', 1)",
+                params![
+                    format!("link-{memory_record_id}-{entity_id}"),
+                    memory_record_id,
+                    entity_id
+                ],
             )
             .unwrap();
     }

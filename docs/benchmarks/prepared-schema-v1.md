@@ -257,6 +257,8 @@ Common fields:
 - `document_id`: original document ID, if applicable
 - `role`: normalized role such as `user`, `assistant`, or `system`
 - `speaker`: original speaker field from the dataset
+- `graph_source_entity`: optional generic provenance declaration with `name` and registered
+  `entity_type`; graph ingestion links the source record to this entity without creating a fact
 - `turn_index`: turn index inside a conversation or session
 - `conversation_index`: legacy PersonaMem-style conversation index
 

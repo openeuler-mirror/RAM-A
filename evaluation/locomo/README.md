@@ -103,7 +103,9 @@ For the RAM-A backend, the wrapper first converts the raw LoCoMo file into
 `benchmark-prepared-v1` schema. The prepared memories preserve LoCoMo-specific
 fields such as `raw_memory_path`, `session_timestamp`, and `observed_at_ms` in
 metadata so graph extraction can use observation time without adding LoCoMo
-parsing logic to `memory-bench`.
+parsing logic to `memory-bench`. When a turn has a speaker, the adapter also maps it to the
+generic `metadata.graph_source_entity` contract, so graph provenance can link the source record
+to its author without treating the author link as a fact.
 
 The optional mem0 comparison implementation lives under `evaluation/locomo/backends/mem0/`.
 
