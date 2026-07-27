@@ -17,6 +17,8 @@ def test_run_add_passes_graph_build_flags(monkeypatch, tmp_path):
         tmp_path / "store.sqlite",
         tmp_path / "prepared.json",
         graph_build=True,
+        graph_build_concurrency=4,
+        resume=True,
         graph_weight=0.4,
         graph_memory_space_mode="metadata-field",
         graph_memory_space_field="tenant_id",
@@ -29,6 +31,7 @@ def test_run_add_passes_graph_build_flags(monkeypatch, tmp_path):
 
     cmd = captured["cmd"]
     assert "--graph-build" in cmd
+    assert cmd[cmd.index("--graph-build-concurrency") + 1] == "4"
     assert "--graph-weight" in cmd
     assert "0.4" in cmd
     assert "--graph-memory-space-mode" in cmd
@@ -42,6 +45,8 @@ def test_run_add_passes_graph_build_flags(monkeypatch, tmp_path):
     assert "--graph-llm-timeout-ms" in cmd
     assert "60000" in cmd
     assert cmd.index("--graph-build") < cmd.index("add")
+    assert cmd.index("--graph-build-concurrency") < cmd.index("add")
+    assert "--resume" in cmd[cmd.index("add"):]
 
 
 def test_run_search_passes_graph_flags(monkeypatch, tmp_path):
@@ -75,3 +80,4 @@ def test_run_search_passes_graph_flags(monkeypatch, tmp_path):
     assert "--graph-memory-space-field" in cmd
     assert "tenant_id" in cmd
     assert cmd.index("--graph") < cmd.index("search")
+    assert "--graph-build-concurrency" not in cmd

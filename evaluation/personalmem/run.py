@@ -276,6 +276,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--candidate-k", type=int)
     parser.add_argument("--graph", action="store_true")
     parser.add_argument("--graph-build", action="store_true")
+    parser.add_argument("--graph-build-concurrency", default=1, type=int)
     parser.add_argument("--graph-weight", default=0.2, type=float)
     parser.add_argument("--graph-fail-open", action="store_true")
     parser.add_argument(
@@ -387,6 +388,8 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
 
 
 def validate_experiment_args(args: argparse.Namespace) -> None:
+    if args.graph_build_concurrency < 1:
+        raise ValueError("--graph-build-concurrency must be at least 1")
     if args.phase == "full" and args.frozen_config is None:
         raise ValueError("--frozen-config is required for full runs")
     if args.phase == "full" and args.promotion_policy is None:
@@ -688,7 +691,11 @@ def run_add(args: argparse.Namespace) -> int:
         return 2
     command = bench_base_command(args)
     if args.graph_build:
-        command.append("--graph-build")
+        command.extend([
+            "--graph-build",
+            "--graph-build-concurrency",
+            str(args.graph_build_concurrency),
+        ])
     command += [
         "add",
         "--dataset",
@@ -696,6 +703,8 @@ def run_add(args: argparse.Namespace) -> int:
         "--text-fields",
         args.text_fields,
     ]
+    if args.resume:
+        command.append("--resume")
     return run_command(command, args.repo_root)
 
 
@@ -1378,6 +1387,7 @@ def write_personamem_run_meta(args: argparse.Namespace, phase: str) -> dict[str,
         top_k=args.top_k,
         graph=getattr(args, "graph", False),
         graph_build=getattr(args, "graph_build", False),
+        graph_build_concurrency=getattr(args, "graph_build_concurrency", 1),
         graph_weight=getattr(args, "graph_weight", 0.2),
         graph_fail_open=getattr(args, "graph_fail_open", False),
         graph_memory_space_mode=getattr(args, "graph_memory_space_mode", "auto"),

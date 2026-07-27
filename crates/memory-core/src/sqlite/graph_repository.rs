@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -37,6 +38,7 @@ const GRAPH_RETRIEVAL_STOP_WORDS: &[&str] = &[
 #[derive(Clone, Debug)]
 pub struct GraphRepository {
     path: PathBuf,
+    operation_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Clone, Debug)]
@@ -171,7 +173,10 @@ struct BundleMembers {
 
 impl GraphRepository {
     pub fn open(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            operation_lock: Arc::new(Mutex::new(())),
+        }
     }
 
     pub async fn accept_memory_record(
@@ -179,11 +184,10 @@ impl GraphRepository {
         request: GraphAddMemoryRequest,
     ) -> MemoryResult<GraphAddMemoryResponse> {
         let path = self.path.clone();
-        tokio::task::spawn_blocking(move || accept_memory_record_sync(&path, request))
-            .await
-            .map_err(|error| MemoryError::StoreBackend {
-                message: format!("sqlite task failed: {error}"),
-            })?
+        run_sqlite_operation(self.operation_lock.clone(), move || {
+            accept_memory_record_sync(&path, request)
+        })
+        .await
     }
 
     pub async fn claim_pending_run(
@@ -192,12 +196,32 @@ impl GraphRepository {
     ) -> MemoryResult<ClaimedIngestionRun> {
         let path = self.path.clone();
         let ingestion_run_id = ingestion_run_id.to_string();
-        run_sqlite_operation(move || claim_pending_run_sync(&path, &ingestion_run_id)).await
+        run_sqlite_operation(self.operation_lock.clone(), move || {
+            claim_pending_run_sync(&path, &ingestion_run_id)
+        })
+        .await
+    }
+
+    pub async fn reset_incomplete_run_for_resume(
+        &self,
+        ingestion_run_id: &str,
+        memory_space_id: &str,
+    ) -> MemoryResult<String> {
+        let path = self.path.clone();
+        let ingestion_run_id = ingestion_run_id.to_string();
+        let memory_space_id = memory_space_id.to_string();
+        run_sqlite_operation(self.operation_lock.clone(), move || {
+            reset_incomplete_run_for_resume_sync(&path, &ingestion_run_id, &memory_space_id)
+        })
+        .await
     }
 
     pub async fn store_record_embedding(&self, update: RecordEmbeddingUpdate) -> MemoryResult<()> {
         let path = self.path.clone();
-        run_sqlite_operation(move || store_record_embedding_sync(&path, &update)).await
+        run_sqlite_operation(self.operation_lock.clone(), move || {
+            store_record_embedding_sync(&path, &update)
+        })
+        .await
     }
 
     pub async fn claim_extraction_run(
@@ -206,7 +230,10 @@ impl GraphRepository {
     ) -> MemoryResult<ClaimedExtractionRun> {
         let path = self.path.clone();
         let ingestion_run_id = ingestion_run_id.to_string();
-        run_sqlite_operation(move || claim_extraction_run_sync(&path, &ingestion_run_id)).await
+        run_sqlite_operation(self.operation_lock.clone(), move || {
+            claim_extraction_run_sync(&path, &ingestion_run_id)
+        })
+        .await
     }
 
     pub async fn store_extraction_success(
@@ -214,7 +241,10 @@ impl GraphRepository {
         completion: ExtractionRunCompletion,
     ) -> MemoryResult<ExtractionRun> {
         let path = self.path.clone();
-        run_sqlite_operation(move || store_extraction_success_sync(&path, &completion)).await
+        run_sqlite_operation(self.operation_lock.clone(), move || {
+            store_extraction_success_sync(&path, &completion)
+        })
+        .await
     }
 
     pub async fn store_extraction_failure(
@@ -222,7 +252,10 @@ impl GraphRepository {
         failure: ExtractionRunFailure,
     ) -> MemoryResult<ExtractionRun> {
         let path = self.path.clone();
-        run_sqlite_operation(move || store_extraction_failure_sync(&path, &failure)).await
+        run_sqlite_operation(self.operation_lock.clone(), move || {
+            store_extraction_failure_sync(&path, &failure)
+        })
+        .await
     }
 
     pub async fn claim_resolution_run(
@@ -231,7 +264,10 @@ impl GraphRepository {
     ) -> MemoryResult<ClaimedResolutionRun> {
         let path = self.path.clone();
         let ingestion_run_id = ingestion_run_id.to_string();
-        run_sqlite_operation(move || claim_resolution_run_sync(&path, &ingestion_run_id)).await
+        run_sqlite_operation(self.operation_lock.clone(), move || {
+            claim_resolution_run_sync(&path, &ingestion_run_id)
+        })
+        .await
     }
 
     pub async fn publish_resolution(
@@ -239,7 +275,10 @@ impl GraphRepository {
         request: ResolutionPublishRequest,
     ) -> MemoryResult<ResolutionPublishResult> {
         let path = self.path.clone();
-        run_sqlite_operation(move || publish_resolution_sync(&path, &request)).await
+        run_sqlite_operation(self.operation_lock.clone(), move || {
+            publish_resolution_sync(&path, &request)
+        })
+        .await
     }
 
     pub async fn retrieve_context(
@@ -247,7 +286,10 @@ impl GraphRepository {
         request: GraphRetrieveContextRequest,
     ) -> MemoryResult<ContextBundle> {
         let path = self.path.clone();
-        run_sqlite_operation(move || retrieve_context_sync(&path, &request)).await
+        run_sqlite_operation(self.operation_lock.clone(), move || {
+            retrieve_context_sync(&path, &request)
+        })
+        .await
     }
 
     pub async fn mark_run_failed_if_current_attempt(
@@ -263,7 +305,7 @@ impl GraphRepository {
         let stage = stage.to_string();
         let error_code = error_code.to_string();
         let error_message = error_message.to_string();
-        run_sqlite_operation(move || {
+        run_sqlite_operation(self.operation_lock.clone(), move || {
             mark_run_failed_if_current_attempt_sync(
                 &path,
                 &ingestion_run_id,
@@ -284,7 +326,10 @@ impl GraphRepository {
         let path = self.path.clone();
         let ingestion_run_id = ingestion_run_id.to_string();
         let memory_space_id = memory_space_id.to_string();
-        run_sqlite_operation(move || get_run_sync(&path, &ingestion_run_id, &memory_space_id)).await
+        run_sqlite_operation(self.operation_lock.clone(), move || {
+            get_run_sync(&path, &ingestion_run_id, &memory_space_id)
+        })
+        .await
     }
 
     pub async fn get_graph_memory_record(
@@ -295,7 +340,7 @@ impl GraphRepository {
         let path = self.path.clone();
         let memory_record_id = memory_record_id.to_string();
         let memory_space_id = memory_space_id.to_string();
-        run_sqlite_operation(move || {
+        run_sqlite_operation(self.operation_lock.clone(), move || {
             get_graph_memory_record_sync(&path, &memory_record_id, &memory_space_id)
         })
         .await
@@ -309,7 +354,7 @@ impl GraphRepository {
         let path = self.path.clone();
         let extraction_run_id = extraction_run_id.to_string();
         let memory_space_id = memory_space_id.to_string();
-        run_sqlite_operation(move || {
+        run_sqlite_operation(self.operation_lock.clone(), move || {
             get_extraction_run_sync(&path, &extraction_run_id, &memory_space_id)
         })
         .await
@@ -318,7 +363,7 @@ impl GraphRepository {
     pub async fn count_facts(&self, memory_space_id: &str) -> MemoryResult<i64> {
         let path = self.path.clone();
         let memory_space_id = memory_space_id.to_string();
-        run_sqlite_operation(move || {
+        run_sqlite_operation(self.operation_lock.clone(), move || {
             let connection = open_graph_connection(&path)?;
             let count = connection.query_row(
                 "SELECT COUNT(*) FROM graph_facts WHERE memory_space_id = ?1",
@@ -331,16 +376,23 @@ impl GraphRepository {
     }
 }
 
-async fn run_sqlite_operation<T, F>(operation: F) -> MemoryResult<T>
+async fn run_sqlite_operation<T, F>(operation_lock: Arc<Mutex<()>>, operation: F) -> MemoryResult<T>
 where
     T: Send + 'static,
     F: FnOnce() -> MemoryResult<T> + Send + 'static,
 {
-    tokio::task::spawn_blocking(operation)
-        .await
-        .map_err(|error| MemoryError::StoreBackend {
-            message: format!("sqlite task failed: {error}"),
-        })?
+    tokio::task::spawn_blocking(move || {
+        let _guard = operation_lock
+            .lock()
+            .map_err(|_| MemoryError::StoreBackend {
+                message: "graph sqlite operation lock is poisoned".to_string(),
+            })?;
+        operation()
+    })
+    .await
+    .map_err(|error| MemoryError::StoreBackend {
+        message: format!("sqlite task failed: {error}"),
+    })?
 }
 
 fn open_graph_connection(path: &Path) -> MemoryResult<Connection> {
@@ -1742,6 +1794,55 @@ fn claim_pending_run_sync(
         text,
         attempt_count: next_attempt,
     })
+}
+
+fn reset_incomplete_run_for_resume_sync(
+    path: &Path,
+    ingestion_run_id: &str,
+    memory_space_id: &str,
+) -> MemoryResult<String> {
+    let mut connection = open_graph_connection(path)?;
+    let transaction = connection.transaction()?;
+    let status: String = transaction.query_row(
+        "SELECT status
+         FROM graph_ingestion_runs
+         WHERE id = ?1 AND memory_space_id = ?2",
+        params![ingestion_run_id, memory_space_id],
+        |row| row.get(0),
+    )?;
+
+    match status.as_str() {
+        "pending" | "completed" => {
+            transaction.commit()?;
+            Ok(status)
+        }
+        "failed" | "running" => {
+            let now = current_time_ms() as i64;
+            let updated = transaction.execute(
+                "UPDATE graph_ingestion_runs
+                 SET status = 'pending',
+                     stage = 'accepted',
+                     error_code = NULL,
+                     error_message = NULL,
+                     updated_at_ms = ?1,
+                     completed_at_ms = NULL
+                 WHERE id = ?2
+                   AND memory_space_id = ?3
+                   AND status = ?4",
+                params![now, ingestion_run_id, memory_space_id, status],
+            )?;
+            if updated != 1 {
+                return Err(MemoryError::StoreBackend {
+                    message: "failed to reset incomplete graph ingestion run".to_string(),
+                });
+            }
+            transaction.commit()?;
+            Ok("pending".to_string())
+        }
+        _ => Err(MemoryError::StoreBackend {
+            message: format!("graph ingestion run has unknown status `{status}`"),
+        }),
+    }
 }
 
 fn store_record_embedding_sync(path: &Path, update: &RecordEmbeddingUpdate) -> MemoryResult<()> {

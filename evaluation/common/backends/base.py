@@ -18,6 +18,8 @@ class BackendConfig:
     top_k: int
     graph: bool = False
     graph_build: bool = False
+    graph_build_concurrency: int = 1
+    resume: bool = False
     graph_weight: float = 0.2
     graph_fail_open: bool = False
     graph_memory_space_mode: str = "auto"

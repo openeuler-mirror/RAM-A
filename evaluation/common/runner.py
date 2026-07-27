@@ -29,6 +29,8 @@ def run_add(
     api_key_env: str = DEFAULT_API_KEY_ENV,
     batch_size: int = 64,
     graph_build: bool = False,
+    graph_build_concurrency: int = 1,
+    resume: bool = False,
     graph_weight: float = 0.2,
     graph_memory_space_mode: str = "auto",
     graph_memory_space_field: str = "scope_id",
@@ -49,6 +51,7 @@ def run_add(
     ]
     if graph_build:
         cmd.append("--graph-build")
+        cmd.extend(["--graph-build-concurrency", str(graph_build_concurrency)])
         cmd.extend(_graph_common_args(
             graph_weight=graph_weight,
             graph_memory_space_mode=graph_memory_space_mode,
@@ -60,6 +63,8 @@ def run_add(
             graph_llm_timeout_ms=graph_llm_timeout_ms,
         ))
     cmd.extend(["add", "--dataset", str(dataset_path)])
+    if resume:
+        cmd.append("--resume")
     _run(cmd, f"add ({dataset_path.name})")
 
 

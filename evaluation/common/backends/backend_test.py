@@ -42,6 +42,8 @@ def test_backend_config_carries_graph_options():
 
     assert config.graph is False
     assert config.graph_build is False
+    assert config.graph_build_concurrency == 1
+    assert config.resume is False
     assert config.graph_weight == 0.2
     assert config.graph_fail_open is False
     assert config.graph_memory_space_mode == "auto"
@@ -76,6 +78,8 @@ def test_rama_backend_passes_graph_options(monkeypatch, tmp_path):
         top_k=3,
         graph=True,
         graph_build=True,
+        graph_build_concurrency=4,
+        resume=True,
         graph_weight=0.4,
         graph_fail_open=True,
         graph_memory_space_mode="metadata-field",
@@ -92,10 +96,13 @@ def test_rama_backend_passes_graph_options(monkeypatch, tmp_path):
     backend.search(tmp_path / "prepared.json", tmp_path / "search.json")
 
     assert captured["add"]["graph_build"] is True
+    assert captured["add"]["graph_build_concurrency"] == 4
+    assert captured["add"]["resume"] is True
     assert captured["add"]["graph_weight"] == 0.4
     assert captured["add"]["graph_memory_space_mode"] == "metadata-field"
     assert captured["add"]["graph_llm_api_key_env"] == "GRAPH_KEY"
     assert captured["search"]["graph"] is True
+    assert "graph_build_concurrency" not in captured["search"]
     assert captured["search"]["graph_fail_open"] is True
     assert captured["search"]["graph_memory_space_field"] == "tenant_id"
 

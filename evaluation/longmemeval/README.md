@@ -102,6 +102,7 @@ python3 evaluation/longmemeval/run.py [options]
 | `--extractor-responses` / `--grounding-responses` | *(none)* | Paired response maps for fully offline extraction |
 | **Graph memory** | | |
 | `--graph-build` | false | Build graph memory during add |
+| `--graph-build-concurrency` | 1 | Maximum concurrent graph builds; raise gradually within provider limits |
 | `--graph` | false | Enable graph retrieval during search |
 | `--graph-weight` | 0.2 | Graph retrieval fusion weight |
 | `--graph-fail-open` | false | Fall back to non-graph retrieval if graph search fails |
@@ -188,6 +189,9 @@ python3 evaluation/longmemeval/run.py --memory-mode extracted --resume
 python3 evaluation/longmemeval/run.py --resume \
   --run-dir outputs/longmemeval/<your-run-dir>
 ```
+
+Resume still invokes `memory-bench add --resume`: existing memories are skipped and
+incomplete graph records are rebuilt before search resumes.
 
 Automatic resume discovery is scoped to `--memory-mode`; a raw arm never
 selects an extracted run, and vice versa.

@@ -97,6 +97,7 @@ python3 evaluation/longmemeval/run.py [选项]
 | `--extractor-responses` / `--grounding-responses` | *（无）* | 完全离线抽取使用的成对响应 maps |
 | **图记忆** | | |
 | `--graph-build` | false | add 阶段构建图记忆 |
+| `--graph-build-concurrency` | 1 | 同时构建的图记录上限；应根据服务商限流逐步提高 |
 | `--graph` | false | search 阶段开启 graph retrieval |
 | `--graph-weight` | 0.2 | graph retrieval 融合权重 |
 | `--graph-fail-open` | false | graph search 失败时退化为非 graph 检索 |
@@ -182,6 +183,9 @@ python3 evaluation/longmemeval/run.py --memory-mode extracted --resume
 python3 evaluation/longmemeval/run.py --resume \
   --run-dir outputs/longmemeval/<你的运行目录>
 ```
+
+恢复时仍会调用 `memory-bench add --resume`：已有记忆会跳过，未完成的图记录会先补建，
+随后再恢复检索。
 
 自动恢复发现按 `--memory-mode` 隔离；raw arm 不会选择 extracted 运行，反之亦然。
 

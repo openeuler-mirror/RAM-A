@@ -156,6 +156,8 @@ valid candidates; inspect `extraction_stats.json` before estimating or comparing
   `--graph-llm-api-key-env OPENROUTER_API_KEY`,
   `--graph-llm-base-url https://openrouter.ai/api/v1`,
   `--graph-llm-model openai/gpt-4o-mini`.
+- `--graph-build-concurrency` bounds concurrent graph ingestion. It defaults to `1`; raise it
+  gradually only when the graph LLM provider has sufficient rate-limit headroom.
 
 In graph `auto` memory-space mode, prepared-schema queries use the filter field configured by
 `--graph-memory-space-field` (default `scope_id`), and raw top-level-array datasets use path
@@ -197,6 +199,14 @@ Use separate stores for baseline and graph runs. LoCoMo is the primary graph-mem
 analysis dataset, but LongMemEval and PersonaMem should also be run end-to-end before
 reporting final benchmark conclusions. Dataset wrapper flags are documented in each
 dataset README when wrapper passthrough is enabled.
+
+Use the graph audit before changing extraction or retrieval behavior:
+
+```bash
+python3 evaluation/graph_audit.py \
+  --store data/locomo_graph.sqlite \
+  --output outputs/locomo_graph_audit.json
+```
 
 ## Output
 

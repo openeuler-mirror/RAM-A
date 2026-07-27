@@ -16,6 +16,7 @@ use memory_core::{
     RetrievalConfig, SearchMemoryRequest, SearchMode, SqliteMemoryStore,
 };
 use serde::{Deserialize, Serialize};
+use tokio::task::JoinSet;
 
 const PREPARED_SCHEMA_VERSION: &str = "benchmark-prepared-v1";
 const TARGET_SPEAKER_METADATA_KEY: &str = "target_speaker";
@@ -80,6 +81,8 @@ struct Cli {
     graph_llm_base_url: String,
     #[arg(long)]
     graph_llm_timeout_ms: Option<u64>,
+    #[arg(long, default_value_t = 1, value_parser = parse_graph_build_concurrency)]
+    graph_build_concurrency: usize,
     #[arg(long, default_value = "OPENROUTER_API_KEY")]
     api_key_env: String,
     #[arg(long, default_value = "baai/bge-m3")]
@@ -90,6 +93,16 @@ struct Cli {
     batch_size: usize,
     #[command(subcommand)]
     command: Command,
+}
+
+fn parse_graph_build_concurrency(value: &str) -> std::result::Result<usize, String> {
+    let concurrency = value
+        .parse::<usize>()
+        .map_err(|_| "must be a positive integer".to_string())?;
+    if concurrency == 0 {
+        return Err("must be at least 1".to_string());
+    }
+    Ok(concurrency)
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -233,7 +246,7 @@ async fn main() -> Result<()> {
 struct BenchRuntime {
     manager: MemoryManager,
     store: Arc<dyn MemoryStore>,
-    graph_pipeline: Option<GraphBuildPipeline>,
+    graph_pipeline: Option<Arc<GraphBuildPipeline>>,
 }
 
 struct AddRunOptions<'a> {
@@ -310,7 +323,7 @@ fn build_graph_pipeline(
     cli: &Cli,
     store: &Arc<dyn MemoryStore>,
     embedder: Arc<dyn EmbeddingProvider>,
-) -> Result<Option<GraphBuildPipeline>> {
+) -> Result<Option<Arc<GraphBuildPipeline>>> {
     if !cli.graph_build {
         return Ok(None);
     }
@@ -332,9 +345,9 @@ fn build_graph_pipeline(
     )
     .with_timeout_ms(cli.graph_llm_timeout_ms);
     let extractor = Arc::new(LlmGraphExtractor::new(Arc::new(client), registry.clone()));
-    Ok(Some(GraphBuildPipeline::new(
+    Ok(Some(Arc::new(GraphBuildPipeline::new(
         repository, embedder, extractor, registry,
-    )))
+    ))))
 }
 
 fn build_reranker(cli: &Cli, rerank_config: &RerankConfig) -> Result<Option<Arc<dyn Reranker>>> {
@@ -365,7 +378,7 @@ fn build_store(cli: &Cli) -> Arc<dyn MemoryStore> {
 async fn run_add(
     manager: MemoryManager,
     store: Arc<dyn MemoryStore>,
-    graph_pipeline: Option<GraphBuildPipeline>,
+    graph_pipeline: Option<Arc<GraphBuildPipeline>>,
     options: AddRunOptions<'_>,
 ) -> Result<()> {
     let json = load_json(&options.dataset)?;
@@ -437,8 +450,14 @@ async fn run_add(
             })?;
         progress.finish();
     }
-    if let Some(graph_pipeline) = graph_pipeline.as_ref() {
-        build_graph_memories(graph_pipeline, graph_requests).await?;
+    if let Some(graph_pipeline) = graph_pipeline {
+        build_graph_memories(
+            graph_pipeline,
+            graph_requests,
+            options.cli.graph_build_concurrency,
+            options.resume,
+        )
+        .await?;
     }
     summary.added = summary.total - summary.skipped_existing;
 
@@ -454,7 +473,7 @@ async fn run_add(
 async fn run_add_prepared_memories(
     manager: MemoryManager,
     store: Arc<dyn MemoryStore>,
-    graph_pipeline: Option<GraphBuildPipeline>,
+    graph_pipeline: Option<Arc<GraphBuildPipeline>>,
     json: &serde_json::Value,
     options: AddRunOptions<'_>,
 ) -> Result<()> {
@@ -552,8 +571,14 @@ async fn run_add_prepared_memories(
             })?;
         progress.finish();
     }
-    if let Some(graph_pipeline) = graph_pipeline.as_ref() {
-        build_graph_memories(graph_pipeline, graph_requests).await?;
+    if let Some(graph_pipeline) = graph_pipeline {
+        build_graph_memories(
+            graph_pipeline,
+            graph_requests,
+            options.cli.graph_build_concurrency,
+            options.resume,
+        )
+        .await?;
     }
     summary.added = summary.total - summary.skipped_existing;
 
@@ -1044,23 +1069,59 @@ fn print_add_summary(summary: &AddSummary) {
 }
 
 async fn build_graph_memories(
-    graph_pipeline: &GraphBuildPipeline,
+    graph_pipeline: Arc<GraphBuildPipeline>,
     requests: Vec<GraphAddMemoryRequest>,
+    concurrency: usize,
+    resume: bool,
 ) -> Result<()> {
     if requests.is_empty() {
         return Ok(());
     }
     let mut progress = ProgressReporter::new("Building graph memories", requests.len());
-    for request in requests {
-        let source_ref = request.source_ref.clone();
-        graph_pipeline
-            .build_memory_if_needed(request)
-            .await
-            .with_context(|| format!("failed to build graph memory for {source_ref:?}"))?;
+    let mut requests = requests.into_iter();
+    let mut in_flight = JoinSet::new();
+    for _ in 0..concurrency {
+        let Some(request) = requests.next() else {
+            break;
+        };
+        spawn_graph_build(&mut in_flight, graph_pipeline.clone(), request, resume);
+    }
+
+    while let Some(result) = in_flight.join_next().await {
+        let (source_ref, result) = result.context("graph build task panicked")?;
+        if let Err(error) = result {
+            in_flight.abort_all();
+            while in_flight.join_next().await.is_some() {}
+            return Err(error)
+                .with_context(|| format!("failed to build graph memory for {source_ref:?}"));
+        }
         progress.inc(1);
+        if let Some(request) = requests.next() {
+            spawn_graph_build(&mut in_flight, graph_pipeline.clone(), request, resume);
+        }
     }
     progress.finish();
     Ok(())
+}
+
+fn spawn_graph_build(
+    tasks: &mut JoinSet<(
+        Option<String>,
+        memory_core::MemoryResult<Option<memory_core::GraphBuildResult>>,
+    )>,
+    graph_pipeline: Arc<GraphBuildPipeline>,
+    request: GraphAddMemoryRequest,
+    resume: bool,
+) {
+    tasks.spawn(async move {
+        let source_ref = request.source_ref.clone();
+        let result = if resume {
+            graph_pipeline.resume_memory(request).await
+        } else {
+            graph_pipeline.build_memory_if_needed(request).await
+        };
+        (source_ref, result)
+    });
 }
 
 fn build_graph_add_request(
@@ -1600,6 +1661,8 @@ mod tests {
             "https://openrouter.ai/api/v1",
             "--graph-llm-timeout-ms",
             "1000",
+            "--graph-build-concurrency",
+            "4",
             "search",
             "--query",
             "Where does Alice live?",
@@ -1622,6 +1685,27 @@ mod tests {
         assert_eq!(cli.graph_llm_model, "openai/gpt-4o-mini");
         assert_eq!(cli.graph_llm_base_url, "https://openrouter.ai/api/v1");
         assert_eq!(cli.graph_llm_timeout_ms, Some(1000));
+        assert_eq!(cli.graph_build_concurrency, 4);
+    }
+
+    #[test]
+    fn cli_rejects_zero_graph_build_concurrency() {
+        let result = Cli::try_parse_from([
+            "memory-bench",
+            "--embedding",
+            "hash",
+            "--graph-build-concurrency",
+            "0",
+            "add",
+            "--dataset",
+            "data/test.json",
+        ]);
+        let error = match result {
+            Ok(_) => panic!("zero concurrency must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("must be at least 1"));
     }
 
     #[test]
@@ -2183,7 +2267,7 @@ mod tests {
         run_add(
             resume_manager,
             store,
-            Some(graph_pipeline),
+            Some(Arc::new(graph_pipeline)),
             AddRunOptions {
                 dataset,
                 text_fields: &text_fields,
@@ -2196,6 +2280,58 @@ mod tests {
         .expect("resume graph build");
 
         assert_eq!(repository.count_facts("path:$[0]").await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn graph_build_concurrency_builds_every_record() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dataset = temp.path().join("dataset.json");
+        std::fs::write(
+            &dataset,
+            r#"[{"text":"Alice lives in Shanghai."},{"text":"Alice lives in Shanghai."}]"#,
+        )
+        .expect("write dataset");
+        let db_path = temp.path().join("memory.sqlite");
+        let store: Arc<dyn MemoryStore> = Arc::new(SqliteMemoryStore::new(&db_path));
+        let repository = memory_core::sqlite::GraphRepository::open(&db_path);
+        let pipeline = Arc::new(GraphBuildPipeline::new(
+            repository.clone(),
+            Arc::new(HashEmbedding::new(8)),
+            Arc::new(BenchGraphExtractor),
+            GraphTypeRegistry::new_default(),
+        ));
+        let cli = Cli::try_parse_from([
+            "memory-bench",
+            "--embedding",
+            "hash",
+            "--graph-build",
+            "--graph-build-concurrency",
+            "2",
+            "add",
+            "--dataset",
+            dataset.to_str().expect("dataset path"),
+        ])
+        .expect("parse graph build CLI");
+        let manager = MemoryManager::new(store.clone(), Arc::new(HashEmbedding::new(8)));
+        let text_fields = vec!["text".to_string()];
+
+        run_add(
+            manager,
+            store,
+            Some(pipeline),
+            AddRunOptions {
+                dataset,
+                text_fields: &text_fields,
+                batch_size: 1,
+                resume: false,
+                cli: &cli,
+            },
+        )
+        .await
+        .expect("concurrent graph build");
+
+        assert_eq!(repository.count_facts("path:$[0]").await.unwrap(), 1);
+        assert_eq!(repository.count_facts("path:$[1]").await.unwrap(), 1);
     }
 
     fn graph_test_cli() -> Cli {

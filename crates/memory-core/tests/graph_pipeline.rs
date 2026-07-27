@@ -6,11 +6,39 @@ use memory_core::graph::{
 };
 use memory_core::sqlite::GraphRepository;
 use memory_core::{
-    GraphAddMemoryRequest, GraphRetrieveContextRequest, HashEmbedding, MemoryResult,
+    GraphAddMemoryRequest, GraphRetrieveContextRequest, HashEmbedding, MemoryError, MemoryResult,
 };
 
 #[derive(Debug)]
 struct LivesInExtractor;
+
+#[derive(Debug)]
+struct FailingExtractor;
+
+#[async_trait::async_trait]
+impl GraphExtractor for FailingExtractor {
+    fn extractor_name(&self) -> &str {
+        "failing-test-extractor"
+    }
+
+    fn model_name(&self) -> &str {
+        "test-model"
+    }
+
+    fn prompt_version(&self) -> &str {
+        "test-prompt-v1"
+    }
+
+    fn schema_version(&self) -> &str {
+        "test-schema-v1"
+    }
+
+    async fn extract(&self, _input: GraphExtractionInput) -> MemoryResult<GraphExtractionOutput> {
+        Err(MemoryError::Extraction {
+            message: "transient extraction failure".to_string(),
+        })
+    }
+}
 
 #[async_trait::async_trait]
 impl GraphExtractor for LivesInExtractor {
@@ -172,5 +200,112 @@ async fn graph_build_pipeline_skips_completed_idempotent_memory() {
         .expect("repeated graph build should be idempotent");
 
     assert!(repeated.is_none());
+    assert_eq!(repository.count_facts("scope-a").await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn graph_build_pipeline_resumes_failed_extraction_with_a_new_attempt() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repository = GraphRepository::open(temp.path().join("graph.sqlite"));
+    let registry = GraphTypeRegistry::new_default();
+    let request = GraphAddMemoryRequest {
+        memory_space_id: "scope-a".to_string(),
+        owner_id: "benchmark".to_string(),
+        idempotency_key: "record-1".to_string(),
+        text: "Alice lives in Shanghai.".to_string(),
+        metadata: serde_json::json!({"scope_id": "scope-a"}),
+        session_id: None,
+        session_sequence: None,
+        source_kind: "benchmark".to_string(),
+        source_ref: Some("record-1".to_string()),
+        content_role: "message".to_string(),
+        created_by_agent_id: None,
+        observed_at_ms: None,
+    };
+    let failing_pipeline = GraphBuildPipeline::new(
+        repository.clone(),
+        Arc::new(HashEmbedding::new(8)),
+        Arc::new(FailingExtractor),
+        registry.clone(),
+    );
+
+    failing_pipeline
+        .build_memory(request.clone())
+        .await
+        .expect_err("first extraction must fail");
+    let failed = repository
+        .accept_memory_record(request.clone())
+        .await
+        .unwrap();
+    assert_eq!(failed.status, "failed");
+
+    let resumed_pipeline = GraphBuildPipeline::new(
+        repository.clone(),
+        Arc::new(HashEmbedding::new(8)),
+        Arc::new(LivesInExtractor),
+        registry,
+    );
+    let resumed = resumed_pipeline
+        .resume_memory(request)
+        .await
+        .expect("resume failed graph build")
+        .expect("failed graph build should be retried");
+
+    assert_eq!(resumed.ingestion_run.status, "completed");
+    assert_eq!(resumed.ingestion_run.attempt_count, 2);
+    assert_eq!(resumed.extraction_run.attempt_number, 2);
+    assert_eq!(repository.count_facts("scope-a").await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn graph_build_pipeline_resumes_interrupted_running_attempt() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repository = GraphRepository::open(temp.path().join("graph.sqlite"));
+    let registry = GraphTypeRegistry::new_default();
+    let request = GraphAddMemoryRequest {
+        memory_space_id: "scope-a".to_string(),
+        owner_id: "benchmark".to_string(),
+        idempotency_key: "record-1".to_string(),
+        text: "Alice lives in Shanghai.".to_string(),
+        metadata: serde_json::json!({"scope_id": "scope-a"}),
+        session_id: None,
+        session_sequence: None,
+        source_kind: "benchmark".to_string(),
+        source_ref: Some("record-1".to_string()),
+        content_role: "message".to_string(),
+        created_by_agent_id: None,
+        observed_at_ms: None,
+    };
+    let accepted = repository
+        .accept_memory_record(request.clone())
+        .await
+        .unwrap();
+    repository
+        .claim_pending_run(&accepted.ingestion_run_id)
+        .await
+        .expect("simulate interrupted running attempt");
+    assert_eq!(
+        repository
+            .get_run(&accepted.ingestion_run_id, "scope-a")
+            .await
+            .unwrap()
+            .status,
+        "running"
+    );
+
+    let pipeline = GraphBuildPipeline::new(
+        repository.clone(),
+        Arc::new(HashEmbedding::new(8)),
+        Arc::new(LivesInExtractor),
+        registry,
+    );
+    let resumed = pipeline
+        .resume_memory(request)
+        .await
+        .expect("resume interrupted graph build")
+        .expect("running graph build should be retried");
+
+    assert_eq!(resumed.ingestion_run.status, "completed");
+    assert_eq!(resumed.ingestion_run.attempt_count, 2);
     assert_eq!(repository.count_facts("scope-a").await.unwrap(), 1);
 }

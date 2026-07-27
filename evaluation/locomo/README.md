@@ -202,10 +202,13 @@ Graph-specific environment variables:
 | `GRAPH_LLM_MODEL` | `openai/gpt-4o-mini` | Graph extraction model |
 | `GRAPH_LLM_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible graph extraction base URL |
 | `GRAPH_LLM_TIMEOUT_MS` | `60000` | Graph extraction timeout |
+| `GRAPH_BUILD_CONCURRENCY` | `1` | Maximum concurrent graph-build records; increase gradually if the provider permits |
 
 When `MEMORY_BENCH_GRAPH=1`, the shell wrapper passes `--graph-build` to
 `memory-bench add` and `--graph` to `memory-bench search`. `GRAPH_LLM_MODEL`
 maps to the `memory-bench` `--graph-llm-model` flag.
+`GRAPH_BUILD_CONCURRENCY` maps only to add-stage `--graph-build-concurrency`; the default `1`
+preserves serial build behavior.
 In the default `auto` memory-space mode, prepared LoCoMo records use
 `scope_id` values such as `path:$[0]`. If a graph build is resumed, completed
 graph runs are skipped, missing graph runs are built, and failed/running graph
@@ -230,6 +233,10 @@ python3 locomo/locomo_retrieval.py \
   --dataset fixtures/locomo_sample.json --input search_results.json \
   --input-format memory-bench --output-json retrieval_metrics.json \
   --html-report retrieval_report.html
+
+python3 graph_audit.py \
+  --store ../outputs/locomo/<RUN_ID>/ram-a/store.sqlite \
+  --output ../outputs/locomo/<RUN_ID>/ram-a/graph_audit.json
 
 python3 locomo/locomo_responses.py \
   --technique-type memory_bench --dataset fixtures/locomo_sample.json \

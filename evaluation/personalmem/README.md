@@ -284,6 +284,7 @@ python evaluation/personalmem/run.py add \
 | `--frozen-config` | *(none)* | Frozen immutable manifest; required for `full` |
 | `--promotion-policy` | *(none)* | Policy whose hash is frozen; required for `full` |
 | `--graph-build` | false | Build graph memory during add |
+| `--graph-build-concurrency` | 1 | Maximum concurrent graph builds; raise gradually within provider limits |
 | `--graph` | false | Enable graph retrieval during search |
 | `--graph-weight` | 0.2 | Graph retrieval fusion weight |
 | `--graph-llm-api-key-env` | `OPENROUTER_API_KEY` | Env var for graph extraction API key |

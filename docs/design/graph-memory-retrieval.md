@@ -194,6 +194,8 @@ GraphRetrieveContextRequest
 
 - `--graph-build`：add 阶段在普通 MemoryRecord 写入成功后，继续执行
   accept -> record embedding -> LLM extraction -> resolution，生成正式图；
+- `--graph-build-concurrency`：限制同时构建的 graph record 数，默认 `1`。它只影响吞吐；
+  不改变每条 record 的抽取、解析和落库逻辑；
 - `--graph`：search 阶段开启 `RetrievalConfig.graph.enabled`，把 graph evidence record
   作为增强召回通道并入原有检索结果；
 - `--search-mode graph`：只返回 graph store 内的 fact-grounded evidence 或直接 evidence
@@ -214,6 +216,8 @@ failed / running ingestion run 不会被自动重置，而是明确报错，避�
 graph build 需要真实 LLM key。默认读取 `OPENROUTER_API_KEY`，默认 base URL 是
 `https://openrouter.ai/api/v1`，默认模型是 `openai/gpt-4o-mini`。可以用
 `--graph-llm-api-key-env`、`--graph-llm-base-url` 和 `--graph-llm-model` 覆盖。
+当 provider 的并发额度允许时，可逐步提高 `--graph-build-concurrency`；遇到限流应降低该值，
+而不是改变 extraction 语义。
 
 建议 baseline 和 graph run 使用不同 SQLite 文件，避免对比时混用已经构建过图的状态。
 

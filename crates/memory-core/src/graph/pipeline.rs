@@ -49,6 +49,13 @@ impl GraphBuildPipeline {
         request: GraphAddMemoryRequest,
     ) -> MemoryResult<GraphBuildResult> {
         let add_response = self.repository.accept_memory_record(request).await?;
+        self.build_accepted_memory(add_response).await
+    }
+
+    async fn build_accepted_memory(
+        &self,
+        add_response: GraphAddMemoryResponse,
+    ) -> MemoryResult<GraphBuildResult> {
         self.ingestion
             .process_vector_stage(&add_response.ingestion_run_id)
             .await?;
@@ -91,23 +98,23 @@ impl GraphBuildPipeline {
             });
         }
 
-        self.ingestion
-            .process_vector_stage(&add_response.ingestion_run_id)
-            .await?;
-        let extraction_run = self
-            .extraction
-            .process_extraction_stage(&add_response.ingestion_run_id)
-            .await?;
-        let resolution = self
-            .resolution
-            .process_resolution_stage(&add_response.ingestion_run_id)
-            .await?;
+        self.build_accepted_memory(add_response).await.map(Some)
+    }
 
-        Ok(Some(GraphBuildResult {
-            add_response,
-            ingestion_run: resolution.ingestion_run.clone(),
-            extraction_run,
-            resolution,
-        }))
+    pub async fn resume_memory(
+        &self,
+        request: GraphAddMemoryRequest,
+    ) -> MemoryResult<Option<GraphBuildResult>> {
+        let memory_space_id = request.memory_space_id.clone();
+        let add_response = self.repository.accept_memory_record(request).await?;
+        let status = self
+            .repository
+            .reset_incomplete_run_for_resume(&add_response.ingestion_run_id, &memory_space_id)
+            .await?;
+        if status == "completed" {
+            return Ok(None);
+        }
+
+        self.build_accepted_memory(add_response).await.map(Some)
     }
 }

@@ -56,10 +56,12 @@ def test_run_locomo_eval_uses_locomo_entrypoints():
     assert 'GRAPH_LLM_MODEL="${GRAPH_LLM_MODEL:-openai/gpt-4o-mini}"' in content
     assert 'GRAPH_LLM_BASE_URL="${GRAPH_LLM_BASE_URL:-https://openrouter.ai/api/v1}"' in content
     assert 'GRAPH_LLM_TIMEOUT_MS="${GRAPH_LLM_TIMEOUT_MS:-60000}"' in content
+    assert 'GRAPH_BUILD_CONCURRENCY="${GRAPH_BUILD_CONCURRENCY:-1}"' in content
     assert 'MEMORY_BENCH_RERANK_ARGS="' in content
     assert 'MEMORY_BENCH_ADD_RESUME_ARGS="' in content
     assert 'MEMORY_BENCH_GRAPH_ADD_ARGS="' in content
     assert 'MEMORY_BENCH_GRAPH_SEARCH_ARGS="' in content
+    assert 'MEMORY_BENCH_GRAPH_ADD_ARGS="--graph-build --graph-build-concurrency $GRAPH_BUILD_CONCURRENCY' in content
     assert '--rerank --rerank-provider $RERANK_PROVIDER' in content
     assert '--rerank-api-key-env $RERANK_API_KEY_ENV' in content
     assert '$MEMORY_BENCH_RERANK_ARGS \\' in content

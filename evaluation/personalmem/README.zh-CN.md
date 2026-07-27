@@ -147,6 +147,7 @@ embedding 和小型 PersonaMem fixture，全程不访问网络。这些 fixture 
 | `--frozen-config` | *（无）* | 冻结 immutable manifest；`full` 必需 |
 | `--promotion-policy` | *（无）* | hash 被冻结的晋级策略；`full` 必需 |
 | `--graph-build` | false | add 阶段构建图记忆 |
+| `--graph-build-concurrency` | 1 | 同时构建的图记录上限；应根据服务商限流逐步提高 |
 | `--graph` | false | search 阶段开启 graph retrieval |
 | `--graph-weight` | 0.2 | graph retrieval 融合权重 |
 | `--graph-llm-api-key-env` | `OPENROUTER_API_KEY` | 图候选抽取 API key 环境变量 |

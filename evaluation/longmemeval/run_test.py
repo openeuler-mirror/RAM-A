@@ -175,6 +175,13 @@ def test_full_mode_requires_frozen_config_before_runner_calls(monkeypatch):
         validate_experiment_args(args)
 
 
+def test_graph_build_concurrency_must_be_positive(monkeypatch):
+    args = _parse(monkeypatch, "--graph-build-concurrency", "0")
+
+    with pytest.raises(ValueError, match="graph-build-concurrency"):
+        validate_experiment_args(args)
+
+
 def test_canonical_experiment_and_pipeline_phases_are_distinct(monkeypatch):
     args = _parse(
         monkeypatch,
@@ -445,6 +452,7 @@ def test_extracted_arm_routes_raw_and_indexed_prepared_to_correct_consumers(
         "extracted",
         "--pipeline-phase",
         "all",
+        "--resume",
         "--pair-id",
         "pair-42",
         "--extractor-responses",
@@ -454,6 +462,8 @@ def test_extracted_arm_routes_raw_and_indexed_prepared_to_correct_consumers(
         "--preflight",
         str(preflight),
     )
+    run_dir.mkdir()
+    (run_dir / "store.jsonl").write_text("partial\n", encoding="utf-8")
     calls = []
     prepared = {
         "schema_version": "benchmark-prepared-v1",
@@ -475,7 +485,7 @@ def test_extracted_arm_routes_raw_and_indexed_prepared_to_correct_consumers(
             Path(output).write_text("{}\n", encoding="utf-8")
 
     class FakeBackend:
-        persists_local_store = False
+        persists_local_store = True
 
         def add(self, prepared_path):
             calls.append(("add", Path(prepared_path)))
@@ -621,6 +631,8 @@ def test_parser_accepts_graph_flags(monkeypatch):
             "run.py",
             "--graph",
             "--graph-build",
+            "--graph-build-concurrency",
+            "4",
             "--graph-weight",
             "0.4",
             "--graph-fail-open",
@@ -645,6 +657,7 @@ def test_parser_accepts_graph_flags(monkeypatch):
 
     assert args.graph is True
     assert args.graph_build is True
+    assert args.graph_build_concurrency == 4
     assert args.graph_weight == 0.4
     assert args.graph_fail_open is True
     assert args.graph_memory_space_mode == "metadata-field"

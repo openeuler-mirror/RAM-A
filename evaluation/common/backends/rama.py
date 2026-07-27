@@ -29,6 +29,8 @@ class RamaBackend(MemoryBackend):
             api_key_env=self.config.api_key_env,
             batch_size=self.config.batch_size,
             graph_build=self.config.graph_build,
+            graph_build_concurrency=self.config.graph_build_concurrency,
+            resume=self.config.resume,
             graph_weight=self.config.graph_weight,
             graph_memory_space_mode=self.config.graph_memory_space_mode,
             graph_memory_space_field=self.config.graph_memory_space_field,

@@ -142,6 +142,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Build graph memory during memory-bench add",
     )
     parser.add_argument(
+        "--graph-build-concurrency",
+        type=int,
+        default=1,
+        help="Maximum concurrent graph-build records (default: 1)",
+    )
+    parser.add_argument(
         "--graph-weight",
         type=float,
         default=0.2,
@@ -358,6 +364,8 @@ def build_run_paths(args: argparse.Namespace) -> RunPaths:
 
 
 def validate_experiment_args(args: argparse.Namespace) -> None:
+    if args.graph_build_concurrency < 1:
+        raise ValueError("--graph-build-concurrency must be at least 1")
     if args.phase == "full" and args.frozen_config is None:
         raise ValueError("--frozen-config is required for full runs")
     if args.phase == "full" and args.promotion_policy is None:
@@ -723,6 +731,8 @@ def main() -> None:
             top_k=retrieval_top_k,
             graph=args.graph,
             graph_build=args.graph_build,
+            graph_build_concurrency=args.graph_build_concurrency,
+            resume=args.resume,
             graph_weight=args.graph_weight,
             graph_fail_open=args.graph_fail_open,
             graph_memory_space_mode=args.graph_memory_space_mode,
@@ -735,11 +745,8 @@ def main() -> None:
         ))
 
         # --- Step 2: Add memories to store ---
-        if args.resume and backend.persists_local_store and store_path.exists():
-            print("[run] Skipping add (store exists)")
-        else:
-            print("[run] Running add...")
-            backend.add(indexed_prepared_path)
+        print("[run] Running add...")
+        backend.add(indexed_prepared_path)
 
         # --- Step 3: Search ---
         if args.resume and os.path.isfile(search_results_path):
@@ -881,6 +888,7 @@ def main() -> None:
         "embedding_batch_size": args.embedding_batch_size,
         "graph": args.graph,
         "graph_build": args.graph_build,
+        "graph_build_concurrency": args.graph_build_concurrency,
         "graph_weight": args.graph_weight,
         "graph_fail_open": args.graph_fail_open,
         "graph_memory_space_mode": args.graph_memory_space_mode,

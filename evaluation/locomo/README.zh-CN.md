@@ -194,6 +194,7 @@ shell 和离线 smoke 回归。如果任一检查失败，接入代码必须保�
 | `GRAPH_LLM_MODEL` | `openai/gpt-4o-mini` | 图候选抽取模型 |
 | `GRAPH_LLM_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible 图候选抽取 base URL |
 | `GRAPH_LLM_TIMEOUT_MS` | `60000` | 图候选抽取超时 |
+| `GRAPH_BUILD_CONCURRENCY` | `1` | 同时构图的最大记录数；需根据 provider 限流逐步提高 |
 
 当 `MEMORY_BENCH_GRAPH=1` 时，shell wrapper 会给 `memory-bench add` 传入
 `--graph-build`，给 `memory-bench search` 传入 `--graph`。`GRAPH_LLM_MODEL`

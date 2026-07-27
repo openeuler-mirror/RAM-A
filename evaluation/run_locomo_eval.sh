@@ -38,6 +38,7 @@ GRAPH_LLM_API_KEY_ENV="${GRAPH_LLM_API_KEY_ENV:-OPENROUTER_API_KEY}"
 GRAPH_LLM_MODEL="${GRAPH_LLM_MODEL:-openai/gpt-4o-mini}"
 GRAPH_LLM_BASE_URL="${GRAPH_LLM_BASE_URL:-https://openrouter.ai/api/v1}"
 GRAPH_LLM_TIMEOUT_MS="${GRAPH_LLM_TIMEOUT_MS:-60000}"
+GRAPH_BUILD_CONCURRENCY="${GRAPH_BUILD_CONCURRENCY:-1}"
 RUN_ID="${RUN_ID:-$(date +%Y-%m-%dT%H%M%S)}"
 if [ "${RUN_DIR:-}" ]; then
     case "$RUN_DIR" in
@@ -104,7 +105,7 @@ MEMORY_BENCH_GRAPH_SEARCH_ARGS=""
 case "$MEMORY_BENCH_GRAPH" in
     1|true|TRUE|yes|YES)
         MEMORY_BENCH_GRAPH_COMMON_ARGS="--graph-weight $GRAPH_WEIGHT --graph-memory-space-mode $GRAPH_MEMORY_SPACE_MODE --graph-memory-space-field $GRAPH_MEMORY_SPACE_FIELD --graph-owner-id $GRAPH_OWNER_ID --graph-llm-api-key-env $GRAPH_LLM_API_KEY_ENV --graph-llm-model $GRAPH_LLM_MODEL --graph-llm-base-url $GRAPH_LLM_BASE_URL --graph-llm-timeout-ms $GRAPH_LLM_TIMEOUT_MS"
-        MEMORY_BENCH_GRAPH_ADD_ARGS="--graph-build $MEMORY_BENCH_GRAPH_COMMON_ARGS"
+        MEMORY_BENCH_GRAPH_ADD_ARGS="--graph-build --graph-build-concurrency $GRAPH_BUILD_CONCURRENCY $MEMORY_BENCH_GRAPH_COMMON_ARGS"
         MEMORY_BENCH_GRAPH_SEARCH_ARGS="--graph $MEMORY_BENCH_GRAPH_COMMON_ARGS"
         case "$GRAPH_FAIL_OPEN" in
             1|true|TRUE|yes|YES)

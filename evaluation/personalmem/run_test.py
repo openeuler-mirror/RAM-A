@@ -315,6 +315,13 @@ def test_fixture_mode_requires_paired_response_maps(tmp_path):
         personalmem_run.validate_experiment_args(args)
 
 
+def test_graph_build_concurrency_must_be_positive():
+    args = _parse("pipeline", "--graph-build-concurrency", "0")
+
+    with pytest.raises(ValueError, match="graph-build-concurrency"):
+        personalmem_run.validate_experiment_args(args)
+
+
 def test_full_mode_requires_frozen_config_and_promotion_policy():
     args = _parse("pipeline", "--phase", "full")
 
@@ -820,6 +827,8 @@ def test_parser_accepts_graph_flags():
         "data.json",
         "--graph",
         "--graph-build",
+        "--graph-build-concurrency",
+        "4",
         "--graph-weight",
         "0.4",
         "--graph-fail-open",
@@ -841,6 +850,7 @@ def test_parser_accepts_graph_flags():
 
     assert args.graph is True
     assert args.graph_build is True
+    assert args.graph_build_concurrency == 4
     assert args.graph_weight == 0.4
     assert args.graph_fail_open is True
     assert args.graph_memory_space_mode == "metadata-field"
@@ -879,3 +889,30 @@ def test_bench_base_command_includes_graph_search_flags(tmp_path):
     assert "metadata-field" in command
     assert "--graph-memory-space-field" in command
     assert "tenant_id" in command
+
+
+def test_run_add_passes_graph_build_concurrency(monkeypatch, tmp_path):
+    parser = personalmem_run.build_parser()
+    args = parser.parse_args([
+        "add",
+        "--dataset",
+        str(tmp_path / "data.json"),
+        "--graph-build",
+        "--graph-build-concurrency",
+        "4",
+        "--resume",
+    ])
+    personalmem_run.apply_default_paths(args)
+    captured = {}
+
+    def fake_run(command, cwd, *, quiet=False):
+        captured["command"] = command
+        return 0
+
+    monkeypatch.setattr(personalmem_run, "run_command", fake_run)
+
+    assert personalmem_run.run_add(args) == 0
+    command = captured["command"]
+    assert command[command.index("--graph-build-concurrency") + 1] == "4"
+    assert command.index("--graph-build-concurrency") < command.index("add")
+    assert "--resume" in command[command.index("add"):]
