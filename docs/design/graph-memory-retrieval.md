@@ -11,7 +11,7 @@ graph channel 接入 `MemoryManager::search(...)` 的方式。
 ```text
 GraphRetrieveContextRequest
   -> 参数化 SQLite FTS seed retrieval
-  -> Entity / Fact seed
+  -> Entity / Fact / Evidence-record seed
   -> Entity -> Fact 或 Fact -> Entity 扩展
   -> Evidence -> GraphMemoryRecord
   -> ContextBundle
@@ -36,8 +36,8 @@ GraphRetrieveContextRequest
 统一 search 入口。
 
 本阶段不做 LLM query rewrite、Neo4j 后端、community / clustering、复杂时间推理、
-FactLink 发布，也不生成 entity / fact embedding。`memory-bench` 可以通过显式开关调用
-graph build 和 graph retrieval；数据集 wrapper 的参数透传属于 benchmark runner 集成层。
+FactLink 发布或图内向量检索。`memory-bench` 可以通过显式开关调用 graph build 和 graph
+retrieval；数据集 wrapper 的参数透传属于 benchmark runner 集成层。
 
 ## 2. 请求结构
 
@@ -45,10 +45,12 @@ graph build 和 graph retrieval；数据集 wrapper 的参数透传属于 benchm
 
 - `memory_space_id`：检索边界。所有 seed、fact、entity、evidence 都必须在同一空间内；
 - `query`：用户查询文本。当前最多 4 KiB，转换为 FTS query 时最多使用前 256 个 token；
-- `top_k`：最多返回多少条 `FactContextUnit`；
+- `top_k`：每类 context 最多返回多少条记录；
 - `reference_time_ms`：返回到 `ContextBundle.reference_time_ms`，未提供时使用当前时间；
 - `seed_limit`：每次检索最多保留多少 seed，默认 `max(top_k * 10, 30)`；
 - `max_evidence_records_per_fact`：每条 fact 最多附带多少条 evidence record，默认 3。
+- `query_embedding` / `query_embedding_model`：为未来独立的语义图检索提供者预留；当前 SQLite
+  图检索不读取这两个字段。
 
 空白 query 会返回 `InvalidInput`。
 
@@ -78,7 +80,8 @@ graph build 和 graph retrieval；数据集 wrapper 的参数透传属于 benchm
 1. `graph_entity_fts`：命中 entity canonical name，生成 Entity seed；
 2. `graph_entity_alias_fts`：命中 alias，映射到所属 Entity seed；
 3. `graph_fact_fts`：命中 fact text，生成 Fact seed；
-4. `graph_memory_record_fts`：命中原文 record，再通过 evidence 反查支持的 Fact seed。
+4. `graph_memory_record_fts`：命中原文 record。它既会反查支持的 Fact seed，也会作为独立的
+   evidence-record context unit 返回。
 
 所有通道都限制在同一 `memory_space_id`，并过滤 deleted entity / record、retired fact 和非
 active fact。
@@ -115,7 +118,8 @@ entity 在小查询里拉出无界 fact 集合。最终结果仍会在全局按�
 2. 分数相同按 fact `recorded_at_ms`；
 3. 再相同按 fact id，保证输出稳定。
 
-最终只返回前 `top_k` 条 fact context。
+最终会返回前 `top_k` 条 fact context，以及前 `top_k` 条直接 evidence-record context。
+候选投影为结果时按 record id 去重并再次截断；直接证据节点不会被转换为或标注为 fact。
 
 ## 5. ContextBundle 组装
 
@@ -127,7 +131,18 @@ entity 在小查询里拉出无界 fact 集合。最终结果仍会在全局按�
 - evidence records；
 - traversal path；
 - score；
-- valid time。当前只有 `valid_from_ms` 和 `valid_to_ms` 同时存在时才返回 `valid_time`。
+- 独立的 `valid_from_ms`、`valid_to_ms` 和 `recorded_at_ms`。answer context 只展示来自
+  可信时间解析器的闭合时间点或区间，避免把 LLM 推测的日期或“首次观测时间”误写成
+  “事实发生时间”。
+
+每条 `EvidenceRecordContextUnit` 包含已接受到同一 graph memory space 的原始记录、
+`record:<id>` 路径、匹配类型和分数。它不含 predicate、entity
+或事实时间字段，因为它是可追溯证据节点而非抽取事实。
+
+投影到 `MemoryRecord` 后，事实支持仍写入 `metadata.graph_facts`；直接证据节点写入
+`metadata.graph_matches`，其中 `kind = "evidence_record"`，并以 `match_kind` 区分
+`lexical`。这使评估可以分别统计图事实覆盖和原始证据覆盖，不能把后者误报为
+结构化事实检索能力。
 
 `ContextBundle` 会同时返回去重后的：
 
@@ -148,14 +163,14 @@ entity 在小查询里拉出无界 fact 集合。最终结果仍会在全局按�
 Dense mode  -> dense candidates
 BM25 mode   -> BM25 candidates
 Hybrid mode -> dense + BM25 fusion
+Graph mode  -> graph facts + graph-store evidence nodes
 ```
 
 当 `RetrievalConfig.graph.enabled = true` 时，会额外执行：
 
 ```text
 GraphRetrieveContextRequest
-  -> ContextBundle.fact_context_units
-  -> evidence_records
+  -> ContextBundle fact and evidence-record units
   -> project GraphMemoryRecord back to MemoryRecord
   -> fuse with base candidates
 ```
@@ -163,11 +178,12 @@ GraphRetrieveContextRequest
 融合规则：
 
 1. 以 `MemoryRecord.id` 去重；
-2. 基础检索分数和 graph 分数分别做 min-max normalization；
-3. 最终分数为 `(base_norm + graph.weight * graph_norm) / (1.0 + graph.weight)`，
-   保持 score 在 `[0, 1]` 区间；
-4. 同一 evidence record 被多条 fact 命中时保留最高 graph 分；
-5. 返回前按最终分数降序排序，并截断到目标候选数。
+2. 默认 `rerank_with_graph = false` 且 `allow_graph_only = false`：保留基础检索的候选集合和
+   排序，仅把匹配的 graph facts / evidence-node metadata 合并到同一 record；
+3. 显式开启 graph rerank 时，基础检索分数和 graph 分数分别做 min-max normalization，最终分数为
+   `(base_norm + graph.weight * graph_norm) / (1.0 + graph.weight)`；
+4. 同一 evidence record 被多条 fact 或 evidence-node 路径命中时保留最高 graph 分；
+5. 显式允许 graph-only 候选时，才把未在基础结果中的图记录加入最终候选池。
 
 如果 hybrid rerank 开启，graph channel 会先参与候选融合，再交给 reranker。这样 reranker
 可以看到 graph evidence record，而不是只看到 dense/BM25 候选。
@@ -180,6 +196,9 @@ GraphRetrieveContextRequest
   accept -> record embedding -> LLM extraction -> resolution，生成正式图；
 - `--graph`：search 阶段开启 `RetrievalConfig.graph.enabled`，把 graph evidence record
   作为增强召回通道并入原有检索结果；
+- `--search-mode graph`：只返回 graph store 内的 fact-grounded evidence 或直接 evidence
+  node，不读取 dense/BM25 候选。该模式默认不启用，主要用于分别测量图事实与证据节点覆盖；它
+  不等同于 `--graph-allow-graph-only`，后者仍是混合检索中的有限候选补充；
 - `--graph-weight`：控制 graph channel 的融合权重，默认 0.2；
 - `--graph-fail-open`：graph channel 出错时退化为只返回基础检索结果，默认关闭；
 - `--graph-memory-space-mode auto`：prepared schema 使用 `scope_id`，raw top-level-array
@@ -201,8 +220,12 @@ graph build 需要真实 LLM key。默认读取 `OPENROUTER_API_KEY`，默认 ba
 ## 8. 边界和限制
 
 - 本阶段只做图上下文检索，不直接生成自然语言答案。
-- 本阶段 graph seed 只用 FTS，不使用 query embedding。
+- 当前图检索只使用 FTS、实体和事实邻接关系，以及 fact 到原始 evidence 的可追溯链路；它不会
+  扫描或重排原始 record 向量，也不会扫描 fact 向量。未来若接入图语义检索，必须以独立、可测量的
+  provider 实现，不能改变 dense / BM25 / hybrid 基线。
 - graph channel 接入现有 search fusion，但不改变 dense / BM25 / hybrid 的默认行为。
+- 实体命中只用于补足图邻域；直接命中的 fact text 或 evidence record 始终优先，避免“提到某人”
+  的实体扩展压过问题中的关系、活动或对象词。
 - Evidence 返回的是 `GraphMemoryRecord`，不是逐条 evidence span 的独立返回对象；
   span 仍然保存在 `graph_fact_evidence` 表中。
 - 同一 fact 的 evidence records 会按 evidence group / evidence 创建顺序返回，并受

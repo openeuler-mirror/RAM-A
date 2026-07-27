@@ -6,20 +6,33 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use uuid::Uuid;
 
 use crate::graph::{
-    normalize_graph_text, stable_input_hash, ContextBundle, Entity, ExtractedEntityCandidate,
-    ExtractedFactCandidate, ExtractionRun, Fact, FactContextUnit, FactLink, FactStatus,
-    GraphExtractionOutput, GraphInputHashFields, GraphMemoryRecord, IngestionRun,
+    normalize_graph_text, ContextBundle, Entity, EvidenceRecordContextUnit,
+    EvidenceRecordMatchKind, ExtractedEntityCandidate, ExtractedFactCandidate, ExtractionRun, Fact,
+    FactContextUnit, FactLink, FactStatus, GraphExtractionOutput, GraphMemoryRecord,
+    GraphSourceEntity, IngestionRun,
 };
 use crate::{
     GraphAddMemoryRequest, GraphAddMemoryResponse, GraphRetrieveContextRequest, MemoryError,
-    MemoryResult,
+    MemoryResult, MAX_GRAPH_EVIDENCE_RECORDS_PER_FACT, MAX_GRAPH_RETRIEVAL_QUERY_BYTES,
+    MAX_GRAPH_RETRIEVAL_TOP_K, MAX_GRAPH_SEED_LIMIT,
 };
 
 const GRAPH_PIPELINE_VERSION: &str = "graph-pipeline-v1";
 const FACT_EVIDENCE_KIND_SUPPORT: &str = "support";
 const RESOLUTION_METHOD_DETERMINISTIC: &str = "deterministic";
-const MAX_GRAPH_RETRIEVAL_QUERY_BYTES: usize = 4 * 1024;
 const MAX_GRAPH_FTS_QUERY_TERMS: usize = 256;
+// An entity name identifies a neighborhood, not a query-relevant fact. Keep traversal
+// available as a fallback, but never let it outrank lexical fact/evidence matches.
+const ENTITY_EXPANSION_SEED_WEIGHT: f32 = 0.0;
+const FACT_TEXT_SEED_WEIGHT: f32 = 1.0;
+// A direct source-record match is useful when extraction has no fact coverage,
+// but a matching materialized fact is the more specific graph signal.
+const DIRECT_EVIDENCE_RECORD_WEIGHT: f32 = 0.25;
+const GRAPH_RETRIEVAL_STOP_WORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "did", "do", "does", "for", "from", "had", "has",
+    "have", "how", "in", "is", "of", "on", "or", "the", "to", "was", "were", "what", "when",
+    "where", "which", "who", "whom", "whose", "why", "would",
+];
 
 #[derive(Clone, Debug)]
 pub struct GraphRepository {
@@ -386,17 +399,7 @@ fn accept_memory_record_sync(
         });
     }
 
-    let input_hash = stable_input_hash(&GraphInputHashFields {
-        memory_space_id: request.memory_space_id.clone(),
-        session_id: request.session_id.clone(),
-        session_sequence: request.session_sequence,
-        text: request.text.clone(),
-        source_kind: request.source_kind.clone(),
-        source_ref: request.source_ref.clone(),
-        content_role: request.content_role.clone(),
-        observed_at_ms: request.observed_at_ms,
-        metadata: request.metadata.clone(),
-    });
+    let input_hash = request.input_hash();
 
     let existing = transaction
         .query_row(
@@ -524,48 +527,92 @@ fn retrieve_context_sync(
             ),
         });
     }
+    if request.top_k == 0 || request.top_k > MAX_GRAPH_RETRIEVAL_TOP_K {
+        return Err(MemoryError::InvalidInput {
+            message: format!(
+                "graph retrieval top_k must be between 1 and {MAX_GRAPH_RETRIEVAL_TOP_K}"
+            ),
+        });
+    }
+    let seed_limit = request.seed_limit();
+    if seed_limit == 0 || seed_limit > MAX_GRAPH_SEED_LIMIT {
+        return Err(MemoryError::InvalidInput {
+            message: format!(
+                "graph retrieval seed_limit must be between 1 and {MAX_GRAPH_SEED_LIMIT}"
+            ),
+        });
+    }
+    let evidence_limit = request.max_evidence_records_per_fact();
+    if evidence_limit == 0 || evidence_limit > MAX_GRAPH_EVIDENCE_RECORDS_PER_FACT {
+        return Err(MemoryError::InvalidInput {
+            message: format!(
+                "graph retrieval max_evidence_records_per_fact must be between 1 and {MAX_GRAPH_EVIDENCE_RECORDS_PER_FACT}"
+            ),
+        });
+    }
 
     let connection = open_graph_connection(path)?;
-    let Some(fts_query) = graph_fts_query(query) else {
-        return Ok(ContextBundle {
-            query: request.query.clone(),
-            memory_space_id: request.memory_space_id.clone(),
-            reference_time_ms: request.reference_time_ms.unwrap_or_else(current_time_ms),
-            fact_context_units: Vec::new(),
-            records: Vec::new(),
-            entities: Vec::new(),
-            facts: Vec::new(),
-            fact_links: Vec::new(),
-            paths: Vec::new(),
-            truncation: None,
-            degraded_reason: Some("query produced no graph retrieval terms".to_string()),
-        });
+    let fts_query = graph_fts_query(query);
+
+    let target_subject_entity_id = if let Some(name) = request.target_subject_entity_name.as_deref()
+    {
+        find_active_entity_by_normalized_name(
+            &connection,
+            &request.memory_space_id,
+            &normalize_graph_text(name),
+        )?
+    } else {
+        None
     };
 
-    let seeds = collect_graph_seeds(
+    let seeds = fts_query
+        .as_deref()
+        .map(|fts_query| {
+            collect_graph_seeds(
+                &connection,
+                &request.memory_space_id,
+                fts_query,
+                request.seed_limit(),
+                target_subject_entity_id.as_deref(),
+            )
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let fact_candidates = expand_seed_facts(
         &connection,
         &request.memory_space_id,
-        &fts_query,
-        request.seed_limit(),
+        &seeds,
+        request.top_k,
+        target_subject_entity_id.as_deref(),
     )?;
-    let fact_candidates =
-        expand_seed_facts(&connection, &request.memory_space_id, &seeds, request.top_k)?;
     let (fact_context_units, loaded_facts) =
         load_fact_context_units(&connection, request, &fact_candidates)?;
-    let bundle_members = collect_bundle_members(&fact_context_units, loaded_facts);
+    let evidence_record_context_units = fts_query
+        .as_deref()
+        .map(|fts_query| load_direct_evidence_record_context_units(&connection, request, fts_query))
+        .transpose()?
+        .unwrap_or_default();
+    let bundle_members = collect_bundle_members(
+        &fact_context_units,
+        &evidence_record_context_units,
+        loaded_facts,
+    );
 
     Ok(ContextBundle {
         query: request.query.clone(),
         memory_space_id: request.memory_space_id.clone(),
         reference_time_ms: request.reference_time_ms.unwrap_or_else(current_time_ms),
         fact_context_units,
+        evidence_record_context_units,
         records: bundle_members.records,
         entities: bundle_members.entities,
         facts: bundle_members.facts,
         fact_links: bundle_members.fact_links,
         paths: bundle_members.paths,
         truncation: None,
-        degraded_reason: None,
+        degraded_reason: fts_query
+            .is_none()
+            .then_some("query produced no graph retrieval terms".to_string()),
     })
 }
 
@@ -573,8 +620,8 @@ fn graph_fts_query(query: &str) -> Option<String> {
     let terms = query
         .split_whitespace()
         .filter_map(|term| {
-            let trimmed = term.trim();
-            if trimmed.is_empty() {
+            let trimmed = normalize_graph_query_term(term);
+            if trimmed.is_empty() || is_graph_retrieval_stop_word(&trimmed) {
                 None
             } else {
                 Some(format!("\"{}\"", trimmed.replace('"', "\"\"")))
@@ -589,11 +636,71 @@ fn graph_fts_query(query: &str) -> Option<String> {
     }
 }
 
+fn normalize_graph_query_term(term: &str) -> String {
+    term.trim()
+        .trim_matches(|ch: char| ch.is_ascii_punctuation() && ch != '"')
+        .to_string()
+}
+
+fn is_graph_retrieval_stop_word(term: &str) -> bool {
+    GRAPH_RETRIEVAL_STOP_WORDS
+        .iter()
+        .any(|stop_word| term.eq_ignore_ascii_case(stop_word))
+}
+
+fn find_active_entity_by_normalized_name(
+    connection: &Connection,
+    memory_space_id: &str,
+    normalized_name: &str,
+) -> MemoryResult<Option<String>> {
+    if normalized_name.trim().is_empty() {
+        return Ok(None);
+    }
+
+    if let Some(entity_id) = connection
+        .query_row(
+            "SELECT id
+             FROM graph_entities
+             WHERE memory_space_id = ?1
+               AND normalized_name = ?2
+               AND status = 'active'
+               AND deleted_at_ms IS NULL
+             ORDER BY created_at_ms, id
+             LIMIT 1",
+            params![memory_space_id, normalized_name],
+            |row| row.get(0),
+        )
+        .optional()?
+    {
+        return Ok(Some(entity_id));
+    }
+
+    connection
+        .query_row(
+            "SELECT entities.id
+             FROM graph_entity_aliases aliases
+             JOIN graph_entities entities
+               ON entities.id = aliases.entity_id
+              AND entities.memory_space_id = aliases.memory_space_id
+             WHERE aliases.memory_space_id = ?1
+               AND aliases.normalized_alias = ?2
+               AND entities.status = 'active'
+               AND entities.deleted_at_ms IS NULL
+             ORDER BY aliases.created_at_ms, entities.created_at_ms, entities.id
+             LIMIT 1",
+            params![memory_space_id, normalized_name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
 fn collect_graph_seeds(
     connection: &Connection,
     memory_space_id: &str,
     fts_query: &str,
     limit: usize,
+    target_subject_entity_id: Option<&str>,
 ) -> MemoryResult<Vec<GraphSeed>> {
     if limit == 0 {
         return Ok(Vec::new());
@@ -602,9 +709,27 @@ fn collect_graph_seeds(
     let mut seeds = Vec::new();
     collect_entity_name_seeds(connection, memory_space_id, fts_query, limit, &mut seeds)?;
     collect_entity_alias_seeds(connection, memory_space_id, fts_query, limit, &mut seeds)?;
-    collect_fact_text_seeds(connection, memory_space_id, fts_query, limit, &mut seeds)?;
-    collect_record_evidence_fact_seeds(connection, memory_space_id, fts_query, limit, &mut seeds)?;
+    collect_fact_text_seeds(
+        connection,
+        memory_space_id,
+        fts_query,
+        limit,
+        target_subject_entity_id,
+        &mut seeds,
+    )?;
+    collect_record_evidence_fact_seeds(
+        connection,
+        memory_space_id,
+        fts_query,
+        limit,
+        target_subject_entity_id,
+        &mut seeds,
+    )?;
 
+    Ok(merge_graph_seeds(seeds, limit))
+}
+
+fn merge_graph_seeds(seeds: Vec<GraphSeed>, limit: usize) -> Vec<GraphSeed> {
     let mut best_by_key: HashMap<(GraphSeedKind, String), f32> = HashMap::new();
     for seed in seeds {
         let key = (seed.kind, seed.id);
@@ -625,7 +750,7 @@ fn collect_graph_seeds(
             .then_with(|| left.id.cmp(&right.id))
     });
     merged.truncate(limit);
-    Ok(merged)
+    merged
 }
 
 fn collect_entity_name_seeds(
@@ -652,6 +777,7 @@ fn collect_entity_name_seeds(
         &mut statement,
         params![fts_query, memory_space_id, limit as i64],
         GraphSeedKind::Entity,
+        ENTITY_EXPANSION_SEED_WEIGHT,
         seeds,
     )
 }
@@ -685,6 +811,7 @@ fn collect_entity_alias_seeds(
         &mut statement,
         params![fts_query, memory_space_id, limit as i64],
         GraphSeedKind::Entity,
+        ENTITY_EXPANSION_SEED_WEIGHT,
         seeds,
     )
 }
@@ -694,27 +821,64 @@ fn collect_fact_text_seeds(
     memory_space_id: &str,
     fts_query: &str,
     limit: usize,
+    target_subject_entity_id: Option<&str>,
     seeds: &mut Vec<GraphSeed>,
 ) -> MemoryResult<()> {
-    let mut statement = connection.prepare(
-        "SELECT facts.id
-         FROM graph_fact_fts
-         JOIN graph_facts facts
-           ON facts.id = graph_fact_fts.id
-          AND facts.memory_space_id = graph_fact_fts.memory_space_id
-         WHERE graph_fact_fts MATCH ?1
-           AND graph_fact_fts.memory_space_id = ?2
-           AND facts.status = 'active'
-           AND facts.retired_at_ms IS NULL
-         ORDER BY bm25(graph_fact_fts), facts.recorded_at_ms, facts.id
-         LIMIT ?3",
-    )?;
-    collect_seed_rows(
-        &mut statement,
-        params![fts_query, memory_space_id, limit as i64],
-        GraphSeedKind::Fact,
-        seeds,
-    )
+    if let Some(target_subject_entity_id) = target_subject_entity_id {
+        let mut statement = connection.prepare(
+            // Self-loop and MENTIONED facts are extraction noise, not retrieval evidence.
+            "SELECT facts.id
+             FROM graph_fact_fts
+             JOIN graph_facts facts
+               ON facts.id = graph_fact_fts.id
+              AND facts.memory_space_id = graph_fact_fts.memory_space_id
+             WHERE graph_fact_fts MATCH ?1
+               AND graph_fact_fts.memory_space_id = ?2
+               AND facts.status = 'active'
+               AND facts.retired_at_ms IS NULL
+               AND facts.subject_entity_id = ?3
+               AND facts.subject_entity_id <> facts.object_entity_id
+               AND facts.predicate <> 'MENTIONED'
+             ORDER BY bm25(graph_fact_fts), facts.recorded_at_ms, facts.id
+             LIMIT ?4",
+        )?;
+        collect_seed_rows(
+            &mut statement,
+            params![
+                fts_query,
+                memory_space_id,
+                target_subject_entity_id,
+                limit as i64
+            ],
+            GraphSeedKind::Fact,
+            FACT_TEXT_SEED_WEIGHT,
+            seeds,
+        )
+    } else {
+        let mut statement = connection.prepare(
+            // Self-loop and MENTIONED facts are extraction noise, not retrieval evidence.
+            "SELECT facts.id
+             FROM graph_fact_fts
+             JOIN graph_facts facts
+               ON facts.id = graph_fact_fts.id
+              AND facts.memory_space_id = graph_fact_fts.memory_space_id
+             WHERE graph_fact_fts MATCH ?1
+               AND graph_fact_fts.memory_space_id = ?2
+               AND facts.status = 'active'
+               AND facts.retired_at_ms IS NULL
+               AND facts.subject_entity_id <> facts.object_entity_id
+               AND facts.predicate <> 'MENTIONED'
+             ORDER BY bm25(graph_fact_fts), facts.recorded_at_ms, facts.id
+             LIMIT ?3",
+        )?;
+        collect_seed_rows(
+            &mut statement,
+            params![fts_query, memory_space_id, limit as i64],
+            GraphSeedKind::Fact,
+            FACT_TEXT_SEED_WEIGHT,
+            seeds,
+        )
+    }
 }
 
 fn collect_record_evidence_fact_seeds(
@@ -722,46 +886,97 @@ fn collect_record_evidence_fact_seeds(
     memory_space_id: &str,
     fts_query: &str,
     limit: usize,
+    target_subject_entity_id: Option<&str>,
     seeds: &mut Vec<GraphSeed>,
 ) -> MemoryResult<()> {
-    let mut statement = connection.prepare(
-        "SELECT facts.id
-         FROM graph_memory_record_fts
-         JOIN graph_memory_records records
-           ON records.id = graph_memory_record_fts.id
-          AND records.memory_space_id = graph_memory_record_fts.memory_space_id
-         JOIN graph_fact_evidence evidence
-           ON evidence.memory_record_id = records.id
-          AND evidence.memory_space_id = records.memory_space_id
-          AND evidence.deleted_at_ms IS NULL
-         JOIN graph_fact_evidence_groups groups
-           ON groups.id = evidence.evidence_group_id
-          AND groups.memory_space_id = evidence.memory_space_id
-          AND groups.deleted_at_ms IS NULL
-         JOIN graph_facts facts
-           ON facts.id = groups.fact_id
-          AND facts.memory_space_id = groups.memory_space_id
-         WHERE graph_memory_record_fts MATCH ?1
-           AND graph_memory_record_fts.memory_space_id = ?2
-           AND records.deleted_at_ms IS NULL
-           AND facts.status = 'active'
-           AND facts.retired_at_ms IS NULL
-         GROUP BY facts.id
-         ORDER BY MIN(facts.recorded_at_ms), facts.id
-         LIMIT ?3",
-    )?;
-    collect_seed_rows(
-        &mut statement,
-        params![fts_query, memory_space_id, limit as i64],
-        GraphSeedKind::Fact,
-        seeds,
-    )
+    if let Some(target_subject_entity_id) = target_subject_entity_id {
+        let mut statement = connection.prepare(
+            // Self-loop and MENTIONED facts are extraction noise, not retrieval evidence.
+            "SELECT facts.id
+             FROM graph_memory_record_fts
+             JOIN graph_memory_records records
+               ON records.id = graph_memory_record_fts.id
+              AND records.memory_space_id = graph_memory_record_fts.memory_space_id
+             JOIN graph_fact_evidence evidence
+               ON evidence.memory_record_id = records.id
+              AND evidence.memory_space_id = records.memory_space_id
+              AND evidence.deleted_at_ms IS NULL
+             JOIN graph_fact_evidence_groups groups
+               ON groups.id = evidence.evidence_group_id
+              AND groups.memory_space_id = evidence.memory_space_id
+              AND groups.deleted_at_ms IS NULL
+             JOIN graph_facts facts
+               ON facts.id = groups.fact_id
+              AND facts.memory_space_id = groups.memory_space_id
+             WHERE graph_memory_record_fts MATCH ?1
+               AND graph_memory_record_fts.memory_space_id = ?2
+               AND records.deleted_at_ms IS NULL
+               AND facts.status = 'active'
+               AND facts.retired_at_ms IS NULL
+               AND facts.subject_entity_id = ?3
+               AND facts.subject_entity_id <> facts.object_entity_id
+               AND facts.predicate <> 'MENTIONED'
+             GROUP BY facts.id
+             ORDER BY MIN(facts.recorded_at_ms), facts.id
+             LIMIT ?4",
+        )?;
+        collect_seed_rows(
+            &mut statement,
+            params![
+                fts_query,
+                memory_space_id,
+                target_subject_entity_id,
+                limit as i64
+            ],
+            GraphSeedKind::Fact,
+            FACT_TEXT_SEED_WEIGHT,
+            seeds,
+        )
+    } else {
+        let mut statement = connection.prepare(
+            // Self-loop and MENTIONED facts are extraction noise, not retrieval evidence.
+            "SELECT facts.id
+             FROM graph_memory_record_fts
+             JOIN graph_memory_records records
+               ON records.id = graph_memory_record_fts.id
+              AND records.memory_space_id = graph_memory_record_fts.memory_space_id
+             JOIN graph_fact_evidence evidence
+               ON evidence.memory_record_id = records.id
+              AND evidence.memory_space_id = records.memory_space_id
+              AND evidence.deleted_at_ms IS NULL
+             JOIN graph_fact_evidence_groups groups
+               ON groups.id = evidence.evidence_group_id
+              AND groups.memory_space_id = evidence.memory_space_id
+              AND groups.deleted_at_ms IS NULL
+             JOIN graph_facts facts
+               ON facts.id = groups.fact_id
+              AND facts.memory_space_id = groups.memory_space_id
+             WHERE graph_memory_record_fts MATCH ?1
+               AND graph_memory_record_fts.memory_space_id = ?2
+               AND records.deleted_at_ms IS NULL
+               AND facts.status = 'active'
+               AND facts.retired_at_ms IS NULL
+               AND facts.subject_entity_id <> facts.object_entity_id
+               AND facts.predicate <> 'MENTIONED'
+             GROUP BY facts.id
+             ORDER BY MIN(facts.recorded_at_ms), facts.id
+             LIMIT ?3",
+        )?;
+        collect_seed_rows(
+            &mut statement,
+            params![fts_query, memory_space_id, limit as i64],
+            GraphSeedKind::Fact,
+            FACT_TEXT_SEED_WEIGHT,
+            seeds,
+        )
+    }
 }
 
 fn collect_seed_rows<P>(
     statement: &mut rusqlite::Statement<'_>,
     params: P,
     kind: GraphSeedKind,
+    weight: f32,
     seeds: &mut Vec<GraphSeed>,
 ) -> MemoryResult<()>
 where
@@ -772,16 +987,21 @@ where
     for row in rows {
         raw_rows.push(row?);
     }
-    append_ranked_seeds(kind, raw_rows, seeds);
+    append_ranked_seeds(kind, raw_rows, weight, seeds);
     Ok(())
 }
 
-fn append_ranked_seeds(kind: GraphSeedKind, raw_rows: Vec<String>, seeds: &mut Vec<GraphSeed>) {
+fn append_ranked_seeds(
+    kind: GraphSeedKind,
+    raw_rows: Vec<String>,
+    weight: f32,
+    seeds: &mut Vec<GraphSeed>,
+) {
     for (index, id) in raw_rows.into_iter().enumerate() {
         seeds.push(GraphSeed {
             kind: kind.clone(),
             id,
-            score: 1.0 / (index as f32 + 1.0),
+            score: weight / (index as f32 + 1.0),
         });
     }
 }
@@ -791,6 +1011,7 @@ fn expand_seed_facts(
     memory_space_id: &str,
     seeds: &[GraphSeed],
     limit: usize,
+    target_subject_entity_id: Option<&str>,
 ) -> MemoryResult<Vec<FactCandidate>> {
     if limit == 0 || seeds.is_empty() {
         return Ok(Vec::new());
@@ -800,9 +1021,12 @@ fn expand_seed_facts(
     for seed in seeds {
         match seed.kind {
             GraphSeedKind::Fact => {
-                if let Some(recorded_at_ms) =
-                    active_fact_recorded_at(connection, memory_space_id, &seed.id)?
-                {
+                if let Some(recorded_at_ms) = active_fact_recorded_at(
+                    connection,
+                    memory_space_id,
+                    &seed.id,
+                    target_subject_entity_id,
+                )? {
                     upsert_fact_candidate(
                         &mut candidates_by_fact,
                         FactCandidate {
@@ -815,9 +1039,13 @@ fn expand_seed_facts(
                 }
             }
             GraphSeedKind::Entity => {
-                for (fact_id, recorded_at_ms) in
-                    active_facts_for_entity(connection, memory_space_id, &seed.id, limit)?
-                {
+                for (fact_id, recorded_at_ms) in active_facts_for_entity(
+                    connection,
+                    memory_space_id,
+                    &seed.id,
+                    limit,
+                    target_subject_entity_id,
+                )? {
                     upsert_fact_candidate(
                         &mut candidates_by_fact,
                         FactCandidate {
@@ -883,20 +1111,44 @@ fn active_fact_recorded_at(
     connection: &Connection,
     memory_space_id: &str,
     fact_id: &str,
+    target_subject_entity_id: Option<&str>,
 ) -> MemoryResult<Option<u64>> {
-    connection
-        .query_row(
-            "SELECT recorded_at_ms
-             FROM graph_facts
-             WHERE id = ?1
-               AND memory_space_id = ?2
-               AND status = 'active'
-               AND retired_at_ms IS NULL",
-            params![fact_id, memory_space_id],
-            |row| Ok(row.get::<_, i64>(0)? as u64),
-        )
-        .optional()
-        .map_err(Into::into)
+    if let Some(target_subject_entity_id) = target_subject_entity_id {
+        connection
+            .query_row(
+                // Self-loop and MENTIONED facts are extraction noise, not retrieval evidence.
+                "SELECT recorded_at_ms
+                 FROM graph_facts
+                 WHERE id = ?1
+                   AND memory_space_id = ?2
+                   AND subject_entity_id = ?3
+                   AND status = 'active'
+                   AND retired_at_ms IS NULL
+                   AND subject_entity_id <> object_entity_id
+                   AND predicate <> 'MENTIONED'",
+                params![fact_id, memory_space_id, target_subject_entity_id],
+                |row| Ok(row.get::<_, i64>(0)? as u64),
+            )
+            .optional()
+            .map_err(Into::into)
+    } else {
+        connection
+            .query_row(
+                // Self-loop and MENTIONED facts are extraction noise, not retrieval evidence.
+                "SELECT recorded_at_ms
+                 FROM graph_facts
+                 WHERE id = ?1
+                   AND memory_space_id = ?2
+                   AND status = 'active'
+                   AND retired_at_ms IS NULL
+                   AND subject_entity_id <> object_entity_id
+                   AND predicate <> 'MENTIONED'",
+                params![fact_id, memory_space_id],
+                |row| Ok(row.get::<_, i64>(0)? as u64),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
 }
 
 fn active_facts_for_entity(
@@ -904,25 +1156,58 @@ fn active_facts_for_entity(
     memory_space_id: &str,
     entity_id: &str,
     limit: usize,
+    target_subject_entity_id: Option<&str>,
 ) -> MemoryResult<Vec<(String, u64)>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
 
-    let mut statement = connection.prepare(
-        "SELECT id, recorded_at_ms
-         FROM graph_facts
-         WHERE memory_space_id = ?1
-           AND (subject_entity_id = ?2 OR object_entity_id = ?2)
-           AND status = 'active'
-           AND retired_at_ms IS NULL
-         ORDER BY recorded_at_ms, id
-         LIMIT ?3",
-    )?;
-    let rows = statement.query_map(params![memory_space_id, entity_id, limit as i64], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
-    })?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    if let Some(target_subject_entity_id) = target_subject_entity_id {
+        let mut statement = connection.prepare(
+            // When a query names a target subject, entity expansion should stay on facts
+            // authored by that graph subject instead of all facts that merely mention it.
+            "SELECT id, recorded_at_ms
+             FROM graph_facts
+             WHERE memory_space_id = ?1
+               AND subject_entity_id = ?2
+               AND (subject_entity_id = ?3 OR object_entity_id = ?3)
+               AND status = 'active'
+               AND retired_at_ms IS NULL
+               AND subject_entity_id <> object_entity_id
+               AND predicate <> 'MENTIONED'
+             ORDER BY recorded_at_ms, id
+             LIMIT ?4",
+        )?;
+        let rows = statement.query_map(
+            params![
+                memory_space_id,
+                target_subject_entity_id,
+                entity_id,
+                limit as i64
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64)),
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    } else {
+        let mut statement = connection.prepare(
+            // Self-loop and MENTIONED facts are extraction noise, not retrieval evidence.
+            "SELECT id, recorded_at_ms
+             FROM graph_facts
+             WHERE memory_space_id = ?1
+               AND (subject_entity_id = ?2 OR object_entity_id = ?2)
+               AND status = 'active'
+               AND retired_at_ms IS NULL
+               AND subject_entity_id <> object_entity_id
+               AND predicate <> 'MENTIONED'
+             ORDER BY recorded_at_ms, id
+             LIMIT ?3",
+        )?;
+        let rows = statement
+            .query_map(params![memory_space_id, entity_id, limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
 }
 
 fn load_fact_context_units(
@@ -946,6 +1231,7 @@ fn load_fact_context_units(
             &request.memory_space_id,
             &fact.id,
             request.max_evidence_records_per_fact(),
+            request.target_evidence_speaker.as_deref(),
         )?;
         let mut path = candidate.path.clone();
         for record in &evidence_records {
@@ -954,10 +1240,6 @@ fn load_fact_context_units(
                 path.push(record_path);
             }
         }
-        let valid_time = match (fact.valid_from_ms, fact.valid_to_ms) {
-            (Some(valid_from_ms), Some(valid_to_ms)) => Some((valid_from_ms, valid_to_ms)),
-            _ => None,
-        };
         units.push(FactContextUnit {
             fact_id: fact.id.clone(),
             fact_text: fact.fact_text.clone(),
@@ -969,7 +1251,9 @@ fn load_fact_context_units(
             path,
             score: candidate.score,
             status: fact.status.clone(),
-            valid_time,
+            valid_from_ms: fact.valid_from_ms,
+            valid_to_ms: fact.valid_to_ms,
+            recorded_at_ms: fact.recorded_at_ms,
         });
         loaded_facts.push(fact);
     }
@@ -978,6 +1262,7 @@ fn load_fact_context_units(
 
 fn collect_bundle_members(
     fact_context_units: &[FactContextUnit],
+    evidence_record_context_units: &[EvidenceRecordContextUnit],
     loaded_facts: Vec<Fact>,
 ) -> BundleMembers {
     let mut records = Vec::new();
@@ -1016,6 +1301,13 @@ fn collect_bundle_members(
         paths.push(unit.path.clone());
     }
 
+    for unit in evidence_record_context_units {
+        if record_ids.insert(unit.record.id.clone()) {
+            records.push(unit.record.clone());
+        }
+        paths.push(unit.path.clone());
+    }
+
     BundleMembers {
         records,
         entities,
@@ -1023,6 +1315,101 @@ fn collect_bundle_members(
         fact_links,
         paths,
     }
+}
+
+fn load_direct_evidence_record_context_units(
+    connection: &Connection,
+    request: &GraphRetrieveContextRequest,
+    fts_query: &str,
+) -> MemoryResult<Vec<EvidenceRecordContextUnit>> {
+    if request.top_k == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Fetch a bounded superset before applying the optional speaker constraint,
+    // since speaker currently lives in metadata JSON rather than an indexed column.
+    let fetch_limit = request.seed_limit();
+    let mut statement = connection.prepare(
+        "SELECT records.id, records.memory_space_id, records.session_id,
+                records.ingestion_sequence, records.session_sequence, records.text,
+                records.metadata_json, records.source_kind, records.source_ref,
+                records.content_role, records.created_by_agent_id, records.observed_at_ms,
+                records.embedding, records.embedding_dims, records.embedding_model,
+                records.embedding_version, records.created_at_ms, records.updated_at_ms,
+                records.deleted_at_ms
+         FROM graph_memory_record_fts
+         JOIN graph_memory_records records
+           ON records.id = graph_memory_record_fts.id
+          AND records.memory_space_id = graph_memory_record_fts.memory_space_id
+         WHERE graph_memory_record_fts MATCH ?1
+           AND graph_memory_record_fts.memory_space_id = ?2
+           AND records.deleted_at_ms IS NULL
+         ORDER BY bm25(graph_memory_record_fts), records.ingestion_sequence, records.id
+         LIMIT ?3",
+    )?;
+    let rows = statement.query_map(
+        params![fts_query, &request.memory_space_id, fetch_limit as i64],
+        |row| graph_memory_record_from_row(row, false),
+    )?;
+
+    let mut records = rows.collect::<Result<Vec<_>, _>>()?;
+    if let Some(target_evidence_speaker) = request.target_evidence_speaker.as_deref() {
+        records.retain(|record| record_speaker_matches(&record.metadata, target_evidence_speaker));
+    }
+
+    Ok(records
+        .into_iter()
+        .take(request.top_k)
+        .enumerate()
+        .map(|(index, record)| EvidenceRecordContextUnit {
+            path: vec![format!("record:{}", record.id)],
+            record,
+            score: DIRECT_EVIDENCE_RECORD_WEIGHT / (index as f32 + 1.0),
+            match_kind: EvidenceRecordMatchKind::Lexical,
+        })
+        .collect())
+}
+
+fn graph_memory_record_from_row(
+    row: &rusqlite::Row<'_>,
+    include_embedding: bool,
+) -> rusqlite::Result<GraphMemoryRecord> {
+    let id = row.get::<_, String>(0)?;
+    let metadata_json = row.get::<_, String>(6)?;
+    let metadata = serde_json::from_str(&metadata_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let embedding = if include_embedding {
+        blob_to_embedding(row.get(12)?, row.get(13)?, &id).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                12,
+                rusqlite::types::Type::Blob,
+                Box::new(error),
+            )
+        })?
+    } else {
+        None
+    };
+    Ok(GraphMemoryRecord {
+        id: id.clone(),
+        memory_space_id: row.get(1)?,
+        session_id: row.get(2)?,
+        ingestion_sequence: row.get(3)?,
+        session_sequence: row.get(4)?,
+        text: row.get(5)?,
+        metadata,
+        source_kind: row.get(7)?,
+        source_ref: row.get(8)?,
+        content_role: row.get(9)?,
+        created_by_agent_id: row.get(10)?,
+        observed_at_ms: row.get::<_, Option<i64>>(11)?.map(|value| value as u64),
+        embedding,
+        embedding_model: row.get(14)?,
+        embedding_version: row.get(15)?,
+        created_at_ms: row.get::<_, i64>(16)? as u64,
+        updated_at_ms: row.get::<_, i64>(17)? as u64,
+        deleted_at_ms: row.get::<_, Option<i64>>(18)?.map(|value| value as u64),
+    })
 }
 
 fn load_active_fact(
@@ -1174,6 +1561,7 @@ fn load_evidence_records_for_fact(
     memory_space_id: &str,
     fact_id: &str,
     limit: usize,
+    target_evidence_speaker: Option<&str>,
 ) -> MemoryResult<Vec<GraphMemoryRecord>> {
     if limit == 0 {
         return Ok(Vec::new());
@@ -1198,10 +1586,9 @@ fn load_evidence_records_for_fact(
            AND groups.memory_space_id = ?2
            AND groups.deleted_at_ms IS NULL
            AND records.deleted_at_ms IS NULL
-         ORDER BY groups.created_at_ms, evidence.created_at_ms, records.id
-         LIMIT ?3",
+         ORDER BY groups.created_at_ms, evidence.created_at_ms, records.id",
     )?;
-    let rows = statement.query_map(params![fact_id, memory_space_id, limit as i64], |row| {
+    let rows = statement.query_map(params![fact_id, memory_space_id], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
@@ -1269,7 +1656,19 @@ fn load_evidence_records_for_fact(
             deleted_at_ms: deleted_at_ms.map(|value| value as u64),
         });
     }
+
+    if let Some(target_evidence_speaker) = target_evidence_speaker {
+        records.retain(|record| record_speaker_matches(&record.metadata, target_evidence_speaker));
+    }
+    records.truncate(limit);
     Ok(records)
+}
+
+fn record_speaker_matches(metadata: &serde_json::Value, target_speaker: &str) -> bool {
+    metadata
+        .get("speaker")
+        .and_then(|value| value.as_str())
+        .is_some_and(|speaker| speaker.eq_ignore_ascii_case(target_speaker))
 }
 
 fn parse_fact_status(status: &str) -> MemoryResult<FactStatus> {
@@ -2602,8 +3001,9 @@ fn blob_to_embedding(
 #[cfg(test)]
 mod tests {
     use super::{
-        active_facts_for_entity, collect_graph_seeds, fact_dedup_key, graph_fts_query,
-        open_graph_connection,
+        active_facts_for_entity, collect_graph_seeds, expand_seed_facts, fact_dedup_key,
+        find_active_entity_by_normalized_name, graph_fts_query, normalize_graph_text,
+        open_graph_connection, GraphSeedKind,
     };
     use rusqlite::params;
     use std::path::Path;
@@ -2676,6 +3076,15 @@ mod tests {
     }
 
     #[test]
+    fn graph_fts_query_drops_question_stop_words() {
+        assert_eq!(super::graph_fts_query("When did the").as_deref(), None);
+        assert_eq!(
+            super::graph_fts_query("When did Alice visit Shanghai?").as_deref(),
+            Some("\"Alice\" OR \"visit\" OR \"Shanghai\"")
+        );
+    }
+
+    #[test]
     fn graph_fts_query_limits_terms() {
         let query = std::iter::repeat_n("Alice", super::MAX_GRAPH_FTS_QUERY_TERMS + 1)
             .collect::<Vec<_>>()
@@ -2690,7 +3099,7 @@ mod tests {
 
     #[test]
     fn retrieve_context_rejects_oversized_query() {
-        let query = "a".repeat(super::MAX_GRAPH_RETRIEVAL_QUERY_BYTES + 1);
+        let query = "a".repeat(crate::MAX_GRAPH_RETRIEVAL_QUERY_BYTES + 1);
         let error = super::retrieve_context_sync(
             Path::new(":memory:"),
             &crate::GraphRetrieveContextRequest {
@@ -2698,6 +3107,10 @@ mod tests {
                 query,
                 top_k: 5,
                 reference_time_ms: None,
+                query_embedding: None,
+                query_embedding_model: None,
+                target_subject_entity_name: None,
+                target_evidence_speaker: None,
                 seed_limit: None,
                 max_evidence_records_per_fact: None,
             },
@@ -2705,6 +3118,62 @@ mod tests {
         .expect_err("oversized graph retrieval query should fail");
 
         assert!(format!("{error}").contains("graph retrieval query must be at most"));
+    }
+
+    #[test]
+    fn retrieve_context_accepts_the_mcp_query_character_limit() {
+        let query = "\u{1f642}".repeat(32_000);
+        let bundle = super::retrieve_context_sync(
+            Path::new(":memory:"),
+            &crate::GraphRetrieveContextRequest {
+                memory_space_id: "space-1".to_string(),
+                query,
+                top_k: 5,
+                reference_time_ms: None,
+                query_embedding: None,
+                query_embedding_model: None,
+                target_subject_entity_name: None,
+                target_evidence_speaker: None,
+                seed_limit: None,
+                max_evidence_records_per_fact: None,
+            },
+        )
+        .expect("queries accepted by MCP validation should reach graph retrieval");
+
+        assert!(bundle.fact_context_units.is_empty());
+    }
+
+    #[test]
+    fn retrieve_context_rejects_unbounded_explicit_limits() {
+        for (top_k, seed_limit, evidence_limit, expected) in [
+            (crate::MAX_GRAPH_RETRIEVAL_TOP_K + 1, None, None, "top_k"),
+            (5, Some(crate::MAX_GRAPH_SEED_LIMIT + 1), None, "seed_limit"),
+            (
+                5,
+                None,
+                Some(crate::MAX_GRAPH_EVIDENCE_RECORDS_PER_FACT + 1),
+                "max_evidence_records_per_fact",
+            ),
+        ] {
+            let error = super::retrieve_context_sync(
+                Path::new(":memory:"),
+                &crate::GraphRetrieveContextRequest {
+                    memory_space_id: "space-1".to_string(),
+                    query: "Alice".to_string(),
+                    top_k,
+                    reference_time_ms: None,
+                    query_embedding: None,
+                    query_embedding_model: None,
+                    target_subject_entity_name: None,
+                    target_evidence_speaker: None,
+                    seed_limit,
+                    max_evidence_records_per_fact: evidence_limit,
+                },
+            )
+            .expect_err("oversized graph retrieval limit should fail");
+
+            assert!(format!("{error}").contains(expected));
+        }
     }
 
     #[test]
@@ -2718,7 +3187,7 @@ mod tests {
         insert_test_alias(&connection, "alias-b-1", "entity-b", "Alice third", 3);
 
         let fts_query = graph_fts_query("Alice").unwrap();
-        let seeds = collect_graph_seeds(&connection, "space-1", &fts_query, 2).unwrap();
+        let seeds = collect_graph_seeds(&connection, "space-1", &fts_query, 2, None).unwrap();
         let seed_ids = seeds
             .into_iter()
             .map(|seed| seed.id)
@@ -2727,6 +3196,19 @@ mod tests {
         assert_eq!(seed_ids.len(), 2);
         assert!(seed_ids.contains("entity-a"));
         assert!(seed_ids.contains("entity-b"));
+    }
+
+    #[test]
+    fn target_subject_entity_lookup_resolves_aliases() {
+        let connection = open_graph_connection(Path::new(":memory:")).unwrap();
+        seed_graph_space(&connection);
+        insert_test_entity(&connection, "entity-a", "Melanie", "melanie");
+        insert_test_alias(&connection, "alias-a-1", "entity-a", "Mel", 1);
+
+        let entity_id =
+            find_active_entity_by_normalized_name(&connection, "space-1", "mel").unwrap();
+
+        assert_eq!(entity_id.as_deref(), Some("entity-a"));
     }
 
     #[test]
@@ -2745,11 +3227,168 @@ mod tests {
             );
         }
 
-        let facts = active_facts_for_entity(&connection, "space-1", "entity-a", 2).unwrap();
+        let facts = active_facts_for_entity(&connection, "space-1", "entity-a", 2, None).unwrap();
 
         assert_eq!(facts.len(), 2);
         assert_eq!(facts[0].0, "fact-0");
         assert_eq!(facts[1].0, "fact-1");
+    }
+
+    #[test]
+    fn graph_retrieval_excludes_non_signal_facts_from_entity_expansion() {
+        let connection = open_graph_connection(Path::new(":memory:")).unwrap();
+        seed_graph_space(&connection);
+        insert_test_entity(&connection, "entity-a", "Person A", "person-a");
+        insert_test_entity(&connection, "entity-b", "Person B", "person-b");
+        insert_test_fact_with_predicate(
+            &connection,
+            "fact-strong",
+            "entity-a",
+            "RELATED_TO",
+            "entity-b",
+            1,
+        );
+        insert_test_fact_with_predicate(
+            &connection,
+            "fact-mentioned",
+            "entity-a",
+            "MENTIONED",
+            "entity-b",
+            2,
+        );
+        insert_test_fact_with_predicate(
+            &connection,
+            "fact-self-loop",
+            "entity-a",
+            "HAS_ATTRIBUTE",
+            "entity-a",
+            3,
+        );
+
+        let facts = active_facts_for_entity(&connection, "space-1", "entity-a", 10, None).unwrap();
+
+        assert_eq!(facts, vec![("fact-strong".to_string(), 1)]);
+    }
+
+    #[test]
+    fn graph_retrieval_excludes_non_signal_fact_seeds() {
+        let connection = open_graph_connection(Path::new(":memory:")).unwrap();
+        seed_graph_space(&connection);
+        insert_test_entity(&connection, "entity-a", "Person A", "person-a");
+        insert_test_entity(&connection, "entity-b", "Person B", "person-b");
+        insert_test_fact_with_predicate(
+            &connection,
+            "fact-mentioned",
+            "entity-a",
+            "MENTIONED",
+            "entity-b",
+            1,
+        );
+        insert_test_fact_fts(&connection, "fact-mentioned", "mentioned entity-b");
+        insert_test_fact_with_predicate(
+            &connection,
+            "fact-self-loop",
+            "entity-a",
+            "HAS_ATTRIBUTE",
+            "entity-a",
+            2,
+        );
+        insert_test_fact_fts(&connection, "fact-self-loop", "self loop attribute");
+
+        let fts_query = graph_fts_query("mentioned self").unwrap();
+        let seeds = collect_graph_seeds(&connection, "space-1", &fts_query, 10, None).unwrap();
+
+        assert!(seeds.is_empty(), "seeds: {seeds:?}");
+    }
+
+    #[test]
+    fn entity_expansion_seed_never_outranks_fact_text_seed() {
+        let connection = open_graph_connection(Path::new(":memory:")).unwrap();
+        seed_graph_space(&connection);
+        insert_test_entity(&connection, "alice", "Alice", "alice");
+        insert_test_entity(&connection, "adoption", "adoption", "adoption");
+        insert_test_fact_with_text(
+            &connection,
+            "adoption-fact",
+            "alice",
+            "RELATED_TO",
+            "adoption",
+            "Alice researches adoption agencies.",
+            1,
+        );
+        insert_test_fact_fts(
+            &connection,
+            "adoption-fact",
+            "Alice researches adoption agencies.",
+        );
+
+        let fts_query = graph_fts_query("Alice adoption").unwrap();
+        let seeds = collect_graph_seeds(&connection, "space-1", &fts_query, 10, None).unwrap();
+        let entity_seed = seeds
+            .iter()
+            .find(|seed| seed.kind == GraphSeedKind::Entity && seed.id == "alice")
+            .expect("Alice entity seed");
+        let fact_seed = seeds
+            .iter()
+            .find(|seed| seed.kind == GraphSeedKind::Fact && seed.id == "adoption-fact")
+            .expect("adoption fact seed");
+
+        assert_eq!(entity_seed.score, 0.0);
+        assert!(fact_seed.score > entity_seed.score);
+    }
+
+    #[test]
+    fn graph_retrieval_target_subject_filters_fact_seeds_and_entity_expansion() {
+        let connection = open_graph_connection(Path::new(":memory:")).unwrap();
+        seed_graph_space(&connection);
+        insert_test_entity(&connection, "caroline", "Caroline", "caroline");
+        insert_test_entity(&connection, "melanie", "Melanie", "melanie");
+        insert_test_entity(
+            &connection,
+            "adoption",
+            "adoption agency",
+            "adoption agency",
+        );
+        insert_test_fact_with_text(
+            &connection,
+            "caroline-fact",
+            "caroline",
+            "RELATED_TO",
+            "adoption",
+            "Caroline is researching adoption agencies.",
+            1,
+        );
+        insert_test_fact_with_text(
+            &connection,
+            "melanie-fact",
+            "melanie",
+            "RELATED_TO",
+            "caroline",
+            "Melanie is asking Caroline about adoption agencies.",
+            2,
+        );
+        insert_test_fact_fts(
+            &connection,
+            "caroline-fact",
+            "Caroline is researching adoption agencies.",
+        );
+        insert_test_fact_fts(
+            &connection,
+            "melanie-fact",
+            "Melanie is asking Caroline about adoption agencies.",
+        );
+
+        let fts_query = graph_fts_query("Caroline adoption").unwrap();
+        let seeds =
+            collect_graph_seeds(&connection, "space-1", &fts_query, 10, Some("caroline")).unwrap();
+        let candidates =
+            expand_seed_facts(&connection, "space-1", &seeds, 10, Some("caroline")).unwrap();
+        let fact_ids = candidates
+            .into_iter()
+            .map(|candidate| candidate.fact_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(fact_ids, vec!["caroline-fact"]);
     }
 
     fn seed_graph_space(connection: &rusqlite::Connection) {
@@ -2794,13 +3433,20 @@ mod tests {
         display_alias: &str,
         created_at_ms: i64,
     ) {
+        let normalized_alias = normalize_graph_text(display_alias);
         connection
             .execute(
                 "INSERT INTO graph_entity_aliases (
                     id, memory_space_id, entity_id, display_alias, normalized_alias, created_at_ms
                  )
-                 VALUES (?1, 'space-1', ?2, ?3, ?3, ?4)",
-                params![id, entity_id, display_alias, created_at_ms],
+                 VALUES (?1, 'space-1', ?2, ?3, ?4, ?5)",
+                params![
+                    id,
+                    entity_id,
+                    display_alias,
+                    normalized_alias,
+                    created_at_ms
+                ],
             )
             .unwrap();
         connection
@@ -2819,14 +3465,76 @@ mod tests {
         object_entity_id: &str,
         recorded_at_ms: i64,
     ) {
+        insert_test_fact_with_predicate(
+            connection,
+            id,
+            subject_entity_id,
+            "RELATED_TO",
+            object_entity_id,
+            recorded_at_ms,
+        );
+    }
+
+    fn insert_test_fact_with_predicate(
+        connection: &rusqlite::Connection,
+        id: &str,
+        subject_entity_id: &str,
+        predicate: &str,
+        object_entity_id: &str,
+        recorded_at_ms: i64,
+    ) {
         connection
             .execute(
                 "INSERT INTO graph_facts (
                     id, memory_space_id, subject_entity_id, predicate, object_entity_id,
                     fact_text, status, recorded_at_ms, type_registry_version
                  )
-                 VALUES (?1, 'space-1', ?2, 'RELATED_TO', ?3, ?1, 'active', ?4, 'registry-v1')",
-                params![id, subject_entity_id, object_entity_id, recorded_at_ms],
+                 VALUES (?1, 'space-1', ?2, ?3, ?4, ?1, 'active', ?5, 'registry-v1')",
+                params![
+                    id,
+                    subject_entity_id,
+                    predicate,
+                    object_entity_id,
+                    recorded_at_ms
+                ],
+            )
+            .unwrap();
+    }
+
+    fn insert_test_fact_with_text(
+        connection: &rusqlite::Connection,
+        id: &str,
+        subject_entity_id: &str,
+        predicate: &str,
+        object_entity_id: &str,
+        fact_text: &str,
+        recorded_at_ms: i64,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO graph_facts (
+                    id, memory_space_id, subject_entity_id, predicate, object_entity_id,
+                    fact_text, status, recorded_at_ms, type_registry_version
+                 )
+                 VALUES (?1, 'space-1', ?2, ?3, ?4, ?5, 'active', ?6, 'registry-v1')",
+                params![
+                    id,
+                    subject_entity_id,
+                    predicate,
+                    object_entity_id,
+                    fact_text,
+                    recorded_at_ms
+                ],
+            )
+            .unwrap();
+    }
+
+    fn insert_test_fact_fts(connection: &rusqlite::Connection, id: &str, fact_text: &str) {
+        connection
+            .execute(
+                "INSERT INTO graph_fact_fts (id, memory_space_id, fact_text)
+                 VALUES (?1, 'space-1', ?2)",
+                params![id, fact_text],
             )
             .unwrap();
     }

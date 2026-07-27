@@ -18,6 +18,7 @@ use memory_core::{
 use serde::{Deserialize, Serialize};
 
 const PREPARED_SCHEMA_VERSION: &str = "benchmark-prepared-v1";
+const TARGET_SPEAKER_METADATA_KEY: &str = "target_speaker";
 
 #[derive(Parser)]
 #[command(name = "memory-bench")]
@@ -59,6 +60,10 @@ struct Cli {
     graph: bool,
     #[arg(long, default_value_t = 0.2)]
     graph_weight: f32,
+    #[arg(long)]
+    graph_rerank: bool,
+    #[arg(long)]
+    graph_allow_graph_only: bool,
     #[arg(long)]
     graph_fail_open: bool,
     #[arg(long, value_enum, default_value_t = GraphMemorySpaceMode::Auto)]
@@ -103,6 +108,7 @@ enum StoreBackendKind {
 enum SearchModeKind {
     Dense,
     Bm25,
+    Graph,
     Hybrid,
 }
 
@@ -123,6 +129,7 @@ impl From<SearchModeKind> for SearchMode {
         match value {
             SearchModeKind::Dense => SearchMode::Dense,
             SearchModeKind::Bm25 => SearchMode::Bm25,
+            SearchModeKind::Graph => SearchMode::Graph,
             SearchModeKind::Hybrid => SearchMode::Hybrid,
         }
     }
@@ -274,6 +281,8 @@ fn build_runtime(cli: &Cli) -> Result<BenchRuntime> {
         graph: GraphRetrievalConfig {
             enabled: cli.graph,
             weight: cli.graph_weight,
+            rerank_with_graph: cli.graph_rerank,
+            allow_graph_only: cli.graph_allow_graph_only,
             seed_limit: None,
             max_evidence_records_per_fact: None,
             fail_open: cli.graph_fail_open,
@@ -608,6 +617,8 @@ async fn run_search(
                 top_k: options.top_k,
                 filter: cli_filter.clone(),
                 graph_memory_space_id,
+                graph_target_subject: None,
+                graph_target_evidence_speaker: None,
             })
             .await
             .with_context(|| format!("failed to search query at {}", item.path))?;
@@ -642,6 +653,8 @@ async fn run_search(
                     } else {
                         None
                     },
+                    graph_target_subject: None,
+                    graph_target_evidence_speaker: None,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -745,6 +758,16 @@ async fn run_search_prepared_queries(
             } else {
                 None
             },
+            graph_target_subject: if cli.graph {
+                prepared_target_speaker(metadata.as_ref()).map(str::to_string)
+            } else {
+                None
+            },
+            graph_target_evidence_speaker: if cli.graph {
+                prepared_target_speaker(metadata.as_ref()).map(str::to_string)
+            } else {
+                None
+            },
         });
         output_templates.push(QueryOutput {
             query_path: format!("$.queries[{index}].text"),
@@ -827,10 +850,7 @@ fn load_existing_outputs(output: &Path) -> Option<Vec<QueryOutput>> {
 /// both sides have one, otherwise by the `$.queries[i].text` path embedded in
 /// `query_path`. A query counts as completed only when its existing row has at
 /// least one result, so an empty (interrupted) row is re-searched.
-fn resume_completed_indexes(
-    templates: &[QueryOutput],
-    existing: &[QueryOutput],
-) -> Vec<usize> {
+fn resume_completed_indexes(templates: &[QueryOutput], existing: &[QueryOutput]) -> Vec<usize> {
     let by_query_id: HashMap<String, usize> = existing
         .iter()
         .enumerate()
@@ -1073,7 +1093,9 @@ fn build_graph_add_request(
         source_ref: Some(id.to_string()),
         content_role: "message".to_string(),
         created_by_agent_id: None,
-        observed_at_ms: None,
+        observed_at_ms: metadata
+            .get("observed_at_ms")
+            .and_then(|value| value.as_u64()),
     })
 }
 
@@ -1306,6 +1328,14 @@ fn insert_default_metadata(target: &mut serde_json::Value, key: &str, value: ser
     target_object.entry(key.to_string()).or_insert(value);
 }
 
+fn prepared_target_speaker(metadata: Option<&serde_json::Value>) -> Option<&str> {
+    metadata?
+        .get(TARGET_SPEAKER_METADATA_KEY)?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct QueryOutput {
     query_path: String,
@@ -1394,6 +1424,7 @@ mod tests {
                         end_byte: None,
                     }],
                     confidence: Some(1.0),
+                    temporal_expression: None,
                     valid_from_ms: None,
                     valid_to_ms: None,
                 }],
@@ -1480,6 +1511,27 @@ mod tests {
         assert_eq!(cli.embedding_weight, 0.6);
         assert_eq!(cli.bm25_weight, 0.4);
         assert_eq!(cli.candidate_k, Some(42));
+    }
+
+    #[test]
+    fn cli_parses_graph_search_mode() {
+        let cli = Cli::try_parse_from([
+            "memory-bench",
+            "--embedding",
+            "hash",
+            "--graph",
+            "--search-mode",
+            "graph",
+            "search",
+            "--query",
+            "Where does Alice live?",
+            "--output",
+            "outputs/search.json",
+        ])
+        .expect("parse graph-only retrieval CLI");
+
+        assert!(matches!(cli.search_mode, SearchModeKind::Graph));
+        assert!(cli.graph);
     }
 
     #[test]
@@ -1591,12 +1643,12 @@ mod tests {
     }
 
     #[test]
-    fn graph_memory_space_auto_uses_top_level_path_for_raw_locomo_shape() {
+    fn graph_memory_space_auto_uses_top_level_path_for_raw_array_shape() {
         let cli = graph_test_cli();
         let filter = serde_json::json!({"scope_id": "scope-a"});
         assert_eq!(
             graph_memory_space_for_memory(
-                "$[12].conversation.session_1[0].text",
+                "$[12].messages[0].text",
                 &serde_json::json!({}),
                 false,
                 &cli,
@@ -1605,7 +1657,7 @@ mod tests {
             Some("path:$[12]".to_string())
         );
         assert_eq!(
-            graph_memory_space_for_query("$[12].qa[0].question", Some(&filter), false, &cli)
+            graph_memory_space_for_query("$[12].queries[0].text", Some(&filter), false, &cli)
                 .expect("query space"),
             Some("path:$[12]".to_string())
         );
@@ -1701,6 +1753,31 @@ mod tests {
         assert!(format!("{error}").contains(
             "graph memory space could not be derived for memory `record-1` at `$.memory.text`"
         ));
+    }
+
+    #[test]
+    fn graph_add_request_uses_observed_at_metadata() {
+        let cli = graph_test_cli();
+
+        let request = build_graph_add_request(
+            &cli,
+            "turn-1",
+            "I went to a LGBTQ support group yesterday.",
+            serde_json::json!({
+                "scope_id": "scope-a",
+                "session_id": "session_2",
+                "turn_index": 0,
+                "observed_at_ms": 1_683_554_160_000u64,
+            }),
+            "$.memories[0].text",
+            true,
+        )
+        .expect("graph request");
+
+        assert_eq!(request.memory_space_id, "scope-a");
+        assert_eq!(request.session_id.as_deref(), Some("session_2"));
+        assert_eq!(request.session_sequence, Some(0));
+        assert_eq!(request.observed_at_ms, Some(1_683_554_160_000));
     }
 
     #[test]

@@ -58,6 +58,7 @@ impl GraphExtractor for LivesInExtractor {
                     end_byte: None,
                 }],
                 confidence: Some(1.0),
+                temporal_expression: None,
                 valid_from_ms: None,
                 valid_to_ms: None,
             }],
@@ -111,6 +112,10 @@ async fn graph_build_pipeline_materializes_queryable_graph() {
             query: "Where does Alice live?".to_string(),
             top_k: 5,
             reference_time_ms: None,
+            query_embedding: None,
+            query_embedding_model: None,
+            target_subject_entity_name: None,
+            target_evidence_speaker: None,
             seed_limit: None,
             max_evidence_records_per_fact: None,
         })

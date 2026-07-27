@@ -1,10 +1,21 @@
 use serde::{Deserialize, Serialize};
 
+use crate::graph::{stable_input_hash, GraphInputHashFields};
 use crate::record::MemoryRecord;
 
 const GRAPH_SEED_LIMIT_MULTIPLIER: usize = 10;
 const MIN_GRAPH_SEED_LIMIT: usize = 30;
 const DEFAULT_MAX_EVIDENCE_RECORDS_PER_FACT: usize = 3;
+
+/// Maximum UTF-8 size accepted by graph retrieval. This covers the MCP query
+/// contract of 32,000 Unicode scalar values at four bytes each.
+pub const MAX_GRAPH_RETRIEVAL_QUERY_BYTES: usize = 32_000 * 4;
+/// Hard ceiling for callers using the graph repository directly.
+pub const MAX_GRAPH_RETRIEVAL_TOP_K: usize = 500;
+/// Hard ceiling for the fact/entity seed pool used by graph expansion.
+pub const MAX_GRAPH_SEED_LIMIT: usize = MAX_GRAPH_RETRIEVAL_TOP_K * GRAPH_SEED_LIMIT_MULTIPLIER;
+/// Hard ceiling for evidence records loaded for any one graph fact.
+pub const MAX_GRAPH_EVIDENCE_RECORDS_PER_FACT: usize = 100;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AddMemoryRequest {
@@ -36,6 +47,22 @@ pub struct GraphAddMemoryRequest {
     pub observed_at_ms: Option<u64>,
 }
 
+impl GraphAddMemoryRequest {
+    pub fn input_hash(&self) -> String {
+        stable_input_hash(&GraphInputHashFields {
+            memory_space_id: self.memory_space_id.clone(),
+            session_id: self.session_id.clone(),
+            session_sequence: self.session_sequence,
+            text: self.text.clone(),
+            source_kind: self.source_kind.clone(),
+            source_ref: self.source_ref.clone(),
+            content_role: self.content_role.clone(),
+            observed_at_ms: self.observed_at_ms,
+            metadata: self.metadata.clone(),
+        })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GraphAddMemoryResponse {
     pub memory_record_id: String,
@@ -51,6 +78,16 @@ pub struct GraphRetrieveContextRequest {
     pub query: String,
     pub top_k: usize,
     pub reference_time_ms: Option<u64>,
+    /// Reserved for a future external semantic retrieval provider. The current graph
+    /// retrieval path is deterministic and does not consume query embeddings.
+    #[serde(default)]
+    pub query_embedding: Option<Vec<f32>>,
+    #[serde(default)]
+    pub query_embedding_model: Option<String>,
+    #[serde(default)]
+    pub target_subject_entity_name: Option<String>,
+    #[serde(default)]
+    pub target_evidence_speaker: Option<String>,
     #[serde(default)]
     pub seed_limit: Option<usize>,
     #[serde(default)]
@@ -80,6 +117,10 @@ pub struct SearchMemoryRequest {
     pub filter: Option<serde_json::Value>,
     #[serde(default)]
     pub graph_memory_space_id: Option<String>,
+    #[serde(default)]
+    pub graph_target_subject: Option<String>,
+    #[serde(default)]
+    pub graph_target_evidence_speaker: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -87,6 +128,8 @@ pub struct SearchMemoryRequest {
 pub enum SearchMode {
     Dense,
     Bm25,
+    /// Retrieve records only from graph facts and graph-store evidence nodes.
+    Graph,
     #[default]
     Hybrid,
 }
@@ -134,6 +177,10 @@ pub struct GraphRetrievalConfig {
     #[serde(default = "default_graph_weight")]
     pub weight: f32,
     #[serde(default)]
+    pub rerank_with_graph: bool,
+    #[serde(default)]
+    pub allow_graph_only: bool,
+    #[serde(default)]
     pub seed_limit: Option<usize>,
     #[serde(default)]
     pub max_evidence_records_per_fact: Option<usize>,
@@ -146,6 +193,8 @@ impl Default for GraphRetrievalConfig {
         Self {
             enabled: false,
             weight: default_graph_weight(),
+            rerank_with_graph: false,
+            allow_graph_only: false,
             seed_limit: None,
             max_evidence_records_per_fact: None,
             fail_open: false,
@@ -296,6 +345,10 @@ mod tests {
             query: "Where does Alice live?".to_string(),
             top_k: 3,
             reference_time_ms: None,
+            query_embedding: None,
+            query_embedding_model: None,
+            target_subject_entity_name: None,
+            target_evidence_speaker: None,
             seed_limit: None,
             max_evidence_records_per_fact: None,
         };

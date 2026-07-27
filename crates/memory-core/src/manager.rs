@@ -10,10 +10,18 @@ use crate::{
     GraphRetrieveContextRequest, MemoryError, MemoryRecord, MemoryResult, MemoryStore, Reranker,
     RetrievalConfig, ScoredMemory, SearchMemoryRequest, SearchMode, SqliteMemoryStore,
 };
-use crate::{graph::GraphMemoryRecord, sqlite::GraphRepository};
+use crate::{
+    graph::{EvidenceRecordContextUnit, FactContextUnit, GraphMemoryRecord},
+    sqlite::GraphRepository,
+};
 
 const DEFAULT_EMBEDDING_BATCH_SIZE: usize = 64;
 const EMBEDDING_PROFILE_METADATA_KEY: &str = "memory_core_embedding_profile";
+const GRAPH_FACTS_METADATA_KEY: &str = "graph_facts";
+const GRAPH_FACTS_TRUNCATED_METADATA_KEY: &str = "graph_facts_truncated";
+const GRAPH_MATCHES_METADATA_KEY: &str = "graph_matches";
+const MAX_GRAPH_FACTS_PER_RECORD: usize = 16;
+const MAX_GRAPH_FACT_METADATA_BYTES: usize = 16 * 1024;
 
 #[async_trait]
 pub trait LongTermMemory: Send + Sync {
@@ -220,6 +228,11 @@ impl MemoryManager {
                     .search_many_bm25_with_progress(requests, &mut on_embedded)
                     .await;
             }
+            SearchMode::Graph => {
+                return self
+                    .search_many_graph_with_progress(requests, &mut on_embedded)
+                    .await;
+            }
             SearchMode::Hybrid => {
                 return self
                     .search_many_hybrid_with_progress(requests, &mut on_embedded)
@@ -295,6 +308,22 @@ impl MemoryManager {
         Ok(all_results)
     }
 
+    async fn search_many_graph_with_progress<F>(
+        &self,
+        requests: Vec<SearchMemoryRequest>,
+        on_searched: &mut F,
+    ) -> MemoryResult<Vec<Vec<ScoredMemory>>>
+    where
+        F: FnMut(usize),
+    {
+        let mut all_results = Vec::with_capacity(requests.len());
+        for request in requests {
+            all_results.push(self.search_graph(request).await?);
+            on_searched(1);
+        }
+        Ok(all_results)
+    }
+
     async fn search_bm25(&self, request: SearchMemoryRequest) -> MemoryResult<Vec<ScoredMemory>> {
         if request.top_k == 0 {
             return Ok(Vec::new());
@@ -312,6 +341,21 @@ impl MemoryManager {
             .await?;
         self.fuse_optional_graph_channel(&request, candidates, request.top_k)
             .await
+    }
+
+    async fn search_graph(&self, request: SearchMemoryRequest) -> MemoryResult<Vec<ScoredMemory>> {
+        if request.top_k == 0 {
+            return Ok(Vec::new());
+        }
+        if request.query.trim().is_empty() {
+            return Err(MemoryError::InvalidInput {
+                message: "search query must not be empty".to_string(),
+            });
+        }
+
+        // This is an explicit evaluation/serving mode: do not fall back to raw-memory
+        // candidates, so graph recall can be measured independently from dense/BM25.
+        self.graph_candidates(&request, request.top_k).await
     }
 
     async fn search_many_hybrid_with_progress<F>(
@@ -475,6 +519,8 @@ impl MemoryManager {
             graph_candidates,
             limit,
             self.retrieval_config.graph.weight,
+            self.retrieval_config.graph.rerank_with_graph,
+            self.retrieval_config.graph.allow_graph_only,
         ))
     }
 
@@ -524,6 +570,10 @@ impl MemoryManager {
             query: query.to_string(),
             top_k: limit,
             reference_time_ms: None,
+            query_embedding: None,
+            query_embedding_model: None,
+            target_subject_entity_name: request.graph_target_subject.clone(),
+            target_evidence_speaker: request.graph_target_evidence_speaker.clone(),
             seed_limit: self.retrieval_config.graph.seed_limit,
             max_evidence_records_per_fact: self
                 .retrieval_config
@@ -535,22 +585,54 @@ impl MemoryManager {
             Ok(bundle) => {
                 let mut candidates = HashMap::new();
                 for unit in bundle.fact_context_units {
+                    let graph_fact = graph_fact_metadata(&unit);
                     for record in unit.evidence_records {
                         if !metadata_matches(&record.metadata, request.filter.as_ref()) {
                             continue;
                         }
                         let score = unit.score;
-                        let memory_record = graph_record_to_memory_record(record);
+                        let mut memory_record = graph_record_to_memory_record(record);
+                        append_graph_fact_metadata(&mut memory_record.metadata, graph_fact.clone());
                         candidates
                             .entry(memory_record.id.clone())
                             .and_modify(|existing: &mut ScoredMemory| {
                                 existing.score = existing.score.max(score);
+                                merge_graph_facts_metadata(
+                                    &mut existing.record.metadata,
+                                    &memory_record.metadata,
+                                );
                             })
                             .or_insert(ScoredMemory {
                                 record: memory_record,
                                 score,
                             });
                     }
+                }
+                for unit in bundle.evidence_record_context_units {
+                    if !metadata_matches(&unit.record.metadata, request.filter.as_ref()) {
+                        continue;
+                    }
+                    let score = unit.score;
+                    let graph_match = graph_evidence_record_metadata(&unit);
+                    let mut memory_record = graph_record_to_memory_record(unit.record);
+                    append_graph_match_metadata(&mut memory_record.metadata, graph_match);
+                    candidates
+                        .entry(memory_record.id.clone())
+                        .and_modify(|existing: &mut ScoredMemory| {
+                            existing.score = existing.score.max(score);
+                            merge_graph_facts_metadata(
+                                &mut existing.record.metadata,
+                                &memory_record.metadata,
+                            );
+                            merge_graph_matches_metadata(
+                                &mut existing.record.metadata,
+                                &memory_record.metadata,
+                            );
+                        })
+                        .or_insert(ScoredMemory {
+                            record: memory_record,
+                            score,
+                        });
                 }
                 let mut results = candidates.into_values().collect::<Vec<_>>();
                 sort_scored_desc(&mut results);
@@ -693,11 +775,178 @@ fn embedding_profile_mismatch_error(
     }
 }
 
+fn graph_fact_metadata(unit: &FactContextUnit) -> serde_json::Value {
+    serde_json::json!({
+        "fact_id": unit.fact_id,
+        "fact_text": unit.fact_text,
+        "predicate": unit.predicate,
+        "score": unit.score,
+        "subject": {
+            "id": unit.subject_entity.id,
+            "name": unit.subject_entity.canonical_name,
+            "entity_type": unit.subject_entity.entity_type,
+        },
+        "object": {
+            "id": unit.object_entity.id,
+            "name": unit.object_entity.canonical_name,
+            "entity_type": unit.object_entity.entity_type,
+        },
+        "valid_from_ms": unit.valid_from_ms,
+        "valid_to_ms": unit.valid_to_ms,
+        "recorded_at_ms": unit.recorded_at_ms,
+        "path": unit.path,
+    })
+}
+
+fn graph_evidence_record_metadata(unit: &EvidenceRecordContextUnit) -> serde_json::Value {
+    let match_kind = match unit.match_kind {
+        crate::graph::EvidenceRecordMatchKind::Lexical => "lexical",
+    };
+    serde_json::json!({
+        "kind": "evidence_record",
+        "match_kind": match_kind,
+        "record_id": unit.record.id,
+        "score": unit.score,
+        "path": unit.path,
+    })
+}
+
+fn append_graph_fact_metadata(metadata: &mut serde_json::Value, graph_fact: serde_json::Value) {
+    ensure_metadata_object(metadata);
+    let Some(metadata_object) = metadata.as_object_mut() else {
+        return;
+    };
+    let graph_facts = metadata_object
+        .entry(GRAPH_FACTS_METADATA_KEY.to_string())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if !graph_facts.is_array() {
+        *graph_facts = serde_json::Value::Array(Vec::new());
+    }
+    let Some(graph_facts) = graph_facts.as_array_mut() else {
+        return;
+    };
+    if let Some(fact_id) = graph_fact.get("fact_id").and_then(|value| value.as_str()) {
+        if graph_facts.iter().any(|existing| {
+            existing.get("fact_id").and_then(|value| value.as_str()) == Some(fact_id)
+        }) {
+            return;
+        }
+    }
+    let oversized = serde_json::to_vec(&graph_fact)
+        .map(|encoded| encoded.len() > MAX_GRAPH_FACT_METADATA_BYTES)
+        .unwrap_or(true);
+    if oversized || graph_facts.len() >= MAX_GRAPH_FACTS_PER_RECORD {
+        metadata_object.insert(
+            GRAPH_FACTS_TRUNCATED_METADATA_KEY.to_string(),
+            serde_json::Value::Bool(true),
+        );
+        return;
+    }
+    graph_facts.push(graph_fact);
+}
+
+fn merge_graph_facts_metadata(
+    target_metadata: &mut serde_json::Value,
+    source_metadata: &serde_json::Value,
+) {
+    let Some(source_graph_facts) = source_metadata
+        .get(GRAPH_FACTS_METADATA_KEY)
+        .and_then(|value| value.as_array())
+    else {
+        return;
+    };
+    if source_metadata
+        .get(GRAPH_FACTS_TRUNCATED_METADATA_KEY)
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        ensure_metadata_object(target_metadata);
+        if let Some(target) = target_metadata.as_object_mut() {
+            target.insert(
+                GRAPH_FACTS_TRUNCATED_METADATA_KEY.to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+    }
+    for graph_fact in source_graph_facts {
+        append_graph_fact_metadata(target_metadata, graph_fact.clone());
+    }
+}
+
+fn append_graph_match_metadata(metadata: &mut serde_json::Value, graph_match: serde_json::Value) {
+    ensure_metadata_object(metadata);
+    let Some(metadata_object) = metadata.as_object_mut() else {
+        return;
+    };
+    let graph_matches = metadata_object
+        .entry(GRAPH_MATCHES_METADATA_KEY.to_string())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if !graph_matches.is_array() {
+        *graph_matches = serde_json::Value::Array(Vec::new());
+    }
+    let Some(graph_matches) = graph_matches.as_array_mut() else {
+        return;
+    };
+    let record_id = graph_match
+        .get("record_id")
+        .and_then(|value| value.as_str());
+    let kind = graph_match.get("kind").and_then(|value| value.as_str());
+    let match_kind = graph_match
+        .get("match_kind")
+        .and_then(|value| value.as_str());
+    if graph_matches.iter().any(|existing| {
+        existing.get("record_id").and_then(|value| value.as_str()) == record_id
+            && existing.get("kind").and_then(|value| value.as_str()) == kind
+            && existing.get("match_kind").and_then(|value| value.as_str()) == match_kind
+    }) {
+        return;
+    }
+    graph_matches.push(graph_match);
+}
+
+fn merge_graph_matches_metadata(
+    target_metadata: &mut serde_json::Value,
+    source_metadata: &serde_json::Value,
+) {
+    let Some(source_graph_matches) = source_metadata
+        .get(GRAPH_MATCHES_METADATA_KEY)
+        .and_then(|value| value.as_array())
+    else {
+        return;
+    };
+    for graph_match in source_graph_matches {
+        append_graph_match_metadata(target_metadata, graph_match.clone());
+    }
+}
+
+fn ensure_metadata_object(metadata: &mut serde_json::Value) {
+    if !metadata.is_object() {
+        *metadata = serde_json::Value::Object(serde_json::Map::new());
+    }
+}
+
 fn graph_record_to_memory_record(record: GraphMemoryRecord) -> MemoryRecord {
+    let id = record
+        .source_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&record.id)
+        .to_string();
+    let mut metadata = record.metadata;
+    if let Some(source_agent_id) = record.created_by_agent_id {
+        ensure_metadata_object(&mut metadata);
+        if let Some(metadata) = metadata.as_object_mut() {
+            metadata.insert(
+                "source_agent_id".to_string(),
+                serde_json::Value::String(source_agent_id),
+            );
+        }
+    }
     MemoryRecord {
-        id: record.id,
+        id,
         text: record.text,
-        metadata: record.metadata,
+        metadata,
         embedding: record.embedding.unwrap_or_default(),
         created_at_ms: record.created_at_ms,
         updated_at_ms: record.updated_at_ms,
@@ -781,7 +1030,13 @@ fn fuse_graph_candidates(
     graph_candidates: Vec<ScoredMemory>,
     top_k: usize,
     graph_weight: f32,
+    rerank_with_graph: bool,
+    allow_graph_only: bool,
 ) -> Vec<ScoredMemory> {
+    if top_k == 0 {
+        return Vec::new();
+    }
+
     if graph_candidates.is_empty() {
         let mut results = base_candidates;
         sort_scored_desc(&mut results);
@@ -789,23 +1044,62 @@ fn fuse_graph_candidates(
         return results;
     }
 
-    let mut candidates = HashMap::new();
-    for candidate in base_candidates {
-        candidates.insert(
-            candidate.record.id.clone(),
-            GraphFusionCandidate {
+    let graph_weight = if graph_weight.is_finite() {
+        graph_weight.max(0.0)
+    } else {
+        0.0
+    };
+    let total_weight = 1.0 + graph_weight;
+
+    let mut protected_base = base_candidates;
+    sort_scored_desc(&mut protected_base);
+    protected_base.truncate(top_k);
+
+    let mut base_candidates = HashMap::new();
+    let mut graph_only_candidates = HashMap::new();
+    for candidate in protected_base {
+        let id = candidate.record.id.clone();
+        base_candidates
+            .entry(id)
+            .and_modify(|existing: &mut GraphFusionCandidate| {
+                if existing
+                    .base_score
+                    .is_none_or(|score| candidate.score > score)
+                {
+                    existing.record = candidate.record.clone();
+                    existing.base_score = Some(candidate.score);
+                }
+            })
+            .or_insert_with(|| GraphFusionCandidate {
                 record: candidate.record,
                 base_score: Some(candidate.score),
                 graph_score: None,
-            },
-        );
+            });
     }
 
     for candidate in graph_candidates {
-        candidates
-            .entry(candidate.record.id.clone())
-            .and_modify(|existing| {
-                existing.graph_score = Some(candidate.score);
+        let id = candidate.record.id.clone();
+        if let Some(existing) = base_candidates.get_mut(&id) {
+            existing.graph_score = Some(
+                existing
+                    .graph_score
+                    .map_or(candidate.score, |score| score.max(candidate.score)),
+            );
+            merge_graph_facts_metadata(&mut existing.record.metadata, &candidate.record.metadata);
+            merge_graph_matches_metadata(&mut existing.record.metadata, &candidate.record.metadata);
+            continue;
+        }
+
+        graph_only_candidates
+            .entry(id)
+            .and_modify(|existing: &mut GraphFusionCandidate| {
+                if existing
+                    .graph_score
+                    .is_none_or(|score| candidate.score > score)
+                {
+                    existing.record = candidate.record.clone();
+                    existing.graph_score = Some(candidate.score);
+                }
             })
             .or_insert_with(|| GraphFusionCandidate {
                 record: candidate.record,
@@ -815,37 +1109,60 @@ fn fuse_graph_candidates(
     }
 
     let base_range = score_range(
-        candidates
+        base_candidates
             .values()
             .filter_map(|candidate| candidate.base_score),
     );
     let graph_range = score_range(
-        candidates
+        base_candidates
             .values()
+            .chain(graph_only_candidates.values())
             .filter_map(|candidate| candidate.graph_score),
     );
-    let graph_weight = if graph_weight.is_finite() {
-        graph_weight.max(0.0)
-    } else {
-        0.0
-    };
-    let total_weight = 1.0 + graph_weight;
 
-    let mut results = candidates
+    let mut results = base_candidates
         .into_values()
         .map(|candidate| {
-            let base_norm = normalize_present_score(candidate.base_score, base_range);
-            let graph_norm = normalize_present_score(candidate.graph_score, graph_range);
+            let score = if rerank_with_graph {
+                let base_norm = normalize_present_score(candidate.base_score, base_range);
+                let graph_norm = normalize_present_score(candidate.graph_score, graph_range);
+                (base_norm + graph_weight * graph_norm) / total_weight
+            } else {
+                candidate.base_score.unwrap_or(0.0)
+            };
             ScoredMemory {
                 record: candidate.record,
-                score: (base_norm + graph_weight * graph_norm) / total_weight,
+                score,
             }
         })
         .collect::<Vec<_>>();
 
+    if allow_graph_only && rerank_with_graph && graph_weight > 0.0 {
+        let mut graph_only_results = graph_only_candidates
+            .into_values()
+            .map(|candidate| {
+                let graph_norm = normalize_present_score(candidate.graph_score, graph_range);
+                ScoredMemory {
+                    record: candidate.record,
+                    score: graph_weight * graph_norm / total_weight,
+                }
+            })
+            .collect::<Vec<_>>();
+        sort_scored_desc(&mut graph_only_results);
+        let graph_only_limit = graph_only_result_limit(top_k, graph_weight);
+        results.extend(graph_only_results.into_iter().take(graph_only_limit));
+    }
+
     sort_scored_desc(&mut results);
     results.truncate(top_k);
     results
+}
+
+fn graph_only_result_limit(top_k: usize, graph_weight: f32) -> usize {
+    if top_k == 0 || graph_weight <= 0.0 {
+        return 0;
+    }
+    ((top_k as f32) * graph_weight).ceil() as usize
 }
 
 fn score_range(scores: impl Iterator<Item = f32>) -> Option<(f32, f32)> {
@@ -926,6 +1243,7 @@ impl LongTermMemory for MemoryManager {
         match self.retrieval_config.mode {
             SearchMode::Dense => {}
             SearchMode::Bm25 => return self.search_bm25(request).await,
+            SearchMode::Graph => return self.search_graph(request).await,
             SearchMode::Hybrid => return self.search_hybrid(request).await,
         }
 
@@ -1060,6 +1378,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn graph_fact_metadata_is_bounded_and_marks_truncation() {
+        let mut metadata = serde_json::json!({});
+        for index in 0..17 {
+            append_graph_fact_metadata(
+                &mut metadata,
+                serde_json::json!({"fact_id": format!("fact-{index}")}),
+            );
+        }
+
+        assert_eq!(
+            metadata[GRAPH_FACTS_METADATA_KEY].as_array().unwrap().len(),
+            16
+        );
+        assert_eq!(metadata["graph_facts_truncated"], true);
+
+        let mut oversized = serde_json::json!({});
+        append_graph_fact_metadata(
+            &mut oversized,
+            serde_json::json!({
+                "fact_id": "oversized",
+                "fact_text": "x".repeat(16 * 1024 + 1)
+            }),
+        );
+        assert!(oversized[GRAPH_FACTS_METADATA_KEY]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(oversized[GRAPH_FACTS_TRUNCATED_METADATA_KEY], true);
+    }
+
     struct BatchOnlyStore {
         records: Mutex<Vec<MemoryRecord>>,
     }
@@ -1155,9 +1504,255 @@ mod tests {
             }],
             2,
             0.2,
+            true,
+            true,
         );
 
         assert!(results.iter().all(|result| result.score <= 1.0));
+    }
+
+    #[test]
+    fn graph_fusion_protects_base_candidates_by_default() {
+        let results = fuse_graph_candidates(
+            vec![
+                ScoredMemory {
+                    record: MemoryRecord {
+                        id: "base-high".to_string(),
+                        text: "base high".to_string(),
+                        metadata: serde_json::json!({}),
+                        embedding: vec![1.0],
+                        created_at_ms: 1,
+                        updated_at_ms: 1,
+                    },
+                    score: 0.9,
+                },
+                ScoredMemory {
+                    record: MemoryRecord {
+                        id: "base-low".to_string(),
+                        text: "base low".to_string(),
+                        metadata: serde_json::json!({}),
+                        embedding: vec![1.0],
+                        created_at_ms: 1,
+                        updated_at_ms: 1,
+                    },
+                    score: 0.1,
+                },
+            ],
+            vec![ScoredMemory {
+                record: MemoryRecord {
+                    id: "graph-only".to_string(),
+                    text: "graph only".to_string(),
+                    metadata: serde_json::json!({}),
+                    embedding: vec![1.0],
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                },
+                score: 1.0,
+            }],
+            2,
+            0.2,
+            false,
+            false,
+        );
+
+        let ids = results
+            .iter()
+            .map(|result| result.record.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["base-high", "base-low"]);
+    }
+
+    #[test]
+    fn graph_fusion_enriches_overlapping_base_candidates_without_rerank_by_default() {
+        let base_candidates = vec![
+            ScoredMemory {
+                record: MemoryRecord {
+                    id: "base-only".to_string(),
+                    text: "base only".to_string(),
+                    metadata: serde_json::json!({}),
+                    embedding: vec![1.0],
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                },
+                score: 0.9,
+            },
+            ScoredMemory {
+                record: MemoryRecord {
+                    id: "base-graph".to_string(),
+                    text: "base graph".to_string(),
+                    metadata: serde_json::json!({}),
+                    embedding: vec![1.0],
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                },
+                score: 0.1,
+            },
+        ];
+        let graph_candidates = vec![ScoredMemory {
+            record: MemoryRecord {
+                id: "base-graph".to_string(),
+                text: "base graph".to_string(),
+                metadata: serde_json::json!({
+                    GRAPH_FACTS_METADATA_KEY: [{
+                        "fact_id": "fact-1",
+                        "fact_text": "base graph fact"
+                    }]
+                }),
+                embedding: vec![1.0],
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+            score: 1.0,
+        }];
+        let results =
+            fuse_graph_candidates(base_candidates, graph_candidates, 2, 1.0, false, false);
+
+        let enriched = results
+            .iter()
+            .find(|result| result.record.id == "base-graph")
+            .expect("base graph candidate");
+        assert!((enriched.score - 0.1).abs() < f32::EPSILON);
+        assert!(enriched
+            .record
+            .metadata
+            .get(GRAPH_FACTS_METADATA_KEY)
+            .is_some());
+    }
+
+    #[test]
+    fn graph_fusion_boosts_overlapping_base_candidates_when_rerank_is_enabled() {
+        let base_candidates = vec![
+            ScoredMemory {
+                record: MemoryRecord {
+                    id: "base-only".to_string(),
+                    text: "base only".to_string(),
+                    metadata: serde_json::json!({}),
+                    embedding: vec![1.0],
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                },
+                score: 0.9,
+            },
+            ScoredMemory {
+                record: MemoryRecord {
+                    id: "base-graph".to_string(),
+                    text: "base graph".to_string(),
+                    metadata: serde_json::json!({}),
+                    embedding: vec![1.0],
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                },
+                score: 0.1,
+            },
+        ];
+        let graph_candidates = vec![ScoredMemory {
+            record: MemoryRecord {
+                id: "base-graph".to_string(),
+                text: "base graph".to_string(),
+                metadata: serde_json::json!({}),
+                embedding: vec![1.0],
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+            score: 1.0,
+        }];
+        let unboosted = fuse_graph_candidates(
+            base_candidates.clone(),
+            graph_candidates.clone(),
+            2,
+            0.0,
+            true,
+            false,
+        );
+        let boosted = fuse_graph_candidates(base_candidates, graph_candidates, 2, 1.0, true, false);
+
+        let unboosted_score = unboosted
+            .iter()
+            .find(|result| result.record.id == "base-graph")
+            .expect("base graph candidate")
+            .score;
+        let boosted_score = boosted
+            .iter()
+            .find(|result| result.record.id == "base-graph")
+            .expect("base graph candidate")
+            .score;
+        assert!(boosted_score > unboosted_score);
+    }
+
+    #[test]
+    fn graph_fusion_supplements_when_graph_only_is_allowed() {
+        let results = fuse_graph_candidates(
+            vec![ScoredMemory {
+                record: MemoryRecord {
+                    id: "base".to_string(),
+                    text: "base".to_string(),
+                    metadata: serde_json::json!({}),
+                    embedding: vec![1.0],
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                },
+                score: 0.9,
+            }],
+            vec![ScoredMemory {
+                record: MemoryRecord {
+                    id: "graph-only".to_string(),
+                    text: "graph only".to_string(),
+                    metadata: serde_json::json!({}),
+                    embedding: vec![1.0],
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                },
+                score: 1.0,
+            }],
+            2,
+            1.0,
+            true,
+            true,
+        );
+
+        let ids = results
+            .iter()
+            .map(|result| result.record.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["base", "graph-only"]);
+    }
+
+    #[test]
+    fn graph_fusion_limits_allowed_graph_only_results_by_graph_weight() {
+        let base_candidates = (0..5)
+            .map(|index| ScoredMemory {
+                record: MemoryRecord {
+                    id: format!("base-{index}"),
+                    text: format!("base {index}"),
+                    metadata: serde_json::json!({}),
+                    embedding: vec![1.0],
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                },
+                score: 1.0 - (index as f32 * 0.25),
+            })
+            .collect::<Vec<_>>();
+        let graph_candidates = (0..5)
+            .map(|index| ScoredMemory {
+                record: MemoryRecord {
+                    id: format!("graph-{index}"),
+                    text: format!("graph {index}"),
+                    metadata: serde_json::json!({}),
+                    embedding: vec![1.0],
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                },
+                score: 1.0,
+            })
+            .collect::<Vec<_>>();
+
+        let results = fuse_graph_candidates(base_candidates, graph_candidates, 5, 0.2, true, true);
+        let graph_only_count = results
+            .iter()
+            .filter(|result| result.record.id.starts_with("graph-"))
+            .count();
+
+        assert_eq!(graph_only_count, 1);
     }
 
     #[test]
@@ -1188,6 +1783,8 @@ mod tests {
                 }],
                 2,
                 graph_weight,
+                true,
+                true,
             );
 
             assert!(
@@ -1253,6 +1850,8 @@ mod tests {
                 top_k: 1,
                 filter: None,
                 graph_memory_space_id: None,
+                graph_target_subject: None,
+                graph_target_evidence_speaker: None,
             })
             .await
             .expect("search memory");
@@ -1439,6 +2038,9 @@ mod tests {
                 query: "first".to_string(),
                 top_k: 1,
                 filter: Some(serde_json::json!({"scope_id": "scope-a"})),
+                graph_memory_space_id: None,
+                graph_target_subject: None,
+                graph_target_evidence_speaker: None,
             })
             .await
             .expect_err("same scope must reject search with different embedding profile");
@@ -1540,6 +2142,9 @@ mod tests {
                 query: "alpha".to_string(),
                 top_k: 5,
                 filter: Some(serde_json::json!({"scope_id": "dataset-1"})),
+                graph_memory_space_id: None,
+                graph_target_subject: None,
+                graph_target_evidence_speaker: None,
             })
             .await
             .expect("search deleted term");
@@ -1548,6 +2153,9 @@ mod tests {
                 query: "beta".to_string(),
                 top_k: 5,
                 filter: Some(serde_json::json!({"scope_id": "dataset-1"})),
+                graph_memory_space_id: None,
+                graph_target_subject: None,
+                graph_target_evidence_speaker: None,
             })
             .await
             .expect("search retained term");
@@ -1609,12 +2217,16 @@ mod tests {
                 top_k: 2,
                 filter: None,
                 graph_memory_space_id: None,
+                graph_target_subject: None,
+                graph_target_evidence_speaker: None,
             },
             SearchMemoryRequest {
                 query: "health endpoint".to_string(),
                 top_k: 2,
                 filter: Some(serde_json::json!({"kind": "work"})),
                 graph_memory_space_id: None,
+                graph_target_subject: None,
+                graph_target_evidence_speaker: None,
             },
         ];
 
@@ -1698,6 +2310,8 @@ mod tests {
             top_k: 2,
             filter: Some(serde_json::json!({"kind": "drink"})),
             graph_memory_space_id: None,
+            graph_target_subject: None,
+            graph_target_evidence_speaker: None,
         };
         let file_ids = file_manager
             .search(search_request.clone())
@@ -1755,6 +2369,8 @@ mod tests {
                 top_k: 5,
                 filter: Some(serde_json::json!({"scope_id": "scope-a"})),
                 graph_memory_space_id: None,
+                graph_target_subject: None,
+                graph_target_evidence_speaker: None,
             })
             .await
             .expect("bm25 search");
@@ -1817,6 +2433,8 @@ mod tests {
                 top_k: 2,
                 filter: Some(serde_json::json!({"scope_id": "scope-a"})),
                 graph_memory_space_id: None,
+                graph_target_subject: None,
+                graph_target_evidence_speaker: None,
             })
             .await
             .expect("hybrid search");
@@ -1872,6 +2490,8 @@ mod tests {
                 top_k: 2,
                 filter: Some(serde_json::json!({"scope_id": "scope-a"})),
                 graph_memory_space_id: None,
+                graph_target_subject: None,
+                graph_target_evidence_speaker: None,
             })
             .await
             .expect("hybrid search");
@@ -1907,6 +2527,8 @@ mod tests {
                 top_k: 1,
                 filter: Some(serde_json::json!({"scope_id": "scope-a"})),
                 graph_memory_space_id: None,
+                graph_target_subject: None,
+                graph_target_evidence_speaker: None,
             })
             .await
             .expect("reranked hybrid search");
@@ -1941,6 +2563,8 @@ mod tests {
                 top_k: 1,
                 filter: Some(serde_json::json!({"scope_id": "scope-a"})),
                 graph_memory_space_id: None,
+                graph_target_subject: None,
+                graph_target_evidence_speaker: None,
             })
             .await
             .expect("reranked hybrid search");
@@ -1970,6 +2594,8 @@ mod tests {
                 top_k: 1,
                 filter: Some(serde_json::json!({"scope_id": "scope-a"})),
                 graph_memory_space_id: None,
+                graph_target_subject: None,
+                graph_target_evidence_speaker: None,
             })
             .await
             .expect_err("fail closed rerank should fail search");
@@ -1996,6 +2622,8 @@ mod tests {
                 top_k: 1,
                 filter: Some(serde_json::json!({"scope_id": "scope-a"})),
                 graph_memory_space_id: None,
+                graph_target_subject: None,
+                graph_target_evidence_speaker: None,
             })
             .await
             .expect("fail open should return hybrid results");
@@ -2033,6 +2661,8 @@ mod tests {
                 top_k: 5,
                 filter: None,
                 graph_memory_space_id: None,
+                graph_target_subject: None,
+                graph_target_evidence_speaker: None,
             })
             .await
             .expect_err("should fail on dimension mismatch");

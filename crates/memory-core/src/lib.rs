@@ -14,6 +14,8 @@ pub use api::{
     AddMemoryRequest, AddMemoryResponse, GraphAddMemoryRequest, GraphAddMemoryResponse,
     GraphRetrievalConfig, GraphRetrieveContextRequest, RerankConfig, RerankProvider,
     RetrievalConfig, ScoredMemory, SearchMemoryRequest, SearchMode,
+    MAX_GRAPH_EVIDENCE_RECORDS_PER_FACT, MAX_GRAPH_RETRIEVAL_QUERY_BYTES,
+    MAX_GRAPH_RETRIEVAL_TOP_K, MAX_GRAPH_SEED_LIMIT,
 };
 pub use embedding::{EmbeddingProvider, HashEmbedding, OpenRouterEmbedding};
 pub use error::{MemoryError, MemoryResult};

@@ -240,7 +240,7 @@ impl GraphExtractor for LlmGraphExtractor {
         sanitize_llm_fact_times(&mut output, &input.text);
         drop_low_signal_facts(&mut output);
         uniquify_fact_local_ids(&mut output);
-        deduplicate_semantic_facts(&mut output);
+        deduplicate_equivalent_facts(&mut output);
         if response.input_tokens.is_some() {
             output.input_tokens = response.input_tokens;
         }
@@ -592,7 +592,7 @@ fn uniquify_fact_local_ids(output: &mut GraphExtractionOutput) {
     }
 }
 
-fn deduplicate_semantic_facts(output: &mut GraphExtractionOutput) {
+fn deduplicate_equivalent_facts(output: &mut GraphExtractionOutput) {
     let facts = std::mem::take(&mut output.facts);
     let mut deduped = Vec::with_capacity(facts.len());
     let mut seen = HashMap::new();

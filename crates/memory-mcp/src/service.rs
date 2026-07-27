@@ -255,6 +255,9 @@ where
                 query: request.query,
                 top_k: candidate_limit,
                 filter: Some(json!({"scope_id": principal.scope_id()})),
+                graph_memory_space_id: None,
+                graph_target_subject: None,
+                graph_target_evidence_speaker: None,
             })
             .await
             .map_err(|_| ServiceError::Storage)?;

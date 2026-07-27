@@ -9,9 +9,9 @@ use memory_core::{
         GraphTypeRegistry,
     },
     sqlite::GraphRepository,
-    EmbeddingProvider, GraphAddMemoryRequest, GraphRetrievalConfig, GraphRetrieveContextRequest,
-    LongTermMemory, MemoryManager, MemoryResult, RerankConfig, Reranker, RetrievalConfig,
-    ScoredMemory, SearchMemoryRequest, SearchMode, SqliteMemoryStore,
+    AddMemoryRequest, EmbeddingProvider, GraphAddMemoryRequest, GraphRetrievalConfig,
+    GraphRetrieveContextRequest, LongTermMemory, MemoryManager, MemoryResult, RerankConfig,
+    Reranker, RetrievalConfig, ScoredMemory, SearchMemoryRequest, SearchMode, SqliteMemoryStore,
 };
 
 #[derive(Debug)]
@@ -112,7 +112,8 @@ impl GraphExtractor for SingleFactExtractor {
                     end_byte: Some(end),
                 }],
                 confidence: Some(0.97),
-                valid_from_ms: None,
+                temporal_expression: None,
+                valid_from_ms: Some(1_650_000_000_000),
                 valid_to_ms: None,
             }],
             input_tokens: Some(12),
@@ -187,6 +188,7 @@ impl GraphExtractor for TwoFactExtractor {
                         end_byte: Some(shanghai_end),
                     }],
                     confidence: Some(0.97),
+                    temporal_expression: None,
                     valid_from_ms: None,
                     valid_to_ms: None,
                 },
@@ -202,12 +204,47 @@ impl GraphExtractor for TwoFactExtractor {
                         end_byte: Some(beijing_end),
                     }],
                     confidence: Some(0.96),
+                    temporal_expression: None,
                     valid_from_ms: None,
                     valid_to_ms: None,
                 },
             ],
             input_tokens: Some(20),
             output_tokens: Some(40),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct EmptyExtractor;
+
+#[async_trait::async_trait]
+impl GraphExtractor for EmptyExtractor {
+    fn extractor_name(&self) -> &str {
+        "retrieval-empty-extractor"
+    }
+
+    fn model_name(&self) -> &str {
+        "retrieval-fixed-model"
+    }
+
+    fn prompt_version(&self) -> &str {
+        "prompt-v1"
+    }
+
+    fn schema_version(&self) -> &str {
+        "graph-extraction-candidates-v1"
+    }
+
+    async fn extract(
+        &self,
+        _input: memory_core::graph::GraphExtractionInput,
+    ) -> memory_core::MemoryResult<GraphExtractionOutput> {
+        Ok(GraphExtractionOutput {
+            entities: Vec::new(),
+            facts: Vec::new(),
+            input_tokens: Some(4),
+            output_tokens: Some(2),
         })
     }
 }
@@ -219,12 +256,30 @@ fn request(
     session_sequence: i64,
     text: &str,
 ) -> GraphAddMemoryRequest {
+    request_with_metadata(
+        memory_space_id,
+        owner_id,
+        idempotency_key,
+        session_sequence,
+        text,
+        serde_json::json!({"source": "retrieval-test"}),
+    )
+}
+
+fn request_with_metadata(
+    memory_space_id: &str,
+    owner_id: &str,
+    idempotency_key: &str,
+    session_sequence: i64,
+    text: &str,
+    metadata: serde_json::Value,
+) -> GraphAddMemoryRequest {
     GraphAddMemoryRequest {
         memory_space_id: memory_space_id.to_string(),
         owner_id: owner_id.to_string(),
         idempotency_key: idempotency_key.to_string(),
         text: text.to_string(),
-        metadata: serde_json::json!({"source": "retrieval-test"}),
+        metadata,
         session_id: Some("session-a".to_string()),
         session_sequence: Some(session_sequence),
         source_kind: "conversation".to_string(),
@@ -293,6 +348,10 @@ async fn graph_retrieval_finds_fact_from_entity_seed() {
             query: "Alice".to_string(),
             top_k: 5,
             reference_time_ms: Some(1_700_000_000_000),
+            query_embedding: None,
+            query_embedding_model: None,
+            target_subject_entity_name: None,
+            target_evidence_speaker: None,
             seed_limit: Some(10),
             max_evidence_records_per_fact: Some(2),
         })
@@ -316,10 +375,165 @@ async fn graph_retrieval_finds_fact_from_entity_seed() {
         "Shanghai"
     );
     assert_eq!(bundle.fact_context_units[0].evidence_records.len(), 1);
+    assert_eq!(bundle.evidence_record_context_units.len(), 1);
+    assert!(
+        bundle.fact_context_units[0].score > bundle.evidence_record_context_units[0].score,
+        "a matching fact must outrank its raw evidence-node fallback"
+    );
+    assert_eq!(
+        bundle.fact_context_units[0].valid_from_ms,
+        Some(1_650_000_000_000)
+    );
+    assert_eq!(bundle.fact_context_units[0].valid_to_ms, None);
+    assert_eq!(
+        bundle.fact_context_units[0].recorded_at_ms,
+        bundle.facts[0].recorded_at_ms
+    );
     assert!(bundle.fact_context_units[0]
         .path
         .iter()
         .any(|step| step.starts_with("fact:")));
+}
+
+#[tokio::test]
+async fn graph_retrieval_returns_direct_evidence_for_a_record_without_facts() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = GraphRepository::open(temp.path().join("graph.sqlite"));
+    run_completed_with_extractor(
+        &repo,
+        request_with_metadata(
+            "space-1",
+            "user-1",
+            "raw-adoption",
+            1,
+            "Alice is researching adoption agencies.",
+            serde_json::json!({"speaker": "Alice"}),
+        ),
+        Arc::new(EmptyExtractor),
+    )
+    .await;
+
+    let bundle = repo
+        .retrieve_context(GraphRetrieveContextRequest {
+            memory_space_id: "space-1".to_string(),
+            query: "adoption research".to_string(),
+            top_k: 5,
+            reference_time_ms: None,
+            query_embedding: None,
+            query_embedding_model: None,
+            target_subject_entity_name: None,
+            target_evidence_speaker: Some("Alice".to_string()),
+            seed_limit: Some(10),
+            max_evidence_records_per_fact: Some(2),
+        })
+        .await
+        .expect("retrieve direct graph evidence");
+
+    assert!(bundle.fact_context_units.is_empty());
+    assert_eq!(bundle.evidence_record_context_units.len(), 1);
+    let unit = &bundle.evidence_record_context_units[0];
+    assert_eq!(unit.record.source_ref.as_deref(), Some("raw-adoption"));
+    assert!(unit.path.iter().any(|step| step.starts_with("record:")));
+    assert!(unit.score > 0.0);
+    assert_eq!(bundle.records.len(), 1);
+}
+
+#[tokio::test]
+async fn graph_retrieval_lexical_evidence_does_not_decode_record_embedding() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let db_path = temp.path().join("graph.sqlite");
+    let repo = GraphRepository::open(&db_path);
+    run_completed_with_extractor(
+        &repo,
+        request_with_metadata(
+            "space-1",
+            "user-1",
+            "raw-adoption",
+            1,
+            "Alice is researching adoption agencies.",
+            serde_json::json!({"speaker": "Alice"}),
+        ),
+        Arc::new(EmptyExtractor),
+    )
+    .await;
+
+    let connection = rusqlite::Connection::open(&db_path).expect("open graph database");
+    connection
+        .execute(
+            "UPDATE graph_memory_records
+             SET embedding = ?1
+             WHERE source_ref = ?2",
+            rusqlite::params![vec![1_u8, 2, 3], "raw-adoption"],
+        )
+        .expect("corrupt embedding blob");
+
+    let bundle = repo
+        .retrieve_context(GraphRetrieveContextRequest {
+            memory_space_id: "space-1".to_string(),
+            query: "adoption research".to_string(),
+            top_k: 5,
+            reference_time_ms: None,
+            query_embedding: None,
+            query_embedding_model: None,
+            target_subject_entity_name: None,
+            target_evidence_speaker: Some("Alice".to_string()),
+            seed_limit: Some(10),
+            max_evidence_records_per_fact: Some(2),
+        })
+        .await
+        .expect("retrieve lexical graph evidence");
+
+    assert_eq!(bundle.evidence_record_context_units.len(), 1);
+    assert_eq!(
+        bundle.evidence_record_context_units[0]
+            .record
+            .source_ref
+            .as_deref(),
+        Some("raw-adoption")
+    );
+}
+
+#[tokio::test]
+async fn graph_retrieval_filters_direct_evidence_by_target_speaker() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = GraphRepository::open(temp.path().join("graph.sqlite"));
+    for (id, speaker) in [("alice-adoption", "Alice"), ("bob-adoption", "Bob")] {
+        run_completed_with_extractor(
+            &repo,
+            request_with_metadata(
+                "space-1",
+                "user-1",
+                id,
+                1,
+                "Adoption agencies are being discussed.",
+                serde_json::json!({"speaker": speaker}),
+            ),
+            Arc::new(EmptyExtractor),
+        )
+        .await;
+    }
+
+    let bundle = repo
+        .retrieve_context(GraphRetrieveContextRequest {
+            memory_space_id: "space-1".to_string(),
+            query: "adoption agencies".to_string(),
+            top_k: 5,
+            reference_time_ms: None,
+            query_embedding: None,
+            query_embedding_model: None,
+            target_subject_entity_name: None,
+            target_evidence_speaker: Some("Alice".to_string()),
+            seed_limit: Some(10),
+            max_evidence_records_per_fact: Some(2),
+        })
+        .await
+        .expect("retrieve speaker-filtered direct graph evidence");
+
+    assert_eq!(bundle.evidence_record_context_units.len(), 1);
+    assert_eq!(
+        bundle.evidence_record_context_units[0].record.metadata["speaker"],
+        "Alice"
+    );
 }
 
 #[tokio::test]
@@ -335,6 +549,10 @@ async fn graph_retrieval_finds_entities_and_evidence_from_fact_seed() {
             query: "lives Shanghai".to_string(),
             top_k: 5,
             reference_time_ms: Some(1_700_000_000_000),
+            query_embedding: None,
+            query_embedding_model: None,
+            target_subject_entity_name: None,
+            target_evidence_speaker: None,
             seed_limit: Some(10),
             max_evidence_records_per_fact: Some(2),
         })
@@ -374,6 +592,10 @@ async fn graph_retrieval_does_not_cross_memory_space() {
             query: "Alice".to_string(),
             top_k: 5,
             reference_time_ms: Some(1_700_000_000_000),
+            query_embedding: None,
+            query_embedding_model: None,
+            target_subject_entity_name: None,
+            target_evidence_speaker: None,
             seed_limit: Some(10),
             max_evidence_records_per_fact: Some(2),
         })
@@ -400,6 +622,10 @@ async fn graph_retrieval_returns_empty_bundle_for_no_match() {
             query: "unmatched-term".to_string(),
             top_k: 5,
             reference_time_ms: Some(1_700_000_000_000),
+            query_embedding: None,
+            query_embedding_model: None,
+            target_subject_entity_name: None,
+            target_evidence_speaker: None,
             seed_limit: Some(10),
             max_evidence_records_per_fact: Some(2),
         })
@@ -436,6 +662,10 @@ async fn graph_retrieval_applies_top_k_and_evidence_limits() {
             query: "Alice".to_string(),
             top_k: 1,
             reference_time_ms: Some(1_700_000_000_000),
+            query_embedding: None,
+            query_embedding_model: None,
+            target_subject_entity_name: None,
+            target_evidence_speaker: None,
             seed_limit: Some(10),
             max_evidence_records_per_fact: Some(2),
         })
@@ -449,6 +679,10 @@ async fn graph_retrieval_applies_top_k_and_evidence_limits() {
             query: "Shanghai".to_string(),
             top_k: 5,
             reference_time_ms: Some(1_700_000_000_000),
+            query_embedding: None,
+            query_embedding_model: None,
+            target_subject_entity_name: None,
+            target_evidence_speaker: None,
             seed_limit: Some(10),
             max_evidence_records_per_fact: Some(1),
         })
@@ -460,6 +694,64 @@ async fn graph_retrieval_applies_top_k_and_evidence_limits() {
         .find(|unit| unit.fact_text == "Alice lives in Shanghai.")
         .expect("Shanghai fact context unit");
     assert_eq!(shanghai_unit.evidence_records.len(), 1);
+}
+
+#[tokio::test]
+async fn graph_retrieval_filters_evidence_records_by_target_speaker() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = GraphRepository::open(temp.path().join("graph.sqlite"));
+
+    run_completed_with_extractor(
+        &repo,
+        request_with_metadata(
+            "space-1",
+            "user-1",
+            "msg-alice",
+            1,
+            "Alice lives in Shanghai.",
+            serde_json::json!({"source": "retrieval-test", "speaker": "Alice"}),
+        ),
+        Arc::new(SingleFactExtractor),
+    )
+    .await;
+    run_completed_with_extractor(
+        &repo,
+        request_with_metadata(
+            "space-1",
+            "user-1",
+            "msg-bob",
+            2,
+            "Alice lives in Shanghai.",
+            serde_json::json!({"source": "retrieval-test", "speaker": "Bob"}),
+        ),
+        Arc::new(SingleFactExtractor),
+    )
+    .await;
+
+    let bundle = repo
+        .retrieve_context(GraphRetrieveContextRequest {
+            memory_space_id: "space-1".to_string(),
+            query: "Alice Shanghai".to_string(),
+            top_k: 5,
+            reference_time_ms: Some(1_700_000_000_000),
+            query_embedding: None,
+            query_embedding_model: None,
+            target_subject_entity_name: Some("Alice".to_string()),
+            target_evidence_speaker: Some("Alice".to_string()),
+            seed_limit: Some(10),
+            max_evidence_records_per_fact: Some(5),
+        })
+        .await
+        .expect("retrieve graph context");
+
+    assert_eq!(bundle.fact_context_units.len(), 1);
+    let speakers = bundle.fact_context_units[0]
+        .evidence_records
+        .iter()
+        .map(|record| record.metadata["speaker"].as_str().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(speakers, vec!["Alice"]);
 }
 
 #[tokio::test]
@@ -478,6 +770,8 @@ async fn memory_manager_search_can_include_graph_channel_when_enabled() {
             graph: GraphRetrievalConfig {
                 enabled: true,
                 weight: 1.0,
+                rerank_with_graph: true,
+                allow_graph_only: true,
                 fail_open: false,
                 seed_limit: Some(10),
                 max_evidence_records_per_fact: Some(2),
@@ -492,6 +786,8 @@ async fn memory_manager_search_can_include_graph_channel_when_enabled() {
             top_k: 5,
             filter: None,
             graph_memory_space_id: Some("space-1".to_string()),
+            graph_target_subject: None,
+            graph_target_evidence_speaker: None,
         })
         .await
         .expect("search with graph channel");
@@ -499,6 +795,204 @@ async fn memory_manager_search_can_include_graph_channel_when_enabled() {
     assert!(results
         .iter()
         .any(|result| result.record.text == "Alice lives in Shanghai."));
+    let graph_result = results
+        .iter()
+        .find(|result| result.record.text == "Alice lives in Shanghai.")
+        .expect("graph-backed result");
+    assert_eq!(
+        graph_result.record.metadata["graph_facts"][0]["fact_text"],
+        "Alice lives in Shanghai."
+    );
+    assert_eq!(
+        graph_result.record.metadata["graph_facts"][0]["predicate"],
+        "LIVES_IN"
+    );
+    assert_eq!(
+        graph_result.record.metadata["graph_facts"][0]["subject"]["name"],
+        "Alice"
+    );
+    assert_eq!(
+        graph_result.record.metadata["graph_facts"][0]["object"]["name"],
+        "Shanghai"
+    );
+    assert_eq!(
+        graph_result.record.metadata["graph_facts"][0]["valid_from_ms"],
+        1_650_000_000_000_u64
+    );
+    assert!(graph_result.record.metadata["graph_facts"][0]["valid_to_ms"].is_null());
+    assert!(
+        graph_result.record.metadata["graph_facts"][0]["recorded_at_ms"]
+            .as_u64()
+            .is_some_and(|value| value > 0)
+    );
+}
+
+#[tokio::test]
+async fn memory_manager_graph_search_returns_only_graph_evidence() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let db_path = temp.path().join("memory.sqlite");
+    let repo = GraphRepository::open(&db_path);
+    run_completed_graph_fixture(&repo).await;
+
+    let store = Arc::new(SqliteMemoryStore::new(&db_path));
+    let manager = MemoryManager::with_retrieval_config(
+        store,
+        Arc::new(FixedEmbedding),
+        RetrievalConfig {
+            mode: SearchMode::Graph,
+            graph: GraphRetrievalConfig {
+                enabled: true,
+                fail_open: false,
+                seed_limit: Some(10),
+                max_evidence_records_per_fact: Some(2),
+                ..GraphRetrievalConfig::default()
+            },
+            ..RetrievalConfig::default()
+        },
+    );
+
+    manager
+        .add(AddMemoryRequest {
+            id: Some("raw-only".to_string()),
+            text: "Shanghai is a raw-memory distractor.".to_string(),
+            metadata: serde_json::json!({"source": "base-only"}),
+        })
+        .await
+        .expect("seed base-only memory");
+
+    let results = manager
+        .search(SearchMemoryRequest {
+            query: "Shanghai".to_string(),
+            top_k: 5,
+            filter: None,
+            graph_memory_space_id: Some("space-1".to_string()),
+            graph_target_subject: None,
+            graph_target_evidence_speaker: None,
+        })
+        .await
+        .expect("graph-only search");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].record.id, "msg-1");
+    assert_eq!(results[0].record.text, "Alice lives in Shanghai.");
+    assert!(results.iter().all(|result| result.record.id != "raw-only"));
+    assert_eq!(
+        results[0].record.metadata["graph_facts"][0]["fact_text"],
+        "Alice lives in Shanghai."
+    );
+}
+
+#[tokio::test]
+async fn memory_manager_graph_search_returns_direct_evidence_without_creating_a_fact() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let db_path = temp.path().join("memory.sqlite");
+    let repo = GraphRepository::open(&db_path);
+    run_completed_with_extractor(
+        &repo,
+        request_with_metadata(
+            "space-1",
+            "user-1",
+            "raw-adoption",
+            1,
+            "Alice is researching adoption agencies.",
+            serde_json::json!({"speaker": "Alice"}),
+        ),
+        Arc::new(EmptyExtractor),
+    )
+    .await;
+
+    let manager = MemoryManager::with_retrieval_config(
+        Arc::new(SqliteMemoryStore::new(&db_path)),
+        Arc::new(FixedEmbedding),
+        RetrievalConfig {
+            mode: SearchMode::Graph,
+            graph: GraphRetrievalConfig {
+                enabled: true,
+                fail_open: false,
+                seed_limit: Some(10),
+                ..GraphRetrievalConfig::default()
+            },
+            ..RetrievalConfig::default()
+        },
+    );
+
+    let results = manager
+        .search(SearchMemoryRequest {
+            query: "adoption research".to_string(),
+            top_k: 5,
+            filter: None,
+            graph_memory_space_id: Some("space-1".to_string()),
+            graph_target_subject: None,
+            graph_target_evidence_speaker: Some("Alice".to_string()),
+        })
+        .await
+        .expect("graph-only direct evidence search");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].record.id, "raw-adoption");
+    assert_eq!(
+        results[0].record.metadata["graph_matches"][0]["kind"],
+        "evidence_record"
+    );
+    assert!(results[0].record.metadata.get("graph_facts").is_none());
+}
+
+#[tokio::test]
+async fn memory_manager_graph_channel_merges_with_base_record_by_source_ref() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let db_path = temp.path().join("memory.sqlite");
+    let repo = GraphRepository::open(&db_path);
+    run_completed_graph_fixture(&repo).await;
+
+    let store = Arc::new(SqliteMemoryStore::new(&db_path));
+    let manager = MemoryManager::with_retrieval_config(
+        store,
+        Arc::new(FixedEmbedding),
+        RetrievalConfig {
+            mode: SearchMode::Bm25,
+            graph: GraphRetrievalConfig {
+                enabled: true,
+                weight: 1.0,
+                rerank_with_graph: false,
+                allow_graph_only: false,
+                fail_open: false,
+                seed_limit: Some(10),
+                max_evidence_records_per_fact: Some(2),
+            },
+            ..RetrievalConfig::default()
+        },
+    );
+    manager
+        .add(AddMemoryRequest {
+            id: Some("msg-1".to_string()),
+            text: "Alice lives in Shanghai.".to_string(),
+            metadata: serde_json::json!({"source": "retrieval-test"}),
+        })
+        .await
+        .expect("seed base memory");
+
+    let results = manager
+        .search(SearchMemoryRequest {
+            query: "Alice".to_string(),
+            top_k: 5,
+            filter: None,
+            graph_memory_space_id: Some("space-1".to_string()),
+            graph_target_subject: None,
+            graph_target_evidence_speaker: None,
+        })
+        .await
+        .expect("search with graph channel");
+
+    let matching_records = results
+        .iter()
+        .filter(|result| result.record.text == "Alice lives in Shanghai.")
+        .collect::<Vec<_>>();
+    assert_eq!(matching_records.len(), 1, "results: {results:?}");
+    assert_eq!(matching_records[0].record.id, "msg-1");
+    assert_eq!(
+        matching_records[0].record.metadata["graph_facts"][0]["fact_text"],
+        "Alice lives in Shanghai."
+    );
 }
 
 #[tokio::test]
@@ -525,6 +1019,8 @@ async fn memory_manager_graph_channel_requires_memory_space_when_fail_closed() {
             top_k: 5,
             filter: None,
             graph_memory_space_id: None,
+            graph_target_subject: None,
+            graph_target_evidence_speaker: None,
         })
         .await
         .expect_err("missing graph memory space should fail closed");
@@ -556,6 +1052,8 @@ async fn memory_manager_graph_channel_can_fail_open_when_space_is_missing() {
             top_k: 5,
             filter: None,
             graph_memory_space_id: None,
+            graph_target_subject: None,
+            graph_target_evidence_speaker: None,
         })
         .await
         .expect("missing graph memory space should fail open");
@@ -589,6 +1087,8 @@ async fn memory_manager_graph_channel_fails_closed_on_graph_repository_error() {
             top_k: 5,
             filter: None,
             graph_memory_space_id: Some("space-1".to_string()),
+            graph_target_subject: None,
+            graph_target_evidence_speaker: None,
         })
         .await
         .expect_err("graph repository error should fail closed");
@@ -625,6 +1125,8 @@ async fn memory_manager_graph_channel_fails_open_on_graph_repository_error() {
             top_k: 5,
             filter: None,
             graph_memory_space_id: Some("space-1".to_string()),
+            graph_target_subject: None,
+            graph_target_evidence_speaker: None,
         })
         .await
         .expect("graph repository error should fail open");
@@ -658,6 +1160,8 @@ async fn memory_manager_graph_channel_fails_closed_for_non_sqlite_store() {
             top_k: 5,
             filter: None,
             graph_memory_space_id: Some("space-1".to_string()),
+            graph_target_subject: None,
+            graph_target_evidence_speaker: None,
         })
         .await
         .expect_err("non-sqlite graph channel should fail closed");
@@ -691,6 +1195,8 @@ async fn memory_manager_graph_channel_fails_open_for_non_sqlite_store() {
             top_k: 5,
             filter: None,
             graph_memory_space_id: Some("space-1".to_string()),
+            graph_target_subject: None,
+            graph_target_evidence_speaker: None,
         })
         .await
         .expect("non-sqlite graph channel should fail open");
@@ -714,6 +1220,8 @@ async fn memory_manager_rerank_receives_graph_candidates() {
             mode: SearchMode::Hybrid,
             graph: GraphRetrievalConfig {
                 enabled: true,
+                rerank_with_graph: true,
+                allow_graph_only: true,
                 seed_limit: Some(10),
                 max_evidence_records_per_fact: Some(2),
                 ..GraphRetrievalConfig::default()
@@ -737,6 +1245,8 @@ async fn memory_manager_rerank_receives_graph_candidates() {
             top_k: 1,
             filter: None,
             graph_memory_space_id: Some("space-1".to_string()),
+            graph_target_subject: None,
+            graph_target_evidence_speaker: None,
         })
         .await
         .expect("graph candidates should enter rerank");
