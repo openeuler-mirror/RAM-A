@@ -202,10 +202,13 @@ GraphRetrieveContextRequest
 1. 以 `MemoryRecord.id` 去重；
 2. 默认 `rerank_with_graph = false` 且 `allow_graph_only = false`：保留基础检索的候选集合和
    排序，仅把匹配的 graph facts / evidence-node metadata 合并到同一 record；
-3. 显式开启 graph rerank 时，基础检索分数和 graph 分数分别做 min-max normalization，最终分数为
-   `(base_norm + graph.weight * graph_norm) / (1.0 + graph.weight)`；
+3. 显式开启 graph rerank 时，使用加权倒数排名融合（weighted reciprocal rank fusion）合并
+   基础检索和 graph 排名，不直接比较两个通道量纲不同的原始分数；
 4. 同一 evidence record 被多条 fact 或 evidence-node 路径命中时保留最高 graph 分；
-5. 显式允许 graph-only 候选时，才把未在基础结果中的图记录加入最终候选池。
+5. 显式允许 graph-only 候选时，才把未在基础结果中的图记录加入最终候选池；
+6. graph-only 结果容量与 `graph.weight` 解耦，由 `max_graph_only_results` 单独控制；未配置时
+   使用最终 `top_k` 的 20% 作为保守上限。该容量会预留给排名最高的 graph-only 结果，避免
+   图通道既完全进不来，也无界挤掉基础证据。
 
 如果 hybrid rerank 开启，graph channel 会先参与候选融合，再交给 reranker。这样 reranker
 可以看到 graph evidence record，而不是只看到 dense/BM25 候选。
@@ -224,6 +227,10 @@ GraphRetrieveContextRequest
   node，不读取 dense/BM25 候选。该模式默认不启用，主要用于分别测量图事实与证据节点覆盖；它
   不等同于 `--graph-allow-graph-only`，后者仍是混合检索中的有限候选补充；
 - `--graph-weight`：控制 graph channel 的融合权重，默认 0.2；
+- `--graph-rerank`：使用加权倒数排名融合重排基础与 graph 候选；
+- `--graph-allow-graph-only`：允许 graph channel 补入基础检索未召回的 evidence record；
+- `--graph-max-graph-only-results`：限制 graph-only evidence record 在最终结果中的数量；不设置时
+  使用 `top_k` 的 20%，该参数不改变 graph 相关性分数；
 - `--graph-fail-open`：graph channel 出错时退化为只返回基础检索结果，默认关闭；
 - `--graph-memory-space-mode auto`：prepared schema 使用 `scope_id`，raw top-level-array
   数据使用 `path:$[N]` 作为 graph memory space；单条 `--query` 没有 top-level-array path，

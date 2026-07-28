@@ -521,6 +521,7 @@ impl MemoryManager {
             self.retrieval_config.graph.weight,
             self.retrieval_config.graph.rerank_with_graph,
             self.retrieval_config.graph.allow_graph_only,
+            self.retrieval_config.graph.max_graph_only_results,
         ))
     }
 
@@ -963,6 +964,8 @@ struct GraphFusionCandidate {
     record: MemoryRecord,
     base_score: Option<f32>,
     graph_score: Option<f32>,
+    base_rank: Option<usize>,
+    graph_rank: Option<usize>,
 }
 
 fn fuse_hybrid_candidates(
@@ -1032,6 +1035,7 @@ fn fuse_graph_candidates(
     graph_weight: f32,
     rerank_with_graph: bool,
     allow_graph_only: bool,
+    max_graph_only_results: Option<usize>,
 ) -> Vec<ScoredMemory> {
     if top_k == 0 {
         return Vec::new();
@@ -1049,15 +1053,13 @@ fn fuse_graph_candidates(
     } else {
         0.0
     };
-    let total_weight = 1.0 + graph_weight;
-
     let mut protected_base = base_candidates;
     sort_scored_desc(&mut protected_base);
     protected_base.truncate(top_k);
 
     let mut base_candidates = HashMap::new();
     let mut graph_only_candidates = HashMap::new();
-    for candidate in protected_base {
+    for (index, candidate) in protected_base.into_iter().enumerate() {
         let id = candidate.record.id.clone();
         base_candidates
             .entry(id)
@@ -1068,22 +1070,32 @@ fn fuse_graph_candidates(
                 {
                     existing.record = candidate.record.clone();
                     existing.base_score = Some(candidate.score);
+                    existing.base_rank = Some(index + 1);
                 }
             })
             .or_insert_with(|| GraphFusionCandidate {
                 record: candidate.record,
                 base_score: Some(candidate.score),
                 graph_score: None,
+                base_rank: Some(index + 1),
+                graph_rank: None,
             });
     }
 
-    for candidate in graph_candidates {
+    let mut graph_candidates = graph_candidates;
+    sort_scored_desc(&mut graph_candidates);
+    for (index, candidate) in graph_candidates.into_iter().enumerate() {
         let id = candidate.record.id.clone();
         if let Some(existing) = base_candidates.get_mut(&id) {
             existing.graph_score = Some(
                 existing
                     .graph_score
                     .map_or(candidate.score, |score| score.max(candidate.score)),
+            );
+            existing.graph_rank = Some(
+                existing
+                    .graph_rank
+                    .map_or(index + 1, |rank| rank.min(index + 1)),
             );
             merge_graph_facts_metadata(&mut existing.record.metadata, &candidate.record.metadata);
             merge_graph_matches_metadata(&mut existing.record.metadata, &candidate.record.metadata);
@@ -1099,34 +1111,23 @@ fn fuse_graph_candidates(
                 {
                     existing.record = candidate.record.clone();
                     existing.graph_score = Some(candidate.score);
+                    existing.graph_rank = Some(index + 1);
                 }
             })
             .or_insert_with(|| GraphFusionCandidate {
                 record: candidate.record,
                 base_score: None,
                 graph_score: Some(candidate.score),
+                base_rank: None,
+                graph_rank: Some(index + 1),
             });
     }
-
-    let base_range = score_range(
-        base_candidates
-            .values()
-            .filter_map(|candidate| candidate.base_score),
-    );
-    let graph_range = score_range(
-        base_candidates
-            .values()
-            .chain(graph_only_candidates.values())
-            .filter_map(|candidate| candidate.graph_score),
-    );
 
     let mut results = base_candidates
         .into_values()
         .map(|candidate| {
             let score = if rerank_with_graph {
-                let base_norm = normalize_present_score(candidate.base_score, base_range);
-                let graph_norm = normalize_present_score(candidate.graph_score, graph_range);
-                (base_norm + graph_weight * graph_norm) / total_weight
+                graph_rank_fusion_score(candidate.base_rank, candidate.graph_rank, graph_weight)
             } else {
                 candidate.base_score.unwrap_or(0.0)
             };
@@ -1140,17 +1141,22 @@ fn fuse_graph_candidates(
     if allow_graph_only && rerank_with_graph && graph_weight > 0.0 {
         let mut graph_only_results = graph_only_candidates
             .into_values()
-            .map(|candidate| {
-                let graph_norm = normalize_present_score(candidate.graph_score, graph_range);
-                ScoredMemory {
-                    record: candidate.record,
-                    score: graph_weight * graph_norm / total_weight,
-                }
+            .map(|candidate| ScoredMemory {
+                record: candidate.record,
+                score: graph_rank_fusion_score(
+                    candidate.base_rank,
+                    candidate.graph_rank,
+                    graph_weight,
+                ),
             })
             .collect::<Vec<_>>();
         sort_scored_desc(&mut graph_only_results);
-        let graph_only_limit = graph_only_result_limit(top_k, graph_weight);
-        results.extend(graph_only_results.into_iter().take(graph_only_limit));
+        let graph_only_limit = graph_only_result_limit(top_k, max_graph_only_results);
+        graph_only_results.truncate(graph_only_limit);
+
+        sort_scored_desc(&mut results);
+        results.truncate(top_k.saturating_sub(graph_only_results.len()));
+        results.extend(graph_only_results);
     }
 
     sort_scored_desc(&mut results);
@@ -1158,11 +1164,30 @@ fn fuse_graph_candidates(
     results
 }
 
-fn graph_only_result_limit(top_k: usize, graph_weight: f32) -> usize {
-    if top_k == 0 || graph_weight <= 0.0 {
+const GRAPH_RRF_RANK_CONSTANT: f32 = 60.0;
+const DEFAULT_GRAPH_ONLY_RESULT_RATIO: f32 = 0.2;
+
+fn graph_rank_fusion_score(
+    base_rank: Option<usize>,
+    graph_rank: Option<usize>,
+    graph_weight: f32,
+) -> f32 {
+    let base_score = base_rank
+        .map(|rank| 1.0 / (GRAPH_RRF_RANK_CONSTANT + rank as f32))
+        .unwrap_or(0.0);
+    let graph_score = graph_rank
+        .map(|rank| graph_weight / (GRAPH_RRF_RANK_CONSTANT + rank as f32))
+        .unwrap_or(0.0);
+    base_score + graph_score
+}
+
+fn graph_only_result_limit(top_k: usize, configured_limit: Option<usize>) -> usize {
+    if top_k == 0 {
         return 0;
     }
-    ((top_k as f32) * graph_weight).ceil() as usize
+    configured_limit
+        .unwrap_or_else(|| ((top_k as f32) * DEFAULT_GRAPH_ONLY_RESULT_RATIO).ceil() as usize)
+        .min(top_k)
 }
 
 fn score_range(scores: impl Iterator<Item = f32>) -> Option<(f32, f32)> {
@@ -1506,6 +1531,7 @@ mod tests {
             0.2,
             true,
             true,
+            None,
         );
 
         assert!(results.iter().all(|result| result.score <= 1.0));
@@ -1553,6 +1579,7 @@ mod tests {
             0.2,
             false,
             false,
+            None,
         );
 
         let ids = results
@@ -1604,8 +1631,15 @@ mod tests {
             },
             score: 1.0,
         }];
-        let results =
-            fuse_graph_candidates(base_candidates, graph_candidates, 2, 1.0, false, false);
+        let results = fuse_graph_candidates(
+            base_candidates,
+            graph_candidates,
+            2,
+            1.0,
+            false,
+            false,
+            None,
+        );
 
         let enriched = results
             .iter()
@@ -1663,8 +1697,10 @@ mod tests {
             0.0,
             true,
             false,
+            None,
         );
-        let boosted = fuse_graph_candidates(base_candidates, graph_candidates, 2, 1.0, true, false);
+        let boosted =
+            fuse_graph_candidates(base_candidates, graph_candidates, 2, 1.0, true, false, None);
 
         let unboosted_score = unboosted
             .iter()
@@ -1708,6 +1744,7 @@ mod tests {
             1.0,
             true,
             true,
+            None,
         );
 
         let ids = results
@@ -1718,7 +1755,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_fusion_limits_allowed_graph_only_results_by_graph_weight() {
+    fn graph_fusion_uses_an_independent_graph_only_result_limit() {
         let base_candidates = (0..5)
             .map(|index| ScoredMemory {
                 record: MemoryRecord {
@@ -1746,13 +1783,73 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let results = fuse_graph_candidates(base_candidates, graph_candidates, 5, 0.2, true, true);
+        let results = fuse_graph_candidates(
+            base_candidates,
+            graph_candidates,
+            5,
+            0.2,
+            true,
+            true,
+            Some(2),
+        );
         let graph_only_count = results
             .iter()
             .filter(|result| result.record.id.starts_with("graph-"))
             .count();
 
-        assert_eq!(graph_only_count, 1);
+        assert_eq!(graph_only_count, 2);
+    }
+
+    #[test]
+    fn graph_rank_fusion_uses_rank_instead_of_raw_score_scale() {
+        let score = graph_rank_fusion_score(Some(1), Some(2), 0.2);
+        let expected = (1.0 / 61.0) + (0.2 / 62.0);
+
+        assert!((score - expected).abs() < f32::EPSILON);
+        assert!(score > graph_rank_fusion_score(Some(2), Some(3), 0.2));
+    }
+
+    #[test]
+    fn graph_fusion_order_is_invariant_to_channel_score_scale() {
+        fn candidate(id: &str, score: f32) -> ScoredMemory {
+            ScoredMemory {
+                record: MemoryRecord {
+                    id: id.to_string(),
+                    text: id.to_string(),
+                    metadata: serde_json::json!({}),
+                    embedding: vec![1.0],
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                },
+                score,
+            }
+        }
+
+        let fuse = |base_scores: [f32; 2], graph_scores: [f32; 2]| {
+            fuse_graph_candidates(
+                vec![
+                    candidate("base-first", base_scores[0]),
+                    candidate("graph-first", base_scores[1]),
+                ],
+                vec![
+                    candidate("graph-first", graph_scores[0]),
+                    candidate("base-first", graph_scores[1]),
+                ],
+                2,
+                0.2,
+                true,
+                false,
+                None,
+            )
+            .into_iter()
+            .map(|result| result.record.id)
+            .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            fuse([0.9, 0.1], [0.8, 0.2]),
+            fuse([900.0, -20.0], [0.008, 0.002])
+        );
     }
 
     #[test]
@@ -1785,6 +1882,7 @@ mod tests {
                 graph_weight,
                 true,
                 true,
+                None,
             );
 
             assert!(

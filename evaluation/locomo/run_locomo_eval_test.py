@@ -48,6 +48,9 @@ def test_run_locomo_eval_uses_locomo_entrypoints():
     assert 'MEMORY_BENCH_GRAPH="${MEMORY_BENCH_GRAPH:-0}"' in content
     assert 'MEMORY_BENCH_SEARCH_MODE="${MEMORY_BENCH_SEARCH_MODE:-hybrid}"' in content
     assert 'GRAPH_WEIGHT="${GRAPH_WEIGHT:-0.2}"' in content
+    assert 'GRAPH_RERANK="${GRAPH_RERANK:-0}"' in content
+    assert 'GRAPH_ALLOW_GRAPH_ONLY="${GRAPH_ALLOW_GRAPH_ONLY:-0}"' in content
+    assert 'GRAPH_MAX_GRAPH_ONLY_RESULTS="${GRAPH_MAX_GRAPH_ONLY_RESULTS:-}"' in content
     assert 'GRAPH_FAIL_OPEN="${GRAPH_FAIL_OPEN:-0}"' in content
     assert 'GRAPH_MEMORY_SPACE_MODE="${GRAPH_MEMORY_SPACE_MODE:-auto}"' in content
     assert 'GRAPH_MEMORY_SPACE_FIELD="${GRAPH_MEMORY_SPACE_FIELD:-scope_id}"' in content
@@ -62,6 +65,9 @@ def test_run_locomo_eval_uses_locomo_entrypoints():
     assert 'MEMORY_BENCH_GRAPH_ADD_ARGS="' in content
     assert 'MEMORY_BENCH_GRAPH_SEARCH_ARGS="' in content
     assert 'MEMORY_BENCH_GRAPH_ADD_ARGS="--graph-build --graph-build-concurrency $GRAPH_BUILD_CONCURRENCY' in content
+    assert "--graph-rerank" in content
+    assert "--graph-allow-graph-only" in content
+    assert "--graph-max-graph-only-results $GRAPH_MAX_GRAPH_ONLY_RESULTS" in content
     assert '--rerank --rerank-provider $RERANK_PROVIDER' in content
     assert '--rerank-api-key-env $RERANK_API_KEY_ENV' in content
     assert '$MEMORY_BENCH_RERANK_ARGS \\' in content

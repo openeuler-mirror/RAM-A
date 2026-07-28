@@ -196,6 +196,9 @@ Graph-specific environment variables:
 |----------|---------|---------|
 | `MEMORY_BENCH_GRAPH` | `0` | Set to `1` to pass graph flags to RAM-A add/search |
 | `GRAPH_WEIGHT` | `0.2` | Graph retrieval fusion weight |
+| `GRAPH_RERANK` | `0` | Set to `1` to apply weighted reciprocal rank fusion |
+| `GRAPH_ALLOW_GRAPH_ONLY` | `0` | Set to `1` to admit graph-only evidence records |
+| `GRAPH_MAX_GRAPH_ONLY_RESULTS` | *(20% of top-k)* | Maximum graph-only records in the final result |
 | `GRAPH_FAIL_OPEN` | `0` | Set to `1` to fall back to non-graph retrieval if graph search fails |
 | `GRAPH_MEMORY_SPACE_MODE` | `auto` | Memory-space derivation mode for `memory-bench` |
 | `GRAPH_MEMORY_SPACE_FIELD` | `scope_id` | Metadata/filter field used when mode is `metadata-field` |

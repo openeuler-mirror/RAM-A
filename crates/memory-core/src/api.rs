@@ -185,6 +185,8 @@ pub struct GraphRetrievalConfig {
     #[serde(default)]
     pub allow_graph_only: bool,
     #[serde(default)]
+    pub max_graph_only_results: Option<usize>,
+    #[serde(default)]
     pub seed_limit: Option<usize>,
     #[serde(default)]
     pub max_evidence_records_per_fact: Option<usize>,
@@ -199,6 +201,7 @@ impl Default for GraphRetrievalConfig {
             weight: default_graph_weight(),
             rerank_with_graph: false,
             allow_graph_only: false,
+            max_graph_only_results: None,
             seed_limit: None,
             max_evidence_records_per_fact: None,
             fail_open: false,

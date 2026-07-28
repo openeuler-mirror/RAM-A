@@ -186,6 +186,9 @@ shell 和离线 smoke 回归。如果任一检查失败，接入代码必须保�
 |------|--------|------|
 | `MEMORY_BENCH_GRAPH` | `0` | 设为 `1` 后给 RAM-A add/search 传入 graph 参数 |
 | `GRAPH_WEIGHT` | `0.2` | graph retrieval 融合权重 |
+| `GRAPH_RERANK` | `0` | 设为 `1` 后使用加权倒数排名融合 |
+| `GRAPH_ALLOW_GRAPH_ONLY` | `0` | 设为 `1` 后允许加入 graph-only 证据记录 |
+| `GRAPH_MAX_GRAPH_ONLY_RESULTS` | *（top-k 的 20%）* | 最终结果中 graph-only 记录数量上限 |
 | `GRAPH_FAIL_OPEN` | `0` | 设为 `1` 后 graph search 失败时退化为非 graph 检索 |
 | `GRAPH_MEMORY_SPACE_MODE` | `auto` | `memory-bench` 推导 memory space 的方式 |
 | `GRAPH_MEMORY_SPACE_FIELD` | `scope_id` | `metadata-field` 模式使用的 metadata/filter 字段 |

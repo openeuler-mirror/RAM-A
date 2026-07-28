@@ -30,6 +30,9 @@ RERANK_FAIL_OPEN="${RERANK_FAIL_OPEN:-0}"
 MEMORY_BENCH_GRAPH="${MEMORY_BENCH_GRAPH:-0}"
 MEMORY_BENCH_SEARCH_MODE="${MEMORY_BENCH_SEARCH_MODE:-hybrid}"
 GRAPH_WEIGHT="${GRAPH_WEIGHT:-0.2}"
+GRAPH_RERANK="${GRAPH_RERANK:-0}"
+GRAPH_ALLOW_GRAPH_ONLY="${GRAPH_ALLOW_GRAPH_ONLY:-0}"
+GRAPH_MAX_GRAPH_ONLY_RESULTS="${GRAPH_MAX_GRAPH_ONLY_RESULTS:-}"
 GRAPH_FAIL_OPEN="${GRAPH_FAIL_OPEN:-0}"
 GRAPH_MEMORY_SPACE_MODE="${GRAPH_MEMORY_SPACE_MODE:-auto}"
 GRAPH_MEMORY_SPACE_FIELD="${GRAPH_MEMORY_SPACE_FIELD:-scope_id}"
@@ -107,6 +110,19 @@ case "$MEMORY_BENCH_GRAPH" in
         MEMORY_BENCH_GRAPH_COMMON_ARGS="--graph-weight $GRAPH_WEIGHT --graph-memory-space-mode $GRAPH_MEMORY_SPACE_MODE --graph-memory-space-field $GRAPH_MEMORY_SPACE_FIELD --graph-owner-id $GRAPH_OWNER_ID --graph-llm-api-key-env $GRAPH_LLM_API_KEY_ENV --graph-llm-model $GRAPH_LLM_MODEL --graph-llm-base-url $GRAPH_LLM_BASE_URL --graph-llm-timeout-ms $GRAPH_LLM_TIMEOUT_MS"
         MEMORY_BENCH_GRAPH_ADD_ARGS="--graph-build --graph-build-concurrency $GRAPH_BUILD_CONCURRENCY $MEMORY_BENCH_GRAPH_COMMON_ARGS"
         MEMORY_BENCH_GRAPH_SEARCH_ARGS="--graph $MEMORY_BENCH_GRAPH_COMMON_ARGS"
+        case "$GRAPH_RERANK" in
+            1|true|TRUE|yes|YES)
+                MEMORY_BENCH_GRAPH_SEARCH_ARGS="$MEMORY_BENCH_GRAPH_SEARCH_ARGS --graph-rerank"
+                ;;
+        esac
+        case "$GRAPH_ALLOW_GRAPH_ONLY" in
+            1|true|TRUE|yes|YES)
+                MEMORY_BENCH_GRAPH_SEARCH_ARGS="$MEMORY_BENCH_GRAPH_SEARCH_ARGS --graph-allow-graph-only"
+                ;;
+        esac
+        if [ -n "$GRAPH_MAX_GRAPH_ONLY_RESULTS" ]; then
+            MEMORY_BENCH_GRAPH_SEARCH_ARGS="$MEMORY_BENCH_GRAPH_SEARCH_ARGS --graph-max-graph-only-results $GRAPH_MAX_GRAPH_ONLY_RESULTS"
+        fi
         case "$GRAPH_FAIL_OPEN" in
             1|true|TRUE|yes|YES)
                 MEMORY_BENCH_GRAPH_SEARCH_ARGS="$MEMORY_BENCH_GRAPH_SEARCH_ARGS --graph-fail-open"

@@ -65,6 +65,8 @@ struct Cli {
     #[arg(long)]
     graph_allow_graph_only: bool,
     #[arg(long)]
+    graph_max_graph_only_results: Option<usize>,
+    #[arg(long)]
     graph_fail_open: bool,
     #[arg(long, value_enum, default_value_t = GraphMemorySpaceMode::Auto)]
     graph_memory_space_mode: GraphMemorySpaceMode,
@@ -295,6 +297,7 @@ fn build_runtime(cli: &Cli) -> Result<BenchRuntime> {
             weight: cli.graph_weight,
             rerank_with_graph: cli.graph_rerank,
             allow_graph_only: cli.graph_allow_graph_only,
+            max_graph_only_results: cli.graph_max_graph_only_results,
             seed_limit: None,
             max_evidence_records_per_fact: None,
             fail_open: cli.graph_fail_open,
@@ -1629,6 +1632,10 @@ mod tests {
             "--graph",
             "--graph-weight",
             "0.4",
+            "--graph-rerank",
+            "--graph-allow-graph-only",
+            "--graph-max-graph-only-results",
+            "7",
             "--graph-fail-open",
             "--graph-memory-space-mode",
             "path-prefix",
@@ -1657,6 +1664,9 @@ mod tests {
         assert!(cli.graph_build);
         assert!(cli.graph);
         assert_eq!(cli.graph_weight, 0.4);
+        assert!(cli.graph_rerank);
+        assert!(cli.graph_allow_graph_only);
+        assert_eq!(cli.graph_max_graph_only_results, Some(7));
         assert!(cli.graph_fail_open);
         assert!(matches!(
             cli.graph_memory_space_mode,
