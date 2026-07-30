@@ -1,0 +1,681 @@
+[
+  {
+    "id": "召回_单文档强匹配",
+    "question": "打印机显示缺纸但纸盒有纸，怎么办？",
+    "standard_answer": "应该检查纸张是否放正、纸张导板是否太紧、纸盒传感器和取纸轮是否脏，并清掉卡住的打印任务后重启打印队列。",
+    "expected_sources": [
+      "打印机显示缺纸但纸盒有纸.md"
+    ],
+    "required_answer_terms": [
+      "打印机",
+      "缺纸"
+    ],
+    "required_reference_terms": [
+      "纸盒有纸",
+      "纸盒传感器"
+    ],
+    "required_solution_terms": [
+      "纸张导板",
+      "取纸轮",
+      "重启打印队列"
+    ],
+    "top_k": 2
+  },
+  {
+    "id": "召回_文件名补召回",
+    "question": "摄像头画面倒置怎么办？",
+    "standard_answer": "这条用例的核心查询词只出现在文档名里。命中文档后，应根据正文说明关闭 flip vertical，执行设备重新校准；如果仍然异常，删除 video profile 配置文件并让客户端重建默认参数。",
+    "expected_sources": [
+      "摄像头画面倒置.md"
+    ],
+    "required_answer_terms": [
+      "摄像头",
+      "重新校准"
+    ],
+    "required_reference_terms": [
+      "影像上下翻转",
+      "方向也不对"
+    ],
+    "required_solution_terms": [
+      "flip vertical",
+      "重新校准",
+      "video profile"
+    ],
+    "top_k": 1
+  },
+  {
+    "id": "召回_语义改写命中",
+    "question": "桌面出来后托盘图标一直刷，开始菜单点了没反应，怎么办？",
+    "standard_answer": "桌面出现后系统响应很慢，通常要检查会话启动时自动运行的软件。根据文档，应在任务管理器启动页禁用不必要的自启动项，清理计划任务，卸载不用的常驻软件，必要时再查硬盘健康。",
+    "expected_sources": [
+      "电脑开机慢因为启动软件太多.md"
+    ],
+    "required_answer_terms": [
+      "托盘图标",
+      "软件"
+    ],
+    "required_reference_terms": [
+      "托盘图标",
+      "开始菜单",
+      "自动运行",
+      "启动阶段"
+    ],
+    "required_solution_terms": [
+      "任务管理器",
+      "自启动项",
+      "计划任务"
+    ],
+    "top_k": 2
+  },
+  {
+    "id": "召回_同症状多原因_宽泛查询",
+    "question": "家里 Wi-Fi 很慢，可能有哪些原因？",
+    "standard_answer": [
+      "家里 Wi-Fi 慢可能来自多类原因：路由器信道拥挤、有人后台上传占满带宽、DNS 解析异常、运营商外网丢包，或路由器过热降速。处理时应分别检查信道和 5GHz、上行流量和 QoS、DNS",
+      "缓存、mtr/traceroute 丢包证据，以及路由器散热和固件。"
+    ],
+    "expected_sources": [
+      "WiFi慢因为路由器信道拥挤.md",
+      "WiFi慢因为有人后台上传.md",
+      "WiFi慢因为DNS解析异常.md",
+      "WiFi慢因为运营商丢包.md",
+      "WiFi慢因为路由器过热降速.txt"
+    ],
+    "required_answer_terms": [
+      "Wi-Fi",
+      "变慢"
+    ],
+    "required_reference_terms": [
+      "信道拥挤",
+      "后台上传",
+      "DNS",
+      "公网网关",
+      "过热"
+    ],
+    "required_solution_terms": [
+      "80MHz",
+      "路由器 QoS",
+      "ipconfig /flushdns",
+      "运营商报修",
+      "升级固件"
+    ],
+    "top_k": 8
+  },
+  {
+    "id": "召回_同症状多原因_处置汇总",
+    "question": "视频会议总是卡，可能怎么处理？",
+    "standard_answer": "视频会议卡顿可能来自三方面：摄像头画质太高、Wi-Fi 信号弱、后台下载占网速。处理时可以降到 720p、关闭虚拟背景，改用网线或靠近路由器，并暂停系统更新、网盘同步和大文件下载。",
+    "expected_sources": [
+      "视频会议卡因为摄像头画质太高.md",
+      "视频会议卡因为WiFi信号弱.md",
+      "视频会议卡因为后台下载占网速.txt"
+    ],
+    "required_answer_terms": [
+      "视频会议",
+      "卡"
+    ],
+    "required_reference_terms": [
+      "摄像头",
+      "Wi-Fi 信号弱",
+      "后台"
+    ],
+    "required_solution_terms": [
+      "720p",
+      "网线",
+      "暂停系统更新",
+      "会议软件"
+    ],
+    "top_k": 3
+  },
+  {
+    "id": "格式_非结构化文本_错别字查询",
+    "question": "Windows 上蓝芽键盘一直转圈，配对失败怎么办？",
+    "standard_answer": "蓝牙键盘配对失败时，应先删除系统里旧的键盘条目，长按键盘配对键让指示灯快速闪烁，再清理灰色 HID Keyboard Device、重启 bthserv，重新搜索后输入配对码；必要时关闭会自动回连的旧电脑。",
+    "expected_sources": [
+      "客服记录-蓝牙外设.txt"
+    ],
+    "required_answer_terms": [
+      "蓝牙键盘",
+      "配对失败"
+    ],
+    "required_reference_terms": [
+      "一直转圈",
+      "HID Keyboard Device"
+    ],
+    "required_solution_terms": [
+      "配对键",
+      "bthserv",
+      "配对码"
+    ],
+    "top_k": 3
+  },
+  {
+    "id": "召回_泛文件名正文命中",
+    "question": "扫描仪 ADF 自动进纸歪斜，双面扫描漏页怎么办？",
+    "standard_answer": "扫描仪 ADF 歪斜漏页时，应清洁分纸垫和进纸轮，放宽纸张导板，把大批量材料拆成小组扫描，并执行走纸传感器校准；复发时优先更换分纸垫组件。",
+    "expected_sources": [
+      "2026-07-01值班记录.txt"
+    ],
+    "required_answer_terms": [
+      "扫描仪",
+      "ADF"
+    ],
+    "required_reference_terms": [
+      "自动进纸",
+      "漏页"
+    ],
+    "required_solution_terms": [
+      "分纸垫",
+      "进纸轮",
+      "走纸传感器校准"
+    ],
+    "top_k": 3
+  },
+  {
+    "id": "精度_硬负例_名称解析",
+    "question": "Wi-Fi 满格但网页提示 ERR_NAME_NOT_RESOLVED，DNS 解析失败怎么处理？",
+    "standard_answer": "这种 Wi-Fi 慢实际是 DNS 解析异常。应把路由器 DNS 改为自动获取或可信公共 DNS，电脑执行 ipconfig /flushdns，手机开关飞行模式，并重启路由器 DNS 代理服务。",
+    "expected_sources": [
+      "WiFi慢因为DNS解析异常.md"
+    ],
+    "required_answer_terms": [
+      "Wi-Fi",
+      "DNS"
+    ],
+    "required_reference_terms": [
+      "ERR_NAME_NOT_RESOLVED",
+      "DNS 代理缓存"
+    ],
+    "required_solution_terms": [
+      "ipconfig /flushdns",
+      "飞行模式",
+      "DNS 代理服务"
+    ],
+    "top_k": 2
+  },
+  {
+    "id": "精度_硬负例_外网丢包",
+    "question": "Wi-Fi 信号正常，但 mtr 和 traceroute 都显示运营商晚高峰链路拥塞、公网网关外网丢包，怎么处理？",
+    "standard_answer": "如果 ping 路由器正常但公网网关丢包，应判断为运营商晚高峰链路拥塞。处理时保存 mtr/traceroute 截图，重启光猫确认光功率，再联系运营商报修外网丢包，临时可切手机热点。",
+    "expected_sources": [
+      "WiFi慢因为运营商丢包.md"
+    ],
+    "required_answer_terms": [
+      "Wi-Fi",
+      "丢包"
+    ],
+    "required_reference_terms": [
+      "ping 路由器",
+      "公网网关"
+    ],
+    "required_solution_terms": [
+      "mtr",
+      "traceroute",
+      "运营商报修"
+    ],
+    "top_k": 2
+  },
+  {
+    "id": "精度_硬负例_设备降速",
+    "question": "路由器发烫后 5GHz 从 866Mbps 降到 72Mbps，Wi-Fi 变慢怎么办？",
+    "standard_answer": "这是路由器高负载过热降频。应把路由器移到通风处，拔掉 USB 移动硬盘，升级固件并关闭不需要的访客网络；仍过热时更换散热更好的路由器。",
+    "expected_sources": [
+      "WiFi慢因为路由器过热降速.txt"
+    ],
+    "required_answer_terms": [
+      "路由器",
+      "5GHz"
+    ],
+    "required_reference_terms": [
+      "866Mbps",
+      "72Mbps"
+    ],
+    "required_solution_terms": [
+      "通风位置",
+      "USB 移动硬盘",
+      "升级固件"
+    ],
+    "top_k": 2
+  },
+  {
+    "id": "查询_中英混合缩写",
+    "question": "VPN 登录一直让 2FA，提示 MFA token expired，怎么处理？",
+    "standard_answer": "VPN 反复要求 2FA 且提示 MFA token expired 时，应先同步手机自动时间，移除旧的 authenticator 绑定，请管理员重置MFA seed，然后重新登录 VPN 并批准推送通知。",
+    "expected_sources": [
+      "VPN-MFA英文缩写.md"
+    ],
+    "required_answer_terms": [
+      "VPN",
+      "MFA"
+    ],
+    "required_reference_terms": [
+      "MFA token expired",
+      "2FA"
+    ],
+    "required_solution_terms": [
+      "sync phone time",
+      "reset the MFA seed",
+      "approve the push notification"
+    ],
+    "top_k": 2
+  },
+  {
+    "id": "召回_长噪声文档_答案后置",
+    "question": "会议室投屏画面每隔十秒停顿，鼠标也有延迟，怎么处理？",
+    "standard_answer": "会议室投屏延迟的最终处理是关闭路由器组播增强，为投屏盒子所在 VLAN 开启 IGMP Snooping，隔离访客网络和办公网络，并给投屏盒子固定DHCP 地址。",
+    "expected_sources": [
+      "会议室投屏延迟长记录.txt"
+    ],
+    "required_answer_terms": [
+      "会议室投屏",
+      "延迟"
+    ],
+    "required_reference_terms": [
+      "每隔十秒",
+      "组播发现包"
+    ],
+    "required_solution_terms": [
+      "关闭组播增强",
+      "IGMP Snooping",
+      "固定 DHCP 地址"
+    ],
+    "top_k": 3
+  },
+  {
+    "id": "格式_Markdown表格列表代码",
+    "question": "NAS 备份 rsync error code 23，只同步一部分文件怎么办？",
+    "standard_answer": "NAS 备份 rsync code 23 时，应重新挂载 NFS 共享，校验 UID/GID 权限映射，并排除 .tmp 临时目录，确认备份用户能读取项目目录。",
+    "expected_sources": [
+      "设备巡检摘录.md"
+    ],
+    "required_answer_terms": [
+      "NAS",
+      "rsync"
+    ],
+    "required_reference_terms": [
+      "rsync error code 23",
+      "NFS 共享"
+    ],
+    "required_solution_terms": [
+      "重新挂载 NFS",
+      "UID/GID 权限映射",
+      ".tmp 临时目录"
+    ],
+    "top_k": 5
+  },
+  {
+    "id": "格式_日志文件英文错误",
+    "question": "gateway 到 payment-api 出现 tls handshake timeout 怎么临时处理？",
+    "standard_answer": [
+      "网关连接 payment-api 出现 TLS 握手超时时，临时处理是轮换 gateway certificate bundle，重启 envoy sidecar，并清理 stale",
+      "upstream cluster cache。"
+    ],
+    "expected_sources": [
+      "网关日志-错误码.log"
+    ],
+    "required_answer_terms": [
+      "gateway",
+      "payment-api"
+    ],
+    "required_reference_terms": [
+      "tls handshake timeout",
+      "payment-api"
+    ],
+    "required_solution_terms": [
+      "rotate gateway certificate bundle",
+      "restart envoy sidecar",
+      "clear stale upstream cluster cache"
+    ],
+    "top_k": 1
+  },
+  {
+    "id": "格式_破损Markdown未闭合代码块",
+    "question": "checkout-api reset connection after idle timeout，nginx 要怎么缓解？",
+    "standard_answer": "破损 Markdown 日志里记录的临时缓解方式是把 keepalive timeout 降到 30s，reload nginx worker，并drain stale upstream sockets。",
+    "expected_sources": [
+      "破损Markdown-日志片段.md"
+    ],
+    "required_answer_terms": [
+      "checkout-api"
+    ],
+    "required_reference_terms": [
+      "reset connection",
+      "idle timeout",
+      "nginx"
+    ],
+    "required_solution_terms": [
+      "lower keepalive timeout to 30s",
+      "reload nginx worker",
+      "drain stale upstream sockets"
+    ],
+    "top_k": 1
+  },
+  {
+    "id": "格式_text_FAQ同义表达",
+    "question": "手机登录时短信 OTP 一直收不到，但后台显示发送成功，应该排查什么？",
+    "standard_answer": [
+      "短信验证码收不到但网关显示 delivered 时，应检查手机号和区号、短信拦截箱、1069 服务号黑名单、免打扰和双卡 SIM。仍失败时可切换语音验证码，并把 SMS_LOGIN_OTP",
+      "模板加入白名单重发，携号转网用户提交运营商路由刷新。"
+    ],
+    "expected_sources": [
+      "FAQ-移动端收不到验证码.txt"
+    ],
+    "required_answer_terms": [
+      "短信",
+      "验证码"
+    ],
+    "required_reference_terms": [
+      "sms gateway",
+      "1069",
+      "携号转网"
+    ],
+    "required_solution_terms": [
+      "语音验证码",
+      "SMS_LOGIN_OTP",
+      "运营商路由刷新"
+    ],
+    "top_k": 3
+  },
+  {
+    "id": "召回_text_值班流水答案后置",
+    "question": "order-service 偶发 503，日志里有 HikariPool connection is not available，怎么处理？",
+    "standard_answer": [
+      "order-service 偶发 503 且 HikariPool 提示连接不可用时，应定位为报表导出任务并发过高占满数据库连接池。处理上把 export_concurrency 调回 2，",
+      "终止卡住的报表 SQL，临时提升 Hikari maximumPoolSize，并让导出任务走只读副库和 distributed lock。"
+    ],
+    "expected_sources": [
+      "值班流水-数据库连接池耗尽.txt"
+    ],
+    "required_answer_terms": [
+      "order-service",
+      "503"
+    ],
+    "required_reference_terms": [
+      "HikariPool-1",
+      "report_export_job",
+      "export_concurrency"
+    ],
+    "required_solution_terms": [
+      "export_concurrency 调回 2",
+      "maximumPoolSize",
+      "distributed lock"
+    ],
+    "top_k": 3
+  },
+  {
+    "id": "格式_text_配置片段错误码",
+    "question": "知识库上传 20MB txt 时 nginx 返回 413 Request Entity Too Large，后端没有日志，怎么改？",
+    "standard_answer": [
+      "上传大文件时 nginx 返回 413 且后端没有日志，说明请求在反向代理层被拦截。应在 server 或 location 中配置 client_max_body_size 100m，确认",
+      "APP_MAX_UPLOAD_SIZE 不低于100m，执行 nginx -t 后 reload nginx；如果前面有 ingress，也同步调大 proxy-body-size。"
+    ],
+    "expected_sources": [
+      "配置说明-反向代理上传413.txt"
+    ],
+    "required_answer_terms": [
+      "nginx",
+      "413"
+    ],
+    "required_reference_terms": [
+      "413 Request Entity Too Large",
+      "client_max_body_size"
+    ],
+    "required_solution_terms": [
+      "client_max_body_size 100m",
+      "APP_MAX_UPLOAD_SIZE",
+      "reload nginx"
+    ],
+    "top_k": 2
+  },
+  {
+    "id": "格式_text_日志时间线去重",
+    "question": "销售日报每天 9 点发两封，日志里同时有 systemd timer 和 CRON，怎么避免重复发送？",
+    "standard_answer": [
+      "日报重复发送是 systemd timer 和旧 crontab 同时触发。应删除 report 用户旧 crontab，只保留 sales-report.timer，把 flock",
+      "锁文件放到/var/lock/sales-report.lock，重载 systemd daemon 后重启 timer，并增加按业务日期去重检查。"
+    ],
+    "expected_sources": [
+      "日志摘录-定时任务重复执行.txt"
+    ],
+    "required_answer_terms": [
+      "日报",
+      "重复"
+    ],
+    "required_reference_terms": [
+      "systemd",
+      "CRON",
+      "flock"
+    ],
+    "required_solution_terms": [
+      "删除 report 用户下的旧 crontab",
+      "/var/lock/sales-report.lock",
+      "业务日期去重"
+    ],
+    "top_k": 3
+  },
+  {
+    "id": "召回_text_会议纪要权限继承",
+    "question": "Project-Apollo 新员工已经进了 ldap group，但共享盘子目录还是看不到，怎么办？",
+    "standard_answer": [
+      "新员工已加入 apollo-dev 但看不到共享盘子目录，是因为 docs、build、release 子目录关闭了 ACL inheritance，父目录权限没有传递。应重新启用 ACL",
+      "inheritance，对三个子目录传播权限，刷新 Samba idmap cache，并让用户重新挂载共享盘。"
+    ],
+    "expected_sources": [
+      "会议纪要-共享盘权限继承异常.txt"
+    ],
+    "required_answer_terms": [
+      "Project-Apollo",
+      "共享盘"
+    ],
+    "required_reference_terms": [
+      "ldap group apollo-dev",
+      "ACL inheritance",
+      "Samba"
+    ],
+    "required_solution_terms": [
+      "重新启用 ACL inheritance",
+      "刷新 Samba idmap cache",
+      "重新挂载共享盘"
+    ],
+    "top_k": 3
+  },
+  {
+    "id": "查询_text_中英混合安全拦截",
+    "question": "供应商的加密 zip 报价单邮件收不到，mail gateway 显示 DLP-ENCRYPTED-ARCHIVE，怎么放行？",
+    "standard_answer": [
+      "加密 zip 报价单被 mail gateway 拦截，是因为命中 DLP-ENCRYPTED-ARCHIVE。应优先让供应商使用公司批准的外部文件交换链接，并在正文写项目编号",
+      "APOLLO-42。必须临时放行时，由安全管理员按 message id 释放 quarantine，并登记 24 小时内有效的 DLP exception。"
+    ],
+    "expected_sources": [
+      "多轮客服记录-邮箱附件被拦截.txt"
+    ],
+    "required_answer_terms": [
+      "mail gateway",
+      "DLP"
+    ],
+    "required_reference_terms": [
+      "DLP-ENCRYPTED-ARCHIVE",
+      "quote_2026.zip",
+      "quarantine"
+    ],
+    "required_solution_terms": [
+      "外部文件交换链接",
+      "APOLLO-42",
+      "DLP exception"
+    ],
+    "top_k": 2
+  },
+  {
+    "id": "精度_text_硬负例_inode而非容量",
+    "question": "df -h 还有 38G，但应用创建缩略图报 No space left on device，应该看什么？",
+    "standard_answer": [
+      "df -h 仍有空间但创建文件报 No space left on device，应检查 inode 是否耗尽。根据记录，/data/cache/thumbs 堆积大量小文件导致 df -i",
+      "显示 inode 100%。应清理 30 天前的小缩略图，迁移缓存到对象存储，并监控 df -h 和 df -i。"
+    ],
+    "expected_sources": [
+      "告警记录-磁盘inode耗尽.txt"
+    ],
+    "required_answer_terms": [
+      "inode",
+      "No space left on device"
+    ],
+    "required_reference_terms": [
+      "df -h",
+      "df -i",
+      "/data/cache/thumbs"
+    ],
+    "required_solution_terms": [
+      "删除 30 天前的 thumbs 小文件",
+      "对象存储",
+      "inode 使用率 85%"
+    ],
+    "top_k": 2
+  },
+  {
+    "id": "格式_text_终端命令安全校验",
+    "question": "ssh 登录 build-node-17 提示 REMOTE HOST IDENTIFICATION HAS CHANGED，可以直接关 StrictHostKeyChecking 吗？",
+    "standard_answer": [
+      "SSH 主机指纹变更不能直接关闭 StrictHostKeyChecking。应先通过资产平台和带外管理确认 build-node-17 确实重装且身份未变，再用 ssh-keygen -R",
+      "build-node-17 删除旧指纹，并用 ssh-keyscan build-node-17 重新登记新指纹。"
+    ],
+    "expected_sources": [
+      "终端记录-SSH主机指纹变更.txt"
+    ],
+    "required_answer_terms": [
+      "SSH",
+      "主机指纹"
+    ],
+    "required_reference_terms": [
+      "REMOTE HOST IDENTIFICATION HAS CHANGED",
+      "known_hosts:42",
+      "host key"
+    ],
+    "required_solution_terms": [
+      "ssh-keygen -R build-node-17",
+      "ssh-keyscan build-node-17",
+      "禁止"
+    ],
+    "top_k": 3
+  },
+  {
+    "id": "格式_text_社区案例井号标题",
+    "question": "openEuler 24.03 SP2 开启 BPF 观测后 pidns_update_load_tasks 触发空指针 Oops，怎么处理？",
+    "standard_answer": [
+      "openEuler 24.03 SP2 上 BPF 观测路径触发 pidns_update_load_tasks 空指针 Oops 时，应获取 Gitee issue ICTJEE",
+      "的官方内核修复补丁，重新编译安装更新后的 kernel 包。临时规避是关闭 bpf-rvi 观测插件，避免启用相关 namespace 统计。"
+    ],
+    "expected_sources": [
+      "社区案例-openEuler空指针Oops.txt"
+    ],
+    "required_answer_terms": [
+      "openEuler",
+      "Oops"
+    ],
+    "required_reference_terms": [
+      "24.03 SP2",
+      "pidns_update_load_tasks",
+      "Unable to handle kernel NULL pointer dereference"
+    ],
+    "required_solution_terms": [
+      "Gitee issue ICTJEE",
+      "重新编译并安装更新后的 kernel 包",
+      "关闭 BPF 观测插件 bpf-rvi"
+    ],
+    "top_k": 3
+  },
+  {
+    "id": "查询_text_URL_IP_Curl错误",
+    "question": "dnf-makecache.service 下载 repomd.xml 超时，日志是 Curl error 28 和 71.41.15.160，怎么修？",
+    "standard_answer": [
+      "dnf-makecache.service 因 Curl error 28 下载 repomd.xml 超时时，应先验证 71.41.15.160是否可达。如果该 IP 不是有效源，需要编辑",
+      "/etc/yum.repos.d/openEuler.repo，把 baseurl 替换为 repo.openeuler.org 或可用内部镜像地址，然后执行 dnf clean all 和",
+      "dnf makecache。"
+    ],
+    "expected_sources": [
+      "社区案例-DNF元数据Curl28.txt"
+    ],
+    "required_answer_terms": [
+      "dnf-makecache",
+      "Curl error 28"
+    ],
+    "required_reference_terms": [
+      "71.41.15.160",
+      "repomd.xml",
+      "baseurl"
+    ],
+    "required_solution_terms": [
+      "/etc/yum.repos.d/openEuler.repo",
+      "https://repo.openeuler.org/",
+      "dnf clean all"
+    ],
+    "top_k": 3
+  },
+  {
+    "id": "精度_text_重复标题_IRQ_managed",
+    "question": "IRQ 352 写 smp_affinity_list 返回 Input/output error，dmesg 有 managed IRQ affinity is immutable，应该怎么调整？",
+    "standard_answer": [
+      "如果 IRQ 352 是 managed MSI-X vector，手动写 smp_affinity_list 返回 Input/output error属于内核管理的中断亲和性限制。",
+      "不要直接写 /proc/irq/352/smp_affinity_list，应通过 ethtool -X 调整 RSS 队列映射，或在驱动加载参数中配置队列数量，并让业务线程绑定到同",
+      "NUMA 节点。"
+    ],
+    "expected_sources": [
+      "社区案例-IRQ352亲和性修改失败-managed.txt"
+    ],
+    "required_answer_terms": [
+      "IRQ 352",
+      "managed"
+    ],
+    "required_reference_terms": [
+      "Input/output error",
+      "managed IRQ affinity is immutable",
+      "MSI-X vector"
+    ],
+    "required_solution_terms": [
+      "ethtool -X",
+      "RSS 队列映射",
+      "local_cpulist"
+    ],
+    "top_k": 3
+  },
+  {
+    "id": "精度_text_重复标题_IRQ_irqbalance",
+    "question": "IRQ 352 的 smp_affinity 写入后过几分钟又变回 ffffffff，journalctl 里是 irqbalance balancing，怎么固定？",
+    "standard_answer": [
+      "如果 smp_affinity 写入后被改回 ffffffff，且 journalctl 显示 irqbalance balancing IRQ 352，说明 irqbalance",
+      "周期性覆盖了人工配置。应停止并禁用 irqbalance.service，再写入 /proc/irq/352/smp_affinity；长期方案是在",
+      "/etc/sysconfig/irqbalance 配置 IRQBALANCE_BANNED_INTERRUPTS。"
+    ],
+    "expected_sources": [
+      "社区案例-IRQ352亲和性修改失败-irqbalance.txt"
+    ],
+    "required_answer_terms": [
+      "IRQ 352",
+      "irqbalance"
+    ],
+    "required_reference_terms": [
+      "ffffffff",
+      "irqbalance: balancing IRQ 352",
+      "smp_affinity"
+    ],
+    "required_solution_terms": [
+      "禁用 irqbalance.service",
+      "/etc/sysconfig/irqbalance",
+      "IRQBALANCE_BANNED_INTERRUPTS"
+    ],
+    "top_k": 3
+  },
+  {
+    "id": "拒答_近域无关_openEuler发版计划",
+    "expect_no_hits": true,
+    "question": "openEuler 26.03 LTS 的正式发布时间和生命周期计划是什么？",
+    "standard_answer": "这是近域但无关联问题。测试文档集包含故障排查和运维处置案例，不包含 openEuler 26.03 LTS 发布计划或生命周期公告，不应强行召回维护案例。",
+    "top_k": 5
+  },
+  {
+    "id": "拒答_无关问题无命中",
+    "expect_no_hits": true,
+    "question": "多肉植物多久浇一次水比较好？",
+    "standard_answer": "这是无关联问题。测试文档集是办公设备、电脑、网络和会议排查文档，不应该找回植物养护相关文档。",
+    "top_k": 5
+  }
+]

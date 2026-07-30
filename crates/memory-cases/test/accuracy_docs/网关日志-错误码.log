@@ -1,0 +1,5 @@
+2026-07-01T07:20:11Z gateway health check failed for upstream payment-api
+2026-07-01T07:20:15Z tls handshake timeout while connecting to upstream payment-api
+2026-07-01T07:20:20Z retry budget exhausted, checkout requests degraded
+temporary fix: rotate gateway certificate bundle, restart envoy sidecar, then clear stale upstream cluster cache
+follow up: replace the expiring intermediate certificate before the next release window

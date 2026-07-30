@@ -1,9 +1,13 @@
-use std::any::Any;
-use std::path::{Path, PathBuf};
-use std::sync::Once;
+use std::{
+    any::Any,
+    path::{Path, PathBuf},
+    sync::Once,
+    thread,
+    time::Duration,
+};
 
 use async_trait::async_trait;
-use rusqlite::{ffi::sqlite3_auto_extension, params, Connection};
+use rusqlite::{ffi::sqlite3_auto_extension, params, Connection, ErrorCode, TransactionBehavior};
 use sqlite_vec::sqlite3_vec_init;
 
 use crate::{
@@ -12,6 +16,11 @@ use crate::{
 };
 
 static REGISTER_SQLITE_VEC: Once = Once::new();
+
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+const SQLITE_LOCK_RETRY_ATTEMPTS: usize = 3;
+const SQLITE_LOCK_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(50);
+const SQLITE_LOCK_RETRY_MAX_DELAY: Duration = Duration::from_millis(500);
 
 type SqliteAutoExtensionEntry = unsafe extern "C" fn(
     *mut rusqlite::ffi::sqlite3,
@@ -87,8 +96,11 @@ impl MemoryStore for SqliteMemoryStore {
         let path = self.path.clone();
         let record = record.clone();
         run_sqlite_operation(move || {
-            let connection = open_connection(&path)?;
-            upsert_record(&connection, &record)?;
+            let mut connection = open_connection(&path)?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            upsert_record(&transaction, &record)?;
+            transaction.commit()?;
             Ok(())
         })
         .await
@@ -99,7 +111,8 @@ impl MemoryStore for SqliteMemoryStore {
         let records = records.to_vec();
         run_sqlite_operation(move || {
             let mut connection = open_connection(&path)?;
-            let transaction = connection.transaction()?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             for record in &records {
                 upsert_record(&transaction, record)?;
             }
@@ -123,8 +136,10 @@ impl MemoryStore for SqliteMemoryStore {
         let records = records.to_vec();
         run_sqlite_operation(move || {
             let mut connection = open_connection(&path)?;
-            let transaction = connection.transaction()?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             transaction.execute("DELETE FROM memories", [])?;
+            transaction.execute("DELETE FROM memory_fts", [])?;
             for record in &records {
                 upsert_record(&transaction, record)?;
             }
@@ -138,9 +153,9 @@ impl MemoryStore for SqliteMemoryStore {
 async fn run_sqlite_operation<T, F>(operation: F) -> MemoryResult<T>
 where
     T: Send + 'static,
-    F: FnOnce() -> MemoryResult<T> + Send + 'static,
+    F: FnMut() -> MemoryResult<T> + Send + 'static,
 {
-    tokio::task::spawn_blocking(operation)
+    tokio::task::spawn_blocking(move || retry_sqlite_locked(operation))
         .await
         .map_err(|error| MemoryError::StoreBackend {
             message: format!("sqlite task failed: {error}"),
@@ -153,8 +168,50 @@ fn open_connection(path: &Path) -> MemoryResult<Connection> {
         std::fs::create_dir_all(parent)?;
     }
     let connection = Connection::open(path)?;
+    configure_connection(&connection)?;
     initialize_schema(&connection)?;
     Ok(connection)
+}
+
+fn configure_connection(connection: &Connection) -> MemoryResult<()> {
+    connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+    connection.pragma_update(None, "journal_mode", "WAL")?;
+    connection.pragma_update(None, "synchronous", "NORMAL")?;
+    Ok(())
+}
+
+fn retry_sqlite_locked<T, F>(mut operation: F) -> MemoryResult<T>
+where
+    F: FnMut() -> MemoryResult<T>,
+{
+    let mut delay = SQLITE_LOCK_RETRY_INITIAL_DELAY;
+    for attempt in 0..=SQLITE_LOCK_RETRY_ATTEMPTS {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                if !is_retryable_sqlite_lock(&error) || attempt == SQLITE_LOCK_RETRY_ATTEMPTS {
+                    return Err(error);
+                }
+                thread::sleep(delay);
+                let next_delay_ms = delay
+                    .as_millis()
+                    .saturating_mul(2)
+                    .min(SQLITE_LOCK_RETRY_MAX_DELAY.as_millis());
+                delay = Duration::from_millis(next_delay_ms as u64);
+            }
+        }
+    }
+    unreachable!("sqlite retry loop always returns");
+}
+
+fn is_retryable_sqlite_lock(error: &MemoryError) -> bool {
+    match error {
+        MemoryError::Sqlite(sqlite_error) => matches!(
+            sqlite_error.sqlite_error_code(),
+            Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+        ),
+        _ => false,
+    }
 }
 
 fn register_sqlite_vec_extension() {

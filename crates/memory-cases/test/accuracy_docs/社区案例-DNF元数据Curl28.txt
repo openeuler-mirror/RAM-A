@@ -1,0 +1,14 @@
+#标题
+DNF 元数据下载超时失败
+
+#内核版本
+openEuler 22.03 LTS SP4
+
+#问题现象
+dnf-makecache.service 定时执行失败，systemctl status 显示任务进入 failed 状态。日志里能看到 Curl error 28: Connection timed out after 30000 milliseconds，下载目标是 http://71.41.15.160/openEuler/repodata/repomd.xml。
+
+#问题根因
+repo 文件中的 baseurl 指向不可达的内部 IP，网络策略拦截了 71.41.15.160 的 HTTP 访问，所以 dnf 在 30 秒内无法下载 repomd.xml 元数据。
+
+#解决方案
+先用 curl -v 验证 71.41.15.160 是否可达。如果该地址不是当前环境的有效内部源，应编辑 /etc/yum.repos.d/openEuler.repo，把 baseurl 替换为 https://repo.openeuler.org/ 或可用的内部镜像地址，然后执行 dnf clean all 和 dnf makecache。

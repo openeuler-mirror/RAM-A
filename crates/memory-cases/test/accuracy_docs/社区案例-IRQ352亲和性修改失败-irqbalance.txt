@@ -1,0 +1,14 @@
+#标题
+IRQ 352 亲和性修改失败
+
+#内核版本
+openEuler 22.03 LTS SP3
+
+#问题现象
+管理员写入 echo 4 > /proc/irq/352/smp_affinity 后短时间内看起来成功，但几分钟后 cat /proc/irq/352/smp_affinity 又恢复成 ffffffff。journalctl 中反复出现 irqbalance: balancing IRQ 352 to package 0。
+
+#问题根因
+irqbalance 服务仍在后台运行，它会周期性重新分配中断亲和性，覆盖人工写入的 smp_affinity。该场景下没有 managed IRQ affinity is immutable，也没有 Input/output error。
+
+#解决方案
+如果需要固定 IRQ 352，先停止并禁用 irqbalance.service，再写入 /proc/irq/352/smp_affinity。长期方案是在 /etc/sysconfig/irqbalance 中配置 IRQBALANCE_BANNED_INTERRUPTS，禁止 irqbalance 接管该中断。

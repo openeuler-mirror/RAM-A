@@ -1,0 +1,12 @@
+值班流水：订单服务接口偶发 503
+
+08:20 监控告警显示 order-service p95 延迟从 180ms 升到 4s，用户反馈提交订单后偶尔看到 503 Service Unavailable。CPU 和内存都没有明显升高。
+
+08:31 查看应用日志，反复出现 HikariPool-1 - Connection is not available, request timed out after 30000ms。数据库慢查询里能看到 report_export_job 在批量导出历史订单。
+
+08:45 误排方向：最初怀疑是 Redis 缓存抖动，但 redis-cli --latency 没有异常；也怀疑网关限流，实际 gateway 只是在等待上游。
+
+09:10 根因定位：凌晨补跑的报表导出任务把 export_concurrency 从 2 临时改成 16，长事务占满连接池。订单写入请求拿不到连接，最终被网关超时转换成 503。
+
+处理结论：
+立即把 export_concurrency 调回 2，终止卡住的报表 SQL，把 Hikari maximumPoolSize 临时提升到 40，并给 report_export_job 增加只读副库连接。复盘要求把导出任务接入 distributed lock，禁止多实例同时补跑。

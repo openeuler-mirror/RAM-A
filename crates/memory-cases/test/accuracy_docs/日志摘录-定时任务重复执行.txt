@@ -1,0 +1,16 @@
+日志摘录：日报任务一天生成两封邮件
+
+用户现象：
+运营同事每天 09:00 会收到两封内容相同的销售日报，邮件 Message-ID 不一样，附件 report.xlsx 的生成时间相差 5 秒。
+
+关键日志：
+2026-07-18 09:00:01 systemd[1]: Started sales-report.timer triggered job.
+2026-07-18 09:00:03 CRON[4821]: (report) CMD (/opt/report/bin/send_daily_report.sh)
+2026-07-18 09:00:06 app: send mail success, job=sales_daily, trigger=systemd
+2026-07-18 09:00:08 app: send mail success, job=sales_daily, trigger=crontab
+
+定位过程：
+迁移到 systemd timer 后，旧 crontab 没有删除。脚本里虽然有 flock，但锁文件写在 /tmp/report.lock，容器重启后 /tmp 被清理，不同运行环境还会各自拿到锁。
+
+修复动作：
+删除 report 用户下的旧 crontab，只保留 sales-report.timer；把 flock 锁文件改到 /var/lock/sales-report.lock；重载 systemd daemon 后重启 timer。为了防止误发，发送邮件前增加按业务日期去重检查。
