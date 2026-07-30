@@ -128,6 +128,24 @@ def _write_personalmem_prepared_fixture(path: Path) -> int:
     return len(prepared["queries"])
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("dataset", "../locomo"),
+        ("phase", "../full"),
+        ("pair_id", "../pair-1"),
+    ),
+)
+def test_selectors_reject_path_traversal_components(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    args = _args("locomo", "pilot", tmp_path)
+    setattr(args, field, value)
+
+    with pytest.raises(ValueError):
+        memory_ab_runner._validate_selectors(args)
+
+
 class OfflinePairRunner:
     """Execute arms/comparison, replacing only expensive preflight and live QA."""
 

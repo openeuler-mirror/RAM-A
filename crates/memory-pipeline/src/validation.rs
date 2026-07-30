@@ -264,6 +264,7 @@ fn validate_evidence(
         }
         let matching_refs = refs
             .iter()
+            .copied()
             .filter(|reference| reference.message_id == message_id)
             .collect::<Vec<_>>();
         if matching_refs.is_empty() || !messages.contains_key(message_id) {
@@ -278,18 +279,24 @@ fn validate_evidence(
                 true,
             );
         }
-        let mut matches = Vec::new();
-        for reference in matching_refs {
-            let source = reference.text.chars().collect::<Vec<_>>();
-            let needle = quote.chars().collect::<Vec<_>>();
-            if needle.len() <= source.len() {
-                for local_char in 0..=source.len() - needle.len() {
-                    if source[local_char..local_char + needle.len()] == needle {
-                        matches.push((reference, local_char));
-                    }
-                }
-            }
-        }
+        let message = &messages[message_id];
+        let source = message.text.chars().collect::<Vec<_>>();
+        let needle = quote.chars().collect::<Vec<_>>();
+        let matches = if needle.len() <= source.len() {
+            (0..=source.len() - needle.len())
+                .filter(|start| source[*start..*start + needle.len()] == needle)
+                .filter(|start| {
+                    span_is_covered(
+                        message_id,
+                        *start,
+                        *start + needle.len(),
+                        matching_refs.iter().copied(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         if matches.is_empty() {
             return (
                 Vec::new(),
@@ -314,8 +321,7 @@ fn validate_evidence(
                 false,
             );
         }
-        let (reference, local_start) = matches[0];
-        let start = reference.start_char + local_start;
+        let start = matches[0];
         output.push(EvidenceRef {
             message_id: message_id.into(),
             quote: quote.into(),
@@ -328,11 +334,39 @@ fn validate_evidence(
 }
 
 fn is_candidate(evidence: &EvidenceRef, refs: &[MessageRef]) -> bool {
-    refs.iter().any(|reference| {
-        reference.message_id == evidence.message_id
-            && reference.start_char <= evidence.start_char
-            && evidence.end_char <= reference.end_char
-    })
+    span_is_covered(
+        &evidence.message_id,
+        evidence.start_char,
+        evidence.end_char,
+        refs.iter(),
+    )
+}
+
+fn span_is_covered<'a>(
+    message_id: &str,
+    start: usize,
+    end: usize,
+    refs: impl Iterator<Item = &'a MessageRef>,
+) -> bool {
+    let mut spans = refs
+        .filter(|reference| reference.message_id == message_id)
+        .map(|reference| (reference.start_char, reference.end_char))
+        .collect::<Vec<_>>();
+    spans.sort_unstable();
+    let mut cursor = start;
+    for (span_start, span_end) in spans {
+        if span_end <= cursor {
+            continue;
+        }
+        if span_start > cursor {
+            return false;
+        }
+        cursor = cursor.max(span_end);
+        if cursor >= end {
+            return true;
+        }
+    }
+    false
 }
 
 fn suspicious_modality(modality: &str, evidence: &[EvidenceRef]) -> bool {

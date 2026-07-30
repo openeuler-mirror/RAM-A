@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -86,7 +86,7 @@ pub async fn run_memory_pipeline<E: MemoryExtractor + ?Sized, V: GroundingVerifi
     let mut verification_tokens = 0i64;
     let mut extraction_latency = 0.0;
     let mut verification_latency = 0.0;
-    let mut grounding_counts: HashMap<String, usize> = HashMap::new();
+    let mut grounding_counts: BTreeMap<String, usize> = BTreeMap::new();
 
     for window in &windows {
         let extraction_result = extract(window, &lookup, extractor, cache).await;
@@ -339,13 +339,15 @@ fn write_jsonl<T: Serialize>(path: impl AsRef<Path>, values: &[T]) -> Result<()>
         content.push_str(&serde_json::to_string(value)?);
         content.push('\n');
     }
-    std::fs::write(path, content)?;
-    Ok(())
+    crate::atomic_file::write(path, content)
 }
 
 fn write_json(path: impl AsRef<Path>, value: &Value) -> Result<()> {
-    std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(value)?))?;
-    Ok(())
+    crate::atomic_file::write(path, format!("{}\n", serde_json::to_string_pretty(value)?))
+}
+
+pub fn write_prepared_output(path: impl AsRef<Path>, value: &Value) -> Result<()> {
+    write_json(path, value)
 }
 
 fn runtime_issue(
@@ -427,11 +429,11 @@ fn source_counts(
     messages: &HashMap<String, NormalizedMessage>,
     memories: &[AtomicMemory],
     unique_memory: bool,
-) -> HashMap<String, usize> {
+) -> BTreeMap<String, usize> {
     let mut counts = messages
         .keys()
         .map(|id| (id.clone(), 0))
-        .collect::<HashMap<_, _>>();
+        .collect::<BTreeMap<_, _>>();
     for memory in memories {
         if unique_memory {
             for id in memory

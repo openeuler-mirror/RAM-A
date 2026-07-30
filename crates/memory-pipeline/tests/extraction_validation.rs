@@ -3,10 +3,12 @@ use std::collections::HashMap;
 use memory_pipeline::episode::{build_episodes, EpisodeConfig};
 use memory_pipeline::extraction::{parse_extraction_json, MemoryExtractor, StaticMemoryExtractor};
 use memory_pipeline::grounding::{GroundingVerifier, StaticGroundingVerifier};
+use memory_pipeline::models::AtomicMemory;
 use memory_pipeline::normalize::normalize_prepared_memories;
 use memory_pipeline::validation::{validate_extraction, ValidationConfig};
 use memory_pipeline::window::{build_windows, WindowConfig};
-use serde_json::{json, Value};
+use memory_pipeline::writer::aggregate_exact_memories;
+use serde_json::{json, Map, Value};
 
 fn setup() -> (
     memory_pipeline::models::ExtractionWindow,
@@ -59,11 +61,88 @@ fn raw_memory(modality: &str) -> Value {
 
 #[test]
 fn fenced_extraction_json_is_accepted() {
-    let parsed = parse_extraction_json(
-        "```json\n{\"schema_version\":\"atomic_memory_v1\",\"memories\":[]}\n```",
+    let payload = "{\"schema_version\":\"atomic_memory_v1\",\"memories\":[]}";
+    for content in [
+        format!("```json\n{payload}\n```"),
+        format!("```JSON\r\n{payload}\r\n```\r\n"),
+        format!("```\r\n{payload}\r\n```"),
+        format!("```json{payload}```"),
+    ] {
+        let parsed = parse_extraction_json(&content).unwrap();
+        assert_eq!(parsed["schema_version"], "atomic_memory_v1");
+    }
+}
+
+#[test]
+fn evidence_quote_can_cross_adjacent_slices_of_one_message() {
+    let prepared = json!({
+        "schema_version": "benchmark-prepared-v1",
+        "memories": [{
+            "id": "m1", "text": "甲。乙。丙。",
+            "metadata": {"scope_id": "u1", "session_id": "s1", "role": "user"}
+        }]
+    });
+    let (messages, _) = normalize_prepared_memories(&prepared).unwrap();
+    let episodes = build_episodes(&messages, &EpisodeConfig::default()).unwrap();
+    let lookup = messages
+        .into_iter()
+        .map(|message| (message.id.clone(), message))
+        .collect::<HashMap<_, _>>();
+    let window = build_windows(
+        &episodes,
+        &lookup,
+        &WindowConfig {
+            max_candidate_tokens: 4,
+            max_window_tokens: 4,
+            context_before_messages: 0,
+            context_after_messages: 0,
+            ..WindowConfig::default()
+        },
     )
-    .unwrap();
-    assert_eq!(parsed["schema_version"], "atomic_memory_v1");
+    .unwrap()
+    .remove(0);
+    assert_eq!(window.candidate_refs.len(), 2);
+    let raw = json!({
+        "text": "甲之后是乙。", "memory_type": "fact",
+        "subject": {"name": "sequence"}, "predicate": "contains", "object": "。乙",
+        "modality": "asserted", "event_time": null, "attributes": {},
+        "evidence": [{"message_id": "m1", "quote": "。乙", "evidence_role": "primary"}]
+    });
+
+    let batch = validate_extraction(&[raw], &window, &lookup, &ValidationConfig::default());
+
+    assert!(batch.rejected.is_empty());
+    assert!(batch.quarantined.is_empty());
+    assert_eq!(batch.valid[0].evidence[0].start_char, 1);
+    assert_eq!(batch.valid[0].evidence[0].end_char, 3);
+}
+
+#[test]
+fn aggregation_compares_observation_times_as_instants() {
+    let memory = |observed_at: &str, window: &str| AtomicMemory {
+        id: format!("candidate-{window}"),
+        scope_id: "u1".into(),
+        text: "Alice likes tea.".into(),
+        memory_type: "preference".into(),
+        subject: Map::from_iter([("name".into(), json!("Alice"))]),
+        predicate: "likes".into(),
+        object: Some(json!("tea")),
+        modality: "asserted".into(),
+        evidence: Vec::new(),
+        event_time: None,
+        attributes: Map::new(),
+        model_confidence: None,
+        observed_at: observed_at.into(),
+        source_episode_id: "episode-1".into(),
+        source_window_id: window.into(),
+        observation_refs: Vec::new(),
+    };
+    let later = memory("2024-01-02T02:04:05Z", "window-1");
+    let earlier = memory("2024-01-02T03:04:05+08:00", "window-2");
+
+    let aggregated = aggregate_exact_memories(&[later, earlier]);
+
+    assert_eq!(aggregated[0].observed_at, "2024-01-02T02:04:05Z");
 }
 
 #[test]

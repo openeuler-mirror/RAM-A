@@ -10,7 +10,9 @@ use memory_pipeline::extraction::{LlmMemoryExtractor, MemoryExtractor, StaticMem
 use memory_pipeline::grounding::{
     GroundingVerifier, LlmGroundingVerifier, StaticGroundingVerifier,
 };
-use memory_pipeline::pipeline::{run_memory_pipeline, write_pipeline_artifacts, PipelineConfig};
+use memory_pipeline::pipeline::{
+    run_memory_pipeline, write_pipeline_artifacts, write_prepared_output, PipelineConfig,
+};
 use memory_pipeline::validation::ValidationConfig;
 use memory_pipeline::window::WindowConfig;
 use serde_json::Value;
@@ -126,7 +128,7 @@ async fn main() -> anyhow::Result<()> {
         validation: ValidationConfig {
             max_memory_chars: args.max_memory_chars,
         },
-        fail_fast: args.fail_fast || !args.no_fail_fast,
+        fail_fast: resolve_fail_fast(args.fail_fast, args.no_fail_fast),
         ..PipelineConfig::default()
     };
     let cache = args
@@ -141,14 +143,16 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
     write_pipeline_artifacts(&run, &args.artifacts_dir)?;
-    if let Some(parent) = args.output.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(
-        &args.output,
-        format!("{}\n", serde_json::to_string_pretty(&run.prepared)?),
-    )?;
+    write_prepared_output(&args.output, &run.prepared)?;
     Ok(())
+}
+
+fn resolve_fail_fast(fail_fast: bool, no_fail_fast: bool) -> bool {
+    match (fail_fast, no_fail_fast) {
+        (true, true) => unreachable!("clap rejects conflicting fail-fast flags"),
+        (_, true) => false,
+        _ => true,
+    }
 }
 
 fn read_object(path: &PathBuf) -> anyhow::Result<Value> {
@@ -169,4 +173,16 @@ fn read_map(path: &PathBuf) -> anyhow::Result<HashMap<String, Value>> {
         .iter()
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_fail_fast;
+
+    #[test]
+    fn fail_fast_defaults_to_enabled_and_allows_explicit_best_effort() {
+        assert!(resolve_fail_fast(false, false));
+        assert!(resolve_fail_fast(true, false));
+        assert!(!resolve_fail_fast(false, true));
+    }
 }

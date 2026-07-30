@@ -44,11 +44,10 @@ fn write_canonical(value: &Value, output: &mut String) {
                     .or_else(|| encoded.parse::<f64>().ok())
                     .expect("valid JSON number parses as f64 or integer");
                 if parsed.is_infinite() {
-                    output.push_str(if parsed.is_sign_negative() {
-                        "-Infinity"
-                    } else {
-                        "Infinity"
-                    });
+                    // `arbitrary_precision` keeps the original valid JSON number even when it
+                    // does not fit in f64. Preserve that representation instead of emitting the
+                    // non-JSON `Infinity` literals, which cannot be read back by serde_json.
+                    output.push_str(&encoded);
                 } else {
                     output.push_str(&python_float(parsed));
                 }

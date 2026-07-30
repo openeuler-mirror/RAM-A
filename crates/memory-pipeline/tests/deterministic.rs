@@ -86,7 +86,21 @@ fn canonical_helpers_match_python_contract() {
     let overflow: serde_json::Value = serde_json::from_str("1e400").unwrap();
     assert_eq!(
         memory_pipeline::canonical::canonical_json(&overflow),
-        "Infinity"
+        "1e+400"
+    );
+}
+
+#[test]
+fn cache_round_trips_arbitrary_precision_numbers() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = memory_pipeline::cache::JsonCache::new(temp.path(), "cache_v1");
+    let value: serde_json::Value = serde_json::from_str(r#"{"subject":{"weight":1e400}}"#).unwrap();
+
+    cache.put("extraction", &[json!("key")], &value).unwrap();
+
+    assert_eq!(
+        cache.get("extraction", &[json!("key")]).unwrap(),
+        Some(value)
     );
 }
 

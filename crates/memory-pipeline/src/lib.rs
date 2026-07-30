@@ -1,5 +1,7 @@
 //! Reusable long-term memory preparation pipeline.
 
+mod atomic_file;
+
 pub mod cache;
 pub mod canonical;
 pub mod client;

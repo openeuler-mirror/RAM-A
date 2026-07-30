@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{json, Map, Value};
 
 use crate::canonical::{canonical_json, stable_hash};
+use crate::episode::parse_time;
 use crate::error::{PipelineError, Result};
 use crate::models::{AtomicMemory, EvidenceRef};
 
@@ -38,11 +39,22 @@ pub fn aggregate_exact_memories(memories: &[AtomicMemory]) -> Vec<AtomicMemory> 
             .observation_refs
             .iter()
             .filter_map(|value| value.get("observed_at").and_then(Value::as_str))
-            .max()
+            .max_by(|left, right| compare_observed_at(left, right))
             .unwrap_or("")
             .to_owned();
     }
     output
+}
+
+fn compare_observed_at(left: &str, right: &str) -> std::cmp::Ordering {
+    match (parse_time(left), parse_time(right)) {
+        (Some(left_time), Some(right_time)) => {
+            left_time.cmp(&right_time).then_with(|| left.cmp(right))
+        }
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (None, None) => left.cmp(right),
+    }
 }
 
 pub fn make_prepared_output(

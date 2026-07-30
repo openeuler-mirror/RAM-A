@@ -35,9 +35,7 @@ impl JsonCache {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let temporary = path.with_extension("json.tmp");
-        std::fs::write(&temporary, crate::canonical::canonical_json(value))?;
-        std::fs::rename(&temporary, &path)?;
+        crate::atomic_file::write(&path, crate::canonical::canonical_json(value))?;
         Ok(path)
     }
 

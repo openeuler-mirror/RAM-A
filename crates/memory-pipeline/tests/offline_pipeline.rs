@@ -122,6 +122,7 @@ async fn static_pipeline_writes_prepared_output_and_audit_bundle() {
 
     let temp = tempfile::tempdir().unwrap();
     write_pipeline_artifacts(&run, temp.path()).unwrap();
+    write_pipeline_artifacts(&run, temp.path()).unwrap();
     for name in [
         "normalized_messages.jsonl",
         "episodes.jsonl",
@@ -136,6 +137,11 @@ async fn static_pipeline_writes_prepared_output_and_audit_bundle() {
     ] {
         assert!(temp.path().join(name).is_file(), "missing {name}");
     }
+    assert!(std::fs::read_dir(temp.path()).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .ends_with(".tmp")));
 }
 
 #[tokio::test]

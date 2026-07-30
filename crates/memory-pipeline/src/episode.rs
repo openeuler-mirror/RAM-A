@@ -133,7 +133,7 @@ fn make_episode(
     }
 }
 
-fn parse_time(value: &str) -> Option<DateTime<Utc>> {
+pub(crate) fn parse_time(value: &str) -> Option<DateTime<Utc>> {
     if value.is_empty() {
         return None;
     }

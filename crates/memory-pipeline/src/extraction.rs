@@ -142,12 +142,8 @@ impl MemoryExtractor for StaticMemoryExtractor {
 }
 
 pub fn parse_extraction_json(content: &str) -> Result<Value> {
-    let mut text = content.trim();
-    if text.starts_with("```json\n") && text.ends_with("\n```") {
-        text = &text[8..text.len() - 4];
-    } else if text.starts_with("```\n") && text.ends_with("\n```") {
-        text = &text[4..text.len() - 4];
-    }
+    let trimmed = content.trim();
+    let text = strip_outer_code_fence(trimmed).unwrap_or(trimmed);
     let value: Value = serde_json::from_str(text).map_err(|error| {
         PipelineError::Protocol(format!("extractor did not return valid JSON: {error}"))
     })?;
@@ -157,6 +153,23 @@ pub fn parse_extraction_json(content: &str) -> Result<Value> {
         ));
     }
     Ok(value)
+}
+
+fn strip_outer_code_fence(text: &str) -> Option<&str> {
+    if !text.starts_with("```") || !text.ends_with("```") || text.len() < 6 {
+        return None;
+    }
+    let mut inner = text[3..text.len() - 3].trim();
+    if inner
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("json"))
+        && inner.get(4..).is_some_and(|rest| {
+            rest.is_empty() || rest.starts_with(char::is_whitespace) || rest.starts_with('{')
+        })
+    {
+        inner = inner[4..].trim_start();
+    }
+    Some(inner.trim())
 }
 
 pub fn batch_from_payload(
