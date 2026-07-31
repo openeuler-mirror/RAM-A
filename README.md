@@ -8,6 +8,7 @@ benchmark runner, and reproducible evaluation scripts.
 
 - `memory-core`: core long-term memory API and storage implementations.
 - `memory-bench`: CLI runner for ingesting benchmark records and searching top-k memories.
+- `memory-cases`: local case knowledge service for storing, indexing, and retrieving case documents.
 - Default local storage: SQLite.
 - Default retrieval mode: hybrid dense embedding retrieval plus BM25 text retrieval.
 - Embedding providers: OpenRouter-compatible embeddings for real runs and a deterministic
@@ -19,6 +20,7 @@ benchmark runner, and reproducible evaluation scripts.
 crates/
   memory-core/       # core memory API, record model, stores, retrieval
   memory-bench/      # benchmark CLI
+  memory-cases/      # case API, ingestor, chunk store, and search index
 
 evaluation/
   common/            # shared evaluation helpers, metrics, reports, backends
@@ -87,6 +89,19 @@ pub struct SearchMemoryRequest {
 }
 ```
 
+## memory-cases Storage
+
+`memory-cases` keeps durable case library data separate from the derived search index:
+
+- Case data store: SQLite tables for datasets, uploaded documents, ingestion tasks, and chunks.
+- Search index store: `memory-core` SQLite index for indexed text, FTS rows, and embeddings.
+  Document index records are scoped with `memory_index_namespace = "memory-cases"` so update
+  and delete flows do not remove other memories in the same DB.
+- Chunk sizing uses tiktoken `cl100k_base` token counting.
+
+See [docs/design/memory-cases-storage-split.md](docs/design/memory-cases-storage-split.md) for
+table ownership and index semantics.
+
 ## Quick Start
 
 Use the checked-in fixture for an offline smoke test:
@@ -133,6 +148,22 @@ cargo run -p memory-bench -- `
 ```
 
 Do not commit API keys, local stores, downloaded datasets, or generated reports.
+
+## HTTP MCP server
+
+`memory-mcp` provides `ram-a-mcp-server`, a Streamable HTTP MCP server for
+long-term memory search, ingest, and tenant-authorized case-library retrieval.
+It exposes `/mcp`, `/healthz`, and `/readyz`, requires bearer-token
+authentication, and stores personal memory plus idempotency state in one
+SQLite WAL database file. Case documents remain in the separate
+`memory-cases` stores.
+
+See [docs/guides/http-mcp-deployment.md](docs/guides/http-mcp-deployment.md)
+for secure local deployment, xiaoO `.mcp.json`, automatic memory settings,
+health checks, and the current single-instance boundary.
+See
+[docs/guides/xiaoo-case-library-integration.md](docs/guides/xiaoo-case-library-integration.md)
+for the `memory_case_search` contract and the xiaoO integration boundary.
 
 ## Evaluation
 

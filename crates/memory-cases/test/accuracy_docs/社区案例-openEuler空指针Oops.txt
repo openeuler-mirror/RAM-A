@@ -1,0 +1,14 @@
+#标题
+openEuler 24.03 SP2 内核空指针 Oops
+
+#内核版本
+openEuler 24.03 LTS SP2
+
+#问题现象
+业务节点运行一段时间后自动重启，串口日志里出现 Unable to handle kernel NULL pointer dereference。触发场景集中在开启 BPF 网络观测后，调用栈里能看到 pidns_update_load_tasks 和 bpf_rvi_update。该问题只在 24.03 SP2 内核上复现，22.03 SP4 环境没有出现。
+
+#问题根因
+pidns_update_load_tasks 对传入的 namespace 指针缺少非空校验。特定负载下进程命名空间已经释放，BPF 统计路径仍继续访问该地址，导致内核 Oops。
+
+#解决方案
+从 Gitee issue ICTJEE 下载官方内核修复补丁，应用后重新编译并安装更新后的 kernel 包。临时规避方式是关闭 BPF 观测插件 bpf-rvi，并避免在该版本上启用相关 namespace 统计。

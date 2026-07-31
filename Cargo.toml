@@ -2,7 +2,9 @@
 members = [
     "crates/memory-core",
     "crates/memory-bench",
+    "crates/memory-mcp",
     "crates/memory-pipeline",
+    "crates/memory-cases",
 ]
 resolver = "2"
 
@@ -14,15 +16,22 @@ license = "MulanPSL-2.0"
 [workspace.dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
+axum = { version = "0.7", features = ["multipart"] }
 clap = { version = "4.5", features = ["derive"] }
 reqwest = { version = "0.12", features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["arbitrary_precision"] }
 thiserror = "1.0"
-tokio = { version = "1.35", features = ["fs", "macros", "rt-multi-thread", "time"] }
+tokio = { version = "1.35", features = ["fs", "macros", "net", "rt-multi-thread", "time"] }
+tiktoken-rs = "0.9.1"
+tokio-util = "0.7"
+url = "2.5"
 uuid = { version = "1.6", features = ["v4", "v5", "serde"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 sqlite-vec = "=0.1.7-alpha.10"
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1.11"
+rmcp = "=2.2.0"
+schemars = "1.0"
 sha2 = "0.10"
+subtle = "2.6"

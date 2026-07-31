@@ -1,0 +1,19 @@
+会议纪要：项目共享盘新成员看不到目录
+
+参会人：
+运维、IT 支持、项目 PM、权限平台负责人
+
+问题描述：
+项目空间 Project-Apollo 已经把新员工加入 ldap group apollo-dev，但是用户登录共享盘后只能看到根目录，看不到 docs、build、release 三个子目录。旧成员访问正常。
+
+讨论结论：
+权限平台同步成功，Samba 侧也能识别 apollo-dev。异常点在于三个子目录去年做过临时授权，当时关闭了 ACL inheritance，导致父目录新增组权限没有继续传递下去。
+
+执行事项：
+1. 在 Project-Apollo 根目录重新启用 ACL inheritance。
+2. 对 docs、build、release 执行权限重新传播，保留显式 deny 规则。
+3. 刷新 Samba idmap cache，并让用户重新挂载共享盘。
+4. 后续临时授权必须写到 exception list，禁止直接关闭继承。
+
+验收：
+新员工重新登录后能看到三个子目录，旧成员权限没有扩大。

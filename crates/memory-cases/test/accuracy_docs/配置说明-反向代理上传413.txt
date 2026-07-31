@@ -1,0 +1,21 @@
+配置说明：文件上传接口返回 413
+
+背景：
+知识库后台通过 nginx 反向代理到 kb-api。小文件上传正常，超过 10MB 的 .txt 或 .pdf 上传时，浏览器控制台显示 413 Request Entity Too Large，后端 access log 没有收到请求。
+
+当前片段：
+server {
+    listen 443 ssl;
+    server_name kb.example.internal;
+
+    location /api/v1/files {
+        proxy_pass http://kb-api;
+        proxy_read_timeout 120s;
+    }
+}
+
+判断：
+请求在 nginx 层被拦截，和 kb-api 的鉴权、对象存储、解析队列无关。因为默认 client_max_body_size 太小，大文件 body 还没转发到后端就被拒绝。
+
+修改建议：
+在 server 或 location 中加入 client_max_body_size 100m；同时确认后端 APP_MAX_UPLOAD_SIZE 不低于 100m。修改后执行 nginx -t，确认配置通过，再 reload nginx。若前面还有 ingress，也要同步调大 proxy-body-size。

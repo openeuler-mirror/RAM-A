@@ -1,0 +1,40 @@
+[package]
+name = "memory-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ram-a-mcp-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+axum = "=0.7.9"
+chrono.workspace = true
+clap.workspace = true
+governor = "=0.6.3"
+http-body-util = "0.1"
+memory-core = { path = "../memory-core" }
+memory-pipeline = { path = "../memory-pipeline" }
+reqwest.workspace = true
+rmcp = { workspace = true, features = ["transport-streamable-http-server"] }
+rusqlite.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+tokio = { workspace = true, features = ["net", "signal", "sync"] }
+tokio-util.workspace = true
+tower = { version = "0.5", features = ["limit", "util"] }
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+memory-core = { path = "../memory-core" }
+memory-pipeline = { path = "../memory-pipeline" }
+tempfile = "3.9"
+tokio = { workspace = true, features = ["test-util"] }
