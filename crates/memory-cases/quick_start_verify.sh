@@ -5,9 +5,6 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/memory-cases-quick-verify.XXXXXX")"
 DEFAULT_DOC_DIR="${ROOT_DIR}/crates/memory-cases/test/accuracy_docs"
 RUN_ID="$(date +%Y%m%d%H%M%S)-$$"
-API_TOKEN="${MEMORY_CASES_API_TOKEN:-quick-verify-${RUN_ID}-${RANDOM}-${RANDOM}}"
-export MEMORY_CASES_API_TOKEN="$API_TOKEN"
-AUTH_HEADER=(--header "Authorization: Bearer ${API_TOKEN}")
 
 # 可通过位置参数或环境变量指定导入目录：
 #   crates/memory-cases/quick_start_verify.sh /path/to/docs
@@ -50,7 +47,6 @@ Environment:
   MEMORY_CASES_DATASET_ID    dataset id，默认带运行号避免重复
   MEMORY_CASES_CHUNK_SIZE    入库切块大小，默认 160
   MEMORY_CASES_CHAT_TOP_K    每次问答取回的引用数，默认 5
-  MEMORY_CASES_API_TOKEN     内部 Bearer token，未设置时仅为本次运行生成
   MEMORY_CASES_KEEP_TMP=1    退出后保留临时目录和日志
 EOF
 }
@@ -103,10 +99,10 @@ fail() {
   exit 1
 }
 
-get() { curl --noproxy '*' -fsS "${AUTH_HEADER[@]}" "$BASE_URL$1"; }
+get() { curl --noproxy '*' -fsS "$BASE_URL$1"; }
 
 post_json() {
-  curl --noproxy '*' -fsS "${AUTH_HEADER[@]}" "$BASE_URL$1" \
+  curl --noproxy '*' -fsS "$BASE_URL$1" \
     --json "$2"
 }
 
@@ -119,7 +115,7 @@ post_file() {
   local mime_type
   mime_type="$(mime_type_for_file "$doc_file")"
 
-  curl --noproxy '*' -fsS "${AUTH_HEADER[@]}" "$BASE_URL$path" \
+  curl --noproxy '*' -fsS "$BASE_URL$path" \
     --form-string "id=${document_id}" \
     --form-string "task_id=${task_id}" \
     --form-string "name=${doc_name}" \
@@ -185,6 +181,16 @@ print_config() {
   echo "doc_count=${#DOC_FILES[@]}"
   echo "chunk_size=$CHUNK_SIZE"
   echo "chat_top_k=$CHAT_TOP_K"
+}
+
+build_memory_cases() {
+  # 先在前台完成编译，不把首次下载依赖或增量编译耗时计入 API 健康检查超时。
+  # cargo run 会复用这里的构建产物，只需负责启动服务。
+  echo "building memory-cases"
+  (
+    cd "$ROOT_DIR"
+    cargo build -p memory-cases --bin memory-cases
+  ) || fail "build memory-cases failed"
 }
 
 start_api() {
@@ -346,7 +352,7 @@ for index, ref in enumerate(references, 1):
 
 interactive_loop() {
   echo
-  echo "Documents have been imported. You can ask questions now. Type :q, :quit, exit, or quit to exit."
+  echo "Documents have been imported. You can ask questions now. Type q, :q, :quit, exit, or quit to exit."
 
   local question
   local payload
@@ -359,7 +365,7 @@ interactive_loop() {
     fi
 
     case "${question,,}" in
-      :q|:quit|exit|quit) break ;;
+      q|:q|:quit|exit|quit) break ;;
     esac
     [[ -n "${question//[[:space:]]/}" ]] || continue
 
@@ -379,6 +385,7 @@ main() {
   validate_inputs "$@"
   collect_doc_files
   print_config
+  build_memory_cases
   start_api
   start_ingestor
   create_dataset

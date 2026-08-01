@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import argparse
 import json
-import os
 import sys
 import urllib.error
 import urllib.request
@@ -52,16 +51,10 @@ def command_sources(args: argparse.Namespace) -> int:
 def post_json(base_url: str, path: str, payload: dict) -> dict:
     # 不走系统代理，避免本地 127.0.0.1 API 请求被代理环境变量干扰。
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    token = os.environ.get("MEMORY_CASES_API_TOKEN")
-    if not token:
-        raise RuntimeError("MEMORY_CASES_API_TOKEN is required")
     request = urllib.request.Request(
         f"{base_url}{path}",
         data=body,
-        headers={
-            "content-type": "application/json",
-            "authorization": f"Bearer {token}",
-        },
+        headers={"content-type": "application/json"},
         method="POST",
     )
     try:

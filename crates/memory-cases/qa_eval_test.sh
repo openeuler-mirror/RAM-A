@@ -19,9 +19,6 @@ RAG_STORE="${MEMORY_CASES_QA_RAG_STORE:-${MEMORY_RAG_QA_RAG_STORE:-${TMP_DIR}/me
 MEMORY_STORE="${MEMORY_CASES_QA_MEMORY_STORE:-${MEMORY_RAG_QA_MEMORY_STORE:-${TMP_DIR}/memory-cases-index.sqlite}}"
 PORT="${MEMORY_CASES_PORT:-${MEMORY_RAG_PORT:-$((20000 + RANDOM % 40000))}}"
 BASE_URL="http://127.0.0.1:${PORT}"
-API_TOKEN="${MEMORY_CASES_API_TOKEN:-qa-eval-${RANDOM}-${RANDOM}-$$}"
-export MEMORY_CASES_API_TOKEN="$API_TOKEN"
-AUTH_HEADER=(--header "Authorization: Bearer ${API_TOKEN}")
 API_LOG="${TMP_DIR}/api.log"
 INGESTOR_LOG="${TMP_DIR}/ingestor.log"
 API_PID=""
@@ -65,11 +62,11 @@ fail() {
   exit 1
 }
 
-get() { curl --noproxy '*' -fsS "${AUTH_HEADER[@]}" "$BASE_URL$1"; }
+get() { curl --noproxy '*' -fsS "$BASE_URL$1"; }
 
 # REST 调用的小封装，让下面的流程更像“测试步骤清单”。
 post_json() {
-  curl --noproxy '*' -fsS "${AUTH_HEADER[@]}" "$BASE_URL$1" \
+  curl --noproxy '*' -fsS "$BASE_URL$1" \
     --json "$2"
 }
 
@@ -83,7 +80,7 @@ post_file() {
   local mime_type
   mime_type="$(mime_type_for_file "$doc_file")"
 
-  curl --noproxy '*' -fsS "${AUTH_HEADER[@]}" "$BASE_URL$path" \
+  curl --noproxy '*' -fsS "$BASE_URL$path" \
     --form-string "id=${document_id}" \
     --form-string "task_id=${task_id}" \
     --form-string "name=${doc_name}" \
@@ -98,14 +95,14 @@ put_file() {
   local mime_type
   mime_type="$(mime_type_for_file "$doc_file")"
 
-  curl --noproxy '*' -fsS "${AUTH_HEADER[@]}" -X PUT "$BASE_URL$path" \
+  curl --noproxy '*' -fsS -X PUT "$BASE_URL$path" \
     --form-string "task_id=${task_id}" \
     --form-string "name=${doc_name}" \
     -F "file=@${doc_file};type=${mime_type}"
 }
 
 delete_path() {
-  curl --noproxy '*' -fsS "${AUTH_HEADER[@]}" -X DELETE "$BASE_URL$1"
+  curl --noproxy '*' -fsS -X DELETE "$BASE_URL$1"
 }
 
 mime_type_for_file() {
@@ -209,6 +206,16 @@ print_config() {
   echo "doc_count=${#DOC_FILES[@]}"
   echo "case_count=$case_count"
   echo "solution_term_case_count=$solution_term_case_count"
+}
+
+build_memory_cases() {
+  # 先在前台完成编译，不把首次下载依赖或增量编译耗时计入 API 健康检查超时。
+  # cargo run 会复用这里的构建产物，只需负责启动服务。
+  echo "building memory-cases"
+  (
+    cd "$ROOT_DIR"
+    cargo build -p memory-cases --bin memory-cases
+  ) || fail "build memory-cases failed"
 }
 
 start_api() {
@@ -419,6 +426,7 @@ main() {
   validate_inputs
   collect_doc_files
   print_config
+  build_memory_cases
   start_api
   create_dataset
   upload_documents

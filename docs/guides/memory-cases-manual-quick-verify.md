@@ -1,16 +1,31 @@
 # quick_start_verify.sh 使用说明
 
+案例仓库：[openeuler/witty-ops-cases](https://atomgit.com/openeuler/witty-ops-cases)
+
 `crates/memory-cases/quick_start_verify.sh` 用于快速启动 `memory-cases`，导入一批案例文档，并进入交互问答，用来确认案例库的上传、解析、检索和引用返回是否可用。
 
 ## 快速使用
 
-在仓库根目录执行：
+从 RAM-A 仓库根目录进入脚本所在目录，并克隆 `witty-ops-cases` 案例仓库：
 
 ```bash
-crates/memory-cases/quick_start_verify.sh 案例库目录
+cd crates/memory-cases
+git clone https://atomgit.com/openeuler/witty-ops-cases.git
 ```
 
-如果不传文档目录，默认使用：
+在当前目录执行以下命令，导入 `community_maintenance` 案例库并启动交互验证：
+
+```bash
+sh quick_start_verify.sh witty-ops-cases/community_maintenance/
+```
+
+也可以传入其他案例库目录：
+
+```bash
+sh quick_start_verify.sh 案例库目录
+```
+
+如果不传案例库目录，默认使用：
 
 ```text
 crates/memory-cases/test/accuracy_docs
@@ -71,11 +86,7 @@ MEMORY_CASES_KEEP_TMP=1 \
 | `MEMORY_CASES_PORT` | API 监听端口，默认随机 |
 | `MEMORY_CASES_CHUNK_SIZE` | 入库切块大小，默认 `160` |
 | `MEMORY_CASES_CHAT_TOP_K` | 每次问答取回的引用数，默认 `5` |
-| `MEMORY_CASES_API_TOKEN` | REST API 内部 Bearer token；未设置时脚本只为本次运行自动生成 |
 | `MEMORY_CASES_KEEP_TMP` | 设置为 `1` 时保留临时目录和日志 |
-
-脚本发出的 `/api/v1/*` 请求都会携带该 token。脚本不会打印 token。
-`/health` 可不带 token，其余 REST API 会拒绝未鉴权请求。
 
 ## 查看结果
 

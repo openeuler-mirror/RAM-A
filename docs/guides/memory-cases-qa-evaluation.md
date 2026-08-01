@@ -65,7 +65,6 @@ MEMORY_STORE=${TMP_DIR}/memory-cases-index.sqlite
 | `MEMORY_CASES_QA_REPORT` | `outputs/memory-cases/qa_eval_report.json` | 评测报告 |
 | `MEMORY_CASES_QA_RAG_STORE` | `${TMP_DIR}/memory-cases.sqlite` | 业务 SQLite，保存 RAG 元数据和 chunks |
 | `MEMORY_CASES_QA_MEMORY_STORE` | `${TMP_DIR}/memory-cases-index.sqlite` | 检索索引 SQLite，保存 memory text、FTS 和 embedding |
-| `MEMORY_CASES_API_TOKEN` | 本次运行自动生成 | REST API 内部 Bearer token；外部设置时使用给定值 |
 | `MEMORY_CASES_QA_CHUNK_SIZE` | `160` | 测试用 chunk size |
 | `MEMORY_CASES_QA_MAX_DOCS` | `0` | 本地调试时限制上传文档数量，0 表示不限制 |
 | `MEMORY_CASES_QA_MIN_SOLUTION_TERM_CASES` | `1` | 声明 `required_solution_terms` 的 case 数量下限 |
@@ -105,17 +104,12 @@ Text:     .txt / .text / .log
 脚本先启动 API：
 
 ```bash
-export MEMORY_CASES_API_TOKEN='replace-with-an-internal-test-token'
 cargo run -p memory-cases -- --api \
   --bind 127.0.0.1:${PORT} \
   --rag-store "$RAG_STORE" \
   --memory-store "$MEMORY_STORE" \
   --chunk-size "$CHUNK_SIZE"
 ```
-
-实际执行脚本时，如果外部没有设置 `MEMORY_CASES_API_TOKEN`，脚本会为本次
-评测自动生成一个且不会打印。所有 `/api/v1/*` 请求（包括 Python QA
-runner）都会携带该 Bearer token。
 
 然后创建固定 dataset：
 

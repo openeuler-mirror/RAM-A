@@ -134,6 +134,8 @@ pub struct SearchRequest {
 #[derive(Debug, Serialize)]
 pub struct SearchChunk {
     pub chunk_id: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub context_chunk_ids: Vec<String>,
     pub dataset_id: String,
     pub document_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
