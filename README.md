@@ -167,7 +167,7 @@ Do not commit API keys, local stores, downloaded datasets, or generated reports.
 
 `memory-mcp` provides `ram-a-mcp-server`, a Streamable HTTP MCP server for
 long-term memory search, ingest, and tenant-authorized case-library retrieval.
-It exposes `/mcp`, `/healthz`, and `/readyz`, requires bearer-token
+It exposes `/mcp`, `/healthy`, and `/ready`, requires bearer-token
 authentication, and stores personal memory plus idempotency state in one
 SQLite WAL database file. Case documents remain in the separate
 `memory-cases` stores.

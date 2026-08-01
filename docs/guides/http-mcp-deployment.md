@@ -2,7 +2,7 @@
 
 RAM-A exposes long-term memory over Streamable HTTP MCP at `POST /mcp`.
 The implemented protocol version is `2025-11-25`. Health endpoints are
-available at `GET /healthz` and `GET /readyz`.
+available at `GET /healthy` and `GET /ready`.
 
 This guide is for secure local or single-host deployment. The current server
 uses one SQLite database file with WAL and is intended to run as a single
@@ -169,8 +169,8 @@ Only these endpoints are supported:
 
 - `POST /mcp`
 - `DELETE /mcp`
-- `GET /healthz`
-- `GET /readyz`
+- `GET /healthy`
+- `GET /ready`
 
 Legacy SSE-only transport, stdio transport, and draft `Mcp-Method` /
 `Mcp-Name` headers are not implemented.
@@ -230,8 +230,8 @@ tool contract, recognition behavior, and data locations.
 
 ## Operations
 
-- `GET /healthz` verifies the HTTP process is alive.
-- `GET /readyz` verifies dependencies are constructed, session capacity is
+- `GET /healthy` verifies the HTTP process is alive.
+- `GET /ready` verifies dependencies are constructed, session capacity is
   available, and the SQLite schema is present.
 - SQLite WAL is used through the shared RAM-A store/idempotency database file.
 - Personal memory and case-library data use separate SQLite files; do not point

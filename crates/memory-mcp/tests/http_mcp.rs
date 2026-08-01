@@ -1135,13 +1135,13 @@ async fn health_is_liveness_while_readiness_checks_dependencies_and_capacity() {
     let health = not_ready
         .app
         .clone()
-        .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+        .oneshot(Request::get("/healthy").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(health.status(), StatusCode::OK);
     let readiness = not_ready
         .app
-        .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+        .oneshot(Request::get("/ready").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(readiness.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -1151,14 +1151,14 @@ async fn health_is_liveness_while_readiness_checks_dependencies_and_capacity() {
     let readiness = ready
         .app
         .clone()
-        .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+        .oneshot(Request::get("/ready").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(readiness.status(), StatusCode::OK);
     std::fs::remove_file(&ready.database_path).unwrap();
     let readiness = ready
         .app
-        .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+        .oneshot(Request::get("/ready").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(readiness.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -1176,7 +1176,7 @@ async fn health_is_liveness_while_readiness_checks_dependencies_and_capacity() {
     .await;
     let readiness = no_capacity
         .app
-        .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+        .oneshot(Request::get("/ready").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(readiness.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -1195,7 +1195,7 @@ async fn readiness_requires_both_memory_and_idempotency_schemas() {
     assert!(fixture.database_path.exists());
     let readiness = fixture
         .app
-        .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+        .oneshot(Request::get("/ready").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(readiness.status(), StatusCode::SERVICE_UNAVAILABLE);
