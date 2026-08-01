@@ -1,0 +1,15 @@
+终端记录：SSH 登录提示主机指纹变更
+
+现象：
+运维从跳板机登录 build-node-17 时，ssh 直接中断并提示 WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED。用户担心是中间人攻击。
+
+现场命令：
+$ ssh build-node-17
+Offending ECDSA key in /home/ops/.ssh/known_hosts:42
+Host key verification failed.
+
+核对结果：
+资产平台显示 build-node-17 昨晚做过系统重装，BMC 序列号和机柜位置没有变化。安全扫描没有发现异常登录。新系统重新生成了 host key，导致本地 known_hosts 里的旧 ECDSA 指纹不匹配。
+
+处置：
+先通过资产平台和带外管理确认机器身份，再执行 ssh-keygen -R build-node-17 删除旧指纹，使用 ssh-keyscan build-node-17 重新登记新指纹。禁止在未核对资产信息前直接关闭 StrictHostKeyChecking。

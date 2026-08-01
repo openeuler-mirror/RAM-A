@@ -13,8 +13,15 @@ repository.
   add, ingestion run, and record embedding stage reference.
 - [design/sqlite-hybrid-search.md](design/sqlite-hybrid-search.md): SQLite storage and
   dense/BM25/hybrid retrieval reference.
+- [design/memory-cases-storage-split.md](design/memory-cases-storage-split.md): `memory-cases`
+  business DB and document/vector index split, table ownership, and index boundaries.
 - [guides/locomo-evaluation.md](guides/locomo-evaluation.md): LoCoMo execution guide and
   output reference.
+- [guides/memory-cases-manual-quick-verify.md](guides/memory-cases-manual-quick-verify.md):
+  `quick_start_verify.sh` usage for the `memory-cases` quick start and verification flow.
+- [guides/memory-cases-qa-evaluation.md](guides/memory-cases-qa-evaluation.md): QA eval
+  test flow, case schema, coverage, strengths and limitations, and comparison with
+  external retrieval tests.
 
 One-off review notes, assistant context, generated reports, and artifact manifests are
 intentionally excluded from the formal documentation set.

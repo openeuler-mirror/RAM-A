@@ -84,8 +84,25 @@ impl MemoryManager {
     where
         F: FnMut(usize),
     {
+        let (responses, new_records) = self
+            .build_records_with_batch_size_and_progress(requests, batch_size, &mut on_embedded)
+            .await?;
+        self.store.add_records(&new_records).await?;
+
+        Ok(responses)
+    }
+
+    async fn build_records_with_batch_size_and_progress<F>(
+        &self,
+        requests: Vec<AddMemoryRequest>,
+        batch_size: usize,
+        on_embedded: &mut F,
+    ) -> MemoryResult<(Vec<AddMemoryResponse>, Vec<MemoryRecord>)>
+    where
+        F: FnMut(usize),
+    {
         if requests.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
 
         let mut explicit_ids = HashSet::new();
@@ -127,11 +144,11 @@ impl MemoryManager {
 
         let now = current_time_ms();
         let mut responses = Vec::with_capacity(requests.len());
-        let mut new_records = Vec::with_capacity(requests.len());
+        let mut records = Vec::with_capacity(requests.len());
         for (request, embedding) in requests.into_iter().zip(embeddings) {
             let id = request.id.unwrap_or_else(|| Uuid::new_v4().to_string());
             responses.push(AddMemoryResponse { id: id.clone() });
-            new_records.push(MemoryRecord {
+            records.push(MemoryRecord {
                 id,
                 text: request.text.trim().to_string(),
                 metadata: request.metadata,
@@ -141,9 +158,28 @@ impl MemoryManager {
             });
         }
 
-        self.store.add_records(&new_records).await?;
+        Ok((responses, records))
+    }
 
-        Ok(responses)
+    pub async fn delete_by_filter(&self, filter: serde_json::Value) -> MemoryResult<usize> {
+        self.delete_by_filters(vec![filter]).await
+    }
+
+    pub async fn delete_by_filters(&self, filters: Vec<serde_json::Value>) -> MemoryResult<usize> {
+        if filters.is_empty() {
+            return Ok(0);
+        }
+        let records = self.store.list_records().await?;
+        let before = records.len();
+        let retained = records
+            .into_iter()
+            .filter(|record| !metadata_matches_any(&record.metadata, &filters))
+            .collect::<Vec<_>>();
+        let deleted = before.saturating_sub(retained.len());
+        if deleted > 0 {
+            self.store.replace_all(&retained).await?;
+        }
+        Ok(deleted)
     }
 
     pub async fn search_many(
@@ -522,6 +558,12 @@ fn sort_scored_desc(results: &mut [ScoredMemory]) {
     });
 }
 
+fn metadata_matches_any(metadata: &serde_json::Value, filters: &[serde_json::Value]) -> bool {
+    filters
+        .iter()
+        .any(|filter| metadata_matches(metadata, Some(filter)))
+}
+
 #[async_trait]
 impl LongTermMemory for MemoryManager {
     async fn add(&self, request: AddMemoryRequest) -> MemoryResult<AddMemoryResponse> {
@@ -850,6 +892,115 @@ mod tests {
             .map(|record| record.id.clone())
             .collect::<Vec<_>>();
         assert_eq!(stored_ids, vec!["m1", "m2"]);
+    }
+
+    #[tokio::test]
+    async fn delete_by_filter_removes_only_matching_metadata_records() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(FileMemoryStore::new(temp.path().join("memory.jsonl")));
+        let embedder = Arc::new(HashEmbedding::new(8));
+        let manager = MemoryManager::new(store.clone(), embedder);
+
+        manager
+            .add_many(vec![
+                AddMemoryRequest {
+                    id: Some("doc-a-chunk".to_string()),
+                    text: "alpha content".to_string(),
+                    metadata: serde_json::json!({
+                        "scope_id": "dataset-1",
+                        "document_id": "doc-a",
+                    }),
+                },
+                AddMemoryRequest {
+                    id: Some("doc-b-chunk".to_string()),
+                    text: "beta content".to_string(),
+                    metadata: serde_json::json!({
+                        "scope_id": "dataset-1",
+                        "document_id": "doc-b",
+                    }),
+                },
+            ])
+            .await
+            .expect("seed memories");
+
+        let deleted = manager
+            .delete_by_filter(serde_json::json!({
+                "scope_id": "dataset-1",
+                "document_id": "doc-a",
+            }))
+            .await
+            .expect("delete filtered memories");
+
+        assert_eq!(deleted, 1);
+        let remaining = store.list_records().await.expect("list records");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, "doc-b-chunk");
+    }
+
+    #[tokio::test]
+    async fn delete_by_filter_removes_sqlite_search_candidates() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(SqliteMemoryStore::new(temp.path().join("memory.sqlite")));
+        let embedder = Arc::new(HashEmbedding::new(8));
+        let manager = MemoryManager::with_retrieval_config(
+            store,
+            embedder,
+            RetrievalConfig {
+                mode: SearchMode::Bm25,
+                ..RetrievalConfig::default()
+            },
+        );
+
+        manager
+            .add_many(vec![
+                AddMemoryRequest {
+                    id: Some("doc-a-chunk".to_string()),
+                    text: "alpha needle".to_string(),
+                    metadata: serde_json::json!({
+                        "scope_id": "dataset-1",
+                        "document_id": "doc-a",
+                    }),
+                },
+                AddMemoryRequest {
+                    id: Some("doc-b-chunk".to_string()),
+                    text: "beta needle".to_string(),
+                    metadata: serde_json::json!({
+                        "scope_id": "dataset-1",
+                        "document_id": "doc-b",
+                    }),
+                },
+            ])
+            .await
+            .expect("seed sqlite memories");
+
+        manager
+            .delete_by_filter(serde_json::json!({
+                "scope_id": "dataset-1",
+                "document_id": "doc-a",
+            }))
+            .await
+            .expect("delete filtered sqlite memories");
+
+        let alpha = manager
+            .search(SearchMemoryRequest {
+                query: "alpha".to_string(),
+                top_k: 5,
+                filter: Some(serde_json::json!({"scope_id": "dataset-1"})),
+            })
+            .await
+            .expect("search deleted term");
+        let beta = manager
+            .search(SearchMemoryRequest {
+                query: "beta".to_string(),
+                top_k: 5,
+                filter: Some(serde_json::json!({"scope_id": "dataset-1"})),
+            })
+            .await
+            .expect("search retained term");
+
+        assert!(alpha.is_empty());
+        assert_eq!(beta.len(), 1);
+        assert_eq!(beta[0].record.id, "doc-b-chunk");
     }
 
     #[tokio::test]
