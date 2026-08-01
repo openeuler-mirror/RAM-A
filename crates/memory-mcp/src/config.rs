@@ -20,7 +20,7 @@ pub struct ServerConfig {
     #[serde(default)]
     pub providers: Option<ProvidersConfig>,
     #[serde(default)]
-    pub case_service: Option<CaseServiceConfig>,
+    pub case_library: Option<CaseLibraryServiceConfig>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,10 +52,10 @@ pub struct FeaturesConfig {
 }
 
 impl FeaturesConfig {
-    pub fn resolve(&self, case_service_configured: bool) -> FeatureFlags {
+    pub fn resolve(&self, case_library_configured: bool) -> FeatureFlags {
         FeatureFlags {
             memory: self.memory.enabled,
-            case_library: self.case_library.enabled.unwrap_or(case_service_configured),
+            case_library: self.case_library.enabled.unwrap_or(case_library_configured),
         }
     }
 }
@@ -178,6 +178,39 @@ pub struct StorageConfig {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct CaseLibraryServiceConfig {
+    #[serde(default = "default_case_rag_store")]
+    pub rag_store: PathBuf,
+    #[serde(default = "default_case_index_store")]
+    pub index_store: PathBuf,
+    #[serde(default)]
+    pub source_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub embedding_provider: EmbeddingProviderKind,
+    #[serde(default)]
+    pub embedding_api_key_env: Option<String>,
+    #[serde(default)]
+    pub embedding_base_url: Option<String>,
+    #[serde(default = "default_case_embedding_model")]
+    pub embedding_model: String,
+    #[serde(default = "default_case_embedding_dimensions")]
+    pub embedding_dimensions: usize,
+    #[serde(default = "default_case_chunk_size")]
+    pub chunk_size: usize,
+    #[serde(default)]
+    pub summary_llm_model: Option<String>,
+    #[serde(default)]
+    pub summary_llm_api_key_env: Option<String>,
+    #[serde(default)]
+    pub summary_llm_base_url: Option<String>,
+    #[serde(default = "default_summary_llm_timeout_ms")]
+    pub summary_llm_timeout_ms: u64,
+    pub default_library: String,
+    pub libraries: Vec<CaseLibraryConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProvidersConfig {
     pub api_key_env: String,
     #[serde(default = "default_provider_base_url")]
@@ -277,6 +310,56 @@ impl CaseServiceConfig {
     }
 }
 
+impl CaseLibraryServiceConfig {
+    pub fn validate(&self, memory_database_path: Option<&Path>) -> Result<()> {
+        validate_case_library_mappings(self.default_library.as_str(), &self.libraries)?;
+        if self.rag_store.as_os_str().is_empty()
+            || self.index_store.as_os_str().is_empty()
+            || self.rag_store == Path::new(":memory:")
+            || self.index_store == Path::new(":memory:")
+        {
+            anyhow::bail!("case library stores must use persistent SQLite files");
+        }
+        if self.rag_store == self.index_store {
+            anyhow::bail!("case library rag_store and index_store must be different files");
+        }
+        if memory_database_path.is_some_and(|path| path == self.index_store) {
+            anyhow::bail!("case library index_store must be separate from RAM-A memory storage");
+        }
+        if self.embedding_model.trim().is_empty()
+            || self.embedding_dimensions == 0
+            || self.chunk_size == 0
+            || self.summary_llm_timeout_ms == 0
+        {
+            anyhow::bail!("case library provider configuration is incomplete");
+        }
+        if let Some(source_dir) = &self.source_dir {
+            if source_dir.as_os_str().is_empty() {
+                anyhow::bail!("case library source_dir must not be empty");
+            }
+        }
+        if let Some(embedding_api_key_env) = self.embedding_api_key_env.as_deref() {
+            if embedding_api_key_env.trim().is_empty() {
+                anyhow::bail!("case library embedding API key environment name must not be empty");
+            }
+        }
+        if let Some(embedding_base_url) = self.embedding_base_url.as_deref() {
+            validate_provider_base_url(embedding_base_url, "case library embedding base URL")?;
+        }
+        if let Some(summary_api_key_env) = self.summary_llm_api_key_env.as_deref() {
+            if summary_api_key_env.trim().is_empty() {
+                anyhow::bail!(
+                    "case library summary LLM API key environment name must not be empty"
+                );
+            }
+        }
+        if let Some(summary_base_url) = self.summary_llm_base_url.as_deref() {
+            validate_provider_base_url(summary_base_url, "case library summary LLM base URL")?;
+        }
+        Ok(())
+    }
+}
+
 fn default_bind_address() -> IpAddr {
     IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
 }
@@ -361,6 +444,30 @@ fn default_case_max_response_bytes() -> usize {
     262_144
 }
 
+fn default_case_rag_store() -> PathBuf {
+    PathBuf::from("data/memory-cases.sqlite")
+}
+
+fn default_case_index_store() -> PathBuf {
+    PathBuf::from("data/memory-cases-index.sqlite")
+}
+
+fn default_case_embedding_model() -> String {
+    "hash".to_string()
+}
+
+fn default_case_embedding_dimensions() -> usize {
+    1_024
+}
+
+fn default_case_chunk_size() -> usize {
+    160
+}
+
+fn default_summary_llm_timeout_ms() -> u64 {
+    30_000
+}
+
 impl ServerConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -372,11 +479,8 @@ impl ServerConfig {
 
     pub fn validate_runtime(&self) -> Result<()> {
         self.http.validate_bind()?;
-        if self.features.case_library.enabled == Some(true) && self.case_service.is_none() {
-            anyhow::bail!("case_library feature requires case_service configuration");
-        }
-        if let Some(case_service) = &self.case_service {
-            case_service.validate()?;
+        if self.features.case_library.enabled == Some(true) && self.case_library.is_none() {
+            anyhow::bail!("case_library feature requires case_library configuration");
         }
         if self.auth.tokens.is_empty() {
             anyhow::bail!("production runtime requires at least one authenticated principal");
@@ -401,6 +505,9 @@ impl ServerConfig {
             || storage.database_path == Path::new(":memory:")
         {
             anyhow::bail!("production runtime requires a persistent SQLite file");
+        }
+        if let Some(case_library) = &self.case_library {
+            case_library.validate(Some(&storage.database_path))?;
         }
         let providers = self
             .providers
@@ -432,6 +539,38 @@ impl ServerConfig {
         }
         Ok(())
     }
+}
+
+fn validate_case_library_mappings(
+    default_library: &str,
+    libraries: &[CaseLibraryConfig],
+) -> Result<()> {
+    if default_library.trim().is_empty() || libraries.is_empty() {
+        anyhow::bail!("case library requires a default library and library mappings");
+    }
+
+    let mut names = HashSet::with_capacity(libraries.len());
+    for library in libraries {
+        if library.name.trim().is_empty()
+            || library.name.trim() != library.name
+            || library.dataset_id.trim().is_empty()
+            || library.dataset_id.trim() != library.dataset_id
+            || library.tenant_ids.is_empty()
+            || library
+                .tenant_ids
+                .iter()
+                .any(|tenant| tenant.trim().is_empty() || tenant.trim() != tenant)
+        {
+            anyhow::bail!("case library mappings must use canonical non-empty values");
+        }
+        if !names.insert(library.name.as_str()) {
+            anyhow::bail!("case library names must be unique");
+        }
+    }
+    if !names.contains(default_library) {
+        anyhow::bail!("default case library must reference a configured library");
+    }
+    Ok(())
 }
 
 fn validate_provider_base_url(value: &str, label: &str) -> Result<()> {

@@ -1358,7 +1358,7 @@ fn production_runtime_config_requires_live_components_and_nonzero_limits() {
         limits: LimitsConfig::default(),
         storage: None,
         providers: None,
-        case_service: None,
+        case_library: None,
     };
     assert!(incomplete.validate_runtime().is_err());
 
@@ -1383,7 +1383,7 @@ fn production_runtime_config_requires_live_components_and_nonzero_limits() {
             timeout_seconds: 30,
             max_retries: 2,
         }),
-        case_service: None,
+        case_library: None,
     };
     assert!(complete.validate_runtime().is_ok());
     for invalid_base_url in [
@@ -1408,7 +1408,7 @@ fn production_runtime_config_requires_live_components_and_nonzero_limits() {
 
 #[test]
 fn production_runtime_config_resolves_memory_and_case_library_feature_switches() {
-    let no_case_service: ServerConfig = serde_json::from_str(
+    let no_case_library: ServerConfig = serde_json::from_str(
         r#"{
           "auth": {
             "tokens": [{
@@ -1435,15 +1435,15 @@ fn production_runtime_config_resolves_memory_and_case_library_feature_switches()
     )
     .unwrap();
     assert_eq!(
-        no_case_service
+        no_case_library
             .features
-            .resolve(no_case_service.case_service.is_some()),
+            .resolve(no_case_library.case_library.is_some()),
         FeatureFlags {
             memory: true,
             case_library: false
         }
     );
-    assert!(no_case_service.validate_runtime().is_ok());
+    assert!(no_case_library.validate_runtime().is_ok());
 
     let explicit_disabled: ServerConfig = serde_json::from_str(
         r#"{
@@ -1478,7 +1478,7 @@ fn production_runtime_config_resolves_memory_and_case_library_feature_switches()
     assert_eq!(
         explicit_disabled
             .features
-            .resolve(explicit_disabled.case_service.is_some()),
+            .resolve(explicit_disabled.case_library.is_some()),
         FeatureFlags {
             memory: false,
             case_library: false
@@ -1486,7 +1486,7 @@ fn production_runtime_config_resolves_memory_and_case_library_feature_switches()
     );
     assert!(explicit_disabled.validate_runtime().is_ok());
 
-    let invalid_case_enabled_without_service: ServerConfig = serde_json::from_str(
+    let invalid_case_enabled_without_library: ServerConfig = serde_json::from_str(
         r#"{
           "auth": {
             "tokens": [{
@@ -1515,9 +1515,59 @@ fn production_runtime_config_resolves_memory_and_case_library_feature_switches()
         }"#,
     )
     .unwrap();
-    assert!(invalid_case_enabled_without_service
+    assert!(invalid_case_enabled_without_library
         .validate_runtime()
         .is_err());
+
+    let enabled_case_library: ServerConfig = serde_json::from_str(
+        r#"{
+          "auth": {
+            "tokens": [{
+              "token_env": "RAM_A_SERVER_TOKEN",
+              "tenant_id": "tenant-a",
+              "user_id": "alice",
+              "agent_id": "agent-a",
+              "permissions": ["memory:read", "memory:write", "cases:read"]
+            }]
+          },
+          "storage": {
+            "database_path": "memory.sqlite"
+          },
+          "providers": {
+            "api_key_env": "RAM_A_PROVIDER_KEY",
+            "base_url": "http://127.0.0.1:8088/v1",
+            "embedding_provider": "hash",
+            "embedding_model": "hash",
+            "embedding_dimensions": 1024,
+            "extractor_model": "GLM-5.2",
+            "verifier_model": "GLM-5.2"
+          },
+          "case_library": {
+            "rag_store": "cases.sqlite",
+            "index_store": "cases-index.sqlite",
+            "embedding_provider": "hash",
+            "embedding_model": "hash",
+            "embedding_dimensions": 1024,
+            "default_library": "ops",
+            "libraries": [{
+              "name": "ops",
+              "dataset_id": "openeuler-ops-cases",
+              "tenant_ids": ["tenant-a"]
+            }]
+          }
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(
+        enabled_case_library
+            .features
+            .resolve(enabled_case_library.case_library.is_some()),
+        FeatureFlags {
+            memory: true,
+            case_library: true
+        }
+    );
+    assert!(enabled_case_library.validate_runtime().is_ok());
 }
 
 #[test]
@@ -1636,12 +1686,13 @@ fn production_runtime_config_accepts_open_router_embedding_provider_alias() {
 }
 
 #[test]
-fn server_binary_requires_a_config_path() {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ram-a-mcp-server"))
+fn server_binary_supports_a_default_config_path() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ram-a-mem"))
         .arg("--help")
         .output()
         .unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Usage: ram-a-mem [OPTIONS]"), "{stdout}");
     assert!(stdout.contains("--config <CONFIG>"), "{stdout}");
 }

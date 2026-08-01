@@ -1155,6 +1155,7 @@ dependencies = [
  "clap",
  "governor",
  "http-body-util",
+ "memory-cases",
  "memory-core",
  "memory-pipeline",
  "reqwest",

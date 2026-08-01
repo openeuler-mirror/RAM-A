@@ -5,10 +5,12 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use memory_cases::model::SearchRequest as CaseLibrarySearchRequest;
+use memory_cases::service::RagService;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{CaseSearchRequest, CaseServiceConfig, Principal};
+use crate::{CaseLibraryConfig, CaseSearchRequest, CaseServiceConfig, Principal};
 
 const MAX_REFERENCE_CHARS: usize = 4_000;
 
@@ -92,6 +94,97 @@ pub struct CaseServiceClient {
     max_response_bytes: usize,
     default_library: String,
     libraries: HashMap<String, LibraryMapping>,
+}
+
+#[derive(Clone)]
+pub struct EmbeddedCaseSearchProvider {
+    service: Arc<RagService>,
+    default_library: String,
+    libraries: HashMap<String, LibraryMapping>,
+}
+
+impl EmbeddedCaseSearchProvider {
+    pub fn new(
+        service: Arc<RagService>,
+        default_library: String,
+        libraries: &[CaseLibraryConfig],
+    ) -> Self {
+        Self {
+            service,
+            default_library,
+            libraries: libraries
+                .iter()
+                .map(|library| {
+                    (
+                        library.name.clone(),
+                        LibraryMapping {
+                            dataset_id: library.dataset_id.clone(),
+                            tenant_ids: library.tenant_ids.iter().cloned().collect(),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+#[async_trait]
+impl CaseSearchProvider for EmbeddedCaseSearchProvider {
+    async fn search(
+        &self,
+        principal: &Principal,
+        request: CaseSearchRequest,
+    ) -> Result<CaseSearchResponse, CaseServiceError> {
+        request
+            .validate()
+            .map_err(|_| CaseServiceError::InvalidRequest)?;
+        let library_name = request.library.as_deref().unwrap_or(&self.default_library);
+        let library = self
+            .libraries
+            .get(library_name)
+            .filter(|library| library.tenant_ids.contains(&principal.tenant_id))
+            .ok_or(CaseServiceError::Forbidden)?;
+
+        let response = self
+            .service
+            .search_dataset(
+                &library.dataset_id,
+                CaseLibrarySearchRequest {
+                    query: request.query,
+                    top_k: request.top_k,
+                },
+            )
+            .await
+            .map_err(|_| CaseServiceError::Unavailable)?;
+
+        let mut truncated = response.chunks.len() > request.top_k;
+        let mut references = Vec::with_capacity(response.chunks.len().min(request.top_k));
+        for chunk in response.chunks.into_iter().take(request.top_k) {
+            if chunk.dataset_id != library.dataset_id
+                || chunk.chunk_id.trim().is_empty()
+                || chunk.document_id.trim().is_empty()
+                || chunk.content.trim().is_empty()
+                || !chunk.score.is_finite()
+            {
+                return Err(CaseServiceError::InvalidResponse);
+            }
+            let (content, content_truncated) = truncate_chars(&chunk.content, MAX_REFERENCE_CHARS);
+            truncated |= content_truncated;
+            references.push(CaseReference {
+                chunk_id: chunk.chunk_id,
+                document_id: chunk.document_id,
+                source_name: chunk.source_name,
+                content,
+                score: chunk.score,
+            });
+        }
+
+        Ok(CaseSearchResponse {
+            library: library_name.to_owned(),
+            references,
+            truncated,
+        })
+    }
 }
 
 impl CaseServiceClient {

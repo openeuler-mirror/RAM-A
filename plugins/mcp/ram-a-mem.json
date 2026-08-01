@@ -49,11 +49,14 @@
     "timeout_seconds": 120,
     "max_retries": 3
   },
-  "case_service": {
-    "base_url": "http://127.0.0.1:18082",
-    "bearer_token_env": "MEMORY_CASES_API_TOKEN",
-    "timeout_seconds": 5,
-    "max_response_bytes": 262144,
+  "case_library": {
+    "rag_store": "data/memory-cases.sqlite",
+    "index_store": "data/memory-cases-index.sqlite",
+    "source_dir": "crates/memory-cases/test/accuracy_docs",
+    "embedding_provider": "hash",
+    "embedding_model": "hash",
+    "embedding_dimensions": 1024,
+    "chunk_size": 160,
     "default_library": "ops",
     "libraries": [
       {
