@@ -18,3 +18,8 @@ Deployment steps and field-by-field notes are documented in
 For xiaoO + RAM-A knowledge base integration, use these examples as the starting point and
 replace all token environment names, identity fields, model provider settings, host allowlists,
 and SQLite paths for your environment.
+
+In `ram-a-mcp.local.json`, `features.memory.enabled` controls the personal long-term
+memory tools and `features.case_library.enabled` controls the case-library search tool.
+When the case-library feature is enabled, keep `case_service` configured and grant
+`cases:read` to the client token that should use it.

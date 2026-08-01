@@ -20,7 +20,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::config::{HttpConfig, LimitsConfig};
+use crate::config::{FeatureFlags, HttpConfig, LimitsConfig};
 use crate::mcp_server::{DynMemoryService, MemoryMcpServer};
 use crate::{DisabledCaseSearchProvider, DynCaseSearchProvider, Principal, TokenAuthenticator};
 
@@ -36,6 +36,7 @@ pub struct HttpRuntime {
     authenticator: Arc<TokenAuthenticator>,
     database_path: PathBuf,
     providers_ready: bool,
+    features: FeatureFlags,
     cancellation_token: CancellationToken,
 }
 
@@ -68,12 +69,18 @@ impl HttpRuntime {
             authenticator,
             database_path,
             providers_ready,
+            features: FeatureFlags::all(),
             cancellation_token,
         }
     }
 
     pub fn with_case_search_provider(mut self, case_search: DynCaseSearchProvider) -> Self {
         self.case_search = case_search;
+        self
+    }
+
+    pub fn with_features(mut self, features: FeatureFlags) -> Self {
+        self.features = features;
         self
     }
 }
@@ -298,6 +305,7 @@ pub fn create_http_router(
     };
     let service_state = runtime.service;
     let case_search = runtime.case_search;
+    let features = runtime.features;
     let cancellation_token = runtime.cancellation_token.clone();
     let service_cancellation_token = cancellation_token.clone();
     let session_manager = Arc::new(LocalSessionManager::default());
@@ -308,6 +316,7 @@ pub fn create_http_router(
                     service_state.clone(),
                     service_cancellation_token.clone(),
                     case_search.clone(),
+                    features,
                 ))
             },
             session_manager.clone(),

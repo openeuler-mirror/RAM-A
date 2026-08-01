@@ -205,6 +205,14 @@ field changes listed below.
       }
     ]
   },
+  "features": {
+    "memory": {
+      "enabled": true
+    },
+    "case_library": {
+      "enabled": true
+    }
+  },
   "http": {
     "bind_address": "127.0.0.1",
     "port": 18081,
@@ -258,13 +266,17 @@ Change these fields before deployment:
 - `RAM_A_XIAOO_TOKEN`: environment variable name that contains the RAM-A bearer token.
 - `tenant_id`, `user_id`, `agent_id`: identity scope for memory isolation.
 - `permissions`: include `memory:read`, `memory:write`, and optionally `cases:read`.
+- `features.memory.enabled`: expose or hide RAM-A personal long-term memory tools
+  (`memory_search`, `memory_ingest`).
+- `features.case_library.enabled`: expose or hide the operational case-library tool
+  (`memory_case_search`). If this is `true`, `case_service` must also be configured.
 - `allowed_hosts`: host and port used by clients to reach RAM-A.
 - `storage.database_path`: RAM-A personal long-term memory SQLite path.
 - `providers.api_key_env`, `providers.base_url`, `extractor_model`, `verifier_model`:
   OpenAI-compatible chat/completions provider used by extraction and verification.
 - `embedding_provider`: use `hash` for local demos; use `openai_compatible` for a real
   embedding service.
-- `case_service`: omit this block if the case-library tool is not needed.
+- `case_service`: configure this block when the case-library tool is enabled.
 
 For real embedding retrieval, replace the hash embedding fields with an OpenAI-compatible
 embedding provider:
@@ -381,8 +393,8 @@ behavior and continue normal chat.
 Check the services:
 
 ```bash
-curl -i http://127.0.0.1:18081/healthz
-curl -i http://127.0.0.1:18081/readyz
+curl -i http://127.0.0.1:18081/healthy
+curl -i http://127.0.0.1:18081/ready
 curl -i http://127.0.0.1:18082/health
 ```
 

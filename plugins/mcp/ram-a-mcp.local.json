@@ -10,6 +10,14 @@
       }
     ]
   },
+  "features": {
+    "memory": {
+      "enabled": true
+    },
+    "case_library": {
+      "enabled": true
+    }
+  },
   "http": {
     "bind_address": "127.0.0.1",
     "port": 18081,

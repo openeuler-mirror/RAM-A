@@ -99,6 +99,19 @@ RAM-A 会移除案例服务返回的 `source_path` 和 `dataset_id`，限制响�
 "permissions": ["memory:read", "memory:write", "cases:read"]
 ```
 
+在 `ram-a-mcp-server` JSON 中打开 RAM-A 长期记忆和案例库 MCP 工具：
+
+```json
+"features": {
+  "memory": {
+    "enabled": true
+  },
+  "case_library": {
+    "enabled": true
+  }
+}
+```
+
 在 `ram-a-mcp-server` JSON 中配置案例服务和 tenant 映射：
 
 ```json

@@ -29,6 +29,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let config = ServerConfig::load(args.config)?;
     config.validate_runtime()?;
+    let features = config.features.resolve(config.case_service.is_some());
     let authenticator = Arc::new(TokenAuthenticator::from_config(&config.auth)?);
     let storage = config
         .storage
@@ -92,8 +93,13 @@ async fn main() -> Result<()> {
         database_path,
         true,
         cancellation_token.clone(),
-    );
-    let runtime = if let Some(case_service) = config.case_service.as_ref() {
+    )
+    .with_features(features);
+    let runtime = if features.case_library {
+        let case_service = config
+            .case_service
+            .as_ref()
+            .context("enabled case_library feature requires case_service configuration")?;
         let case_search = CaseServiceClient::from_config(case_service)
             .context("failed to construct case service client")?;
         runtime.with_case_search_provider(Arc::new(case_search))

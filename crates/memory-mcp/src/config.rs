@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 pub struct ServerConfig {
     pub auth: AuthConfig,
     #[serde(default)]
+    pub features: FeaturesConfig,
+    #[serde(default)]
     pub http: HttpConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
@@ -19,6 +21,61 @@ pub struct ServerConfig {
     pub providers: Option<ProvidersConfig>,
     #[serde(default)]
     pub case_service: Option<CaseServiceConfig>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FeatureFlags {
+    pub memory: bool,
+    pub case_library: bool,
+}
+
+impl FeatureFlags {
+    pub fn all() -> Self {
+        Self {
+            memory: true,
+            case_library: true,
+        }
+    }
+}
+
+impl Default for FeatureFlags {
+    fn default() -> Self {
+        Self::all()
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FeaturesConfig {
+    pub memory: MemoryFeatureConfig,
+    pub case_library: CaseLibraryFeatureConfig,
+}
+
+impl FeaturesConfig {
+    pub fn resolve(&self, case_service_configured: bool) -> FeatureFlags {
+        FeatureFlags {
+            memory: self.memory.enabled,
+            case_library: self.case_library.enabled.unwrap_or(case_service_configured),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemoryFeatureConfig {
+    pub enabled: bool,
+}
+
+impl Default for MemoryFeatureConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CaseLibraryFeatureConfig {
+    pub enabled: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -315,6 +372,9 @@ impl ServerConfig {
 
     pub fn validate_runtime(&self) -> Result<()> {
         self.http.validate_bind()?;
+        if self.features.case_library.enabled == Some(true) && self.case_service.is_none() {
+            anyhow::bail!("case_library feature requires case_service configuration");
+        }
         if let Some(case_service) = &self.case_service {
             case_service.validate()?;
         }

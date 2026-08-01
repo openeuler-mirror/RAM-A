@@ -27,6 +27,14 @@ Create a JSON config file for `ram-a-mcp-server`:
       }
     ]
   },
+  "features": {
+    "memory": {
+      "enabled": true
+    },
+    "case_library": {
+      "enabled": true
+    }
+  },
   "http": {
     "bind_address": "127.0.0.1",
     "port": 18081,
@@ -97,6 +105,12 @@ cargo run -p memory-mcp --bin ram-a-mcp-server -- --config config/ram-a-mcp.json
 When omitted, `embedding_api_key_env` and `embedding_base_url` fall back to
 `api_key_env` and `base_url`. Set them explicitly when chat/extraction uses one
 provider but embeddings use a separate self-hosted service.
+
+`features.memory.enabled` controls exposure of personal long-term memory MCP tools
+(`memory_search` and `memory_ingest`). `features.case_library.enabled` controls exposure
+of `memory_case_search`; when set to `true`, `case_service` must also be configured.
+If `case_library.enabled` is omitted, RAM-A enables the case tool only when
+`case_service` is present.
 
 Each token maps to exactly one `tenant_id`, `user_id`, and `agent_id`.
 Search scope is tenant plus user, so multiple agent tokens for the same
