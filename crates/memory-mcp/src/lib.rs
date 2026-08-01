@@ -15,8 +15,8 @@ pub use case_service::{
     DisabledCaseSearchProvider, DynCaseSearchProvider,
 };
 pub use config::{
-    AuthConfig, CaseLibraryConfig, CaseServiceConfig, HttpConfig, LimitsConfig, ProvidersConfig,
-    ServerConfig, StorageConfig, TokenConfig,
+    AuthConfig, CaseLibraryConfig, CaseServiceConfig, EmbeddingProviderKind, HttpConfig,
+    LimitsConfig, ProvidersConfig, ServerConfig, StorageConfig, TokenConfig,
 };
 pub use http::{create_http_router, HttpRuntime, RequestId, AGENT_ID_HEADER, REQUEST_ID_HEADER};
 pub use idempotency::IdempotencyRepository;

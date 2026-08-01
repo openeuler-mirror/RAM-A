@@ -1,5 +1,6 @@
 use std::{
     any::Any,
+    ffi::{c_char, c_int},
     path::{Path, PathBuf},
     sync::Once,
     thread,
@@ -24,9 +25,9 @@ const SQLITE_LOCK_RETRY_MAX_DELAY: Duration = Duration::from_millis(500);
 
 type SqliteAutoExtensionEntry = unsafe extern "C" fn(
     *mut rusqlite::ffi::sqlite3,
-    *mut *mut i8,
+    *mut *mut c_char,
     *const rusqlite::ffi::sqlite3_api_routines,
-) -> i32;
+) -> c_int;
 
 pub struct SqliteMemoryStore {
     path: PathBuf,

@@ -9,8 +9,9 @@ use axum::response::Response;
 use axum::Router;
 use memory_core::{HashEmbedding, MemoryManager, SqliteMemoryStore};
 use memory_mcp::{
-    create_http_router, AuthConfig, HttpConfig, HttpRuntime, IdempotencyRepository, LimitsConfig,
-    MemoryService, ProvidersConfig, ServerConfig, StorageConfig, TokenAuthenticator, TokenConfig,
+    create_http_router, AuthConfig, EmbeddingProviderKind, HttpConfig, HttpRuntime,
+    IdempotencyRepository, LimitsConfig, MemoryService, ProvidersConfig, ServerConfig,
+    StorageConfig, TokenAuthenticator, TokenConfig,
 };
 use memory_pipeline::error::Result as PipelineResult;
 use memory_pipeline::extraction::{ExtractionBatch, MemoryExtractor, ModelUsage, SCHEMA_VERSION};
@@ -1248,6 +1249,9 @@ fn production_runtime_config_requires_live_components_and_nonzero_limits() {
         providers: Some(ProvidersConfig {
             api_key_env: "RAM_A_PROVIDER_KEY".to_string(),
             base_url: "https://provider.example/v1".to_string(),
+            embedding_provider: EmbeddingProviderKind::OpenAiCompatible,
+            embedding_api_key_env: None,
+            embedding_base_url: None,
             embedding_model: "embedding-model".to_string(),
             embedding_dimensions: 32,
             extractor_model: "extractor-model".to_string(),
@@ -1276,6 +1280,121 @@ fn production_runtime_config_requires_live_components_and_nonzero_limits() {
     assert!(no_principals.validate_runtime().is_err());
     complete.limits.max_in_flight_per_principal_tool = 0;
     assert!(complete.validate_runtime().is_err());
+}
+
+#[test]
+fn production_runtime_config_accepts_hash_embedding_provider() {
+    let config: ServerConfig = serde_json::from_str(
+        r#"{
+          "auth": {
+            "tokens": [{
+              "token_env": "RAM_A_SERVER_TOKEN",
+              "tenant_id": "tenant-a",
+              "user_id": "alice",
+              "agent_id": "agent-a",
+              "permissions": ["memory:read", "memory:write"]
+            }]
+          },
+          "storage": {
+            "database_path": "memory.sqlite"
+          },
+          "providers": {
+            "api_key_env": "RAM_A_PROVIDER_KEY",
+            "base_url": "http://127.0.0.1:8088/v1",
+            "embedding_provider": "hash",
+            "embedding_model": "hash",
+            "embedding_dimensions": 1024,
+            "extractor_model": "GLM-5.2",
+            "verifier_model": "GLM-5.2"
+          }
+        }"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        config.providers.as_ref().unwrap().embedding_provider,
+        EmbeddingProviderKind::Hash
+    );
+    assert!(config.validate_runtime().is_ok());
+}
+
+#[test]
+fn production_runtime_config_accepts_separate_embedding_endpoint() {
+    let config: ServerConfig = serde_json::from_str(
+        r#"{
+          "auth": {
+            "tokens": [{
+              "token_env": "RAM_A_SERVER_TOKEN",
+              "tenant_id": "tenant-a",
+              "user_id": "alice",
+              "agent_id": "agent-a",
+              "permissions": ["memory:read", "memory:write"]
+            }]
+          },
+          "storage": {
+            "database_path": "memory.sqlite"
+          },
+          "providers": {
+            "api_key_env": "RAM_A_CHAT_KEY",
+            "base_url": "http://127.0.0.1:8088/v1",
+            "embedding_provider": "openai_compatible",
+            "embedding_api_key_env": "RAM_A_EMBEDDING_KEY",
+            "embedding_base_url": "http://127.0.0.1:9090/v1",
+            "embedding_model": "local-embedding",
+            "embedding_dimensions": 1024,
+            "extractor_model": "GLM-5.2",
+            "verifier_model": "GLM-5.2"
+          }
+        }"#,
+    )
+    .unwrap();
+
+    let providers = config.providers.as_ref().unwrap();
+    assert_eq!(
+        providers.embedding_api_key_env.as_deref(),
+        Some("RAM_A_EMBEDDING_KEY")
+    );
+    assert_eq!(
+        providers.embedding_base_url.as_deref(),
+        Some("http://127.0.0.1:9090/v1")
+    );
+    assert!(config.validate_runtime().is_ok());
+}
+
+#[test]
+fn production_runtime_config_accepts_open_router_embedding_provider_alias() {
+    let config: ServerConfig = serde_json::from_str(
+        r#"{
+          "auth": {
+            "tokens": [{
+              "token_env": "RAM_A_SERVER_TOKEN",
+              "tenant_id": "tenant-a",
+              "user_id": "alice",
+              "agent_id": "agent-a",
+              "permissions": ["memory:read", "memory:write"]
+            }]
+          },
+          "storage": {
+            "database_path": "memory.sqlite"
+          },
+          "providers": {
+            "api_key_env": "RAM_A_PROVIDER_KEY",
+            "base_url": "http://127.0.0.1:8088/v1",
+            "embedding_provider": "open_router",
+            "embedding_model": "local-embedding",
+            "embedding_dimensions": 1024,
+            "extractor_model": "GLM-5.2",
+            "verifier_model": "GLM-5.2"
+          }
+        }"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        config.providers.as_ref().unwrap().embedding_provider,
+        EmbeddingProviderKind::OpenAiCompatible
+    );
+    assert!(config.validate_runtime().is_ok());
 }
 
 #[test]

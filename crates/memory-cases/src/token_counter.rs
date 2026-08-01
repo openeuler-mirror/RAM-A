@@ -72,7 +72,7 @@ fn test_ascii_run_tokens(len: usize) -> usize {
     if len == 0 {
         0
     } else {
-        (len + 3) / 4
+        len.div_ceil(4)
     }
 }
 

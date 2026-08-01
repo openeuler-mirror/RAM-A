@@ -15,6 +15,10 @@ pub trait EmbeddingProvider: Send + Sync {
         "unknown-embedding-model"
     }
 
+    fn profile_id(&self) -> String {
+        format!("{}:{}", self.model_name(), self.dimensions())
+    }
+
     async fn embed(&self, texts: &[String]) -> MemoryResult<Vec<Vec<f32>>>;
 
     async fn embed_one(&self, text: &str) -> MemoryResult<Vec<f32>> {
@@ -129,6 +133,15 @@ impl EmbeddingProvider for OpenRouterEmbedding {
 
     fn model_name(&self) -> &str {
         &self.model
+    }
+
+    fn profile_id(&self) -> String {
+        format!(
+            "openai_compatible:{}:{}:{}",
+            self.base_url,
+            self.model,
+            self.dimensions()
+        )
     }
 
     async fn embed(&self, texts: &[String]) -> MemoryResult<Vec<Vec<f32>>> {
@@ -262,6 +275,10 @@ impl EmbeddingProvider for HashEmbedding {
 
     fn model_name(&self) -> &str {
         "hash-embedding"
+    }
+
+    fn profile_id(&self) -> String {
+        format!("hash:{}", self.dimensions())
     }
 
     async fn embed(&self, texts: &[String]) -> MemoryResult<Vec<Vec<f32>>> {

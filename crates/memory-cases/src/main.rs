@@ -15,9 +15,12 @@ use std::time::Duration;
 
 use anyhow::{bail, Result};
 use clap::Parser;
-use memory_core::{HashEmbedding, MemoryManager, RetrievalConfig, SearchMode, SqliteMemoryStore};
+use memory_core::{
+    EmbeddingProvider, HashEmbedding, MemoryManager, OpenRouterEmbedding, RetrievalConfig,
+    SearchMode, SqliteMemoryStore,
+};
 
-use crate::config::Cli;
+use crate::config::{Cli, EmbeddingProviderKind};
 use crate::llm::DocumentSummaryClient;
 use crate::repo::RagRepository;
 use crate::service::{RagConfig, RagService};
@@ -53,7 +56,7 @@ fn build_service(cli: &Cli) -> Result<Arc<RagService>> {
     repo.initialize()?;
 
     let store = Arc::new(SqliteMemoryStore::new(&storage_paths.memory_store));
-    let embedder = Arc::new(HashEmbedding::new(cli.embedding_dimensions));
+    let embedder = build_embedding_provider(cli)?;
     let retrieval = RetrievalConfig {
         mode: SearchMode::Hybrid,
         ..RetrievalConfig::default()
@@ -77,6 +80,55 @@ fn build_service(cli: &Cli) -> Result<Arc<RagService>> {
             summary_llm: build_summary_llm(cli)?,
         },
     )))
+}
+
+fn build_embedding_provider(cli: &Cli) -> Result<Arc<dyn EmbeddingProvider>> {
+    match embedding_provider_kind(cli)? {
+        EmbeddingProviderKind::Hash => Ok(Arc::new(HashEmbedding::new(cli.embedding_dimensions))),
+        EmbeddingProviderKind::OpenAiCompatible => {
+            let api_key_env = config_value(
+                &cli.embedding_api_key_env,
+                "MEMORY_CASES_EMBEDDING_API_KEY_ENV",
+                Some("MEMORY_RAG_EMBEDDING_API_KEY_ENV"),
+            );
+            let api_key = std::env::var(&api_key_env).map_err(|_| {
+                anyhow::anyhow!(
+                    "embedding API key environment variable `{api_key_env}` is unavailable"
+                )
+            })?;
+            anyhow::ensure!(
+                !api_key.trim().is_empty(),
+                "embedding API key environment variable `{api_key_env}` is empty"
+            );
+            let base_url = config_value(
+                &cli.embedding_base_url,
+                "MEMORY_CASES_EMBEDDING_BASE_URL",
+                Some("MEMORY_RAG_EMBEDDING_BASE_URL"),
+            );
+            let model = config_value(
+                &cli.embedding_model,
+                "MEMORY_CASES_EMBEDDING_MODEL",
+                Some("MEMORY_RAG_EMBEDDING_MODEL"),
+            );
+            anyhow::ensure!(!base_url.trim().is_empty(), "embedding base URL is empty");
+            anyhow::ensure!(!model.trim().is_empty(), "embedding model is empty");
+            Ok(Arc::new(OpenRouterEmbedding::with_base_url(
+                api_key,
+                base_url,
+                model,
+                cli.embedding_dimensions,
+            )))
+        }
+    }
+}
+
+fn embedding_provider_kind(cli: &Cli) -> Result<EmbeddingProviderKind> {
+    if let Some(value) = env_config_value("MEMORY_CASES_EMBEDDING_PROVIDER")
+        .or_else(|| env_config_value("MEMORY_RAG_EMBEDDING_PROVIDER"))
+    {
+        return crate::config::parse_embedding_provider(&value).map_err(anyhow::Error::msg);
+    }
+    Ok(cli.embedding_provider)
 }
 
 fn build_chunk_token_counter() -> Result<Arc<dyn TokenCounter>> {

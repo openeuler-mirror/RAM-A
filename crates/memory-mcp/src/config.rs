@@ -125,6 +125,12 @@ pub struct ProvidersConfig {
     pub api_key_env: String,
     #[serde(default = "default_provider_base_url")]
     pub base_url: String,
+    #[serde(default)]
+    pub embedding_provider: EmbeddingProviderKind,
+    #[serde(default)]
+    pub embedding_api_key_env: Option<String>,
+    #[serde(default)]
+    pub embedding_base_url: Option<String>,
     pub embedding_model: String,
     pub embedding_dimensions: usize,
     pub extractor_model: String,
@@ -133,6 +139,15 @@ pub struct ProvidersConfig {
     pub timeout_seconds: u64,
     #[serde(default = "default_provider_max_retries")]
     pub max_retries: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum EmbeddingProviderKind {
+    #[default]
+    #[serde(rename = "openai_compatible", alias = "open_router")]
+    OpenAiCompatible,
+    #[serde(rename = "hash")]
+    Hash,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -346,24 +361,36 @@ impl ServerConfig {
         {
             anyhow::bail!("provider configuration is incomplete");
         }
-        let (url_scheme, url_remainder) = providers
-            .base_url
-            .split_once("://")
-            .context("provider base URL must include an HTTP or HTTPS scheme")?;
-        let parsed_base_url =
-            url::Url::parse(&providers.base_url).context("provider base URL is not a valid URL")?;
-        let authority = url_remainder
-            .split(['/', '?', '#'])
-            .next()
-            .unwrap_or_default();
-        if !matches!(url_scheme.to_ascii_lowercase().as_str(), "http" | "https")
-            || parsed_base_url.host_str().is_none()
-            || authority.is_empty()
-        {
-            anyhow::bail!("provider base URL must be an absolute HTTP or HTTPS URL");
+        validate_provider_base_url(&providers.base_url, "provider base URL")?;
+        if let Some(embedding_api_key_env) = providers.embedding_api_key_env.as_deref() {
+            if embedding_api_key_env.trim().is_empty() {
+                anyhow::bail!("embedding API key environment name must not be empty");
+            }
+        }
+        if let Some(embedding_base_url) = providers.embedding_base_url.as_deref() {
+            validate_provider_base_url(embedding_base_url, "embedding base URL")?;
         }
         Ok(())
     }
+}
+
+fn validate_provider_base_url(value: &str, label: &str) -> Result<()> {
+    let (url_scheme, url_remainder) = value
+        .split_once("://")
+        .with_context(|| format!("{label} must include an HTTP or HTTPS scheme"))?;
+    let parsed_base_url =
+        url::Url::parse(value).with_context(|| format!("{label} is not a valid URL"))?;
+    let authority = url_remainder
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    if !matches!(url_scheme.to_ascii_lowercase().as_str(), "http" | "https")
+        || parsed_base_url.host_str().is_none()
+        || authority.is_empty()
+    {
+        anyhow::bail!("{label} must be an absolute HTTP or HTTPS URL");
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

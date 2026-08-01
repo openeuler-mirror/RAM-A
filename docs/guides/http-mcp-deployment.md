@@ -50,6 +50,9 @@ Create a JSON config file for `ram-a-mcp-server`:
   "providers": {
     "api_key_env": "OPENROUTER_API_KEY",
     "base_url": "https://openrouter.ai/api/v1",
+    "embedding_provider": "openai_compatible",
+    "embedding_api_key_env": "OPENROUTER_API_KEY",
+    "embedding_base_url": "https://openrouter.ai/api/v1",
     "embedding_model": "baai/bge-m3",
     "embedding_dimensions": 1024,
     "extractor_model": "openai/gpt-4.1-mini",
@@ -83,6 +86,18 @@ export OPENROUTER_API_KEY='replace-with-provider-key'
 cargo run -p memory-mcp --bin ram-a-mcp-server -- --config config/ram-a-mcp.json
 ```
 
+`providers.embedding_provider` supports:
+
+- `openai_compatible`: call `{base_url}/embeddings` with `embedding_model`. Use this for
+  OpenRouter or a self-hosted OpenAI-compatible embedding service.
+- `hash`: use deterministic local hash embeddings. This is useful for offline smoke tests and
+  demos, but does not provide production semantic recall quality.
+
+`open_router` is accepted as a backwards-compatible alias for `openai_compatible`.
+When omitted, `embedding_api_key_env` and `embedding_base_url` fall back to
+`api_key_env` and `base_url`. Set them explicitly when chat/extraction uses one
+provider but embeddings use a separate self-hosted service.
+
 Each token maps to exactly one `tenant_id`, `user_id`, and `agent_id`.
 Search scope is tenant plus user, so multiple agent tokens for the same
 tenant/user can share memory while different users remain isolated. A request
@@ -98,10 +113,44 @@ export MEMORY_CASES_API_TOKEN='replace-with-a-separate-internal-token'
 cargo run -p memory-cases -- --api \
   --bind 127.0.0.1:18082 \
   --rag-store data/memory-cases.sqlite \
-  --memory-store data/memory-cases-index.sqlite
+  --memory-store data/memory-cases-index.sqlite \
+  --embedding-provider hash \
+  --embedding-dimensions 1024
 ```
 
-Run the ingestor as a separate process against the same two stores. Keep the
+`memory-cases` uses the same `memory-core` embedding abstraction as RAM-A memory search,
+but the recommended deployment keeps the case-library index DB separate from the RAM-A
+long-term memory DB. Use `data/memory-cases-index.sqlite` for case retrieval and
+`data/ram-a-memory.sqlite` for personal long-term memory. This avoids SQLite write-lock
+contention between two independently running services and keeps case reindex/reset
+operations away from user memories.
+
+If you intentionally point `memory-cases` and `ram-a-mcp-server` at the same
+`memory-store` SQLite file for a small smoke test, they must use the same embedding
+provider, base URL, model, key environment name, and dimensions for each shared search
+scope. `memory-core` records the embedding profile on new writes and rejects same-scope
+profile mismatches, because equal vector dimensions do not make two different embedding
+models semantically compatible. Shared SQLite index deployment is not recommended for
+concurrent demo or production services.
+For a real or self-hosted embedding service, start both the API and ingestor with matching
+embedding settings:
+
+```bash
+export LOCAL_EMBEDDING_API_KEY='replace-with-provider-key-or-dummy-if-local-service-ignores-auth'
+cargo run -p memory-cases -- --api \
+  --bind 127.0.0.1:18082 \
+  --rag-store data/memory-cases.sqlite \
+  --memory-store data/memory-cases-index.sqlite \
+  --embedding-provider openai_compatible \
+  --embedding-api-key-env LOCAL_EMBEDDING_API_KEY \
+  --embedding-base-url http://127.0.0.1:8000/v1 \
+  --embedding-model local-embedding-model \
+  --embedding-dimensions 1024
+```
+
+Run the ingestor as a separate process against the same two stores and the same
+embedding provider/model/dimension settings; otherwise newly ingested records and
+queries may use incompatible vector dimensions or semantics. Keep the
 case API on loopback; every `/api/v1/*` request requires the internal bearer
 token, while `/health` remains available for local liveness checks.
 

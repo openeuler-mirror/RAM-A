@@ -3,6 +3,12 @@ use std::path::PathBuf;
 
 use clap::{ArgGroup, Parser};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EmbeddingProviderKind {
+    Hash,
+    OpenAiCompatible,
+}
+
 #[derive(Debug, Parser)]
 #[command(about = "Case-oriented RAG service backed by memory-core")]
 #[command(group(
@@ -32,6 +38,25 @@ pub struct Cli {
     #[arg(long, default_value_t = 256)]
     pub embedding_dimensions: usize,
 
+    #[arg(
+        long = "embedding-provider",
+        default_value = "hash",
+        value_parser = parse_embedding_provider
+    )]
+    pub embedding_provider: EmbeddingProviderKind,
+
+    #[arg(long = "embedding-api-key-env", default_value = "OPENAI_API_KEY")]
+    pub embedding_api_key_env: String,
+
+    #[arg(
+        long = "embedding-base-url",
+        default_value = "https://api.openai.com/v1"
+    )]
+    pub embedding_base_url: String,
+
+    #[arg(long = "embedding-model", default_value = "text-embedding-3-small")]
+    pub embedding_model: String,
+
     #[arg(long = "chunk-size", default_value_t = 512)]
     pub chunk_size: usize,
 
@@ -52,6 +77,16 @@ pub struct Cli {
 
     #[arg(long = "summary-llm-timeout-ms", default_value_t = 30000)]
     pub summary_llm_timeout_ms: u64,
+}
+
+pub fn parse_embedding_provider(value: &str) -> Result<EmbeddingProviderKind, String> {
+    match value {
+        "hash" => Ok(EmbeddingProviderKind::Hash),
+        "openai_compatible" | "open_router" => Ok(EmbeddingProviderKind::OpenAiCompatible),
+        other => Err(format!(
+            "unsupported embedding provider `{other}`; expected `hash` or `openai_compatible`"
+        )),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -141,6 +176,38 @@ mod tests {
         let result = Cli::try_parse_from(["memory-cases", "--rebuild-index"]);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn embedding_provider_defaults_to_hash() {
+        let cli = Cli::parse_from(["memory-cases", "--api"]);
+
+        assert_eq!(cli.embedding_provider, EmbeddingProviderKind::Hash);
+    }
+
+    #[test]
+    fn embedding_provider_accepts_openai_compatible_and_open_router_alias() {
+        let cli = Cli::parse_from([
+            "memory-cases",
+            "--api",
+            "--embedding-provider",
+            "openai_compatible",
+        ]);
+        assert_eq!(
+            cli.embedding_provider,
+            EmbeddingProviderKind::OpenAiCompatible
+        );
+
+        let alias = Cli::parse_from([
+            "memory-cases",
+            "--api",
+            "--embedding-provider",
+            "open_router",
+        ]);
+        assert_eq!(
+            alias.embedding_provider,
+            EmbeddingProviderKind::OpenAiCompatible
+        );
     }
 
     #[test]

@@ -78,15 +78,49 @@ MEMORY_CASES_KEEP_TMP=1 \
   crates/memory-cases/quick_start_verify.sh /root/atomgit/witty-ops-cases/community_maintenance
 ```
 
+默认使用本地 hash embedding，适合离线 smoke 和演示。如果要验证真实或本地部署的
+OpenAI-compatible embedding 服务：
+
+```bash
+export LOCAL_EMBEDDING_API_KEY='replace-with-provider-key-or-dummy-if-local-service-ignores-auth'
+MEMORY_CASES_EMBEDDING_PROVIDER=openai_compatible \
+MEMORY_CASES_EMBEDDING_API_KEY_ENV=LOCAL_EMBEDDING_API_KEY \
+MEMORY_CASES_EMBEDDING_BASE_URL=http://127.0.0.1:8000/v1 \
+MEMORY_CASES_EMBEDDING_MODEL=local-embedding-model \
+MEMORY_CASES_EMBEDDING_DIMENSIONS=1024 \
+  crates/memory-cases/quick_start_verify.sh /root/atomgit/witty-ops-cases/community_maintenance
+```
+
 ## 常用环境变量
 
 | 环境变量 | 说明 |
 | --- | --- |
 | `MEMORY_CASES_DOC_DIR` | 未传位置参数时使用的文档目录 |
 | `MEMORY_CASES_PORT` | API 监听端口，默认随机 |
+| `MEMORY_CASES_RAG_STORE` | 业务 SQLite 路径，保存 dataset、document、task 和 chunk |
+| `MEMORY_CASES_MEMORY_STORE` | 检索索引 SQLite 路径，保存 memory text、FTS 和 embedding |
 | `MEMORY_CASES_CHUNK_SIZE` | 入库切块大小，默认 `160` |
 | `MEMORY_CASES_CHAT_TOP_K` | 每次问答取回的引用数，默认 `5` |
+| `MEMORY_CASES_EMBEDDING_PROVIDER` | `hash` 或 `openai_compatible`，默认 `hash` |
+| `MEMORY_CASES_EMBEDDING_DIMENSIONS` | embedding 维度，默认 `256`；必须与当前案例索引库里已有记录维度一致 |
+| `MEMORY_CASES_EMBEDDING_API_KEY_ENV` | `openai_compatible` 使用的 API key 环境变量名，默认 `OPENAI_API_KEY` |
+| `MEMORY_CASES_EMBEDDING_BASE_URL` | `openai_compatible` 的 OpenAI-compatible `/v1` base URL |
+| `MEMORY_CASES_EMBEDDING_MODEL` | `openai_compatible` 的 embedding 模型名 |
+| `MEMORY_CASES_API_TOKEN` | REST API 内部 Bearer token；未设置时脚本只为本次运行自动生成 |
 | `MEMORY_CASES_KEEP_TMP` | 设置为 `1` 时保留临时目录和日志 |
+
+推荐把 `MEMORY_CASES_MEMORY_STORE` 指向案例库自己的索引库，例如
+`data/memory-cases-index.sqlite`，不要和 RAM-A 长期记忆的
+`data/ram-a-memory.sqlite` 共用一个 SQLite 文件。分库可以避免两个服务并发读写时
+争用 SQLite 写锁，也能让案例库重建/清理索引时不影响用户长期记忆。
+
+如果为了小规模 smoke test 故意共用同一个 SQLite 文件，案例库和 RAM-A MCP 必须
+使用同一套 embedding provider/base URL/model/API key 环境变量名和维度。
+`memory-core` 会在新写入记录里保存 embedding profile，并拒绝同一 `scope_id`
+下混用不同 profile；即使两个模型维度相同，也不能认为它们处于同一语义向量空间。
+
+脚本发出的 `/api/v1/*` 请求都会携带该 token。脚本不会打印 token。
+`/health` 可不带 token，其余 REST API 会拒绝未鉴权请求。
 
 ## 查看结果
 
@@ -96,6 +130,8 @@ MEMORY_CASES_KEEP_TMP=1 \
 api=http://127.0.0.1:xxxxx
 doc_dir=...
 doc_count=...
+embedding_provider=...
+embedding_dimensions=...
 chunk_size=...
 chat_top_k=...
 ```

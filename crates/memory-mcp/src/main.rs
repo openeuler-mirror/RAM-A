@@ -3,10 +3,12 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use memory_core::{EmbeddingProvider, MemoryManager, OpenRouterEmbedding, SqliteMemoryStore};
+use memory_core::{
+    EmbeddingProvider, HashEmbedding, MemoryManager, OpenRouterEmbedding, SqliteMemoryStore,
+};
 use memory_mcp::{
-    create_http_router, HttpRuntime, IdempotencyRepository, MemoryService, ServerConfig,
-    TokenAuthenticator,
+    create_http_router, EmbeddingProviderKind, HttpRuntime, IdempotencyRepository, MemoryService,
+    ServerConfig, TokenAuthenticator,
 };
 use memory_pipeline::client::OpenAiCompatibleClient;
 use memory_pipeline::extraction::{LlmMemoryExtractor, MemoryExtractor};
@@ -46,12 +48,26 @@ async fn main() -> Result<()> {
         .as_ref()
         .context("validated provider configuration is unavailable")?;
     let provider_key = resolve_secret_env(&providers.api_key_env)?;
-    let embedder: Arc<dyn EmbeddingProvider> = Arc::new(OpenRouterEmbedding::with_base_url(
-        provider_key.clone(),
-        &providers.base_url,
-        &providers.embedding_model,
-        providers.embedding_dimensions,
-    ));
+    let embedder: Arc<dyn EmbeddingProvider> = match providers.embedding_provider {
+        EmbeddingProviderKind::OpenAiCompatible => {
+            let embedding_key_env = providers
+                .embedding_api_key_env
+                .as_deref()
+                .unwrap_or(&providers.api_key_env);
+            let embedding_key = resolve_secret_env(embedding_key_env)?;
+            let embedding_base_url = providers
+                .embedding_base_url
+                .as_deref()
+                .unwrap_or(&providers.base_url);
+            Arc::new(OpenRouterEmbedding::with_base_url(
+                embedding_key,
+                embedding_base_url,
+                &providers.embedding_model,
+                providers.embedding_dimensions,
+            ))
+        }
+        EmbeddingProviderKind::Hash => Arc::new(HashEmbedding::new(providers.embedding_dimensions)),
+    };
     let model_client = OpenAiCompatibleClient::new(
         provider_key,
         &providers.base_url,
