@@ -1,0 +1,10 @@
+{
+  "candidate-8bb97477654fd6d8ae8e8ec9": {
+    "status": "SUPPORTED",
+    "reason": "The source turn states the sketchbook and its storage location."
+  },
+  "candidate-e0a7294ddc7d982397e5e98b": {
+    "status": "SUPPORTED",
+    "reason": "The source turn states the planned meeting, person, day, and location."
+  }
+}

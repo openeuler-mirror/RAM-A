@@ -111,6 +111,64 @@ def test_evaluate_qa_writes_results_and_metrics():
         assert metrics["answer_prompt_version"] == "lme_default"
 
 
+def test_qa_diagnostics_use_expanded_source_turn_ids():
+    prepared = {
+        "queries": [
+            {
+                "id": "q001",
+                "text": "What is my commute?",
+                "metadata": {"question_type": "single-session-user"},
+                "task": {
+                    "correct_answer": "45 minutes",
+                    "gold_turn_ids": ["q001_s0_t0"],
+                },
+            }
+        ]
+    }
+    search_results = [
+        {
+            "query_id": "q001",
+            "results": [
+                {
+                    "id": "mem-a",
+                    "text": "The commute takes 45 minutes.",
+                    "metadata": {
+                        "memory_kind": "extracted_memory",
+                        "evidence_refs": [
+                            {"message_id": "q001_s1_t0"},
+                            {"message_id": "q001_s0_t0"},
+                        ],
+                    },
+                    "score": 0.9,
+                }
+            ],
+        }
+    ]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        results_path = os.path.join(tmpdir, "qa_results.json")
+        evaluate_qa(
+            search_results=search_results,
+            prepared=prepared,
+            output_results_path=results_path,
+            output_metrics_path=os.path.join(tmpdir, "qa_metrics.json"),
+            answerer_client=FakeClient(["45 minutes"]),
+            judge_client=FakeClient(["yes"]),
+            answerer_model="answerer",
+            judge_model="judge",
+        )
+
+        saved = json.load(open(results_path, encoding="utf-8"))
+        diagnostic = saved[0]["retrieval_diagnostic"]
+        assert diagnostic["retrieved_source_turn_ids"] == [
+            "q001_s1_t0",
+            "q001_s0_t0",
+        ]
+        assert diagnostic["gold_turn_retrieved"] is True
+        assert diagnostic["gold_turn_ranks"] == [2]
+        assert diagnostic["gold_turn_best_rank"] == 2
+
+
 def test_lme_default_prompt_records_version_and_rules():
     prompt = format_answer_prompt(
         question="What did I buy after the webinar?",

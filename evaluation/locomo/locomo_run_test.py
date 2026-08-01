@@ -1,19 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
+import sys
 
 import pytest
 
 import locomo.locomo_run as locomo_run
 
-from common.memory_pipeline.cache import JsonCache
-from common.memory_pipeline.extraction import StaticMemoryExtractor
-from common.memory_pipeline.grounding import StaticGroundingVerifier
-from common.memory_pipeline.pipeline import PipelineConfig, run_memory_pipeline
 from locomo.locomo_adapter import prepare_locomo
-from locomo.locomo_provenance import render_contexts
 from locomo.locomo_run import (
     RunConfig,
     build_extraction_command,
@@ -21,6 +18,7 @@ from locomo.locomo_run import (
     config_hash,
     ensure_run_mode,
     memory_bench_base_command,
+    run_arm,
     run_stage,
     stage_manifest,
     validate_frozen_config,
@@ -76,6 +74,40 @@ def test_run_config_matches_approved_settings_without_serializing_secret(
     assert config.public_manifest()["llm_temperature"] == 0.0
     assert len(config.immutable_manifest()["implementation_hash"]) == 64
     assert len(config_hash(config)) == 64
+
+
+def test_run_config_records_pair_and_explicit_policy_hash(monkeypatch, tmp_path):
+    policy = tmp_path / "policy.json"
+    policy.write_text('{"schema_version":"locomo-promotion-v1"}\n', encoding="utf-8")
+
+    config = RunConfig.from_env(
+        {
+            "PAIR_ID": "locomo-pair-7",
+            "PROMOTION_POLICY": str(policy),
+            "DATASET": str(tmp_path / "locomo.json"),
+            "RUN_DIR": str(tmp_path / "run"),
+        }
+    )
+
+    assert config.public_manifest()["pair_id"] == "locomo-pair-7"
+    assert config.public_manifest()["promotion_policy_hash"] == locomo_run.file_sha256(policy)
+    assert "pair_id" not in config.immutable_manifest()
+    assert config.immutable_manifest()["promotion_policy_hash"] == locomo_run.file_sha256(policy)
+
+
+def test_direct_script_launcher_can_import_shared_contracts() -> None:
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+
+    result = subprocess.run(
+        [sys.executable, "locomo/locomo_run.py", "--help"],
+        cwd=locomo_run.EVALUATION_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_implementation_hash_covers_shared_llm_client(monkeypatch, tmp_path) -> None:
@@ -146,7 +178,16 @@ def test_extraction_command_disables_fail_fast(tmp_path) -> None:
     )
 
     assert "--no-fail-fast" in command
-    assert command[1:3] == ["-m", "common.memory_pipeline.cli"]
+    assert command[:8] == [
+        "cargo",
+        "run",
+        "--quiet",
+        "--manifest-path",
+        str(locomo_run.PROJECT_ROOT / "Cargo.toml"),
+        "-p",
+        "memory-pipeline",
+        "--",
+    ]
     assert "--model" in command
     assert command[command.index("--model") + 1] == "openai/gpt-4o-mini"
     assert command[command.index("--verifier-model") + 1] == "openai/gpt-4o-mini"
@@ -156,6 +197,46 @@ def test_extraction_command_disables_fail_fast(tmp_path) -> None:
     assert command[command.index("--input") + 1] == str(raw_prepared)
     assert command[command.index("--output") + 1] == str(indexed_prepared)
     assert command[command.index("--artifacts-dir") + 1] == str(artifacts)
+
+
+def test_extraction_command_delegates_to_shared_rust_builder(monkeypatch, tmp_path):
+    config = RunConfig(
+        memory_mode="extracted",
+        phase="pilot",
+        dataset=tmp_path / "locomo.json",
+        run_dir=tmp_path / "run",
+    )
+    raw_prepared = config.run_dir / "raw_prepared.json"
+    indexed_prepared = config.run_dir / "extracted_prepared.json"
+    artifacts = config.run_dir / "artifacts"
+    calls = []
+
+    def fake_builder(shared_config, raw, extracted, artifacts_dir):
+        calls.append((shared_config, raw, extracted, artifacts_dir))
+        return ["shared-command"]
+
+    monkeypatch.setattr(locomo_run, "build_memory_pipeline_command", fake_builder)
+
+    command = build_extraction_command(
+        config, raw_prepared, indexed_prepared, artifacts, "config-digest-abc"
+    )
+
+    assert command == ["shared-command"]
+    shared_config, raw, extracted, artifacts_dir = calls[0]
+    assert shared_config.project_root == locomo_run.PROJECT_ROOT
+    assert shared_config.cache_dir == config.run_dir / "cache" / "memory-pipeline"
+    assert shared_config.cache_version == "config-digest-abc"
+    assert shared_config.model == config.chat_model
+    assert shared_config.verifier_model == config.chat_model
+    assert shared_config.api_key_env == config.credential_env
+    assert shared_config.base_url == config.base_url
+    assert shared_config.episode_boundary_fields == ("session_id",)
+    assert shared_config.fail_fast is False
+    assert (raw, extracted, artifacts_dir) == (
+        raw_prepared,
+        indexed_prepared,
+        artifacts,
+    )
 
 
 def test_search_command_enables_resume_and_rerank(tmp_path) -> None:
@@ -307,6 +388,51 @@ def test_frozen_config_compares_only_immutable_experiment_fields(tmp_path) -> No
         validate_frozen_config(full, frozen)
 
 
+def test_frozen_config_delegates_to_common_manifest_validator(
+    monkeypatch, tmp_path
+) -> None:
+    config = RunConfig(
+        memory_mode="raw",
+        phase="pilot",
+        dataset=tmp_path / "locomo.json",
+        run_dir=tmp_path / "raw",
+    )
+    frozen = tmp_path / "frozen.json"
+    calls = []
+
+    def fake_validate(current_immutable, frozen_path):
+        calls.append((current_immutable, frozen_path))
+
+    monkeypatch.setattr(locomo_run, "validate_frozen_manifest", fake_validate)
+
+    validate_frozen_config(config, frozen)
+
+    assert calls == [(config.immutable_manifest(), frozen)]
+
+
+def test_full_frozen_validation_precedes_dataset_and_api_key_access(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    config = RunConfig(
+        memory_mode="raw",
+        phase="full",
+        dataset=tmp_path / "missing.json",
+        run_dir=tmp_path / "run",
+    )
+    frozen = tmp_path / "frozen.json"
+    value = config.public_manifest()
+    value["top_k"] = 29
+    frozen.write_text(json.dumps(value), encoding="utf-8")
+    monkeypatch.setenv("FROZEN_CONFIG", str(frozen))
+    monkeypatch.delenv(config.credential_env, raising=False)
+
+    with pytest.raises(ValueError, match="frozen configuration mismatch.*top_k"):
+        run_arm(config)
+
+    assert not config.run_dir.exists()
+
+
 def test_run_directory_rejects_switching_between_raw_and_extracted(tmp_path) -> None:
     ensure_run_mode(tmp_path, "raw")
     ensure_run_mode(tmp_path, "raw")
@@ -315,50 +441,12 @@ def test_run_directory_rejects_switching_between_raw_and_extracted(tmp_path) -> 
         ensure_run_mode(tmp_path, "extracted")
 
 
-def test_offline_fixture_runs_pipeline_context_and_cache_resume(tmp_path) -> None:
-    dataset = json.loads(FIXTURE.read_text(encoding="utf-8"))
-    prepared = prepare_locomo(dataset)
-    extractor = StaticMemoryExtractor(
-        json.loads(EXTRACTOR_FIXTURE.read_text(encoding="utf-8"))
-    )
-    verifier = StaticGroundingVerifier(
-        json.loads(GROUNDING_FIXTURE.read_text(encoding="utf-8"))
-    )
-    cache = JsonCache(tmp_path / "cache", version="offline-smoke-v1")
+def test_implementation_hash_tracks_memory_pipeline_binary(tmp_path, monkeypatch) -> None:
+    binary = tmp_path / "memory-pipeline"
+    binary.write_bytes(b"first")
+    monkeypatch.setenv("MEMORY_PIPELINE_BIN", str(binary))
+    first = locomo_run.implementation_hash()
 
-    first = run_memory_pipeline(
-        prepared,
-        PipelineConfig(),
-        extractor,
-        verifier,
-        cache,
-    )
-    second = run_memory_pipeline(
-        prepared,
-        PipelineConfig(),
-        extractor,
-        verifier,
-        cache,
-    )
+    binary.write_bytes(b"second")
 
-    assert first.stats["candidate_source_coverage"] == 1.0
-    assert first.stats["accepted_memory_count"] >= 2
-    assert second.stats["extraction_call_count"] == 0
-    assert second.stats["verification_call_count"] == 0
-    assert second.prepared == first.prepared
-    query = first.prepared["queries"][0]
-    item = {
-        "query_path": "$.queries[0].text",
-        "query": query["text"],
-        "query_id": query["id"],
-        "filter": query["filter"],
-        "metadata": query["metadata"],
-        "task": query["task"],
-        "results": [{**first.prepared["memories"][0], "score": 1.0}],
-    }
-    contexts = render_contexts(dataset, prepared, item, "extracted")
-    assert any(
-        "[Atomic]" in row["memory"] and "[Evidence" in row["memory"]
-        for rows in contexts.values()
-        for row in rows
-    )
+    assert locomo_run.implementation_hash() != first

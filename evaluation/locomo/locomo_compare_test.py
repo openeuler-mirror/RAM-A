@@ -5,6 +5,8 @@ import pytest
 from locomo.locomo_compare import (
     FULL_THRESHOLDS,
     build_comparison,
+    main,
+    maybe_write_history_record,
     pilot_checks,
     promotion_checks,
     validate_arm_contract,
@@ -235,6 +237,126 @@ def test_html_report_contains_separate_audit_tables(tmp_path) -> None:
         assert heading in html
     assert "0.125" in html
     assert "reported_total_tokens" in html
+
+
+def test_complete_failed_full_pair_writes_common_history_without_mutating_report(
+    tmp_path,
+) -> None:
+    report = _common_history_report(phase="full", count=1540, passed=False)
+    before = json_clone(report)
+    output = tmp_path / "history_record.json"
+
+    written = maybe_write_history_record(output, report)
+
+    assert written is True
+    assert report == before
+    records = json_clone_from_path(output)
+    assert [record["memory_mode"] for record in records] == ["raw", "extracted"]
+    assert records[1]["promotion_status"] == "failed"
+    assert records[1]["promotion_reasons"] == ["historical_overall"]
+    assert records[0]["schema_version"] == "memory-ab-history-v1"
+    assert records[0]["split"] == "locomo10"
+
+
+@pytest.mark.parametrize(("phase", "count"), [("pilot", 1540), ("full", 1539)])
+def test_pilot_or_incomplete_pair_does_not_write_common_history(
+    tmp_path, phase: str, count: int
+) -> None:
+    output = tmp_path / "history_record.json"
+    output.write_text("stale", encoding="utf-8")
+
+    written = maybe_write_history_record(
+        output,
+        _common_history_report(phase=phase, count=count, passed=True),
+    )
+
+    assert written is False
+    assert not output.exists()
+
+
+def test_cli_rejects_comparison_history_path_collision_before_reading(tmp_path) -> None:
+    collision = tmp_path / "history_record.json"
+
+    with pytest.raises(ValueError, match="distinct"):
+        main(
+            [
+                "--phase",
+                "pilot",
+                "--raw-dir",
+                str(tmp_path / "missing-raw"),
+                "--treatment-dir",
+                str(tmp_path / "missing-extracted"),
+                "--output-json",
+                str(collision),
+                "--html-report",
+                str(tmp_path / "report.html"),
+            ]
+        )
+
+
+def _common_history_report(*, phase: str, count: int, passed: bool) -> dict:
+    raw_config = {
+        "memory_mode": "raw",
+        "dataset": "/datasets/locomo10.json",
+        "run_dir": "/artifacts/locomo-pair/raw",
+        "chat_model": "answer-model",
+        "top_k": 30,
+        "source_hash": "source-sha",
+        "configuration_hash": "config-sha",
+        "implementation_hash": "code-sha",
+        "preflight_hash": "preflight-sha",
+    }
+    extracted_config = {
+        **raw_config,
+        "memory_mode": "extracted",
+        "run_dir": "/artifacts/locomo-pair/extracted",
+    }
+    arm = {
+        "overall": {"llm_score": 0.41, "count": count},
+        "by_category": {"1": {"llm_score": 0.21}},
+        "held_out": {"overall": {"llm_score": 0.42, "count": count}},
+    }
+    return {
+        "schema_version": "locomo-memory-ab-v1",
+        "phase": phase,
+        "fresh_raw": arm,
+        "treatment": arm,
+        "retrieval": {
+            "fresh_raw": {"overall": {"evidence_hit_at_k": 0.3}},
+            "treatment": {"overall": {"evidence_hit_at_k": 0.4}},
+        },
+        "cost": {"estimated_cost_usd": None},
+        "promotion": {
+            "passed": passed,
+            "checks": [
+                {
+                    "name": "historical_overall",
+                    "passed": passed,
+                    "actual": 0.41,
+                    "operator": ">",
+                    "threshold": 0.4065,
+                }
+            ],
+        },
+        "arm_contract": {
+            "source_hash": "source-sha",
+            "configuration_hash": "config-sha",
+            "implementation_hash": "code-sha",
+            "preflight_hash": "preflight-sha",
+            "query_count": count,
+            "scored_query_count": count,
+        },
+        "configuration": {
+            "fresh_raw": raw_config,
+            "treatment": extracted_config,
+        },
+    }
+
+
+def json_clone_from_path(path):
+    import json
+
+    return json.loads(path.read_text(encoding="utf-8"))
 
 def _judged(query_id: str, category: int, score: int) -> dict:
     return {

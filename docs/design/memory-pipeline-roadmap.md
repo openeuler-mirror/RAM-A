@@ -39,9 +39,8 @@ SQLite hybrid search 解决的是本地存储和候选检索问题：RAM-A 如�
 目标：在写入记忆库之前，把长对话切成更稳定的记忆 chunk。这样可以降低检索噪
 声，让每个记忆单元更适合召回和重排。
 
-详细设计见 [conversation-chunking-design.md](conversation-chunking-design.md)。
-该设计文档包含边界策略、UML/Mermaid 图、三套 benchmark 的落地路径、评估指标
-和参考论文/系统。
+本节概述边界策略和三套 benchmark 的落地路径；已经实现的 episode/window 行为
+以 Rust `memory-pipeline` 的测试和公开 CLI 为准。
 
 初始 chunk 边界应该支持：
 
@@ -302,6 +301,13 @@ extraction 阶段应使用 RAM-A 已有的 OpenAI-compatible LLM client，以及
 judge 调用中已经引入的本地 JSON 解析约定。在跑真实 API benchmark 前，应先用
 stubbed model response 做单元测试。
 
+### 4.1 运行时归属
+
+Episode、window、extraction、validation、grounding、deduplication 和 prepared
+output 已迁移到 Rust `memory-pipeline` crate。Python 只保留数据集 adapter、评测
+编排、指标和报告；原 Python memory pipeline 及其行为对照测试已删除，离线回归
+通过 fixture 直接验证 Rust CLI。MCP 接入不属于本次迁移范围。
+
 ## 5. 第三层：Timeline-Aware Memory Reasoning
 
 目标：用能处理偏好演变、最新状态和时间约束问题的方式表示和检索记忆。
@@ -355,3 +361,12 @@ stubbed model response 做单元测试。
   后的离线 re-extraction？
 - benchmark reports 应该如何对比 raw-chunk retrieval 和 extracted-memory
   retrieval，同时不改变现有评分 schema？
+
+## 8. 统一 A/B 治理入口
+
+PersonaMem、LongMemEval 和 LoCoMo 现在由
+`evaluation/scripts/run_memory_ab.py` 按同一顺序运行：完整 frozen/policy 门禁、
+dataset-bound regression preflight、fresh raw、extracted、comparison，最后才执行 pilot
+freeze 或 full history append。Preflight hash 在 arm 启动前由各 runner 验证并写入
+`config.json`；Python 不补写或伪造 Rust memory pipeline 的结果。只有完整 full pair
+进入版本化 JSONL history，晋级失败的完整 pair 保留为 failed，pilot/不完整 pair 不写。

@@ -100,3 +100,26 @@ def test_preflight_validation_does_not_depend_on_package_import_path(
     monkeypatch.setattr(builtins, "__import__", reject_package_import)
 
     assert len(validate_preflight(config, path)) == 64
+
+
+def test_locomo_accepts_unified_memory_ab_preflight(tmp_path) -> None:
+    config = RunConfig("raw", "pilot", tmp_path / "data.json", tmp_path / "run")
+    report = {
+        "schema_version": "memory-ab-preflight-v1",
+        "dataset": "locomo",
+        "passed": True,
+        "implementation_hash": config.immutable_manifest()["implementation_hash"],
+        "suites": [
+            {"name": name, "exit_code": 0}
+            for name in (
+                "python_evaluation",
+                "rust_workspace",
+                "rust_clippy",
+                "diff_check",
+            )
+        ],
+    }
+    path = tmp_path / "preflight.json"
+    path.write_text(json.dumps(report), encoding="utf-8")
+
+    assert len(validate_preflight(config, path)) == 64

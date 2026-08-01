@@ -1,0 +1,67 @@
+{
+  "window-0c2c77e7a6547b9a0fb24de9": {
+    "schema_version": "atomic_memory_v1",
+    "memories": [
+      {
+        "text": "Maya keeps her red sketchbook in the hall cabinet.",
+        "memory_type": "fact",
+        "subject": {
+          "name": "Maya",
+          "source_speaker": "user"
+        },
+        "predicate": "keeps_in",
+        "object": {
+          "name": "red sketchbook",
+          "type": "object"
+        },
+        "modality": "asserted",
+        "event_time": null,
+        "attributes": {
+          "location": "hall cabinet"
+        },
+        "evidence": [
+          {
+            "message_id": "lme-fixture-1_s0_t0",
+            "quote": "Maya keeps her red sketchbook in the hall cabinet.",
+            "evidence_role": "primary"
+          }
+        ],
+        "model_confidence": 0.99
+      }
+    ]
+  },
+  "window-cec758a584f8d0f50365696e": {
+    "schema_version": "atomic_memory_v1",
+    "memories": [
+      {
+        "text": "Maya plans to meet Omar at the riverside cafe on Friday.",
+        "memory_type": "event",
+        "subject": {
+          "name": "Maya",
+          "source_speaker": "user"
+        },
+        "predicate": "plans_to_meet",
+        "object": {
+          "name": "Omar",
+          "type": "person"
+        },
+        "modality": "planned",
+        "event_time": {
+          "raw": "Friday",
+          "precision": "day"
+        },
+        "attributes": {
+          "location": "riverside cafe"
+        },
+        "evidence": [
+          {
+            "message_id": "lme-fixture-1_s1_t0",
+            "quote": "On Friday I will meet Omar at the riverside cafe.",
+            "evidence_role": "primary"
+          }
+        ],
+        "model_confidence": 0.99
+      }
+    ]
+  }
+}

@@ -12,6 +12,12 @@ from typing import Any, Sequence
 EVALUATION_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(EVALUATION_ROOT))
 
+from common.memory_ab import canonical_sha256, file_sha256
+from common.memory_ab_compare import (
+    build_history_records,
+    remove_stale_history_artifact,
+    resolve_history_artifact_path,
+)
 from common.report import generate_report, html_escape
 from locomo.locomo_metric import aggregate_scores
 
@@ -33,6 +39,17 @@ FULL_THRESHOLDS = {
     "3": 0.2717,
     "4": 0.4509,
 }
+
+
+def promotion_policy_manifest() -> dict[str, Any]:
+    return {
+        "schema_version": "locomo-promotion-v1",
+        "historical_overall": {"operator": ">", "threshold": 0.4065},
+        "fresh_raw_overall": {"operator": ">"},
+        "scored_count": 1540,
+        "category_floors": dict(FULL_THRESHOLDS),
+        "regression_suite_required": True,
+    }
 
 
 def validate_paired_query_ids(raw: dict, treatment: dict) -> None:
@@ -360,6 +377,123 @@ def _check(name, passed, actual, operator, threshold):
     }
 
 
+def maybe_write_history_record(path: Path, report: dict[str, Any]) -> bool:
+    """Write the common pair records for a complete full LoCoMo comparison."""
+    if not _is_complete_full(report):
+        remove_stale_history_artifact(path)
+        return False
+    _write_json_atomic(path, _common_history_records(report))
+    return True
+
+
+def _is_complete_full(report: dict[str, Any]) -> bool:
+    return (
+        report.get("phase") == "full"
+        and (report.get("fresh_raw", {}).get("overall") or {}).get("count") == 1540
+        and (report.get("treatment", {}).get("overall") or {}).get("count") == 1540
+        and report.get("arm_contract", {}).get("scored_query_count") == 1540
+    )
+
+
+def _common_history_records(report: dict[str, Any]) -> list[dict[str, Any]]:
+    configurations = report.get("configuration")
+    if not isinstance(configurations, dict):
+        raise ValueError("LoCoMo comparison configuration is missing")
+    raw_config = configurations.get("fresh_raw")
+    extracted_config = configurations.get("treatment")
+    if not isinstance(raw_config, dict) or not isinstance(extracted_config, dict):
+        raise ValueError("LoCoMo comparison arm configurations are missing")
+    raw_run_dir = _required_text(raw_config, "run_dir")
+    extracted_run_dir = _required_text(extracted_config, "run_dir")
+    raw_dataset = _required_text(raw_config, "dataset")
+    if raw_dataset != _required_text(extracted_config, "dataset"):
+        raise ValueError("LoCoMo raw/extracted dataset mismatch")
+    pair_id = raw_config.get("pair_id")
+    if pair_id is not None and pair_id != extracted_config.get("pair_id"):
+        raise ValueError("LoCoMo raw/extracted pair_id mismatch")
+    if not pair_id:
+        pair_id = "locomo-" + canonical_sha256(
+            {"raw_run_dir": raw_run_dir, "extracted_run_dir": extracted_run_dir}
+        )[:16]
+
+    failed_checks = [
+        str(check["name"])
+        for check in report.get("promotion", {}).get("checks", [])
+        if check.get("passed") is not True
+    ]
+    policy = promotion_policy_manifest()
+    common = {
+        "dataset": "locomo",
+        "split": str(raw_config.get("split") or Path(raw_dataset).stem),
+        "phase": "full",
+        "pair_id": str(pair_id),
+        "complete": True,
+        "arm_contract": report["arm_contract"],
+        "policy_hash": report.get("policy_hash") or canonical_sha256(policy),
+        "fresh_raw": _common_arm(raw_config, report["fresh_raw"], report, "raw"),
+        "treatment": _common_arm(
+            extracted_config, report["treatment"], report, "extracted"
+        ),
+        "promotion": {
+            "passed": report["promotion"]["passed"],
+            "reasons": failed_checks,
+        },
+    }
+    return build_history_records(common)
+
+
+def _common_arm(
+    config: dict[str, Any],
+    qa: dict[str, Any],
+    report: dict[str, Any],
+    memory_mode: str,
+) -> dict[str, Any]:
+    run_dir = _required_text(config, "run_dir")
+    run_id = config.get("run_id") or (
+        f"locomo-{memory_mode}-" + canonical_sha256({"run_dir": run_dir})[:16]
+    )
+    compact_keys = (
+        "chat_model",
+        "embedding_model",
+        "embedding_dimensions",
+        "candidate_k",
+        "rerank_model",
+        "rerank_input_k",
+        "top_k",
+        "max_candidate_tokens",
+        "max_window_tokens",
+    )
+    metrics = {
+        "qa": {
+            "overall": dict(qa["overall"]),
+            "by_category": {
+                str(category): dict(values)
+                for category, values in qa.get("by_category", {}).items()
+            },
+        },
+        "retrieval": dict(report.get("retrieval", {}).get(
+            "fresh_raw" if memory_mode == "raw" else "treatment", {}
+        )),
+    }
+    return {
+        "run_id": str(run_id),
+        "configuration": {
+            key: config[key]
+            for key in compact_keys
+            if key in config and config[key] is not None
+        },
+        "metrics": metrics,
+        "artifact_path": run_dir,
+    }
+
+
+def _required_text(value: dict[str, Any], key: str) -> str:
+    result = value.get(key)
+    if not isinstance(result, (str, Path)) or not str(result):
+        raise ValueError(f"LoCoMo config requires {key}")
+    return str(result)
+
+
 def write_html_report(path: Path, report: dict[str, Any]) -> None:
     overall_rows = [
         (label, arm["overall"].get("llm_score"), arm["overall"].get("count"))
@@ -510,7 +644,7 @@ def _read_json(path: Path) -> dict:
     return value
 
 
-def _write_json_atomic(path: Path, value: dict) -> None:
+def _write_json_atomic(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
@@ -527,6 +661,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--treatment-dir", type=Path)
     parser.add_argument("--output-json", type=Path)
     parser.add_argument("--html-report", type=Path)
+    parser.add_argument("--policy", type=Path)
     parser.add_argument("--assert-passed", action="store_true")
     parser.add_argument("--input", type=Path)
     return parser
@@ -543,6 +678,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError(
             "--phase, --raw-dir, --treatment-dir, --output-json and --html-report are required"
         )
+    history_path = resolve_history_artifact_path(args.output_json)
     raw_judged = _read_json(args.raw_dir / "judge_results.json")
     treatment_judged = _read_json(args.treatment_dir / "judge_results.json")
     raw_retrieval = _read_json(args.raw_dir / "retrieval_metrics.json")
@@ -550,6 +686,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     pipeline_stats = _read_json(args.treatment_dir / "artifacts" / "extraction_stats.json")
     raw_config = _read_json(args.raw_dir / "config.json")
     config = _read_json(args.treatment_dir / "config.json")
+    policy_hash = None
+    if args.policy is not None:
+        policy = _read_json(args.policy)
+        if policy != promotion_policy_manifest():
+            raise ValueError("LoCoMo promotion policy does not match the frozen policy")
+        policy_hash = file_sha256(args.policy)
+        if any(
+            arm.get("promotion_policy_hash") != policy_hash
+            for arm in (raw_config, config)
+        ):
+            raise ValueError("promotion policy hash does not match paired configs")
     raw_prepared = _read_json(args.raw_dir / "raw_prepared.json")
     treatment_prepared = _read_json(args.treatment_dir / "raw_prepared.json")
     contract = validate_arm_contract(
@@ -574,8 +721,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "fresh_raw": raw_config,
         "treatment": config,
     }
+    report["policy_hash"] = policy_hash or config.get("promotion_policy_hash")
+    report["complete"] = _is_complete_full(report)
     _write_json_atomic(args.output_json, report)
     write_html_report(args.html_report, report)
+    maybe_write_history_record(
+        history_path,
+        report,
+    )
     if args.phase == "pilot" and report["promotion"]["passed"]:
         _write_json_atomic(args.output_json.parent / "frozen_config.json", config)
     return 0

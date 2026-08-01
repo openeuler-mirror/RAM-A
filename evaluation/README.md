@@ -110,7 +110,7 @@ Run extraction and independent grounding verification with any OpenAI-compatible
 endpoint:
 
 ```bash
-PYTHONPATH=evaluation python -m common.memory_pipeline.cli \
+cargo run --quiet --manifest-path Cargo.toml -p memory-pipeline -- \
   --input outputs/longmemeval/raw-prepared.json \
   --output outputs/longmemeval/extracted-prepared.json \
   --artifacts-dir outputs/longmemeval/memory-pipeline \
@@ -131,7 +131,7 @@ output prepared file are indexed.
 Offline fixture mode replaces both model calls with JSON response maps:
 
 ```bash
-PYTHONPATH=evaluation python -m common.memory_pipeline.cli \
+cargo run --quiet --manifest-path Cargo.toml -p memory-pipeline -- \
   --input outputs/longmemeval/raw-prepared.json \
   --output /tmp/extracted-prepared.json \
   --artifacts-dir /tmp/memory-pipeline \
@@ -157,6 +157,45 @@ All evaluation runs write to repository-root `outputs/<dataset>/<timestamp>/` by
 Keep large raw artifacts out of Git. Store compact comparison records under
 `evaluation/baselines/` and upload full run artifacts to object storage, release assets,
 or another artifact system.
+
+## Governed raw/extracted pairs
+
+Use the unified entrypoint for PersonaMem, LongMemEval, or LoCoMo promotion
+experiments. Create the explicit policy JSON before the pilot; PersonaMem and
+LongMemEval use `memory-ab-promotion-v1` with dotted metric paths and the exact
+authoritative full-run counts in `completeness_counts`. A passing pilot writes
+its frozen manifest only after both arms and comparison succeed.
+
+```bash
+cargo build -p memory-pipeline
+export MEMORY_PIPELINE_BIN="$PWD/target/debug/memory-pipeline"
+
+PYTHONPATH=evaluation evaluation/.venv/bin/python evaluation/scripts/run_memory_ab.py \
+  --dataset personalmem --phase pilot --pair-id personalmem-32k-v1 \
+  --dataset-file data/personalmem/prepared/personalmem_32k.json \
+  --promotion-policy /absolute/path/personalmem-policy.json
+
+PYTHONPATH=evaluation evaluation/.venv/bin/python evaluation/scripts/run_memory_ab.py \
+  --dataset personalmem --phase full --pair-id personalmem-32k-v1 \
+  --dataset-file data/personalmem/prepared/personalmem_32k.json \
+  --promotion-policy /absolute/path/personalmem-policy.json \
+  --frozen-config evaluation/outputs/memory-ab/personalmem/pilot/personalmem-32k-v1/frozen_config.json
+```
+
+Replace `personalmem` and the dataset path with `longmemeval` or `locomo` for
+the other registries. Options after `--` are forwarded unchanged to both arm
+runners. Before either arm, the entrypoint runs and records the Python suite,
+Rust workspace tests, Clippy, and `git diff --check`; each arm validates the
+dataset-bound preflight artifact and records its SHA-256 in `config.json`.
+
+Artifacts live under
+`evaluation/outputs/memory-ab/<dataset>/<phase>/<pair-id>/`, with independent
+`raw/` and `extracted/` stores plus `preflight.json`, `comparison.json`, and
+`comparison.html`. Pilot and incomplete pairs never update history. A complete
+full pair appends raw then extracted to `history/records/<dataset>.jsonl` and
+regenerates XLSX; a failed promotion is still recorded as failed and is not a
+baseline. Live full scores or promotion are not claimed until that controlled
+command is run manually with real providers.
 
 ## Tests
 

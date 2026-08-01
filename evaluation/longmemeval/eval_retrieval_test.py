@@ -5,6 +5,8 @@ import os
 import sys
 import tempfile
 
+import pytest
+
 # Allow running from any directory
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -103,10 +105,22 @@ def _make_lme_data():
     ]
 
 
+def _source_turn_metadata():
+    return {
+        "q001_s0_t0": {"session_id": "session_0"},
+        "q001_s0_t1": {"session_id": "session_0"},
+        "q001_s1_t0": {"session_id": "session_1"},
+        "q002_s1_t0": {"session_id": "session_1"},
+        "q002_s2_t0": {"session_id": "session_2"},
+    }
+
+
 def test_evaluate_session_recall():
     """Session-level recall: q001 finds session_0 (recall=1.0), q002 misses
     session_3/4 (recall=0.0).  Mean recall@10 = 0.5."""
-    report = evaluate_retrieval(_make_search_results(), _make_lme_data())
+    report = evaluate_retrieval(
+        _make_search_results(), _make_lme_data(), _source_turn_metadata()
+    )
 
     session = report["session"]
     assert "overall" in session
@@ -131,7 +145,9 @@ def test_evaluate_session_recall():
 def test_evaluate_turn_recall():
     """Turn-level: q001 has one has_answer=True turn at rank 1.
     q002 has zero has_answer turns."""
-    report = evaluate_retrieval(_make_search_results(), _make_lme_data())
+    report = evaluate_retrieval(
+        _make_search_results(), _make_lme_data(), _source_turn_metadata()
+    )
 
     turn = report["turn"]
     overall = turn["overall"]
@@ -181,7 +197,9 @@ def test_turn_gold_comes_from_dataset_not_retrieved_results():
         }
     ]
 
-    report = evaluate_retrieval(sr, lme)
+    report = evaluate_retrieval(
+        sr, lme, {"q001_s0_t1": {"session_id": "session_0"}}
+    )
 
     assert report["session"]["overall"]["recall@1"] == 1.0
     assert report["turn"]["overall"]["recall@1"] == 0.0
@@ -189,7 +207,7 @@ def test_turn_gold_comes_from_dataset_not_retrieved_results():
 
 
 def test_missing_search_result_counts_as_zero():
-    report = evaluate_retrieval([], _make_lme_data())
+    report = evaluate_retrieval([], _make_lme_data(), _source_turn_metadata())
 
     assert report["num_missing_results"] == 2
     assert report["session"]["overall"]["recall@10"] == 0.0
@@ -200,6 +218,7 @@ def test_expected_query_ids_limit_evaluation_scope():
     report = evaluate_retrieval(
         _make_search_results()[:1],
         _make_lme_data(),
+        _source_turn_metadata(),
         expected_query_ids=["q001"],
     )
 
@@ -231,7 +250,7 @@ def test_abstention_excluded():
         }
     )
 
-    report = evaluate_retrieval(sr, lme)
+    report = evaluate_retrieval(sr, lme, _source_turn_metadata())
 
     # Only q001 and q002 are non-abstention
     assert report["num_questions"] == 2, (
@@ -252,14 +271,28 @@ def test_load_and_evaluate_writes_file():
     with tempfile.TemporaryDirectory() as tmpdir:
         sr_path = os.path.join(tmpdir, "search_results.json")
         lme_path = os.path.join(tmpdir, "lme_data.json")
+        prepared_path = os.path.join(tmpdir, "prepared.json")
         out_path = os.path.join(tmpdir, "metrics.json")
 
         with open(sr_path, "w") as f:
             json.dump(sr, f)
         with open(lme_path, "w") as f:
             json.dump(lme, f)
+        with open(prepared_path, "w") as f:
+            json.dump(
+                {
+                    "queries": [{"id": "q001"}, {"id": "q002"}],
+                    "memories": [
+                        {"id": memory_id, "metadata": metadata}
+                        for memory_id, metadata in _source_turn_metadata().items()
+                    ],
+                },
+                f,
+            )
 
-        report = load_and_evaluate(sr_path, lme_path, out_path)
+        report = load_and_evaluate(
+            sr_path, lme_path, out_path, prepared_path=prepared_path
+        )
 
         assert os.path.isfile(out_path)
         with open(out_path) as f:
@@ -276,7 +309,7 @@ def test_question_type_from_search_result_metadata():
     # Override question_type in search result metadata
     sr[0]["metadata"]["question_type"] = "custom-type"
 
-    report = evaluate_retrieval(sr, lme)
+    report = evaluate_retrieval(sr, lme, _source_turn_metadata())
 
     by_type = report["session"]["by_type"]
     assert "custom-type" in by_type, (
@@ -285,6 +318,72 @@ def test_question_type_from_search_result_metadata():
     assert "single-session-user" not in by_type, (
         "Old question_type from lme_data should not appear"
     )
+
+
+def test_extracted_results_score_expanded_source_turns_and_sessions():
+    search_results = [
+        {
+            "query_id": "q001",
+            "metadata": {"question_type": "single-session-user"},
+            "task": {
+                "gold_session_ids": ["session_0"],
+                "gold_turn_ids": ["q001_s0_t0"],
+            },
+            "results": [
+                {
+                    "id": "mem-a",
+                    "metadata": {
+                        "memory_kind": "extracted_memory",
+                        "session_id": "must-not-be-used",
+                        "evidence_refs": [
+                            {"message_id": "q001_s1_t0"},
+                            {"message_id": "q001_s0_t0"},
+                        ],
+                    },
+                }
+            ],
+        }
+    ]
+    lme_data = [
+        {
+            "question_id": "q001",
+            "question_type": "single-session-user",
+            "answer_session_ids": ["session_0"],
+        }
+    ]
+    source_turn_metadata = {
+        "q001_s1_t0": {"session_id": "session_1"},
+        "q001_s0_t0": {"session_id": "session_0"},
+    }
+
+    report = evaluate_retrieval(
+        search_results, lme_data, source_turn_metadata, ks=[1, 2]
+    )
+
+    assert report["turn"]["overall"]["recall@1"] == 0.0
+    assert report["turn"]["overall"]["recall@2"] == 1.0
+    assert report["turn"]["overall"]["mrr"] == 0.5
+    assert report["session"]["overall"]["recall@1"] == 0.0
+    assert report["session"]["overall"]["recall@2"] == 1.0
+
+
+def test_evaluate_retrieval_rejects_missing_source_turn_metadata():
+    search_results = [
+        {
+            "query_id": "q001",
+            "results": [
+                {
+                    "id": "mem-a",
+                    "metadata": {
+                        "evidence_refs": [{"message_id": "q001_s0_t0"}]
+                    },
+                }
+            ],
+        }
+    ]
+
+    with pytest.raises(ValueError, match="missing source turn metadata.*q001_s0_t0"):
+        evaluate_retrieval(search_results, _make_lme_data()[:1], {})
 
 
 def main():
