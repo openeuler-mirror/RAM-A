@@ -126,9 +126,9 @@ impl RagService {
             Some(&document_id),
             Some(&task_id),
             &name,
-            file_path
-                .to_str()
-                .with_context(|| format!("file path is not valid UTF-8: {}", file_path.display()))?,
+            file_path.to_str().with_context(|| {
+                format!("file path is not valid UTF-8: {}", file_path.display())
+            })?,
             request.mime_type.as_deref(),
             request.bytes.len() as u64,
         )?;
@@ -192,7 +192,9 @@ impl RagService {
             (
                 file_path
                     .to_str()
-                    .with_context(|| format!("file path is not valid UTF-8: {}", file_path.display()))?
+                    .with_context(|| {
+                        format!("file path is not valid UTF-8: {}", file_path.display())
+                    })?
                     .to_string(),
                 request.mime_type.or_else(|| existing.mime_type.clone()),
                 bytes.len() as u64,
@@ -326,7 +328,11 @@ impl RagService {
                         .as_deref()
                         .or(chunk.source_path.as_deref())
                         .unwrap_or(&chunk.document_id);
-                    format!("Source: {}\n{}", source, truncate_chars(&chunk.content, 180))
+                    format!(
+                        "Source: {}\n{}",
+                        source,
+                        truncate_chars(&chunk.content, 180)
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join("\n\n");
@@ -409,9 +415,9 @@ impl RagService {
             .collect::<Vec<_>>();
 
         if !chunks.is_empty() {
-            let (document_search_text, document_summary_source) =
-                self.build_document_search_text_for_ingest(document, chunks)
-                    .await;
+            let (document_search_text, document_summary_source) = self
+                .build_document_search_text_for_ingest(document, chunks)
+                .await;
             requests.push(build_document_summary_memory_request(
                 document,
                 chunks.len(),
@@ -430,7 +436,10 @@ impl RagService {
     ) -> (String, &'static str) {
         if let Some(summary_llm) = &self.config.summary_llm {
             let content = build_llm_document_summary_source(chunks);
-            match summary_llm.summarize_document(&document.name, &content).await {
+            match summary_llm
+                .summarize_document(&document.name, &content)
+                .await
+            {
                 Ok(summary) => {
                     let summary_lines = document_summary_lines_from_text(&summary);
                     if !summary_lines.is_empty() {
@@ -467,10 +476,8 @@ impl RagService {
     ) -> Result<Vec<SearchChunk>> {
         let mut chunks = Vec::new();
         let mut seen_chunks = HashSet::new();
-        let document_hits =
-            competitive_document_hits(group_retrieval_results_by_document(results));
-        let use_context_windows =
-            self.retrieved_chunk_count(dataset_id, &document_hits)? > top_k;
+        let document_hits = competitive_document_hits(group_retrieval_results_by_document(results));
+        let use_context_windows = self.retrieved_chunk_count(dataset_id, &document_hits)? > top_k;
 
         // Reserve one result for every relevant document before adding more chunks
         // from an already represented document. This is driven by retrieval evidence,
@@ -705,9 +712,8 @@ async fn remove_document_file_dir(file_path: &str) -> Result<()> {
         return match fs::remove_file(file_path).await {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error).with_context(|| {
-                format!("failed to remove document file {}", file_path.display())
-            }),
+            Err(error) => Err(error)
+                .with_context(|| format!("failed to remove document file {}", file_path.display())),
         };
     };
 
@@ -787,10 +793,7 @@ fn group_retrieval_results_by_document(results: Vec<ScoredMemory>) -> Vec<Docume
 }
 
 fn competitive_document_hits(hits: Vec<DocumentRetrievalHit>) -> Vec<DocumentRetrievalHit> {
-    let best_score = hits
-        .iter()
-        .map(|hit| hit.best_score)
-        .fold(0.0f32, f32::max);
+    let best_score = hits.iter().map(|hit| hit.best_score).fold(0.0f32, f32::max);
     if best_score <= 0.0 {
         return hits;
     }
@@ -838,16 +841,8 @@ fn build_weighted_search_index_text(content: &str, profile: &SearchIndexProfile)
         &profile.important_tks,
         INDEX_IMPORTANT_TKS_WEIGHT,
     );
-    push_repeated_index_part(
-        &mut parts,
-        &profile.question_tks,
-        INDEX_QUESTION_TKS_WEIGHT,
-    );
-    push_repeated_index_part(
-        &mut parts,
-        &profile.context_tks,
-        INDEX_CONTEXT_TKS_WEIGHT,
-    );
+    push_repeated_index_part(&mut parts, &profile.question_tks, INDEX_QUESTION_TKS_WEIGHT);
+    push_repeated_index_part(&mut parts, &profile.context_tks, INDEX_CONTEXT_TKS_WEIGHT);
     push_index_part(&mut parts, &build_search_index_text(content));
     parts.join(" ")
 }
@@ -895,12 +890,14 @@ fn ranked_profile_terms(text: &str) -> Vec<String> {
         if !is_profile_keyword_candidate(&term) {
             continue;
         }
-        let entry = scores.entry(term.clone()).or_insert_with(|| ProfileTermScore {
-            term: term.clone(),
-            count: 0,
-            first_position: position,
-            score: 0.0,
-        });
+        let entry = scores
+            .entry(term.clone())
+            .or_insert_with(|| ProfileTermScore {
+                term: term.clone(),
+                count: 0,
+                first_position: position,
+                score: 0.0,
+            });
         entry.count += 1;
         entry.first_position = entry.first_position.min(position);
         entry.score += profile_keyword_score(&term);
@@ -997,7 +994,10 @@ fn representative_context_lines(content: &str) -> Vec<String> {
         .take(SEARCH_PROFILE_MAX_CONTEXT_LINES)
         .collect::<Vec<_>>();
     selected.sort_by_key(|candidate| candidate.order);
-    selected.into_iter().map(|candidate| candidate.text).collect()
+    selected
+        .into_iter()
+        .map(|candidate| candidate.text)
+        .collect()
 }
 
 fn push_unique_limited(values: &mut Vec<String>, value: String, limit: usize) {
@@ -1108,12 +1108,19 @@ fn build_document_body_summary(chunks: &[Chunk]) -> Vec<String> {
         selected
     };
 
-    selected.into_iter().map(|candidate| candidate.text).collect()
+    selected
+        .into_iter()
+        .map(|candidate| candidate.text)
+        .collect()
 }
 
 fn document_summary_candidate_texts(content: &str) -> Vec<String> {
     let mut texts = Vec::new();
-    for paragraph in content.lines().map(str::trim).filter(|line| !line.is_empty()) {
+    for paragraph in content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
         if paragraph.chars().count() <= DOCUMENT_SUMMARY_CANDIDATE_MAX_CHARS {
             texts.push(paragraph.to_string());
             continue;
@@ -1194,12 +1201,7 @@ fn looks_like_document_summary_heading(text: &str) -> bool {
     chars <= 40
         && !text
             .chars()
-            .any(|character| {
-                matches!(
-                    character,
-                    '。' | '！' | '？' | '；' | '.' | '!' | '?' | ';'
-                )
-            })
+            .any(|character| matches!(character, '。' | '！' | '？' | '；' | '.' | '!' | '?' | ';'))
 }
 
 fn select_document_summary_candidates(
@@ -1842,10 +1844,7 @@ fn ranked_chunk_indices(
             } else {
                 0.0
             };
-            let rank_score = raw_score * 2.0
-                + overlap_score
-                + structure_score
-                + intro_score;
+            let rank_score = raw_score * 2.0 + overlap_score + structure_score + intro_score;
             (index, rank_score)
         })
         .collect::<Vec<_>>();
@@ -1882,7 +1881,12 @@ fn chunk_structure_score(content: &str) -> f32 {
     if !version_like_terms(content).is_empty() {
         score += 0.08;
     }
-    if content.lines().filter(|line| !line.trim().is_empty()).count() > 1 {
+    if content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count()
+        > 1
+    {
         score += 0.04;
     }
     score.min(0.4)
@@ -1967,7 +1971,9 @@ mod tests {
         repo.initialize().expect("initialize repo");
         let store = Arc::new(SqliteMemoryStore::new(&memory_db_path));
         let embedder = Arc::new(HashEmbedding::new(embedding_dimensions));
-        let memory = Arc::new(MemoryManager::with_retrieval_config(store, embedder, retrieval));
+        let memory = Arc::new(MemoryManager::with_retrieval_config(
+            store, embedder, retrieval,
+        ));
         let service = RagService::new(
             repo,
             memory,
@@ -2019,12 +2025,10 @@ mod tests {
             )
             .await
             .expect("create document");
-        assert!(
-            service
-                .run_next_ingestion_task()
-                .await
-                .expect("run ingestion task")
-        );
+        assert!(service
+            .run_next_ingestion_task()
+            .await
+            .expect("run ingestion task"));
     }
 
     async fn search_contents(service: &RagService, query: &str) -> Vec<String> {
@@ -2055,12 +2059,10 @@ mod tests {
             "oldneedle original guidance. Keep the legacy appliance online.",
         )
         .await;
-        assert!(
-            search_contents(&service, "oldneedle")
-                .await
-                .iter()
-                .any(|content| content.contains("oldneedle"))
-        );
+        assert!(search_contents(&service, "oldneedle")
+            .await
+            .iter()
+            .any(|content| content.contains("oldneedle")));
 
         let response = service
             .update_document(
@@ -2096,19 +2098,15 @@ mod tests {
         assert!(search_contents(&service, "oldneedle").await.is_empty());
         assert!(search_contents(&service, "newneedle").await.is_empty());
 
-        assert!(
-            service
-                .run_next_ingestion_task()
-                .await
-                .expect("run update ingestion task")
-        );
+        assert!(service
+            .run_next_ingestion_task()
+            .await
+            .expect("run update ingestion task"));
         assert!(search_contents(&service, "oldneedle").await.is_empty());
-        assert!(
-            search_contents(&service, "newneedle")
-                .await
-                .iter()
-                .any(|content| content.contains("newneedle"))
-        );
+        assert!(search_contents(&service, "newneedle")
+            .await
+            .iter()
+            .any(|content| content.contains("newneedle")));
         let documents = service
             .list_documents("dataset-1")
             .expect("list documents after ingest")
@@ -2128,12 +2126,10 @@ mod tests {
             "deleteneedle removable guidance. This content must disappear.",
         )
         .await;
-        assert!(
-            search_contents(&service, "deleteneedle")
-                .await
-                .iter()
-                .any(|content| content.contains("deleteneedle"))
-        );
+        assert!(search_contents(&service, "deleteneedle")
+            .await
+            .iter()
+            .any(|content| content.contains("deleteneedle")));
         let document_dir = temp.path().join("files").join("dataset-1").join("doc-1");
         assert!(document_dir.exists());
 
@@ -2262,8 +2258,7 @@ Fix steps: sync phone time automatically, remove the old authenticator binding, 
             .search_dataset(
                 "dataset-1",
                 SearchRequest {
-                    query: "openEuler 26.03 LTS 的正式发布时间和生命周期计划是什么？"
-                        .to_string(),
+                    query: "openEuler 26.03 LTS 的正式发布时间和生命周期计划是什么？".to_string(),
                     top_k: 5,
                 },
             )
@@ -2441,7 +2436,8 @@ Fix steps: sync phone time automatically, remove the old authenticator binding, 
 
     #[test]
     fn versioned_query_keeps_non_ascii_terms_in_search_text() {
-        let query_text = build_search_query_text("openEuler 26.03 LTS 的正式发布时间和生命周期计划是什么？");
+        let query_text =
+            build_search_query_text("openEuler 26.03 LTS 的正式发布时间和生命周期计划是什么？");
 
         assert!(query_text.contains("openeuler"));
         assert!(query_text.contains("lts"));
@@ -2455,7 +2451,10 @@ Fix steps: sync phone time automatically, remove the old authenticator binding, 
 
     #[test]
     fn document_recall_candidate_top_k_uses_ragflow_style_candidate_pool() {
-        assert_eq!(document_recall_candidate_top_k(5), RAGFLOW_STYLE_RECALL_TOP_K);
+        assert_eq!(
+            document_recall_candidate_top_k(5),
+            RAGFLOW_STYLE_RECALL_TOP_K
+        );
         assert_eq!(
             document_recall_candidate_top_k(RAGFLOW_STYLE_RECALL_TOP_K + 1),
             RAGFLOW_STYLE_RECALL_TOP_K + 1
@@ -2578,10 +2577,7 @@ Fix steps: sync phone time automatically, remove the old authenticator binding, 
             "常见故障说明。设备为什么离线？\n重启以后是否恢复？最后是附录。",
         );
 
-        assert_eq!(
-            questions,
-            vec!["设备为什么离线？", "重启以后是否恢复？"]
-        );
+        assert_eq!(questions, vec!["设备为什么离线？", "重启以后是否恢复？"]);
     }
 
     #[test]

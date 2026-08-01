@@ -41,6 +41,15 @@ impl SqliteMemoryStore {
         &self.path
     }
 
+    pub async fn initialize(&self) -> MemoryResult<()> {
+        let path = self.path.clone();
+        run_sqlite_operation(move || {
+            let _connection = open_connection(&path)?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn bm25_candidates(
         &self,
         query: &str,

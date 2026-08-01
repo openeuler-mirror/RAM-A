@@ -115,7 +115,10 @@ impl RagRepository {
         let name = name.trim();
         let file_path = file_path.trim();
         anyhow::ensure!(!name.is_empty(), "document name must not be empty");
-        anyhow::ensure!(!file_path.is_empty(), "document file path must not be empty");
+        anyhow::ensure!(
+            !file_path.is_empty(),
+            "document file path must not be empty"
+        );
 
         retry_sqlite_locked(|| {
             let mut connection = open_connection(&self.path)?;
@@ -245,7 +248,10 @@ impl RagRepository {
         let name = name.trim();
         let file_path = file_path.trim();
         anyhow::ensure!(!name.is_empty(), "document name must not be empty");
-        anyhow::ensure!(!file_path.is_empty(), "document file path must not be empty");
+        anyhow::ensure!(
+            !file_path.is_empty(),
+            "document file path must not be empty"
+        );
 
         retry_sqlite_locked(|| {
             let mut connection = open_connection(&self.path)?;
@@ -504,7 +510,12 @@ impl RagRepository {
         })
     }
 
-    pub fn replace_chunks(&self, dataset_id: &str, document_id: &str, chunks: &[Chunk]) -> Result<()> {
+    pub fn replace_chunks(
+        &self,
+        dataset_id: &str,
+        document_id: &str,
+        chunks: &[Chunk],
+    ) -> Result<()> {
         retry_sqlite_locked(|| {
             let mut connection = open_connection(&self.path)?;
             let transaction =
@@ -555,7 +566,12 @@ impl RagRepository {
         })
     }
 
-    pub fn complete_task(&self, task_id: &str, document_id: &str, chunk_count: usize) -> Result<()> {
+    pub fn complete_task(
+        &self,
+        task_id: &str,
+        document_id: &str,
+        chunk_count: usize,
+    ) -> Result<()> {
         retry_sqlite_locked(|| {
             let mut connection = open_connection(&self.path)?;
             let transaction =
@@ -989,10 +1005,7 @@ mod tests {
             .list_chunks("dataset-1", "doc-1")
             .expect("list chunks")
             .is_empty());
-        assert!(repo
-            .get_task(&old_task.id)
-            .expect("get old task")
-            .is_none());
+        assert!(repo.get_task(&old_task.id).expect("get old task").is_none());
 
         remove_repo_files(&path);
     }
@@ -1025,10 +1038,7 @@ mod tests {
             .get_stored_document("doc-1")
             .expect("get deleted document")
             .is_none());
-        assert!(repo
-            .get_task("task-1")
-            .expect("get deleted task")
-            .is_none());
+        assert!(repo.get_task("task-1").expect("get deleted task").is_none());
         assert!(repo
             .list_chunks("dataset-1", "doc-1")
             .expect("list chunks")

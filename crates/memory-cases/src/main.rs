@@ -15,9 +15,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Result};
 use clap::Parser;
-use memory_core::{
-    HashEmbedding, MemoryManager, RetrievalConfig, SearchMode, SqliteMemoryStore,
-};
+use memory_core::{HashEmbedding, MemoryManager, RetrievalConfig, SearchMode, SqliteMemoryStore};
 
 use crate::config::Cli;
 use crate::llm::DocumentSummaryClient;
@@ -28,10 +26,22 @@ use crate::token_counter::{Cl100kTokenCounter, TokenCounter};
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let api_token = if cli.api {
+        Some(cli.resolve_api_token()?)
+    } else {
+        None
+    };
     let service = build_service(&cli)?;
 
     match (cli.api, cli.ingestor) {
-        (true, false) => routes::serve(cli.bind, service).await,
+        (true, false) => {
+            routes::serve(
+                cli.bind,
+                service,
+                api_token.expect("API mode resolves its bearer token"),
+            )
+            .await
+        }
         (false, true) => ingestor::run(service, cli.poll_ms).await,
         _ => bail!("choose exactly one mode: --api or --ingestor"),
     }

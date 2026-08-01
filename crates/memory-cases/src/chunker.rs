@@ -239,10 +239,7 @@ fn join_budgeted_text_segments(left: &str, right: &str) -> String {
 }
 
 fn is_sentence_boundary_char(character: char) -> bool {
-    matches!(
-        character,
-        '。' | '！' | '？' | '!' | '?' | '；' | ';' | '.'
-    )
+    matches!(character, '。' | '！' | '？' | '!' | '?' | '；' | ';' | '.')
 }
 
 fn join_with_node_spacing(left: &str, right: &ChunkNode) -> String {
@@ -288,11 +285,7 @@ fn split_sentences(text: &str) -> Vec<String> {
     }
 
     if start < chars.len() {
-        let sentence = chars[start..]
-            .iter()
-            .collect::<String>()
-            .trim()
-            .to_string();
+        let sentence = chars[start..].iter().collect::<String>().trim().to_string();
         if !sentence.is_empty() {
             sentences.push(sentence);
         }
@@ -319,8 +312,8 @@ fn ends_with_protected_period(chars: &[char], index: usize) -> bool {
     let start = index.saturating_sub(12);
     let prefix = chars[start..=index].iter().collect::<String>();
     const PROTECTED: &[&str] = &[
-        "e.g.", "i.e.", "U.S.", "U.K.", "A.M.", "P.M.", "a.m.", "p.m.", "Inc.", "Ltd.",
-        "No.", "vs.", "approx.", "Dr.", "Mr.", "Ms.", "Prof.",
+        "e.g.", "i.e.", "U.S.", "U.K.", "A.M.", "P.M.", "a.m.", "p.m.", "Inc.", "Ltd.", "No.",
+        "vs.", "approx.", "Dr.", "Mr.", "Ms.", "Prof.",
     ];
     PROTECTED.iter().any(|item| prefix.ends_with(item))
 }
@@ -429,7 +422,10 @@ mod tests {
 
     #[test]
     fn markdown_table_rows_become_independent_nodes() {
-        let chunks = chunk_markdown_str("# T\n\n| key | value |\n| --- | --- |\n| a | b |", config(64));
+        let chunks = chunk_markdown_str(
+            "# T\n\n| key | value |\n| --- | --- |\n| a | b |",
+            config(64),
+        );
 
         assert_eq!(chunks, vec!["T\n\nkey | value", "T\n\na | b"]);
     }
@@ -441,10 +437,7 @@ mod tests {
             config(64),
         );
 
-        assert_eq!(
-            chunks,
-            vec!["T\n\npara", "T\n\nfn main() {}", "T\n\nafter"]
-        );
+        assert_eq!(chunks, vec!["T\n\npara", "T\n\nfn main() {}", "T\n\nafter"]);
     }
 
     #[test]

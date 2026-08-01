@@ -53,13 +53,12 @@ impl DocumentSummaryClient {
             );
         }
 
-        let body: ChatCompletionResponse =
-            serde_json::from_str(&body_text).with_context(|| {
-                format!(
-                    "failed to decode document summary LLM response: {}",
-                    preview_body(&body_text)
-                )
-            })?;
+        let body: ChatCompletionResponse = serde_json::from_str(&body_text).with_context(|| {
+            format!(
+                "failed to decode document summary LLM response: {}",
+                preview_body(&body_text)
+            )
+        })?;
         let summary = body
             .choices
             .into_iter()
@@ -67,7 +66,10 @@ impl DocumentSummaryClient {
             .map(|choice| choice.message.content)
             .unwrap_or_default();
         let summary = clean_summary_text(&summary);
-        anyhow::ensure!(!summary.is_empty(), "document summary LLM returned empty content");
+        anyhow::ensure!(
+            !summary.is_empty(),
+            "document summary LLM returned empty content"
+        );
         Ok(summary)
     }
 
@@ -143,7 +145,10 @@ fn clean_summary_text(summary: &str) -> String {
 
 fn preview_body(body: &str) -> String {
     const MAX_BODY_PREVIEW_CHARS: usize = 300;
-    let mut preview = body.chars().take(MAX_BODY_PREVIEW_CHARS).collect::<String>();
+    let mut preview = body
+        .chars()
+        .take(MAX_BODY_PREVIEW_CHARS)
+        .collect::<String>();
     if body.chars().count() > MAX_BODY_PREVIEW_CHARS {
         preview.push_str("...");
     }
@@ -195,7 +200,9 @@ mod tests {
 
     #[test]
     fn clean_summary_text_removes_blank_lines() {
-        assert_eq!(clean_summary_text("  第一行  \n\n 第二行\n"), "第一行\n第二行");
+        assert_eq!(
+            clean_summary_text("  第一行  \n\n 第二行\n"),
+            "第一行\n第二行"
+        );
     }
-
 }

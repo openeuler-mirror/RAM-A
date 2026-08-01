@@ -13,9 +13,11 @@ reqwest.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+subtle.workspace = true
 tiktoken-rs.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 tempfile = "3.9"
+tower = { version = "0.5", features = ["util"] }

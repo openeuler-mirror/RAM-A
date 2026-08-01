@@ -22,6 +22,9 @@ repository.
 - [guides/memory-cases-qa-evaluation.md](guides/memory-cases-qa-evaluation.md): QA eval
   test flow, case schema, coverage, strengths and limitations, and comparison with
   external retrieval tests.
+- [guides/xiaoo-case-library-integration.md](guides/xiaoo-case-library-integration.md):
+  `memory_case_search` deployment, authorization, tool selection, and xiaoO
+  integration boundary.
 
 One-off review notes, assistant context, generated reports, and artifact manifests are
 intentionally excluded from the formal documentation set.

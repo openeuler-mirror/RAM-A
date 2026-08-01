@@ -3,11 +3,15 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use axum::{
-    extract::{Multipart, Path, State},
+    extract::{Multipart, Path, Request, State},
+    http::{header, HeaderValue, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post, put},
     Json, Router,
 };
 use serde::Serialize;
+use subtle::ConstantTimeEq;
 
 use crate::error::{AppError, AppResult};
 use crate::model::{
@@ -16,9 +20,21 @@ use crate::model::{
 };
 use crate::service::RagService;
 
-pub async fn serve(bind: SocketAddr, service: Arc<RagService>) -> Result<()> {
-    let app = Router::new()
-        .route("/health", get(health))
+#[derive(Clone)]
+struct ApiAuthState {
+    bearer_token: Arc<str>,
+}
+
+impl ApiAuthState {
+    fn new(token: impl Into<String>) -> Self {
+        Self {
+            bearer_token: Arc::from(token.into()),
+        }
+    }
+}
+
+pub async fn serve(bind: SocketAddr, service: Arc<RagService>, bearer_token: String) -> Result<()> {
+    let api = Router::new()
         .route("/api/v1/datasets", post(create_dataset).get(list_datasets))
         .route(
             "/api/v1/datasets/:dataset_id/documents",
@@ -34,13 +50,41 @@ pub async fn serve(bind: SocketAddr, service: Arc<RagService>) -> Result<()> {
             get(list_chunks),
         )
         .route("/api/v1/datasets/:dataset_id/search", post(search_dataset))
-        .route("/api/v1/chat/completions", post(chat_completion))
+        .route("/api/v1/chat/completions", post(chat_completion));
+    let app = Router::new()
+        .route("/health", get(health))
+        .merge(protect_api_routes(api, ApiAuthState::new(bearer_token)))
         .with_state(service);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
     println!("memory-cases API listening on http://{bind}");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn protect_api_routes<S>(router: Router<S>, auth: ApiAuthState) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router.route_layer(middleware::from_fn_with_state(auth, authorize_api))
+}
+
+async fn authorize_api(State(auth): State<ApiAuthState>, request: Request, next: Next) -> Response {
+    let authorized = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|token| bool::from(token.as_bytes().ct_eq(auth.bearer_token.as_bytes())));
+    if authorized {
+        return next.run(request).await;
+    }
+
+    let mut response = (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    response
+        .headers_mut()
+        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    response
 }
 
 #[derive(Serialize)]
@@ -190,13 +234,7 @@ async fn parse_document_upload(mut multipart: Multipart) -> AppResult<CreateDocu
             "file" => {
                 file_name = field.file_name().map(str::to_string);
                 mime_type = field.content_type().map(str::to_string);
-                bytes = Some(
-                    field
-                        .bytes()
-                        .await
-                        .map_err(AppError::internal)?
-                        .to_vec(),
-                );
+                bytes = Some(field.bytes().await.map_err(AppError::internal)?.to_vec());
             }
             _ => {}
         }
@@ -227,13 +265,7 @@ async fn parse_document_update(mut multipart: Multipart) -> AppResult<UpdateDocu
             "file" => {
                 file_name = field.file_name().map(str::to_string);
                 mime_type = field.content_type().map(str::to_string);
-                bytes = Some(
-                    field
-                        .bytes()
-                        .await
-                        .map_err(AppError::internal)?
-                        .to_vec(),
-                );
+                bytes = Some(field.bytes().await.map_err(AppError::internal)?.to_vec());
             }
             _ => {}
         }
@@ -246,4 +278,57 @@ async fn parse_document_update(mut multipart: Multipart) -> AppResult<UpdateDocu
         mime_type,
         bytes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::{header, Request, StatusCode};
+    use axum::routing::get;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    use super::{protect_api_routes, ApiAuthState};
+
+    #[tokio::test]
+    async fn api_routes_require_the_exact_bearer_token() {
+        let protected = protect_api_routes(
+            Router::new().route("/protected", get(|| async { StatusCode::NO_CONTENT })),
+            ApiAuthState::new("internal-secret"),
+        );
+
+        for authorization in [
+            None,
+            Some("internal-secret"),
+            Some("Bearer wrong-secret"),
+            Some("bearer internal-secret"),
+        ] {
+            let mut request = Request::builder().uri("/protected");
+            if let Some(authorization) = authorization {
+                request = request.header(header::AUTHORIZATION, authorization);
+            }
+            let response = protected
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                response.headers().get(header::WWW_AUTHENTICATE).unwrap(),
+                "Bearer"
+            );
+        }
+
+        let authorized = protected
+            .oneshot(
+                Request::builder()
+                    .uri("/protected")
+                    .header(header::AUTHORIZATION, "Bearer internal-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), StatusCode::NO_CONTENT);
+    }
 }

@@ -20,6 +20,9 @@ pub struct Cli {
     #[arg(long, default_value = "127.0.0.1:8080")]
     pub bind: SocketAddr,
 
+    #[arg(long = "api-token-env", default_value = "MEMORY_CASES_API_TOKEN")]
+    pub api_token_env: String,
+
     #[arg(long = "rag-store", value_name = "PATH")]
     pub rag_store: Option<PathBuf>,
 
@@ -41,7 +44,10 @@ pub struct Cli {
     #[arg(long = "summary-llm-api-key-env", default_value = "OPENAI_API_KEY")]
     pub summary_llm_api_key_env: String,
 
-    #[arg(long = "summary-llm-base-url", default_value = "https://api.openai.com/v1")]
+    #[arg(
+        long = "summary-llm-base-url",
+        default_value = "https://api.openai.com/v1"
+    )]
     pub summary_llm_base_url: String,
 
     #[arg(long = "summary-llm-timeout-ms", default_value_t = 30000)]
@@ -59,19 +65,34 @@ impl Cli {
         let rag_default = PathBuf::from("data/memory-cases.sqlite");
         let memory_default = PathBuf::from("data/memory-cases-index.sqlite");
 
-        let rag_store = self
-            .rag_store
-            .clone()
-            .unwrap_or(rag_default);
-        let memory_store = self
-            .memory_store
-            .clone()
-            .unwrap_or(memory_default);
+        let rag_store = self.rag_store.clone().unwrap_or(rag_default);
+        let memory_store = self.memory_store.clone().unwrap_or(memory_default);
 
         StoragePaths {
             rag_store,
             memory_store,
         }
+    }
+
+    pub fn resolve_api_token(&self) -> anyhow::Result<String> {
+        let env_name = self.api_token_env.trim();
+        anyhow::ensure!(
+            !env_name.is_empty() && env_name == self.api_token_env,
+            "API token environment name must be canonical and non-empty"
+        );
+        let token = std::env::var_os(env_name)
+            .ok_or_else(|| {
+                anyhow::anyhow!("API token environment variable `{env_name}` is unavailable")
+            })?
+            .into_string()
+            .map_err(|_| {
+                anyhow::anyhow!("API token environment variable `{env_name}` is not valid Unicode")
+            })?;
+        anyhow::ensure!(
+            !token.trim().is_empty() && token.trim() == token,
+            "API token environment variable `{env_name}` must be canonical and non-empty"
+        );
+        Ok(token)
     }
 }
 
@@ -120,5 +141,33 @@ mod tests {
         let result = Cli::try_parse_from(["memory-cases", "--rebuild-index"]);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn api_token_is_loaded_from_the_named_environment_variable() {
+        const ENV_NAME: &str = "RAM_A_MEMORY_CASES_CONFIG_TEST_TOKEN";
+        std::env::set_var(ENV_NAME, "internal-secret");
+        let cli = Cli::parse_from(["memory-cases", "--api", "--api-token-env", ENV_NAME]);
+
+        let token = cli.resolve_api_token().unwrap();
+
+        std::env::remove_var(ENV_NAME);
+        assert_eq!(token, "internal-secret");
+    }
+
+    #[test]
+    fn api_token_configuration_rejects_missing_or_noncanonical_values() {
+        const ENV_NAME: &str = "RAM_A_MEMORY_CASES_CONFIG_TEST_MISSING_TOKEN";
+        std::env::remove_var(ENV_NAME);
+        let missing = Cli::parse_from(["memory-cases", "--api", "--api-token-env", ENV_NAME]);
+        assert!(missing.resolve_api_token().is_err());
+
+        let noncanonical =
+            Cli::parse_from(["memory-cases", "--api", "--api-token-env", " PADDED_ENV "]);
+        assert!(noncanonical.resolve_api_token().is_err());
+
+        std::env::set_var(ENV_NAME, " ");
+        assert!(missing.resolve_api_token().is_err());
+        std::env::remove_var(ENV_NAME);
     }
 }

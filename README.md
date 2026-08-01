@@ -149,6 +149,22 @@ cargo run -p memory-bench -- `
 
 Do not commit API keys, local stores, downloaded datasets, or generated reports.
 
+## HTTP MCP server
+
+`memory-mcp` provides `ram-a-mcp-server`, a Streamable HTTP MCP server for
+long-term memory search, ingest, and tenant-authorized case-library retrieval.
+It exposes `/mcp`, `/healthy`, and `/ready`, requires bearer-token
+authentication, and stores personal memory plus idempotency state in one
+SQLite WAL database file. Case documents remain in the separate
+`memory-cases` stores.
+
+See [docs/guides/http-mcp-deployment.md](docs/guides/http-mcp-deployment.md)
+for secure local deployment, xiaoO `.mcp.json`, automatic memory settings,
+health checks, and the current single-instance boundary.
+See
+[docs/guides/xiaoo-case-library-integration.md](docs/guides/xiaoo-case-library-integration.md)
+for the `memory_case_search` contract and the xiaoO integration boundary.
+
 ## Evaluation
 
 Start from [evaluation/README.md](evaluation/README.md) for the benchmark overview.

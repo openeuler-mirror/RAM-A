@@ -342,43 +342,43 @@ no-hit result: 0/2 passed
 
 ## 6. 优点
 
-1. 端到端覆盖真实链路  
+1. 端到端覆盖真实链路
    它不是只测 parser 或 search 函数，而是完整跑 API、上传、任务入库、chunk 检查、search、chat references。
 
-2. 输入固定，可复现  
+2. 输入固定，可复现
    文档和 case 都在仓库里，临时 SQLite 每次重建，便于复现同一批问题。
 
-3. 同时检查 recall 和 precision  
+3. 同时检查 recall 和 precision
    `expected_sources` 检查漏召，runner 默认要求 references 不混入额外来源，用来检查误召。
 
-4. 能验证 references  
+4. 能验证 references
    不是只看 answer 文本，而是确保 chat 对外返回的引用来源没有丢失。
 
-5. 能覆盖“命中文档但答案 chunk 分散”的情况  
+5. 能覆盖“命中文档但答案 chunk 分散”的情况
    小 chunk size 加 `required_solution_terms` 可以测试同文档扩展是否带回解决方案。
 
-6. 不依赖外部 LLM  
+6. 不依赖外部 LLM
    当前 answer 是服务拼出的检索摘要，测试成本低、速度快、离线可跑。
 
 ## 7. 缺点
 
-1. 不是严格的答案质量评测  
+1. 不是严格的答案质量评测
    `standard_answer` 目前主要用于人工阅读，runner 没有做语义相似度、faithfulness 或 LLM judge。
 
-2. 关键词断言比较硬  
+2. 关键词断言比较硬
    `required_*_terms` 对措辞、大小写和截断敏感，不能表达“语义等价但字面不同”的情况。
 
-3. 当前 embedding 是本地 HashEmbedding  
+3. 当前 embedding 是本地 HashEmbedding
    它适合离线 smoke/回归，但不能代表真实语义 embedding 的召回能力。
 
-4. 没有 expected-fail / threshold 机制  
+4. 没有 expected-fail / threshold 机制
    诊断型 case 失败时脚本会整体返回非零，不适合作为“必须全绿”的 CI 门禁。
 
-5. 文档规模仍然小  
+5. 文档规模仍然小
    目前只有 18 篇文档，不能代表大规模知识库的排序压力、性能压力和长尾格式。
 
-6. 格式覆盖有限  
+6. 格式覆盖有限
    当前 parser 主要支持 Markdown 和纯文本，所以还没有覆盖 PDF、DOCX、PPT、图片 OCR、复杂表格等现实格式。
 
-7. 没有并发和性能指标  
+7. 没有并发和性能指标
    不测吞吐、延迟、批量入库、重复上传、任务恢复和数据库竞争。
