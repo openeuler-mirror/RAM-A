@@ -353,8 +353,8 @@ pub fn create_http_router(
         .layer(middleware::from_fn_with_state(auth, authorize_mcp));
 
     let public = Router::new()
-        .route("/healthz", get(|| async { StatusCode::OK }))
-        .route("/readyz", get(readiness_status))
+        .route("/healthy", get(|| async { StatusCode::OK }))
+        .route("/ready", get(readiness_status))
         .with_state(readiness);
     public.merge(mcp)
 }

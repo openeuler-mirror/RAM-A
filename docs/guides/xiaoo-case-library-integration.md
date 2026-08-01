@@ -157,7 +157,7 @@ crates/memory-cases/quick_start_verify.sh
 ### CLI：已执行的真实验收
 
 2026-07-30 已使用持久化案例库完成一次真实 CLI 调用：导入了 31 份验证案例，
-RAM-A `/healthz`、`/readyz` 均为 `ready`；xiaoO 的 MCP 初始化发现了 3 个工具，
+RAM-A `/healthy`、`/ready` 均为 `ready`；xiaoO 的 MCP 初始化发现了 3 个工具，
 并实际执行了 `mcp__ram-a__memory_case_search`。案例命中
 `WiFi慢因为DNS解析异常.md` 的两个 chunk，最终答案据此给出 DNS 缓存异常、
 `ipconfig /flushdns`、刷新移动端网络以及重启路由器 DNS 代理等步骤，并列出了
