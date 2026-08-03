@@ -19,6 +19,15 @@ pub struct RagRepository {
     path: PathBuf,
 }
 
+pub struct DocumentMutation<'a> {
+    pub document_id: Option<&'a str>,
+    pub task_id: Option<&'a str>,
+    pub name: &'a str,
+    pub file_path: &'a str,
+    pub mime_type: Option<&'a str>,
+    pub size_bytes: u64,
+}
+
 impl RagRepository {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
@@ -105,15 +114,10 @@ impl RagRepository {
     pub fn create_document_with_task(
         &self,
         dataset_id: &str,
-        document_id: Option<&str>,
-        task_id: Option<&str>,
-        name: &str,
-        file_path: &str,
-        mime_type: Option<&str>,
-        size_bytes: u64,
+        mutation: DocumentMutation<'_>,
     ) -> Result<(Document, IngestionTask)> {
-        let name = name.trim();
-        let file_path = file_path.trim();
+        let name = mutation.name.trim();
+        let file_path = mutation.file_path.trim();
         anyhow::ensure!(!name.is_empty(), "document name must not be empty");
         anyhow::ensure!(
             !file_path.is_empty(),
@@ -133,12 +137,12 @@ impl RagRepository {
 
             let now = current_time_ms();
             let document = Document {
-                id: request_id_or_uuid(document_id, "document id")?,
+                id: request_id_or_uuid(mutation.document_id, "document id")?,
                 dataset_id: dataset_id.to_string(),
                 name: name.to_string(),
                 file_path: file_path.to_string(),
-                mime_type: mime_type.map(str::to_string),
-                size_bytes,
+                mime_type: mutation.mime_type.map(str::to_string),
+                size_bytes: mutation.size_bytes,
                 status: "uploaded".to_string(),
                 chunk_count: 0,
                 error: None,
@@ -146,7 +150,7 @@ impl RagRepository {
                 updated_at_ms: now,
             };
             let task = IngestionTask {
-                id: request_id_or_uuid(task_id, "task id")?,
+                id: request_id_or_uuid(mutation.task_id, "task id")?,
                 dataset_id: dataset_id.to_string(),
                 document_id: document.id.clone(),
                 status: "pending".to_string(),
@@ -239,14 +243,10 @@ impl RagRepository {
         &self,
         dataset_id: &str,
         document_id: &str,
-        task_id: Option<&str>,
-        name: &str,
-        file_path: &str,
-        mime_type: Option<&str>,
-        size_bytes: u64,
+        mutation: DocumentMutation<'_>,
     ) -> Result<(Document, IngestionTask)> {
-        let name = name.trim();
-        let file_path = file_path.trim();
+        let name = mutation.name.trim();
+        let file_path = mutation.file_path.trim();
         anyhow::ensure!(!name.is_empty(), "document name must not be empty");
         anyhow::ensure!(
             !file_path.is_empty(),
@@ -290,8 +290,8 @@ impl RagRepository {
                 dataset_id: existing.dataset_id,
                 name: name.to_string(),
                 file_path: file_path.to_string(),
-                mime_type: mime_type.map(str::to_string),
-                size_bytes,
+                mime_type: mutation.mime_type.map(str::to_string),
+                size_bytes: mutation.size_bytes,
                 status: "uploaded".to_string(),
                 chunk_count: 0,
                 error: None,
@@ -299,7 +299,7 @@ impl RagRepository {
                 updated_at_ms: now,
             };
             let task = IngestionTask {
-                id: request_id_or_uuid(task_id, "task id")?,
+                id: request_id_or_uuid(mutation.task_id, "task id")?,
                 dataset_id: dataset_id.to_string(),
                 document_id: document_id.to_string(),
                 status: "pending".to_string(),
@@ -918,7 +918,7 @@ pub fn current_time_ms() -> u64 {
 
 fn request_id_or_uuid(id: Option<&str>, label: &str) -> Result<String> {
     match id.map(str::trim) {
-        Some(id) if id.is_empty() => anyhow::bail!("{label} must not be empty"),
+        Some("") => anyhow::bail!("{label} must not be empty"),
         Some(id) => Ok(id.to_string()),
         None => Ok(Uuid::new_v4().to_string()),
     }
@@ -972,12 +972,14 @@ mod tests {
         let (_document, old_task) = repo
             .create_document_with_task(
                 "dataset-1",
-                Some("doc-1"),
-                Some("task-old"),
-                "old.md",
-                "/tmp/old.md",
-                Some("text/markdown"),
-                12,
+                DocumentMutation {
+                    document_id: Some("doc-1"),
+                    task_id: Some("task-old"),
+                    name: "old.md",
+                    file_path: "/tmp/old.md",
+                    mime_type: Some("text/markdown"),
+                    size_bytes: 12,
+                },
             )
             .expect("create document");
         repo.replace_chunks("dataset-1", "doc-1", &[sample_chunk("doc-1")])
@@ -987,11 +989,14 @@ mod tests {
             .update_document_with_task(
                 "dataset-1",
                 "doc-1",
-                Some("task-new"),
-                "new.md",
-                "/tmp/new.md",
-                Some("text/markdown"),
-                24,
+                DocumentMutation {
+                    document_id: None,
+                    task_id: Some("task-new"),
+                    name: "new.md",
+                    file_path: "/tmp/new.md",
+                    mime_type: Some("text/markdown"),
+                    size_bytes: 24,
+                },
             )
             .expect("update document");
 
@@ -1017,12 +1022,14 @@ mod tests {
             .expect("create dataset");
         repo.create_document_with_task(
             "dataset-1",
-            Some("doc-1"),
-            Some("task-1"),
-            "doc.md",
-            "/tmp/doc.md",
-            Some("text/markdown"),
-            12,
+            DocumentMutation {
+                document_id: Some("doc-1"),
+                task_id: Some("task-1"),
+                name: "doc.md",
+                file_path: "/tmp/doc.md",
+                mime_type: Some("text/markdown"),
+                size_bytes: 12,
+            },
         )
         .expect("create document");
         repo.replace_chunks("dataset-1", "doc-1", &[sample_chunk("doc-1")])
@@ -1072,12 +1079,14 @@ mod tests {
             let repo = RagRepository::new(locked_path);
             repo.create_document_with_task(
                 "dataset-1",
-                Some("doc-locked"),
-                Some("task-locked"),
-                "locked.md",
-                "/tmp/locked.md",
-                Some("text/markdown"),
-                12,
+                DocumentMutation {
+                    document_id: Some("doc-locked"),
+                    task_id: Some("task-locked"),
+                    name: "locked.md",
+                    file_path: "/tmp/locked.md",
+                    mime_type: Some("text/markdown"),
+                    size_bytes: 12,
+                },
             )
         });
 

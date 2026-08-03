@@ -59,6 +59,19 @@ async fn xiaoo_streamable_http_client_shares_memories_by_tenant_user_scope() {
         tool_names,
         vec!["memory_case_search", "memory_ingest", "memory_search"]
     );
+    let case_description = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == json!("memory_case_search"))
+        .and_then(|tool| tool["description"].as_str())
+        .unwrap();
+    assert!(case_description.contains("First use this tool"));
+    assert!(case_description.contains("troubleshooting"));
+    assert!(case_description.contains("similar past cases"));
+    assert!(case_description.contains("previous incidents"));
+    assert!(case_description.contains("known fixes"));
+    assert!(case_description.contains("source references"));
 
     let case_search = call_tool(
         &app,

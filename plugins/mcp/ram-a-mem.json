@@ -1,0 +1,69 @@
+{
+  "auth": {
+    "tokens": [
+      {
+        "token_env": "RAM_A_XIAOO_TOKEN",
+        "tenant_id": "tenant-local",
+        "user_id": "alice",
+        "agent_id": "xiaoo",
+        "permissions": ["memory:read", "memory:write", "cases:read"]
+      }
+    ]
+  },
+  "features": {
+    "memory": {
+      "enabled": true
+    },
+    "case_library": {
+      "enabled": true
+    }
+  },
+  "http": {
+    "bind_address": "127.0.0.1",
+    "port": 18081,
+    "allowed_origins": ["http://127.0.0.1:18080"],
+    "allowed_hosts": ["127.0.0.1:18081"]
+  },
+  "limits": {
+    "max_body_bytes": 1048576,
+    "requests_per_second": 20,
+    "rate_burst": 40,
+    "max_in_flight_per_principal_tool": 4,
+    "initialize_requests_per_second": 4,
+    "initialize_rate_burst": 8,
+    "max_active_sessions_per_principal": 8,
+    "max_active_sessions_global": 256,
+    "session_idle_timeout_seconds": 1800
+  },
+  "storage": {
+    "database_path": "data/ram-a-memory.sqlite"
+  },
+  "providers": {
+    "api_key_env": "LLM_API_KEY",
+    "base_url": "http://127.0.0.1:8000/v1",
+    "embedding_provider": "hash",
+    "embedding_model": "hash",
+    "embedding_dimensions": 1024,
+    "extractor_model": "GLM-5.2",
+    "verifier_model": "GLM-5.2",
+    "timeout_seconds": 120,
+    "max_retries": 3
+  },
+  "case_library": {
+    "rag_store": "data/memory-cases.sqlite",
+    "index_store": "data/memory-cases-index.sqlite",
+    "source_dir": "crates/memory-cases/test/accuracy_docs",
+    "embedding_provider": "hash",
+    "embedding_model": "hash",
+    "embedding_dimensions": 1024,
+    "chunk_size": 160,
+    "default_library": "ops",
+    "libraries": [
+      {
+        "name": "ops",
+        "dataset_id": "openeuler-ops-cases",
+        "tenant_ids": ["tenant-local"]
+      }
+    ]
+  }
+}

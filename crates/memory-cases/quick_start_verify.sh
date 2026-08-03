@@ -25,7 +25,21 @@ CLEANED_UP=0
 DATASET_ID="${MEMORY_CASES_DATASET_ID:-quick-verify-dataset-${RUN_ID}}"
 CHUNK_SIZE="${MEMORY_CASES_CHUNK_SIZE:-160}"
 CHAT_TOP_K="${MEMORY_CASES_CHAT_TOP_K:-5}"
-SERVER_ARGS=(--rag-store "$RAG_STORE" --memory-store "$MEMORY_STORE" --chunk-size "$CHUNK_SIZE")
+EMBEDDING_DIMENSIONS="${MEMORY_CASES_EMBEDDING_DIMENSIONS:-256}"
+EMBEDDING_PROVIDER="${MEMORY_CASES_EMBEDDING_PROVIDER:-hash}"
+EMBEDDING_API_KEY_ENV="${MEMORY_CASES_EMBEDDING_API_KEY_ENV:-OPENAI_API_KEY}"
+EMBEDDING_BASE_URL="${MEMORY_CASES_EMBEDDING_BASE_URL:-https://api.openai.com/v1}"
+EMBEDDING_MODEL="${MEMORY_CASES_EMBEDDING_MODEL:-text-embedding-3-small}"
+SERVER_ARGS=(
+  --rag-store "$RAG_STORE"
+  --memory-store "$MEMORY_STORE"
+  --embedding-dimensions "$EMBEDDING_DIMENSIONS"
+  --embedding-provider "$EMBEDDING_PROVIDER"
+  --embedding-api-key-env "$EMBEDDING_API_KEY_ENV"
+  --embedding-base-url "$EMBEDDING_BASE_URL"
+  --embedding-model "$EMBEDDING_MODEL"
+  --chunk-size "$CHUNK_SIZE"
+)
 
 DOC_FILES=()
 DOCUMENT_IDS=()
@@ -45,6 +59,16 @@ Environment:
   MEMORY_CASES_MEMORY_STORE  检索索引 SQLite 路径，保存 memories/FTS/embedding
   MEMORY_CASES_PORT          API 监听端口，默认随机端口
   MEMORY_CASES_DATASET_ID    dataset id，默认带运行号避免重复
+  MEMORY_CASES_EMBEDDING_DIMENSIONS
+                              memory-core hash embedding 维度，默认 256
+  MEMORY_CASES_EMBEDDING_PROVIDER
+                              embedding provider，hash 或 openai_compatible，默认 hash
+  MEMORY_CASES_EMBEDDING_API_KEY_ENV
+                              openai_compatible provider 使用的 API key 环境变量名
+  MEMORY_CASES_EMBEDDING_BASE_URL
+                              openai_compatible provider 的 /v1 base URL
+  MEMORY_CASES_EMBEDDING_MODEL
+                              openai_compatible provider 的 embedding model
   MEMORY_CASES_CHUNK_SIZE    入库切块大小，默认 160
   MEMORY_CASES_CHAT_TOP_K    每次问答取回的引用数，默认 5
   MEMORY_CASES_KEEP_TMP=1    退出后保留临时目录和日志
@@ -179,6 +203,8 @@ print_config() {
   echo "dataset_id=$DATASET_ID"
   echo "doc_dir=$DOC_DIR"
   echo "doc_count=${#DOC_FILES[@]}"
+  echo "embedding_provider=$EMBEDDING_PROVIDER"
+  echo "embedding_dimensions=$EMBEDDING_DIMENSIONS"
   echo "chunk_size=$CHUNK_SIZE"
   echo "chat_top_k=$CHAT_TOP_K"
 }

@@ -18,7 +18,7 @@ use crate::model::{
     StoredDocument, UpdateDocumentFileRequest, UpdateDocumentResponse,
 };
 use crate::parser::ParserEngine;
-use crate::repo::{current_time_ms, RagRepository};
+use crate::repo::{current_time_ms, DocumentMutation, RagRepository};
 use crate::token_counter::TokenCounter;
 
 const CHUNKING_STRATEGY: &str = "parser_node_chunking_v2";
@@ -123,14 +123,16 @@ impl RagService {
         };
         let (_document, task) = self.repo.create_document_with_task(
             dataset_id,
-            Some(&document_id),
-            Some(&task_id),
-            &name,
-            file_path.to_str().with_context(|| {
-                format!("file path is not valid UTF-8: {}", file_path.display())
-            })?,
-            request.mime_type.as_deref(),
-            request.bytes.len() as u64,
+            DocumentMutation {
+                document_id: Some(&document_id),
+                task_id: Some(&task_id),
+                name: &name,
+                file_path: file_path.to_str().with_context(|| {
+                    format!("file path is not valid UTF-8: {}", file_path.display())
+                })?,
+                mime_type: request.mime_type.as_deref(),
+                size_bytes: request.bytes.len() as u64,
+            },
         )?;
         Ok(CreateDocumentResponse {
             document_id: task.document_id,
@@ -220,11 +222,14 @@ impl RagService {
         let (_document, task) = self.repo.update_document_with_task(
             dataset_id,
             document_id,
-            Some(&task_id),
-            &name,
-            &file_path,
-            mime_type.as_deref(),
-            size_bytes,
+            DocumentMutation {
+                document_id: None,
+                task_id: Some(&task_id),
+                name: &name,
+                file_path: &file_path,
+                mime_type: mime_type.as_deref(),
+                size_bytes,
+            },
         )?;
         self.delete_document_search_records(dataset_id, document_id)
             .await?;
@@ -478,6 +483,12 @@ impl RagService {
         let mut seen_chunks = HashSet::new();
         let document_hits = competitive_document_hits(group_retrieval_results_by_document(results));
         let use_context_windows = self.retrieved_chunk_count(dataset_id, &document_hits)? > top_k;
+        let context = DocumentAppendContext {
+            dataset_id,
+            query,
+            top_k,
+            use_context_windows,
+        };
 
         // Reserve one result for every relevant document before adding more chunks
         // from an already represented document. This is driven by retrieval evidence,
@@ -486,32 +497,14 @@ impl RagService {
             if chunks.len() >= top_k {
                 break;
             }
-            self.append_hit_document_chunks(
-                dataset_id,
-                query,
-                hit,
-                top_k,
-                Some(1),
-                use_context_windows,
-                &mut chunks,
-                &mut seen_chunks,
-            )?;
+            self.append_hit_document_chunks(&context, hit, Some(1), &mut chunks, &mut seen_chunks)?;
         }
 
         for hit in &document_hits {
             if chunks.len() >= top_k {
                 break;
             }
-            self.append_hit_document_chunks(
-                dataset_id,
-                query,
-                hit,
-                top_k,
-                None,
-                use_context_windows,
-                &mut chunks,
-                &mut seen_chunks,
-            )?;
+            self.append_hit_document_chunks(&context, hit, None, &mut chunks, &mut seen_chunks)?;
         }
 
         Ok(chunks)
@@ -519,31 +512,32 @@ impl RagService {
 
     fn append_hit_document_chunks(
         &self,
-        dataset_id: &str,
-        query: &str,
+        context: &DocumentAppendContext<'_>,
         hit: &DocumentRetrievalHit,
-        top_k: usize,
         max_chunks_from_document: Option<usize>,
-        use_context_windows: bool,
         chunks: &mut Vec<SearchChunk>,
         seen_chunks: &mut HashSet<String>,
     ) -> Result<()> {
         let document = match self.repo.get_stored_document(&hit.document_id)? {
-            Some(document) if document.dataset_id == dataset_id => document,
+            Some(document) if document.dataset_id == context.dataset_id => document,
             _ => return Ok(()),
         };
-        let document_chunks = self.repo.list_chunks(dataset_id, &hit.document_id)?;
+        let document_chunks = self
+            .repo
+            .list_chunks(context.dataset_id, &hit.document_id)?;
         append_document_chunks_with_context(
             chunks,
             seen_chunks,
-            &document,
-            &document_chunks,
-            query,
-            &hit.chunk_scores,
-            hit.best_score,
-            top_k,
-            max_chunks_from_document,
-            use_context_windows,
+            AppendDocumentChunksRequest {
+                document: &document,
+                chunks: &document_chunks,
+                query: context.query,
+                chunk_scores: &hit.chunk_scores,
+                base_score: hit.best_score,
+                top_k: context.top_k,
+                max_chunks_from_document,
+                use_context_windows: context.use_context_windows,
+            },
         );
         Ok(())
     }
@@ -1375,9 +1369,7 @@ fn retrieval_overlap_count(
 }
 
 fn is_fuzzy_retrieval_term(term: &str) -> bool {
-    term.chars().count() >= 3
-        && term.chars().any(|character| !character.is_ascii())
-        && !is_search_stop_term(term)
+    term.chars().count() >= 3 && !term.is_ascii() && !is_search_stop_term(term)
 }
 
 fn fuzzy_terms_have_stable_boundary(left: &str, right: &str) -> bool {
@@ -1707,77 +1699,66 @@ fn push_limited_text(text: &mut String, value: &str, max_chars: usize) {
     text.extend(value.chars().take(remaining));
 }
 
-fn append_document_chunks(
-    output: &mut Vec<SearchChunk>,
-    seen_chunks: &mut HashSet<String>,
-    document: &StoredDocument,
-    chunks: &[Chunk],
-    query: &str,
-    chunk_scores: &HashMap<String, f32>,
+struct DocumentAppendContext<'a> {
+    dataset_id: &'a str,
+    query: &'a str,
+    top_k: usize,
+    use_context_windows: bool,
+}
+
+struct AppendDocumentChunksRequest<'a> {
+    document: &'a StoredDocument,
+    chunks: &'a [Chunk],
+    query: &'a str,
+    chunk_scores: &'a HashMap<String, f32>,
     base_score: f32,
     top_k: usize,
     max_chunks_from_document: Option<usize>,
-) {
-    append_document_chunks_with_context(
-        output,
-        seen_chunks,
-        document,
-        chunks,
-        query,
-        chunk_scores,
-        base_score,
-        top_k,
-        max_chunks_from_document,
-        false,
-    );
+    use_context_windows: bool,
 }
 
 fn append_document_chunks_with_context(
     output: &mut Vec<SearchChunk>,
     seen_chunks: &mut HashSet<String>,
-    document: &StoredDocument,
-    chunks: &[Chunk],
-    query: &str,
-    chunk_scores: &HashMap<String, f32>,
-    base_score: f32,
-    top_k: usize,
-    max_chunks_from_document: Option<usize>,
-    use_context_windows: bool,
+    request: AppendDocumentChunksRequest<'_>,
 ) {
-    let ordered_indices = ranked_chunk_indices(query, chunks, chunk_scores);
+    let ordered_indices = ranked_chunk_indices(request.query, request.chunks, request.chunk_scores);
     let mut added_from_document = 0;
     for (rank, index) in ordered_indices.into_iter().enumerate() {
-        if output.len() >= top_k {
+        if output.len() >= request.top_k {
             break;
         }
-        if max_chunks_from_document.is_some_and(|limit| added_from_document >= limit) {
+        if request
+            .max_chunks_from_document
+            .is_some_and(|limit| added_from_document >= limit)
+        {
             break;
         }
-        let Some(chunk) = chunks.get(index) else {
+        let Some(chunk) = request.chunks.get(index) else {
             continue;
         };
         if !chunk.available || seen_chunks.contains(&chunk.id) {
             continue;
         }
-        let score = expanded_chunk_score(base_score, rank);
+        let score = expanded_chunk_score(request.base_score, rank);
         if score < MIN_RELEVANCE_SCORE {
             break;
         }
-        let (content, context_chunk_ids) = if use_context_windows {
-            let context_indices = unseen_context_window_indices(chunks, index, seen_chunks);
+        let (content, context_chunk_ids) = if request.use_context_windows {
+            let context_indices = unseen_context_window_indices(request.chunks, index, seen_chunks);
             for context_index in &context_indices {
-                seen_chunks.insert(chunks[*context_index].id.clone());
+                seen_chunks.insert(request.chunks[*context_index].id.clone());
             }
             let content = context_indices
                 .iter()
-                .map(|context_index| chunks[*context_index].content.trim())
+                .map(|context_index| request.chunks[*context_index].content.trim())
                 .filter(|content| !content.is_empty())
                 .collect::<Vec<_>>()
                 .join("\n\n");
             let context_chunk_ids = if context_indices.len() > 1 {
                 context_indices
                     .into_iter()
-                    .map(|context_index| chunks[context_index].id.clone())
+                    .map(|context_index| request.chunks[context_index].id.clone())
                     .collect()
             } else {
                 Vec::new()
@@ -1792,8 +1773,8 @@ fn append_document_chunks_with_context(
             context_chunk_ids,
             dataset_id: chunk.dataset_id.clone(),
             document_id: chunk.document_id.clone(),
-            source_name: Some(document.name.clone()),
-            source_path: Some(document.file_path.clone()),
+            source_name: Some(request.document.name.clone()),
+            source_path: Some(request.document.file_path.clone()),
             content,
             score,
         });
@@ -2706,16 +2687,19 @@ Fix steps: sync phone time automatically, remove the old authenticator binding, 
         let mut output = Vec::new();
         let mut seen_chunks = HashSet::new();
 
-        append_document_chunks(
+        append_document_chunks_with_context(
             &mut output,
             &mut seen_chunks,
-            &document,
-            &chunks,
-            "扫描仪 ADF 自动进纸歪斜",
-            &HashMap::new(),
-            MIN_RELEVANCE_SCORE,
-            2,
-            None,
+            AppendDocumentChunksRequest {
+                document: &document,
+                chunks: &chunks,
+                query: "扫描仪 ADF 自动进纸歪斜",
+                chunk_scores: &HashMap::new(),
+                base_score: MIN_RELEVANCE_SCORE,
+                top_k: 2,
+                max_chunks_from_document: None,
+                use_context_windows: false,
+            },
         );
 
         assert_eq!(output.len(), 1);
@@ -2778,14 +2762,16 @@ Fix steps: sync phone time automatically, remove the old authenticator binding, 
         append_document_chunks_with_context(
             &mut output,
             &mut seen_chunks,
-            &document,
-            &chunks,
-            "会议室投屏画面每隔十秒停顿，鼠标也有延迟，怎么处理？",
-            &chunk_scores,
-            0.7,
-            3,
-            None,
-            true,
+            AppendDocumentChunksRequest {
+                document: &document,
+                chunks: &chunks,
+                query: "会议室投屏画面每隔十秒停顿，鼠标也有延迟，怎么处理？",
+                chunk_scores: &chunk_scores,
+                base_score: 0.7,
+                top_k: 3,
+                max_chunks_from_document: None,
+                use_context_windows: true,
+            },
         );
 
         let returned_ids = output
@@ -2876,14 +2862,16 @@ Fix steps: sync phone time automatically, remove the old authenticator binding, 
         append_document_chunks_with_context(
             &mut output,
             &mut seen_chunks,
-            &document,
-            &chunks,
-            "家里 Wi-Fi 很慢",
-            &chunk_scores,
-            0.7,
-            1,
-            Some(1),
-            true,
+            AppendDocumentChunksRequest {
+                document: &document,
+                chunks: &chunks,
+                query: "家里 Wi-Fi 很慢",
+                chunk_scores: &chunk_scores,
+                base_score: 0.7,
+                top_k: 1,
+                max_chunks_from_document: Some(1),
+                use_context_windows: true,
+            },
         );
 
         assert_eq!(output.len(), 1);

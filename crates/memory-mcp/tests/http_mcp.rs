@@ -9,8 +9,9 @@ use axum::response::Response;
 use axum::Router;
 use memory_core::{HashEmbedding, MemoryManager, SqliteMemoryStore};
 use memory_mcp::{
-    create_http_router, AuthConfig, HttpConfig, HttpRuntime, IdempotencyRepository, LimitsConfig,
-    MemoryService, ProvidersConfig, ServerConfig, StorageConfig, TokenAuthenticator, TokenConfig,
+    create_http_router, AuthConfig, EmbeddingProviderKind, FeatureFlags, HttpConfig, HttpRuntime,
+    IdempotencyRepository, LimitsConfig, MemoryService, ProvidersConfig, ServerConfig,
+    StorageConfig, TokenAuthenticator, TokenConfig,
 };
 use memory_pipeline::error::Result as PipelineResult;
 use memory_pipeline::extraction::{ExtractionBatch, MemoryExtractor, ModelUsage, SCHEMA_VERSION};
@@ -171,6 +172,37 @@ async fn fixture_router_with_schema(
     providers_ready: bool,
     initialize_memory_schema: bool,
 ) -> Fixture {
+    fixture_router_with_schema_and_features(
+        permissions,
+        limits,
+        extraction_delay,
+        providers_ready,
+        initialize_memory_schema,
+        FeatureFlags::all(),
+    )
+    .await
+}
+
+async fn fixture_router_with_features(features: FeatureFlags) -> Fixture {
+    fixture_router_with_schema_and_features(
+        &["memory:read", "memory:write", "cases:read"],
+        LimitsConfig::default(),
+        Duration::ZERO,
+        true,
+        true,
+        features,
+    )
+    .await
+}
+
+async fn fixture_router_with_schema_and_features(
+    permissions: &[&str],
+    limits: LimitsConfig,
+    extraction_delay: Duration,
+    providers_ready: bool,
+    initialize_memory_schema: bool,
+    features: FeatureFlags,
+) -> Fixture {
     std::env::set_var("RAM_A_HTTP_MCP_TEST_TOKEN", TOKEN);
     std::env::set_var("RAM_A_HTTP_MCP_BOB_TEST_TOKEN", BOB_TOKEN);
     let temp = tempfile::tempdir().unwrap();
@@ -230,7 +262,8 @@ async fn fixture_router_with_schema(
         database_path.clone(),
         providers_ready,
         cancellation_token.clone(),
-    );
+    )
+    .with_features(features);
     Fixture {
         app: create_http_router(runtime, &http, &limits),
         extract_started,
@@ -745,6 +778,96 @@ async fn initialized_session_negotiates_fixed_protocol_and_lists_exactly_three_t
 }
 
 #[tokio::test]
+async fn disabled_memory_feature_hides_memory_tools_and_returns_structured_errors() {
+    let fixture = fixture_router_with_features(FeatureFlags {
+        memory: false,
+        case_library: true,
+    })
+    .await;
+    let (session_id, _) = initialize(&fixture.app).await;
+
+    let listed = fixture
+        .app
+        .clone()
+        .oneshot(session_request(
+            &session_id,
+            json!({"jsonrpc": "2.0", "id": 200, "method": "tools/list", "params": {}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed = response_json(listed).await;
+    let names = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["memory_case_search"]);
+
+    let called = call_tool(
+        &fixture.app,
+        &session_id,
+        201,
+        "memory_search",
+        json!({"query": "window seat"}),
+    )
+    .await;
+    assert_eq!(called.status(), StatusCode::OK);
+    let called = response_json(called).await;
+    assert_eq!(called["result"]["isError"], json!(true));
+    assert_eq!(
+        called["result"]["structuredContent"]["code"],
+        json!("MEMORY_DISABLED")
+    );
+}
+
+#[tokio::test]
+async fn disabled_case_library_feature_hides_case_tool_and_returns_structured_error() {
+    let fixture = fixture_router_with_features(FeatureFlags {
+        memory: true,
+        case_library: false,
+    })
+    .await;
+    let (session_id, _) = initialize(&fixture.app).await;
+
+    let listed = fixture
+        .app
+        .clone()
+        .oneshot(session_request(
+            &session_id,
+            json!({"jsonrpc": "2.0", "id": 202, "method": "tools/list", "params": {}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed = response_json(listed).await;
+    let names = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["memory_ingest", "memory_search"]);
+
+    let called = call_tool(
+        &fixture.app,
+        &session_id,
+        203,
+        "memory_case_search",
+        json!({"query": "DNS failure"}),
+    )
+    .await;
+    assert_eq!(called.status(), StatusCode::OK);
+    let called = response_json(called).await;
+    assert_eq!(called["result"]["isError"], json!(true));
+    assert_eq!(
+        called["result"]["structuredContent"]["code"],
+        json!("CASE_LIBRARY_DISABLED")
+    );
+}
+
+#[tokio::test]
 async fn initialize_rejects_protocol_versions_other_than_2025_11_25() {
     let fixture = fixture_router().await;
     let response = fixture
@@ -1230,16 +1353,18 @@ fn production_runtime_config_requires_live_components_and_nonzero_limits() {
     };
     let incomplete = ServerConfig {
         auth: auth.clone(),
+        features: Default::default(),
         http: HttpConfig::default(),
         limits: LimitsConfig::default(),
         storage: None,
         providers: None,
-        case_service: None,
+        case_library: None,
     };
     assert!(incomplete.validate_runtime().is_err());
 
     let mut complete = ServerConfig {
         auth,
+        features: Default::default(),
         http: HttpConfig::default(),
         limits: LimitsConfig::default(),
         storage: Some(StorageConfig {
@@ -1248,6 +1373,9 @@ fn production_runtime_config_requires_live_components_and_nonzero_limits() {
         providers: Some(ProvidersConfig {
             api_key_env: "RAM_A_PROVIDER_KEY".to_string(),
             base_url: "https://provider.example/v1".to_string(),
+            embedding_provider: EmbeddingProviderKind::OpenAiCompatible,
+            embedding_api_key_env: None,
+            embedding_base_url: None,
             embedding_model: "embedding-model".to_string(),
             embedding_dimensions: 32,
             extractor_model: "extractor-model".to_string(),
@@ -1255,7 +1383,7 @@ fn production_runtime_config_requires_live_components_and_nonzero_limits() {
             timeout_seconds: 30,
             max_retries: 2,
         }),
-        case_service: None,
+        case_library: None,
     };
     assert!(complete.validate_runtime().is_ok());
     for invalid_base_url in [
@@ -1279,12 +1407,292 @@ fn production_runtime_config_requires_live_components_and_nonzero_limits() {
 }
 
 #[test]
-fn server_binary_requires_a_config_path() {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ram-a-mcp-server"))
+fn production_runtime_config_resolves_memory_and_case_library_feature_switches() {
+    let no_case_library: ServerConfig = serde_json::from_str(
+        r#"{
+          "auth": {
+            "tokens": [{
+              "token_env": "RAM_A_SERVER_TOKEN",
+              "tenant_id": "tenant-a",
+              "user_id": "alice",
+              "agent_id": "agent-a",
+              "permissions": ["memory:read", "memory:write"]
+            }]
+          },
+          "storage": {
+            "database_path": "memory.sqlite"
+          },
+          "providers": {
+            "api_key_env": "RAM_A_PROVIDER_KEY",
+            "base_url": "http://127.0.0.1:8088/v1",
+            "embedding_provider": "hash",
+            "embedding_model": "hash",
+            "embedding_dimensions": 1024,
+            "extractor_model": "GLM-5.2",
+            "verifier_model": "GLM-5.2"
+          }
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(
+        no_case_library
+            .features
+            .resolve(no_case_library.case_library.is_some()),
+        FeatureFlags {
+            memory: true,
+            case_library: false
+        }
+    );
+    assert!(no_case_library.validate_runtime().is_ok());
+
+    let explicit_disabled: ServerConfig = serde_json::from_str(
+        r#"{
+          "auth": {
+            "tokens": [{
+              "token_env": "RAM_A_SERVER_TOKEN",
+              "tenant_id": "tenant-a",
+              "user_id": "alice",
+              "agent_id": "agent-a",
+              "permissions": ["memory:read", "memory:write", "cases:read"]
+            }]
+          },
+          "features": {
+            "memory": {"enabled": false},
+            "case_library": {"enabled": false}
+          },
+          "storage": {
+            "database_path": "memory.sqlite"
+          },
+          "providers": {
+            "api_key_env": "RAM_A_PROVIDER_KEY",
+            "base_url": "http://127.0.0.1:8088/v1",
+            "embedding_provider": "hash",
+            "embedding_model": "hash",
+            "embedding_dimensions": 1024,
+            "extractor_model": "GLM-5.2",
+            "verifier_model": "GLM-5.2"
+          }
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(
+        explicit_disabled
+            .features
+            .resolve(explicit_disabled.case_library.is_some()),
+        FeatureFlags {
+            memory: false,
+            case_library: false
+        }
+    );
+    assert!(explicit_disabled.validate_runtime().is_ok());
+
+    let invalid_case_enabled_without_library: ServerConfig = serde_json::from_str(
+        r#"{
+          "auth": {
+            "tokens": [{
+              "token_env": "RAM_A_SERVER_TOKEN",
+              "tenant_id": "tenant-a",
+              "user_id": "alice",
+              "agent_id": "agent-a",
+              "permissions": ["memory:read", "memory:write", "cases:read"]
+            }]
+          },
+          "features": {
+            "case_library": {"enabled": true}
+          },
+          "storage": {
+            "database_path": "memory.sqlite"
+          },
+          "providers": {
+            "api_key_env": "RAM_A_PROVIDER_KEY",
+            "base_url": "http://127.0.0.1:8088/v1",
+            "embedding_provider": "hash",
+            "embedding_model": "hash",
+            "embedding_dimensions": 1024,
+            "extractor_model": "GLM-5.2",
+            "verifier_model": "GLM-5.2"
+          }
+        }"#,
+    )
+    .unwrap();
+    assert!(invalid_case_enabled_without_library
+        .validate_runtime()
+        .is_err());
+
+    let enabled_case_library: ServerConfig = serde_json::from_str(
+        r#"{
+          "auth": {
+            "tokens": [{
+              "token_env": "RAM_A_SERVER_TOKEN",
+              "tenant_id": "tenant-a",
+              "user_id": "alice",
+              "agent_id": "agent-a",
+              "permissions": ["memory:read", "memory:write", "cases:read"]
+            }]
+          },
+          "storage": {
+            "database_path": "memory.sqlite"
+          },
+          "providers": {
+            "api_key_env": "RAM_A_PROVIDER_KEY",
+            "base_url": "http://127.0.0.1:8088/v1",
+            "embedding_provider": "hash",
+            "embedding_model": "hash",
+            "embedding_dimensions": 1024,
+            "extractor_model": "GLM-5.2",
+            "verifier_model": "GLM-5.2"
+          },
+          "case_library": {
+            "rag_store": "cases.sqlite",
+            "index_store": "cases-index.sqlite",
+            "embedding_provider": "hash",
+            "embedding_model": "hash",
+            "embedding_dimensions": 1024,
+            "default_library": "ops",
+            "libraries": [{
+              "name": "ops",
+              "dataset_id": "openeuler-ops-cases",
+              "tenant_ids": ["tenant-a"]
+            }]
+          }
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(
+        enabled_case_library
+            .features
+            .resolve(enabled_case_library.case_library.is_some()),
+        FeatureFlags {
+            memory: true,
+            case_library: true
+        }
+    );
+    assert!(enabled_case_library.validate_runtime().is_ok());
+}
+
+#[test]
+fn production_runtime_config_accepts_hash_embedding_provider() {
+    let config: ServerConfig = serde_json::from_str(
+        r#"{
+          "auth": {
+            "tokens": [{
+              "token_env": "RAM_A_SERVER_TOKEN",
+              "tenant_id": "tenant-a",
+              "user_id": "alice",
+              "agent_id": "agent-a",
+              "permissions": ["memory:read", "memory:write"]
+            }]
+          },
+          "storage": {
+            "database_path": "memory.sqlite"
+          },
+          "providers": {
+            "api_key_env": "RAM_A_PROVIDER_KEY",
+            "base_url": "http://127.0.0.1:8088/v1",
+            "embedding_provider": "hash",
+            "embedding_model": "hash",
+            "embedding_dimensions": 1024,
+            "extractor_model": "GLM-5.2",
+            "verifier_model": "GLM-5.2"
+          }
+        }"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        config.providers.as_ref().unwrap().embedding_provider,
+        EmbeddingProviderKind::Hash
+    );
+    assert!(config.validate_runtime().is_ok());
+}
+
+#[test]
+fn production_runtime_config_accepts_separate_embedding_endpoint() {
+    let config: ServerConfig = serde_json::from_str(
+        r#"{
+          "auth": {
+            "tokens": [{
+              "token_env": "RAM_A_SERVER_TOKEN",
+              "tenant_id": "tenant-a",
+              "user_id": "alice",
+              "agent_id": "agent-a",
+              "permissions": ["memory:read", "memory:write"]
+            }]
+          },
+          "storage": {
+            "database_path": "memory.sqlite"
+          },
+          "providers": {
+            "api_key_env": "RAM_A_CHAT_KEY",
+            "base_url": "http://127.0.0.1:8088/v1",
+            "embedding_provider": "openai_compatible",
+            "embedding_api_key_env": "RAM_A_EMBEDDING_KEY",
+            "embedding_base_url": "http://127.0.0.1:9090/v1",
+            "embedding_model": "local-embedding",
+            "embedding_dimensions": 1024,
+            "extractor_model": "GLM-5.2",
+            "verifier_model": "GLM-5.2"
+          }
+        }"#,
+    )
+    .unwrap();
+
+    let providers = config.providers.as_ref().unwrap();
+    assert_eq!(
+        providers.embedding_api_key_env.as_deref(),
+        Some("RAM_A_EMBEDDING_KEY")
+    );
+    assert_eq!(
+        providers.embedding_base_url.as_deref(),
+        Some("http://127.0.0.1:9090/v1")
+    );
+    assert!(config.validate_runtime().is_ok());
+}
+
+#[test]
+fn production_runtime_config_accepts_open_router_embedding_provider_alias() {
+    let config: ServerConfig = serde_json::from_str(
+        r#"{
+          "auth": {
+            "tokens": [{
+              "token_env": "RAM_A_SERVER_TOKEN",
+              "tenant_id": "tenant-a",
+              "user_id": "alice",
+              "agent_id": "agent-a",
+              "permissions": ["memory:read", "memory:write"]
+            }]
+          },
+          "storage": {
+            "database_path": "memory.sqlite"
+          },
+          "providers": {
+            "api_key_env": "RAM_A_PROVIDER_KEY",
+            "base_url": "http://127.0.0.1:8088/v1",
+            "embedding_provider": "open_router",
+            "embedding_model": "local-embedding",
+            "embedding_dimensions": 1024,
+            "extractor_model": "GLM-5.2",
+            "verifier_model": "GLM-5.2"
+          }
+        }"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        config.providers.as_ref().unwrap().embedding_provider,
+        EmbeddingProviderKind::OpenAiCompatible
+    );
+    assert!(config.validate_runtime().is_ok());
+}
+
+#[test]
+fn server_binary_supports_a_default_config_path() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ram-a-mem"))
         .arg("--help")
         .output()
         .unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Usage: ram-a-mem [OPTIONS]"), "{stdout}");
     assert!(stdout.contains("--config <CONFIG>"), "{stdout}");
 }

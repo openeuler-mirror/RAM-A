@@ -11,8 +11,8 @@ benchmark runner, and reproducible evaluation scripts.
 - `memory-cases`: local case knowledge service for storing, indexing, and retrieving case documents.
 - Default local storage: SQLite.
 - Default retrieval mode: hybrid dense embedding retrieval plus BM25 text retrieval.
-- Embedding providers: OpenRouter-compatible embeddings for real runs and a deterministic
-  hash embedding provider for offline smoke tests.
+- Embedding providers: OpenAI-compatible embeddings, including self-hosted `/v1/embeddings`
+  services, for real runs and a deterministic hash embedding provider for offline smoke tests.
 
 ## Repository Layout
 
@@ -102,6 +102,20 @@ pub struct SearchMemoryRequest {
 See [docs/design/memory-cases-storage-split.md](docs/design/memory-cases-storage-split.md) for
 table ownership and index semantics.
 
+`memory-cases` defaults to local hash embeddings for offline and demo use. Use
+`--embedding-provider openai_compatible` with `--embedding-base-url`, `--embedding-model`,
+`--embedding-api-key-env`, and `--embedding-dimensions` when a real embedding service is
+available. The endpoint must be OpenAI-compatible and expose `/v1/embeddings`; this includes
+self-hosted embedding services.
+
+Keep the case-library search index in a separate SQLite file from RAM-A personal long-term
+memory for demos and deployments. Sharing one SQLite index is only suitable for narrow smoke
+tests because two services can contend on SQLite writer locks and case reindex/reset flows
+should not touch user memories. If a shared `memory-core` SQLite index is intentionally used,
+use one embedding profile per search scope. RAM-A stores embedding profile metadata on new
+records and rejects same-scope profile mismatches, because two providers can have the same
+vector dimensions but incompatible semantic spaces.
+
 ## Quick Start
 
 Use the checked-in fixture for an offline smoke test:
@@ -149,14 +163,248 @@ cargo run -p memory-bench -- `
 
 Do not commit API keys, local stores, downloaded datasets, or generated reports.
 
-## HTTP MCP server
+## RAM-A memory MCP service
 
-`memory-mcp` provides `ram-a-mcp-server`, a Streamable HTTP MCP server for
-long-term memory search, ingest, and tenant-authorized case-library retrieval.
-It exposes `/mcp`, `/healthy`, and `/ready`, requires bearer-token
-authentication, and stores personal memory plus idempotency state in one
-SQLite WAL database file. Case documents remain in the separate
-`memory-cases` stores.
+`memory-mcp` provides `ram-a-mem`, a single Streamable HTTP MCP service for
+personal long-term memory and tenant-authorized case-library retrieval. It exposes
+`/mcp`, `/healthy`, and `/ready` on one configured HTTP port. The service name is
+`ram-a-mem` so it can be distinguished from future services such as `ram-a-kv`.
+
+### Minimal RAM-A + MCP client deployment
+
+The runtime has three configuration surfaces:
+
+- RAM-A memory service config: controls auth, HTTP limits, personal memory storage,
+  model providers, and optional embedded case-library storage.
+- MCP client config, commonly `.mcp.json`: tells an MCP client how to connect to RAM-A.
+- Client application config, for example xiaoO `config.toml`: controls the client's own LLM
+  provider and optional automatic memory behavior.
+
+By default, `ram-a-mem` looks for config in this order:
+
+1. `--config <path>`
+2. `RAM_A_MEM_CONFIG`
+3. `./config/ram-a-mem.json`
+4. `~/.config/ram-a/ram-a-mem.json`
+5. `/etc/ram-a/ram-a-mem.json`
+
+Create `config/ram-a-mem.json`:
+
+Copyable examples are also available under [`plugins/mcp/`](plugins/mcp/), including
+[`plugins/mcp/ram-a-mem.json`](plugins/mcp/ram-a-mem.json),
+[`plugins/mcp/xiaoo.mcp.json`](plugins/mcp/xiaoo.mcp.json), and
+[`plugins/mcp/xiaoo-config.toml`](plugins/mcp/xiaoo-config.toml). For client-side prompt
+guidance, see [`plugins/mcp/case-tool-instruction.md`](plugins/mcp/case-tool-instruction.md).
+xiaoO + RAM-A knowledge base configuration can start from those files and then apply the
+field changes listed below.
+
+```json
+{
+  "auth": {
+    "tokens": [
+      {
+        "token_env": "RAM_A_XIAOO_TOKEN",
+        "tenant_id": "tenant-local",
+        "user_id": "alice",
+        "agent_id": "xiaoo",
+        "permissions": ["memory:read", "memory:write", "cases:read"]
+      }
+    ]
+  },
+  "features": {
+    "memory": {
+      "enabled": true
+    },
+    "case_library": {
+      "enabled": true
+    }
+  },
+  "http": {
+    "bind_address": "127.0.0.1",
+    "port": 18081,
+    "allowed_origins": ["http://127.0.0.1:18080"],
+    "allowed_hosts": ["127.0.0.1:18081"]
+  },
+  "limits": {
+    "max_body_bytes": 1048576,
+    "requests_per_second": 20,
+    "rate_burst": 40,
+    "max_in_flight_per_principal_tool": 4,
+    "initialize_requests_per_second": 4,
+    "initialize_rate_burst": 8,
+    "max_active_sessions_per_principal": 8,
+    "max_active_sessions_global": 256,
+    "session_idle_timeout_seconds": 1800
+  },
+  "storage": {
+    "database_path": "data/ram-a-memory.sqlite"
+  },
+  "providers": {
+    "api_key_env": "LLM_API_KEY",
+    "base_url": "http://127.0.0.1:8000/v1",
+    "embedding_provider": "hash",
+    "embedding_model": "hash",
+    "embedding_dimensions": 1024,
+    "extractor_model": "GLM-5.2",
+    "verifier_model": "GLM-5.2",
+    "timeout_seconds": 120,
+    "max_retries": 3
+  },
+  "case_library": {
+    "rag_store": "data/memory-cases.sqlite",
+    "index_store": "data/memory-cases-index.sqlite",
+    "source_dir": "crates/memory-cases/test/accuracy_docs",
+    "embedding_provider": "hash",
+    "embedding_model": "hash",
+    "embedding_dimensions": 1024,
+    "chunk_size": 160,
+    "default_library": "ops",
+    "libraries": [
+      {
+        "name": "ops",
+        "dataset_id": "openeuler-ops-cases",
+        "tenant_ids": ["tenant-local"]
+      }
+    ]
+  }
+}
+```
+
+Change these fields before deployment:
+
+- `RAM_A_XIAOO_TOKEN`: environment variable name that contains the RAM-A bearer token.
+- `tenant_id`, `user_id`, `agent_id`: identity scope for memory isolation.
+- `permissions`: include `memory:read`, `memory:write`, and optionally `cases:read`.
+- `features.memory.enabled`: expose or hide RAM-A personal long-term memory tools
+  (`memory_search`, `memory_ingest`).
+- `features.case_library.enabled`: expose or hide the operational case-library tool
+  (`memory_case_search`). If this is `true`, `case_library` must also be configured.
+- `allowed_hosts`: host and port used by clients to reach RAM-A.
+- `storage.database_path`: RAM-A personal long-term memory SQLite path.
+- `providers.api_key_env`, `providers.base_url`, `extractor_model`, `verifier_model`:
+  OpenAI-compatible chat/completions provider used by extraction and verification.
+- `providers.embedding_provider`: use `hash` for local demos; use `openai_compatible` for
+  real semantic memory retrieval.
+- `case_library.rag_store`: case-library business SQLite path for datasets, documents,
+  tasks, chunks, and uploaded source files.
+- `case_library.index_store`: case-library retrieval index SQLite path. Keep it separate
+  from `storage.database_path`.
+- `case_library.source_dir`: optional local directory of `.md`/`.txt` documents. When set,
+  `ram-a-mem` imports new files into the default case-library dataset on startup.
+- `case_library.embedding_provider`: case-library retrieval embedding provider. It can be
+  `hash` for demos or `openai_compatible` for a real/self-hosted embedding service.
+
+For real embedding retrieval, replace the hash embedding fields with an OpenAI-compatible
+embedding provider in `providers` or `case_library` as needed:
+
+```json
+{
+  "embedding_provider": "openai_compatible",
+  "embedding_api_key_env": "EMBEDDING_API_KEY",
+  "embedding_base_url": "http://127.0.0.1:8001/v1",
+  "embedding_model": "local-embedding-model",
+  "embedding_dimensions": 1024
+}
+```
+
+Start RAM-A memory service:
+
+```bash
+export RAM_A_XIAOO_TOKEN='replace-with-long-random-token'
+export LLM_API_KEY='replace-with-llm-provider-key'
+
+cargo run -p memory-mcp --bin ram-a-mem
+```
+
+The command above reads `config/ram-a-mem.json` by default. To use another path:
+
+```bash
+RAM_A_MEM_CONFIG=/etc/ram-a/ram-a-mem.json ram-a-mem
+```
+
+Do not point `case_library.index_store` at `storage.database_path`; case index rebuilds and
+personal long-term memories must remain isolated even though both capabilities are served
+from the same `ram-a-mem` process and HTTP port.
+
+### MCP client config
+
+For xiaoO, create `.mcp.json`; see
+[`plugins/mcp/xiaoo.mcp.json`](plugins/mcp/xiaoo.mcp.json) for a copyable example. Other MCP
+clients may use a different config file shape, but they need the same connection values:
+Streamable HTTP transport, `/mcp` URL, bearer token, agent ID if supported, timeout, and MCP
+protocol version `2025-11-25`.
+
+```json
+{
+  "mcpServers": {
+    "ram-a": {
+      "transport": "streamable_http",
+      "url": "http://127.0.0.1:18081/mcp",
+      "bearer_token_env": "RAM_A_XIAOO_TOKEN",
+      "agent_id": "xiaoo",
+      "timeout_ms": 30000
+    }
+  }
+}
+```
+
+Change these fields:
+
+- `url`: RAM-A MCP endpoint. RAM-A currently exposes MCP only at `/mcp`.
+- `bearer_token_env`: client-side environment variable containing the same token configured
+  in RAM-A `auth.tokens[*].token_env`.
+- `agent_id`: must match RAM-A `auth.tokens[*].agent_id` when `X-Agent-ID` is sent.
+- `timeout_ms`: increase this if memory extraction or provider calls are slow.
+
+Do not put `Authorization`, `Origin`, `X-Agent-ID`, `mcp-session-id`, or
+`mcp-protocol-version` into static MCP headers. A compliant Streamable HTTP MCP client should
+manage them per request/session. Non-xiaoO clients must still send bearer auth and negotiate
+MCP protocol version `2025-11-25`.
+
+After initialization, clients can discover RAM-A tools with `tools/list`. The expected tools
+are:
+
+- `memory_search`: search authenticated personal long-term memory.
+- `memory_ingest`: extract, ground, and persist authenticated conversation memory.
+- `memory_case_search`: first-use tool for troubleshooting, incident diagnosis, root-cause
+  analysis, remediation steps, operational case lookup, or similar historical case questions.
+  Also use it when the user asks whether there were similar past cases, previous incidents,
+  known fixes, or examples for a troubleshooting symptom, even if they do not explicitly say
+  "case library" or name the tool.
+  It searches an authorized case library when `case_library` is configured and the token has
+  `cases:read`.
+
+If the client model does not reliably choose the case-library tool by itself, add the prompt
+snippet in [`plugins/mcp/case-tool-instruction.md`](plugins/mcp/case-tool-instruction.md) to
+the client's system prompt, role prompt, or demo prompt. This is a client-side guidance issue;
+RAM-A still exposes the tool through standard `tools/list` and does not force a call.
+
+For xiaoO automatic memory, add this to xiaoO `config.toml`:
+
+```toml
+[memory_automation]
+enabled = true
+server = "ram-a"
+recall_top_k = 5
+recall_token_budget = 512
+context_messages = 4
+queue_path = "memory-automation-queue.jsonl"
+queue_capacity = 256
+max_retries = 5
+retry_backoff_ms = 250
+allowed_agent_roles = ["main", "defaultagent"]
+```
+
+This setting enables pre-turn recall and post-turn durable ingest queueing. It does not
+modify the user's original prompt. If RAM-A is unavailable, xiaoO should degrade memory
+behavior and continue normal chat.
+
+Check the services:
+
+```bash
+curl -i http://127.0.0.1:18081/healthy
+curl -i http://127.0.0.1:18081/ready
+```
 
 See [docs/guides/http-mcp-deployment.md](docs/guides/http-mcp-deployment.md)
 for secure local deployment, xiaoO `.mcp.json`, automatic memory settings,

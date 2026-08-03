@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::record::metadata_matches;
+use crate::record::{extract_scope_id, extract_scope_id_from_filter, metadata_matches};
 use crate::{
     cosine_similarity, AddMemoryRequest, AddMemoryResponse, EmbeddingProvider, MemoryError,
     MemoryRecord, MemoryResult, MemoryStore, Reranker, RetrievalConfig, ScoredMemory,
@@ -12,6 +12,7 @@ use crate::{
 };
 
 const DEFAULT_EMBEDDING_BATCH_SIZE: usize = 64;
+const EMBEDDING_PROFILE_METADATA_KEY: &str = "memory_core_embedding_profile";
 
 #[async_trait]
 pub trait LongTermMemory: Send + Sync {
@@ -87,6 +88,8 @@ impl MemoryManager {
         let (responses, new_records) = self
             .build_records_with_batch_size_and_progress(requests, batch_size, &mut on_embedded)
             .await?;
+        self.validate_new_record_embedding_profiles(&new_records)
+            .await?;
         self.store.add_records(&new_records).await?;
 
         Ok(responses)
@@ -143,6 +146,7 @@ impl MemoryManager {
         }
 
         let now = current_time_ms();
+        let embedding_profile = self.embedding_profile_metadata();
         let mut responses = Vec::with_capacity(requests.len());
         let mut records = Vec::with_capacity(requests.len());
         for (request, embedding) in requests.into_iter().zip(embeddings) {
@@ -151,7 +155,7 @@ impl MemoryManager {
             records.push(MemoryRecord {
                 id,
                 text: request.text.trim().to_string(),
-                metadata: request.metadata,
+                metadata: metadata_with_embedding_profile(request.metadata, &embedding_profile),
                 embedding,
                 created_at_ms: now,
                 updated_at_ms: now,
@@ -413,6 +417,7 @@ impl MemoryManager {
         limit: usize,
     ) -> MemoryResult<Vec<ScoredMemory>> {
         if let Some(sqlite_store) = self.store.as_any().downcast_ref::<SqliteMemoryStore>() {
+            self.validate_search_embedding_profile(filter).await?;
             return sqlite_store
                 .dense_candidates(query_embedding, filter, limit)
                 .await;
@@ -452,6 +457,127 @@ impl MemoryManager {
             .ok_or_else(|| MemoryError::StoreBackend {
                 message: format!("{mode:?} search requires sqlite store backend"),
             })
+    }
+
+    fn embedding_profile_metadata(&self) -> serde_json::Value {
+        serde_json::json!({
+            "profile_id": self.embedder.profile_id(),
+            "model": self.embedder.model_name(),
+            "dimensions": self.embedder.dimensions(),
+        })
+    }
+
+    async fn validate_new_record_embedding_profiles(
+        &self,
+        new_records: &[MemoryRecord],
+    ) -> MemoryResult<()> {
+        let Some(_sqlite_store) = self.store.as_any().downcast_ref::<SqliteMemoryStore>() else {
+            return Ok(());
+        };
+        if new_records.is_empty() {
+            return Ok(());
+        }
+
+        let mut expected_by_scope = HashMap::<String, String>::new();
+        for record in self.store.list_records().await? {
+            let Some(scope_id) = extract_scope_id(&record.metadata) else {
+                continue;
+            };
+            if let Some(profile_id) = record_embedding_profile_id(&record) {
+                insert_expected_embedding_profile(&mut expected_by_scope, &scope_id, &profile_id)?;
+            }
+        }
+
+        let current_profile_id = self.embedder.profile_id();
+        for record in new_records {
+            let Some(scope_id) = extract_scope_id(&record.metadata) else {
+                continue;
+            };
+            let profile_id =
+                record_embedding_profile_id(record).unwrap_or_else(|| current_profile_id.clone());
+            insert_expected_embedding_profile(&mut expected_by_scope, &scope_id, &profile_id)?;
+        }
+
+        Ok(())
+    }
+
+    async fn validate_search_embedding_profile(
+        &self,
+        filter: Option<&serde_json::Value>,
+    ) -> MemoryResult<()> {
+        let current_profile_id = self.embedder.profile_id();
+        let filter_scope_id = extract_scope_id_from_filter(filter);
+        for record in self.store.list_records().await? {
+            if !metadata_matches(&record.metadata, filter) {
+                continue;
+            }
+            if filter_scope_id.is_none() && extract_scope_id(&record.metadata).is_none() {
+                continue;
+            }
+            let Some(profile_id) = record_embedding_profile_id(&record) else {
+                continue;
+            };
+            if profile_id != current_profile_id {
+                return Err(embedding_profile_mismatch_error(
+                    extract_scope_id(&record.metadata).as_deref(),
+                    &current_profile_id,
+                    &profile_id,
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn metadata_with_embedding_profile(
+    metadata: serde_json::Value,
+    profile: &serde_json::Value,
+) -> serde_json::Value {
+    let mut metadata = metadata;
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert(EMBEDDING_PROFILE_METADATA_KEY.to_string(), profile.clone());
+    }
+    metadata
+}
+
+fn record_embedding_profile_id(record: &MemoryRecord) -> Option<String> {
+    record
+        .metadata
+        .get(EMBEDDING_PROFILE_METADATA_KEY)
+        .and_then(|profile| profile.get("profile_id"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+fn insert_expected_embedding_profile(
+    expected_by_scope: &mut HashMap<String, String>,
+    scope_id: &str,
+    profile_id: &str,
+) -> MemoryResult<()> {
+    if let Some(expected) = expected_by_scope.get(scope_id) {
+        if expected != profile_id {
+            return Err(embedding_profile_mismatch_error(
+                Some(scope_id),
+                expected,
+                profile_id,
+            ));
+        }
+    } else {
+        expected_by_scope.insert(scope_id.to_string(), profile_id.to_string());
+    }
+    Ok(())
+}
+
+fn embedding_profile_mismatch_error(
+    scope_id: Option<&str>,
+    expected: &str,
+    actual: &str,
+) -> MemoryError {
+    let scope = scope_id.unwrap_or("<unscoped>");
+    MemoryError::Embedding {
+        message: format!(
+            "embedding profile mismatch for scope `{scope}`: expected `{expected}` got `{actual}`"
+        ),
     }
 }
 
@@ -580,12 +706,17 @@ impl LongTermMemory for MemoryManager {
         let record = MemoryRecord {
             id: id.clone(),
             text: text.to_string(),
-            metadata: request.metadata,
+            metadata: metadata_with_embedding_profile(
+                request.metadata,
+                &self.embedding_profile_metadata(),
+            ),
             embedding,
             created_at_ms: now,
             updated_at_ms: now,
         };
 
+        self.validate_new_record_embedding_profiles(std::slice::from_ref(&record))
+            .await?;
         self.store.add_record(&record).await?;
         Ok(AddMemoryResponse { id })
     }
@@ -639,6 +770,26 @@ mod tests {
     impl EmbeddingProvider for StaticEmbedding {
         fn dimensions(&self) -> usize {
             self.vector.len()
+        }
+
+        async fn embed(&self, texts: &[String]) -> MemoryResult<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| self.vector.clone()).collect())
+        }
+    }
+
+    struct NamedEmbedding {
+        vector: Vec<f32>,
+        model_name: &'static str,
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for NamedEmbedding {
+        fn dimensions(&self) -> usize {
+            self.vector.len()
+        }
+
+        fn model_name(&self) -> &str {
+            self.model_name
         }
 
         async fn embed(&self, texts: &[String]) -> MemoryResult<Vec<Vec<f32>>> {
@@ -892,6 +1043,134 @@ mod tests {
             .map(|record| record.id.clone())
             .collect::<Vec<_>>();
         assert_eq!(stored_ids, vec!["m1", "m2"]);
+    }
+
+    #[tokio::test]
+    async fn sqlite_add_rejects_embedding_profile_mismatch_within_scope() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(SqliteMemoryStore::new(temp.path().join("memory.sqlite")));
+        store.initialize().await.expect("initialize sqlite");
+        let first = MemoryManager::with_retrieval_config(
+            store.clone(),
+            Arc::new(NamedEmbedding {
+                vector: vec![1.0, 0.0],
+                model_name: "embedding-a",
+            }),
+            dense_config(),
+        );
+        first
+            .add(AddMemoryRequest {
+                id: Some("m1".to_string()),
+                text: "first memory".to_string(),
+                metadata: serde_json::json!({"scope_id": "scope-a"}),
+            })
+            .await
+            .expect("add first profile");
+
+        let second = MemoryManager::with_retrieval_config(
+            store,
+            Arc::new(NamedEmbedding {
+                vector: vec![0.0, 1.0],
+                model_name: "embedding-b",
+            }),
+            dense_config(),
+        );
+        let error = second
+            .add(AddMemoryRequest {
+                id: Some("m2".to_string()),
+                text: "second memory".to_string(),
+                metadata: serde_json::json!({"scope_id": "scope-a"}),
+            })
+            .await
+            .expect_err("same scope must reject different embedding profile");
+
+        let message = format!("{error}");
+        assert!(message.contains("embedding profile mismatch"), "{message}");
+        assert!(message.contains("scope-a"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn sqlite_allows_different_embedding_profiles_in_different_scopes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(SqliteMemoryStore::new(temp.path().join("memory.sqlite")));
+        store.initialize().await.expect("initialize sqlite");
+        let first = MemoryManager::with_retrieval_config(
+            store.clone(),
+            Arc::new(NamedEmbedding {
+                vector: vec![1.0, 0.0],
+                model_name: "embedding-a",
+            }),
+            dense_config(),
+        );
+        first
+            .add(AddMemoryRequest {
+                id: Some("m1".to_string()),
+                text: "first memory".to_string(),
+                metadata: serde_json::json!({"scope_id": "scope-a"}),
+            })
+            .await
+            .expect("add first scope");
+
+        let second = MemoryManager::with_retrieval_config(
+            store,
+            Arc::new(NamedEmbedding {
+                vector: vec![0.0, 1.0],
+                model_name: "embedding-b",
+            }),
+            dense_config(),
+        );
+        second
+            .add(AddMemoryRequest {
+                id: Some("m2".to_string()),
+                text: "second memory".to_string(),
+                metadata: serde_json::json!({"scope_id": "scope-b"}),
+            })
+            .await
+            .expect("different scopes may use different profiles");
+    }
+
+    #[tokio::test]
+    async fn sqlite_search_rejects_embedding_profile_mismatch_within_scope() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(SqliteMemoryStore::new(temp.path().join("memory.sqlite")));
+        store.initialize().await.expect("initialize sqlite");
+        let writer = MemoryManager::with_retrieval_config(
+            store.clone(),
+            Arc::new(NamedEmbedding {
+                vector: vec![1.0, 0.0],
+                model_name: "embedding-a",
+            }),
+            dense_config(),
+        );
+        writer
+            .add(AddMemoryRequest {
+                id: Some("m1".to_string()),
+                text: "first memory".to_string(),
+                metadata: serde_json::json!({"scope_id": "scope-a"}),
+            })
+            .await
+            .expect("add first profile");
+
+        let reader = MemoryManager::with_retrieval_config(
+            store,
+            Arc::new(NamedEmbedding {
+                vector: vec![0.0, 1.0],
+                model_name: "embedding-b",
+            }),
+            dense_config(),
+        );
+        let error = reader
+            .search(SearchMemoryRequest {
+                query: "first".to_string(),
+                top_k: 1,
+                filter: Some(serde_json::json!({"scope_id": "scope-a"})),
+            })
+            .await
+            .expect_err("same scope must reject search with different embedding profile");
+
+        let message = format!("{error}");
+        assert!(message.contains("embedding profile mismatch"), "{message}");
+        assert!(message.contains("scope-a"), "{message}");
     }
 
     #[tokio::test]

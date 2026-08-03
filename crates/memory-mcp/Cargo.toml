@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "ram-a-mcp-server"
+name = "ram-a-mem"
 path = "src/main.rs"
 
 [dependencies]
@@ -17,6 +17,7 @@ clap.workspace = true
 governor = "=0.6.3"
 http-body-util = "0.1"
 memory-core = { path = "../memory-core" }
+memory-cases = { path = "../memory-cases" }
 memory-pipeline = { path = "../memory-pipeline" }
 reqwest.workspace = true
 rmcp = { workspace = true, features = ["transport-streamable-http-server"] }

@@ -108,6 +108,11 @@ cargo run -p memory-cases -- --api \
   --bind 127.0.0.1:${PORT} \
   --rag-store "$RAG_STORE" \
   --memory-store "$MEMORY_STORE" \
+  --embedding-provider "${MEMORY_CASES_EMBEDDING_PROVIDER:-hash}" \
+  --embedding-api-key-env "${MEMORY_CASES_EMBEDDING_API_KEY_ENV:-OPENAI_API_KEY}" \
+  --embedding-base-url "${MEMORY_CASES_EMBEDDING_BASE_URL:-https://api.openai.com/v1}" \
+  --embedding-model "${MEMORY_CASES_EMBEDDING_MODEL:-text-embedding-3-small}" \
+  --embedding-dimensions "${MEMORY_CASES_EMBEDDING_DIMENSIONS:-256}" \
   --chunk-size "$CHUNK_SIZE"
 ```
 
@@ -368,8 +373,11 @@ no-hit result: 0/2 passed
 2. 关键词断言比较硬
    `required_*_terms` 对措辞、大小写和截断敏感，不能表达“语义等价但字面不同”的情况。
 
-3. 当前 embedding 是本地 HashEmbedding
-   它适合离线 smoke/回归，但不能代表真实语义 embedding 的召回能力。
+3. 默认 embedding 是本地 HashEmbedding
+   它适合离线 smoke/回归，但不能代表真实语义 embedding 的召回能力。需要验证
+   真实或本地部署的语义召回时，使用 `MEMORY_CASES_EMBEDDING_PROVIDER=openai_compatible`
+   并配置 `MEMORY_CASES_EMBEDDING_BASE_URL`、`MEMORY_CASES_EMBEDDING_MODEL`、
+   `MEMORY_CASES_EMBEDDING_API_KEY_ENV` 和 `MEMORY_CASES_EMBEDDING_DIMENSIONS`。
 
 4. 没有 expected-fail / threshold 机制
    诊断型 case 失败时脚本会整体返回非零，不适合作为“必须全绿”的 CI 门禁。

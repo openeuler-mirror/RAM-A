@@ -1,16 +1,20 @@
 use memory_pipeline::extraction::MemoryExtractor;
 use memory_pipeline::grounding::GroundingVerifier;
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::handler::server::tool::Extension;
+use rmcp::handler::server::tool::{Extension, ToolCallContext};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ProtocolVersion, ServerCapabilities, ServerInfo};
-use rmcp::{tool, tool_handler, tool_router, ServerHandler};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResult, ListToolsResult, PaginatedRequestParams,
+    ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
+};
+use rmcp::service::{RequestContext, RoleServer};
+use rmcp::{tool, tool_router, ErrorData as McpError, ServerHandler};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     CaseSearchRequest, CaseSearchResponse, CaseServiceError, DisabledCaseSearchProvider,
-    DynCaseSearchProvider, IngestRequest, IngestResponse, MemoryService, Principal, SearchRequest,
-    SearchResponse, ServiceError,
+    DynCaseSearchProvider, FeatureFlags, IngestRequest, IngestResponse, MemoryService, Principal,
+    SearchRequest, SearchResponse, ServiceError,
 };
 
 pub type DynMemoryService = MemoryService<dyn MemoryExtractor, dyn GroundingVerifier>;
@@ -19,6 +23,7 @@ pub type DynMemoryService = MemoryService<dyn MemoryExtractor, dyn GroundingVeri
 pub struct MemoryMcpServer {
     service: DynMemoryService,
     case_search: DynCaseSearchProvider,
+    features: FeatureFlags,
     cancellation_token: CancellationToken,
     tool_router: ToolRouter<Self>,
 }
@@ -36,6 +41,7 @@ impl MemoryMcpServer {
             service,
             cancellation_token,
             std::sync::Arc::new(DisabledCaseSearchProvider),
+            FeatureFlags::all(),
         )
     }
 
@@ -43,12 +49,30 @@ impl MemoryMcpServer {
         service: DynMemoryService,
         cancellation_token: CancellationToken,
         case_search: DynCaseSearchProvider,
+        features: FeatureFlags,
     ) -> Self {
+        let mut tool_router = Self::tool_router();
+        if !features.memory {
+            tool_router.disable_route("memory_ingest");
+            tool_router.disable_route("memory_search");
+        }
+        if !features.case_library {
+            tool_router.disable_route("memory_case_search");
+        }
         Self {
             service,
             case_search,
+            features,
             cancellation_token,
-            tool_router: Self::tool_router(),
+            tool_router,
+        }
+    }
+
+    fn disabled_tool_code(&self, name: &str) -> Option<&'static str> {
+        match name {
+            "memory_ingest" | "memory_search" if !self.features.memory => Some("MEMORY_DISABLED"),
+            "memory_case_search" if !self.features.case_library => Some("CASE_LIBRARY_DISABLED"),
+            _ => None,
         }
     }
 }
@@ -127,7 +151,7 @@ impl MemoryMcpServer {
 
     #[tool(
         name = "memory_case_search",
-        description = "Search an authorized operational case library for relevant troubleshooting evidence and source references",
+        description = "First use this tool for operational troubleshooting, incident diagnosis, case lookup, root-cause analysis, remediation steps, or similar historical case questions. Also use this tool when the user asks whether there were similar past cases, previous incidents, known fixes, or examples for a troubleshooting symptom, even if they do not explicitly say \"case library\" or name the tool. It searches an authorized case library and returns evidence plus source references; base troubleshooting answers on those returned references instead of general knowledge alone.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<CaseSearchResponse>()
     )]
     async fn memory_case_search(
@@ -185,7 +209,6 @@ fn tool_error(code: &'static str, retriable: bool) -> CallToolResult {
     }))
 }
 
-#[tool_handler(router = self.tool_router)]
 impl ServerHandler for MemoryMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -193,5 +216,32 @@ impl ServerHandler for MemoryMcpServer {
             .with_instructions(
                 "Authenticated long-term memory and tenant-authorized case retrieval tools.",
             )
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Some(code) = self.disabled_tool_code(request.name.as_ref()) {
+            return Ok(tool_error(code, false));
+        }
+        let context = ToolCallContext::new(self, request, context);
+        self.tool_router.call(context).await
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        Ok(ListToolsResult {
+            tools: self.tool_router.list_all(),
+            ..Default::default()
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.tool_router.get(name).cloned()
     }
 }
