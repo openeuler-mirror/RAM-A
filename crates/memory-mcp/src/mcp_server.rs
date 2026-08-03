@@ -151,7 +151,7 @@ impl MemoryMcpServer {
 
     #[tool(
         name = "memory_case_search",
-        description = "First use this tool for operational troubleshooting, incident diagnosis, case lookup, root-cause analysis, remediation steps, or similar historical case questions. It searches an authorized case library and returns evidence plus source references; base troubleshooting answers on those returned references instead of general knowledge alone.",
+        description = "First use this tool for operational troubleshooting, incident diagnosis, case lookup, root-cause analysis, remediation steps, or similar historical case questions. Also use this tool when the user asks whether there were similar past cases, previous incidents, known fixes, or examples for a troubleshooting symptom, even if they do not explicitly say \"case library\" or name the tool. It searches an authorized case library and returns evidence plus source references; base troubleshooting answers on those returned references instead of general knowledge alone.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<CaseSearchResponse>()
     )]
     async fn memory_case_search(

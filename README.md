@@ -368,6 +368,9 @@ are:
 - `memory_ingest`: extract, ground, and persist authenticated conversation memory.
 - `memory_case_search`: first-use tool for troubleshooting, incident diagnosis, root-cause
   analysis, remediation steps, operational case lookup, or similar historical case questions.
+  Also use it when the user asks whether there were similar past cases, previous incidents,
+  known fixes, or examples for a troubleshooting symptom, even if they do not explicitly say
+  "case library" or name the tool.
   It searches an authorized case library when `case_library` is configured and the token has
   `cases:read`.
 
