@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex as StdMutex, Weak};
 
 use chrono::{DateTime, NaiveDate, Utc};
 use memory_core::{
-    AddMemoryRequest, LongTermMemory, MemoryManager, MemoryRecord,
-    SearchMemoryRequest as CoreSearchRequest,
+    AddMemoryRequest, GraphAddMemoryRequest, GraphBuildPipeline, LongTermMemory, MemoryManager,
+    MemoryRecord, SearchMemoryRequest as CoreSearchRequest,
 };
 use memory_pipeline::extraction::MemoryExtractor;
 use memory_pipeline::grounding::GroundingVerifier;
@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use crate::idempotency::{IdempotencyEntry, IdempotencyError, IdempotencyRepository, Reservation};
@@ -52,7 +53,15 @@ pub struct SearchResult {
     pub observed_at: String,
     pub evidence_refs: Value,
     pub source_agent_id: String,
+    pub graph_facts: Value,
+    pub graph_facts_truncated: bool,
     pub score: f32,
+}
+
+#[derive(Clone)]
+struct GraphMemoryRuntime {
+    pipeline: Arc<GraphBuildPipeline>,
+    build_concurrency: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,6 +106,7 @@ pub struct MemoryService<E: ?Sized, V: ?Sized> {
     extractor: Arc<E>,
     verifier: Arc<V>,
     pipeline_config: PipelineConfig,
+    graph_memory: Option<GraphMemoryRuntime>,
     ingest_locks: Arc<StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>>,
 }
 
@@ -108,6 +118,7 @@ impl<E: ?Sized, V: ?Sized> Clone for MemoryService<E, V> {
             extractor: self.extractor.clone(),
             verifier: self.verifier.clone(),
             pipeline_config: self.pipeline_config.clone(),
+            graph_memory: self.graph_memory.clone(),
             ingest_locks: self.ingest_locks.clone(),
         }
     }
@@ -146,8 +157,25 @@ where
             extractor,
             verifier,
             pipeline_config,
+            graph_memory: None,
             ingest_locks: Arc::new(StdMutex::new(HashMap::new())),
         }
+    }
+
+    pub fn with_graph_memory(
+        mut self,
+        pipeline: Arc<GraphBuildPipeline>,
+        build_concurrency: usize,
+    ) -> Self {
+        assert!(
+            build_concurrency > 0,
+            "graph build concurrency must be non-zero"
+        );
+        self.graph_memory = Some(GraphMemoryRuntime {
+            pipeline,
+            build_concurrency,
+        });
+        self
     }
 
     pub async fn ingest(
@@ -201,6 +229,11 @@ where
         .await
         .map_err(|_| ServiceError::Pipeline)?;
         let requests = stored_memory_requests(&run.prepared, principal, &pipeline_run_id)?;
+        let graph_requests = if self.graph_memory.is_some() {
+            build_graph_add_requests(principal, &requests)?
+        } else {
+            Vec::new()
+        };
         let memory_ids = self
             .manager
             .add_many(requests)
@@ -209,6 +242,9 @@ where
             .into_iter()
             .map(|response| response.id)
             .collect::<Vec<_>>();
+        if let Some(graph_memory) = &self.graph_memory {
+            build_graph_memories(graph_memory, graph_requests).await?;
+        }
         let response = IngestResponse {
             pipeline_run_id: pipeline_run_id.clone(),
             accepted_count: run.accepted_memories.len(),
@@ -255,7 +291,7 @@ where
                 query: request.query,
                 top_k: candidate_limit,
                 filter: Some(json!({"scope_id": principal.scope_id()})),
-                graph_memory_space_id: None,
+                graph_memory_space_id: self.graph_memory.as_ref().map(|_| principal.scope_id()),
                 graph_target_subject: None,
                 graph_target_evidence_speaker: None,
             })
@@ -417,6 +453,112 @@ fn stored_memory_requests(
         .collect()
 }
 
+fn build_graph_add_requests(
+    principal: &Principal,
+    requests: &[AddMemoryRequest],
+) -> Result<Vec<GraphAddMemoryRequest>, ServiceError> {
+    requests
+        .iter()
+        .map(|request| {
+            let id = request.id.as_deref().ok_or(ServiceError::Pipeline)?;
+            let mut metadata = request
+                .metadata
+                .as_object()
+                .cloned()
+                .ok_or(ServiceError::Pipeline)?;
+            metadata.remove("pipeline_run_id");
+            metadata.remove("source_agent_id");
+            if !metadata.contains_key("graph_source_entity") {
+                if let Some(speaker) = metadata
+                    .get("speaker")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|speaker| is_named_source_actor(speaker))
+                {
+                    metadata.insert(
+                        "graph_source_entity".to_string(),
+                        json!({"name": speaker, "entity_type": "PERSON"}),
+                    );
+                }
+            }
+            let mut graph_request = GraphAddMemoryRequest {
+                memory_space_id: principal.scope_id(),
+                owner_id: principal.scope_id(),
+                idempotency_key: String::new(),
+                text: request.text.clone(),
+                metadata: Value::Object(metadata),
+                session_id: request
+                    .metadata
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|session_id| !session_id.is_empty())
+                    .map(str::to_string),
+                session_sequence: request.metadata.get("turn_index").and_then(Value::as_i64),
+                source_kind: "atomic_memory".to_string(),
+                source_ref: Some(id.to_string()),
+                content_role: "memory".to_string(),
+                created_by_agent_id: Some(principal.agent_id.clone()),
+                observed_at_ms: request
+                    .metadata
+                    .get("observed_at_ms")
+                    .and_then(Value::as_u64),
+            };
+            graph_request.idempotency_key = format!("{}:{}", id, graph_request.input_hash());
+            Ok(graph_request)
+        })
+        .collect()
+}
+
+fn is_named_source_actor(speaker: &str) -> bool {
+    let normalized = speaker.trim().to_ascii_lowercase();
+    !normalized.is_empty()
+        && !["user", "assistant", "system", "tool"]
+            .iter()
+            .any(|role| is_role_placeholder(&normalized, role))
+}
+
+fn is_role_placeholder(speaker: &str, role: &str) -> bool {
+    let Some(suffix) = speaker.strip_prefix(role) else {
+        return false;
+    };
+    suffix.is_empty()
+        || suffix
+            .chars()
+            .all(|character| character.is_ascii_digit() || !character.is_alphanumeric())
+}
+
+async fn build_graph_memories(
+    runtime: &GraphMemoryRuntime,
+    requests: Vec<GraphAddMemoryRequest>,
+) -> Result<(), ServiceError> {
+    let mut requests = requests.into_iter();
+    let mut tasks = JoinSet::new();
+    for _ in 0..runtime.build_concurrency {
+        let Some(request) = requests.next() else {
+            break;
+        };
+        spawn_graph_build(&mut tasks, runtime.pipeline.clone(), request);
+    }
+    while let Some(result) = tasks.join_next().await {
+        result
+            .map_err(|_| ServiceError::Pipeline)?
+            .map_err(|_| ServiceError::Pipeline)?;
+        if let Some(request) = requests.next() {
+            spawn_graph_build(&mut tasks, runtime.pipeline.clone(), request);
+        }
+    }
+    Ok(())
+}
+
+fn spawn_graph_build(
+    tasks: &mut JoinSet<memory_core::MemoryResult<Option<memory_core::GraphBuildResult>>>,
+    pipeline: Arc<GraphBuildPipeline>,
+    request: GraphAddMemoryRequest,
+) {
+    tasks.spawn(async move { pipeline.resume_memory(request).await });
+}
+
 fn search_result(record: MemoryRecord, score: f32) -> SearchResult {
     SearchResult {
         id: record.id,
@@ -435,6 +577,16 @@ fn search_result(record: MemoryRecord, score: f32) -> SearchResult {
             .cloned()
             .unwrap_or_else(|| json!([])),
         source_agent_id: metadata_text(&record.metadata, "source_agent_id"),
+        graph_facts: record
+            .metadata
+            .get("graph_facts")
+            .cloned()
+            .unwrap_or_else(|| json!([])),
+        graph_facts_truncated: record
+            .metadata
+            .get("graph_facts_truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         score,
     }
 }
@@ -545,12 +697,17 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
-    use memory_core::{HashEmbedding, MemoryManager, SqliteMemoryStore};
+    use memory_core::{
+        AddMemoryRequest, HashEmbedding, MemoryManager, MemoryRecord, SqliteMemoryStore,
+    };
     use memory_pipeline::extraction::StaticMemoryExtractor;
     use memory_pipeline::grounding::StaticGroundingVerifier;
     use serde_json::json;
 
-    use super::{bounded_candidate_limit, build_prepared_input, stable_source_id, MemoryService};
+    use super::{
+        bounded_candidate_limit, build_graph_add_requests, build_prepared_input, search_result,
+        stable_source_id, MemoryService,
+    };
     use crate::{IdempotencyRepository, IngestMessage, IngestRequest, Principal};
 
     fn principal(user: &str, agent: &str) -> Principal {
@@ -716,5 +873,80 @@ mod tests {
         assert_eq!(bounded_candidate_limit(10), 50);
         assert_eq!(bounded_candidate_limit(100), 500);
         assert_eq!(bounded_candidate_limit(usize::MAX), 500);
+    }
+
+    #[test]
+    fn graph_requests_preserve_atomic_memory_source_context() {
+        let principal = principal("alice", "agent-a");
+        let requests = vec![AddMemoryRequest {
+            id: Some("memory-1".to_string()),
+            text: "Alice prefers a window seat.".to_string(),
+            metadata: json!({
+                "speaker": "Alice",
+                "session_id": "session-1",
+                "turn_index": 7,
+                "observed_at_ms": 1_785_000_000_000_u64,
+                "source_agent_id": "agent-a",
+                "pipeline_run_id": "transient-run-1",
+                "scope_id": principal.scope_id()
+            }),
+        }];
+
+        let graph = build_graph_add_requests(&principal, &requests).unwrap();
+
+        assert_eq!(graph.len(), 1);
+        assert_eq!(graph[0].memory_space_id, principal.scope_id());
+        assert_eq!(graph[0].owner_id, principal.scope_id());
+        assert!(graph[0].idempotency_key.starts_with("memory-1:"));
+        assert_eq!(graph[0].source_ref.as_deref(), Some("memory-1"));
+        assert_eq!(graph[0].source_kind, "atomic_memory");
+        assert_eq!(graph[0].content_role, "memory");
+        assert_eq!(graph[0].created_by_agent_id.as_deref(), Some("agent-a"));
+        assert_eq!(graph[0].session_id.as_deref(), Some("session-1"));
+        assert_eq!(graph[0].session_sequence, Some(7));
+        assert_eq!(graph[0].observed_at_ms, Some(1_785_000_000_000));
+        assert_eq!(
+            graph[0].metadata["graph_source_entity"],
+            json!({"name": "Alice", "entity_type": "PERSON"})
+        );
+        assert!(graph[0].metadata.get("source_agent_id").is_none());
+        assert!(graph[0].metadata.get("pipeline_run_id").is_none());
+    }
+
+    #[test]
+    fn generic_role_speakers_are_not_graph_source_entities() {
+        for speaker in ["user", "User1", "assistant-2", "system_3", "tool 4"] {
+            assert!(!super::is_named_source_actor(speaker), "speaker={speaker}");
+        }
+        for speaker in ["Alice", "Assistant Professor Lee", "Systema"] {
+            assert!(super::is_named_source_actor(speaker), "speaker={speaker}");
+        }
+    }
+
+    #[test]
+    fn search_results_expose_graph_facts_without_changing_memory_text() {
+        let graph_facts = json!([{
+            "fact_id": "fact-1",
+            "fact_text": "Alice prefers a window seat.",
+            "predicate": "LIKES"
+        }]);
+        let result = search_result(
+            MemoryRecord {
+                id: "memory-1".to_string(),
+                text: "Window seats are my preference.".to_string(),
+                metadata: json!({
+                    "graph_facts": graph_facts,
+                    "graph_facts_truncated": true
+                }),
+                embedding: vec![],
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+            0.9,
+        );
+
+        assert_eq!(result.text, "Window seats are my preference.");
+        assert_eq!(result.graph_facts, graph_facts);
+        assert!(result.graph_facts_truncated);
     }
 }

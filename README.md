@@ -261,6 +261,9 @@ field changes listed below.
     },
     "case_library": {
       "enabled": true
+    },
+    "graph_memory": {
+      "enabled": false
     }
   },
   "http": {
@@ -310,6 +313,22 @@ field changes listed below.
         "tenant_ids": ["tenant-local"]
       }
     ]
+  },
+  "graph_memory": {
+    "llm_api_key_env": "GRAPH_LLM_API_KEY",
+    "llm_base_url": "http://127.0.0.1:8000/v1",
+    "llm_model": "GLM-5.2",
+    "llm_timeout_ms": 60000,
+    "build_concurrency": 1,
+    "retrieval": {
+      "weight": 0.2,
+      "rerank_with_graph": false,
+      "allow_graph_only": false,
+      "max_graph_only_results": null,
+      "seed_limit": null,
+      "max_evidence_records_per_fact": null,
+      "fail_open": false
+    }
   }
 }
 ```
@@ -323,6 +342,9 @@ Change these fields before deployment:
   (`memory_search`, `memory_ingest`).
 - `features.case_library.enabled`: expose or hide the operational case-library tool
   (`memory_case_search`). If this is `true`, `case_library` must also be configured.
+- `features.graph_memory.enabled`: augment `memory_ingest` and `memory_search` with graph
+  construction and retrieval. Keep this `false` unless the top-level `graph_memory` settings
+  and `GRAPH_LLM_API_KEY` are configured.
 - `allowed_hosts`: host and port used by clients to reach RAM-A.
 - `storage.database_path`: RAM-A personal long-term memory SQLite path.
 - `providers.api_key_env`, `providers.base_url`, `extractor_model`, `verifier_model`:
@@ -356,6 +378,8 @@ Start RAM-A memory service:
 ```bash
 export RAM_A_XIAOO_TOKEN='replace-with-long-random-token'
 export LLM_API_KEY='replace-with-llm-provider-key'
+# Required only when features.graph_memory.enabled is true.
+export GRAPH_LLM_API_KEY='replace-with-graph-provider-key'
 
 cargo run -p memory-mcp --bin ram-a-mem
 ```

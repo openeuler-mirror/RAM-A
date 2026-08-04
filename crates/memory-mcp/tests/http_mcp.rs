@@ -9,9 +9,9 @@ use axum::response::Response;
 use axum::Router;
 use memory_core::{HashEmbedding, MemoryManager, SqliteMemoryStore};
 use memory_mcp::{
-    create_http_router, AuthConfig, EmbeddingProviderKind, FeatureFlags, HttpConfig, HttpRuntime,
-    IdempotencyRepository, LimitsConfig, MemoryService, ProvidersConfig, ServerConfig,
-    StorageConfig, TokenAuthenticator, TokenConfig,
+    create_http_router, AuthConfig, EmbeddingProviderKind, FeatureFlags,
+    GraphMemoryRetrievalConfig, HttpConfig, HttpRuntime, IdempotencyRepository, LimitsConfig,
+    MemoryService, ProvidersConfig, ServerConfig, StorageConfig, TokenAuthenticator, TokenConfig,
 };
 use memory_pipeline::error::Result as PipelineResult;
 use memory_pipeline::extraction::{ExtractionBatch, MemoryExtractor, ModelUsage, SCHEMA_VERSION};
@@ -1359,6 +1359,7 @@ fn production_runtime_config_requires_live_components_and_nonzero_limits() {
         storage: None,
         providers: None,
         case_library: None,
+        graph_memory: None,
     };
     assert!(incomplete.validate_runtime().is_err());
 
@@ -1384,6 +1385,7 @@ fn production_runtime_config_requires_live_components_and_nonzero_limits() {
             max_retries: 2,
         }),
         case_library: None,
+        graph_memory: None,
     };
     assert!(complete.validate_runtime().is_ok());
     for invalid_base_url in [
@@ -1568,6 +1570,179 @@ fn production_runtime_config_resolves_memory_and_case_library_feature_switches()
         }
     );
     assert!(enabled_case_library.validate_runtime().is_ok());
+}
+
+#[test]
+fn production_runtime_config_keeps_graph_memory_disabled_by_default() {
+    let config: ServerConfig = serde_json::from_str(
+        r#"{
+          "auth": {
+            "tokens": [{
+              "token_env": "RAM_A_SERVER_TOKEN",
+              "tenant_id": "tenant-a",
+              "user_id": "alice",
+              "agent_id": "agent-a",
+              "permissions": ["memory:read", "memory:write"]
+            }]
+          },
+          "storage": {"database_path": "memory.sqlite"},
+          "providers": {
+            "api_key_env": "RAM_A_PROVIDER_KEY",
+            "base_url": "http://127.0.0.1:8088/v1",
+            "embedding_provider": "hash",
+            "embedding_model": "hash",
+            "embedding_dimensions": 1024,
+            "extractor_model": "GLM-5.2",
+            "verifier_model": "GLM-5.2"
+          }
+        }"#,
+    )
+    .unwrap();
+
+    assert!(!config.features.graph_memory.enabled);
+    assert!(config.graph_memory.is_none());
+    assert!(config.validate_runtime().is_ok());
+}
+
+#[test]
+fn production_runtime_config_requires_graph_configuration_when_enabled() {
+    let config: ServerConfig = serde_json::from_str(
+        r#"{
+          "auth": {
+            "tokens": [{
+              "token_env": "RAM_A_SERVER_TOKEN",
+              "tenant_id": "tenant-a",
+              "user_id": "alice",
+              "agent_id": "agent-a",
+              "permissions": ["memory:read", "memory:write"]
+            }]
+          },
+          "features": {"graph_memory": {"enabled": true}},
+          "storage": {"database_path": "memory.sqlite"},
+          "providers": {
+            "api_key_env": "RAM_A_PROVIDER_KEY",
+            "base_url": "http://127.0.0.1:8088/v1",
+            "embedding_provider": "hash",
+            "embedding_model": "hash",
+            "embedding_dimensions": 1024,
+            "extractor_model": "GLM-5.2",
+            "verifier_model": "GLM-5.2"
+          }
+        }"#,
+    )
+    .unwrap();
+
+    let error = config.validate_runtime().unwrap_err().to_string();
+    assert!(error.contains("graph_memory feature requires graph_memory configuration"));
+}
+
+#[test]
+fn production_runtime_config_rejects_graph_memory_without_memory_tools() {
+    let config: ServerConfig = serde_json::from_str(
+        r#"{
+          "auth": {
+            "tokens": [{
+              "token_env": "RAM_A_SERVER_TOKEN",
+              "tenant_id": "tenant-a",
+              "user_id": "alice",
+              "agent_id": "agent-a",
+              "permissions": ["memory:read", "memory:write"]
+            }]
+          },
+          "features": {
+            "memory": {"enabled": false},
+            "graph_memory": {"enabled": true}
+          },
+          "storage": {"database_path": "memory.sqlite"},
+          "providers": {
+            "api_key_env": "RAM_A_PROVIDER_KEY",
+            "base_url": "http://127.0.0.1:8088/v1",
+            "embedding_provider": "hash",
+            "embedding_model": "hash",
+            "embedding_dimensions": 1024,
+            "extractor_model": "GLM-5.2",
+            "verifier_model": "GLM-5.2"
+          },
+          "graph_memory": {
+            "llm_api_key_env": "RAM_A_GRAPH_KEY",
+            "llm_model": "graph-model"
+          }
+        }"#,
+    )
+    .unwrap();
+
+    let error = config.validate_runtime().unwrap_err().to_string();
+    assert!(error.contains("graph_memory feature requires the memory feature"));
+}
+
+#[test]
+fn production_runtime_config_maps_valid_graph_retrieval_settings() {
+    let mut config: ServerConfig = serde_json::from_str(
+        r#"{
+          "auth": {
+            "tokens": [{
+              "token_env": "RAM_A_SERVER_TOKEN",
+              "tenant_id": "tenant-a",
+              "user_id": "alice",
+              "agent_id": "agent-a",
+              "permissions": ["memory:read", "memory:write"]
+            }]
+          },
+          "features": {"graph_memory": {"enabled": true}},
+          "storage": {"database_path": "memory.sqlite"},
+          "providers": {
+            "api_key_env": "RAM_A_PROVIDER_KEY",
+            "base_url": "http://127.0.0.1:8088/v1",
+            "embedding_provider": "hash",
+            "embedding_model": "hash",
+            "embedding_dimensions": 1024,
+            "extractor_model": "GLM-5.2",
+            "verifier_model": "GLM-5.2"
+          },
+          "graph_memory": {
+            "llm_api_key_env": "RAM_A_GRAPH_KEY",
+            "llm_base_url": "http://127.0.0.1:8089/v1",
+            "llm_model": "graph-model",
+            "llm_timeout_ms": 45000,
+            "build_concurrency": 3,
+            "retrieval": {
+              "weight": 0.35,
+              "rerank_with_graph": true,
+              "allow_graph_only": true,
+              "max_graph_only_results": 4,
+              "seed_limit": 60,
+              "max_evidence_records_per_fact": 2,
+              "fail_open": true
+            }
+          }
+        }"#,
+    )
+    .unwrap();
+
+    assert!(config.validate_runtime().is_ok());
+    let graph = config.graph_memory.as_ref().unwrap();
+    assert_eq!(graph.build_concurrency, 3);
+    assert_eq!(
+        graph.retrieval,
+        GraphMemoryRetrievalConfig {
+            weight: 0.35,
+            rerank_with_graph: true,
+            allow_graph_only: true,
+            max_graph_only_results: Some(4),
+            seed_limit: Some(60),
+            max_evidence_records_per_fact: Some(2),
+            fail_open: true,
+        }
+    );
+    let core = graph.retrieval.core_config();
+    assert!(core.enabled);
+    assert_eq!(core.weight, 0.35);
+    assert!(core.rerank_with_graph);
+    assert!(core.allow_graph_only);
+
+    config.graph_memory.as_mut().unwrap().retrieval.seed_limit =
+        Some(memory_core::MAX_GRAPH_SEED_LIMIT + 1);
+    assert!(config.validate_runtime().is_err());
 }
 
 #[test]

@@ -21,6 +21,8 @@ pub struct ServerConfig {
     pub providers: Option<ProvidersConfig>,
     #[serde(default)]
     pub case_library: Option<CaseLibraryServiceConfig>,
+    #[serde(default)]
+    pub graph_memory: Option<GraphMemoryServiceConfig>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,6 +51,7 @@ impl Default for FeatureFlags {
 pub struct FeaturesConfig {
     pub memory: MemoryFeatureConfig,
     pub case_library: CaseLibraryFeatureConfig,
+    pub graph_memory: GraphMemoryFeatureConfig,
 }
 
 impl FeaturesConfig {
@@ -76,6 +79,111 @@ impl Default for MemoryFeatureConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct CaseLibraryFeatureConfig {
     pub enabled: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GraphMemoryFeatureConfig {
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphMemoryServiceConfig {
+    pub llm_api_key_env: String,
+    #[serde(default = "default_provider_base_url")]
+    pub llm_base_url: String,
+    pub llm_model: String,
+    #[serde(default = "default_graph_llm_timeout_ms")]
+    pub llm_timeout_ms: u64,
+    #[serde(default = "default_graph_build_concurrency")]
+    pub build_concurrency: usize,
+    #[serde(default)]
+    pub retrieval: GraphMemoryRetrievalConfig,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GraphMemoryRetrievalConfig {
+    pub weight: f32,
+    pub rerank_with_graph: bool,
+    pub allow_graph_only: bool,
+    pub max_graph_only_results: Option<usize>,
+    pub seed_limit: Option<usize>,
+    pub max_evidence_records_per_fact: Option<usize>,
+    pub fail_open: bool,
+}
+
+impl Default for GraphMemoryRetrievalConfig {
+    fn default() -> Self {
+        let defaults = memory_core::GraphRetrievalConfig::default();
+        Self {
+            weight: defaults.weight,
+            rerank_with_graph: defaults.rerank_with_graph,
+            allow_graph_only: defaults.allow_graph_only,
+            max_graph_only_results: defaults.max_graph_only_results,
+            seed_limit: defaults.seed_limit,
+            max_evidence_records_per_fact: defaults.max_evidence_records_per_fact,
+            fail_open: defaults.fail_open,
+        }
+    }
+}
+
+impl GraphMemoryRetrievalConfig {
+    pub fn core_config(&self) -> memory_core::GraphRetrievalConfig {
+        memory_core::GraphRetrievalConfig {
+            enabled: true,
+            weight: self.weight,
+            rerank_with_graph: self.rerank_with_graph,
+            allow_graph_only: self.allow_graph_only,
+            max_graph_only_results: self.max_graph_only_results,
+            seed_limit: self.seed_limit,
+            max_evidence_records_per_fact: self.max_evidence_records_per_fact,
+            fail_open: self.fail_open,
+        }
+    }
+}
+
+impl GraphMemoryServiceConfig {
+    fn validate(&self) -> Result<()> {
+        if self.llm_api_key_env.trim().is_empty() || self.llm_model.trim().is_empty() {
+            anyhow::bail!("graph memory LLM configuration is incomplete");
+        }
+        validate_provider_base_url(&self.llm_base_url, "graph memory LLM base URL")?;
+        if self.llm_timeout_ms == 0 || self.build_concurrency == 0 {
+            anyhow::bail!("graph memory timeout and build concurrency must be non-zero");
+        }
+        if !self.retrieval.weight.is_finite() || !(0.0..=1.0).contains(&self.retrieval.weight) {
+            anyhow::bail!("graph memory retrieval weight must be between 0 and 1");
+        }
+        if self.retrieval.max_graph_only_results == Some(0)
+            || self.retrieval.seed_limit == Some(0)
+            || self.retrieval.max_evidence_records_per_fact == Some(0)
+        {
+            anyhow::bail!("graph memory retrieval limits must be non-zero when configured");
+        }
+        if self
+            .retrieval
+            .seed_limit
+            .is_some_and(|limit| limit > memory_core::MAX_GRAPH_SEED_LIMIT)
+        {
+            anyhow::bail!(
+                "graph memory retrieval seed_limit must not exceed {}",
+                memory_core::MAX_GRAPH_SEED_LIMIT
+            );
+        }
+        if self
+            .retrieval
+            .max_evidence_records_per_fact
+            .is_some_and(|limit| limit > memory_core::MAX_GRAPH_EVIDENCE_RECORDS_PER_FACT)
+        {
+            anyhow::bail!(
+                "graph memory retrieval max_evidence_records_per_fact must not exceed {}",
+                memory_core::MAX_GRAPH_EVIDENCE_RECORDS_PER_FACT
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -468,6 +576,14 @@ fn default_summary_llm_timeout_ms() -> u64 {
     30_000
 }
 
+fn default_graph_llm_timeout_ms() -> u64 {
+    60_000
+}
+
+fn default_graph_build_concurrency() -> usize {
+    1
+}
+
 impl ServerConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -481,6 +597,12 @@ impl ServerConfig {
         self.http.validate_bind()?;
         if self.features.case_library.enabled == Some(true) && self.case_library.is_none() {
             anyhow::bail!("case_library feature requires case_library configuration");
+        }
+        if self.features.graph_memory.enabled && self.graph_memory.is_none() {
+            anyhow::bail!("graph_memory feature requires graph_memory configuration");
+        }
+        if self.features.graph_memory.enabled && !self.features.memory.enabled {
+            anyhow::bail!("graph_memory feature requires the memory feature");
         }
         if self.auth.tokens.is_empty() {
             anyhow::bail!("production runtime requires at least one authenticated principal");
@@ -508,6 +630,9 @@ impl ServerConfig {
         }
         if let Some(case_library) = &self.case_library {
             case_library.validate(Some(&storage.database_path))?;
+        }
+        if let Some(graph_memory) = &self.graph_memory {
+            graph_memory.validate()?;
         }
         let providers = self
             .providers
@@ -586,10 +711,41 @@ fn validate_provider_base_url(value: &str, label: &str) -> Result<()> {
     if !matches!(url_scheme.to_ascii_lowercase().as_str(), "http" | "https")
         || parsed_base_url.host_str().is_none()
         || authority.is_empty()
+        || !parsed_base_url.username().is_empty()
+        || parsed_base_url.password().is_some()
+        || parsed_base_url.query().is_some()
+        || parsed_base_url.fragment().is_some()
     {
-        anyhow::bail!("{label} must be an absolute HTTP or HTTPS URL");
+        anyhow::bail!(
+            "{label} must be an absolute HTTP or HTTPS URL without credentials, query, or fragment"
+        );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_provider_base_url;
+
+    #[test]
+    fn provider_base_url_rejects_credentials_query_and_fragment() {
+        for value in [
+            "https://user:password@example.com/v1",
+            "https://example.com/v1?token=secret",
+            "https://example.com/v1#fragment",
+        ] {
+            assert!(
+                validate_provider_base_url(value, "provider").is_err(),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_base_url_allows_trusted_http_endpoints() {
+        assert!(validate_provider_base_url("http://127.0.0.1:8080/v1", "provider").is_ok());
+        assert!(validate_provider_base_url("https://example.com/v1", "provider").is_ok());
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -4,7 +4,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use memory_core::{HashEmbedding, MemoryManager, SqliteMemoryStore};
+use memory_core::graph::{
+    ExtractedEntityCandidate, ExtractedFactCandidate, GraphEvidenceSpan, GraphExtractionInput,
+    GraphExtractionOutput, GraphExtractor, GraphTypeRegistry,
+};
+use memory_core::sqlite::GraphRepository;
+use memory_core::{
+    GraphBuildPipeline, HashEmbedding, MemoryError, MemoryManager, MemoryResult, RetrievalConfig,
+    SqliteMemoryStore,
+};
 use memory_mcp::{
     IdempotencyRepository, IngestMessage, IngestRequest, MemoryService, Principal, SearchRequest,
     ServiceError,
@@ -82,6 +90,96 @@ impl MemoryExtractor for PreferenceExtractor {
 
 struct SupportingVerifier;
 
+struct PreferenceGraphExtractor;
+
+struct FailOnceGraphExtractor {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl GraphExtractor for PreferenceGraphExtractor {
+    fn extractor_name(&self) -> &str {
+        "preference-graph-fixture"
+    }
+
+    fn model_name(&self) -> &str {
+        "fixture"
+    }
+
+    fn prompt_version(&self) -> &str {
+        "fixture-v1"
+    }
+
+    fn schema_version(&self) -> &str {
+        "fixture-v1"
+    }
+
+    async fn extract(&self, input: GraphExtractionInput) -> MemoryResult<GraphExtractionOutput> {
+        Ok(GraphExtractionOutput {
+            entities: vec![
+                ExtractedEntityCandidate {
+                    local_id: "entity:alice".to_string(),
+                    name: "Alice".to_string(),
+                    entity_type: "PERSON".to_string(),
+                    confidence: Some(1.0),
+                },
+                ExtractedEntityCandidate {
+                    local_id: "entity:window-seat".to_string(),
+                    name: "window seat".to_string(),
+                    entity_type: "CONCEPT".to_string(),
+                    confidence: Some(1.0),
+                },
+            ],
+            facts: vec![ExtractedFactCandidate {
+                local_id: "fact:alice-likes-window-seat".to_string(),
+                subject_ref: "entity:alice".to_string(),
+                predicate: "LIKES".to_string(),
+                object_ref: "entity:window-seat".to_string(),
+                fact_text: "Alice likes a window seat.".to_string(),
+                evidence: vec![GraphEvidenceSpan {
+                    text: Some(input.text),
+                    start_byte: None,
+                    end_byte: None,
+                }],
+                confidence: Some(1.0),
+                temporal_expression: None,
+                valid_from_ms: None,
+                valid_to_ms: None,
+            }],
+            input_tokens: None,
+            output_tokens: None,
+        })
+    }
+}
+
+#[async_trait]
+impl GraphExtractor for FailOnceGraphExtractor {
+    fn extractor_name(&self) -> &str {
+        "fail-once-graph-fixture"
+    }
+
+    fn model_name(&self) -> &str {
+        "fixture"
+    }
+
+    fn prompt_version(&self) -> &str {
+        "fixture-v1"
+    }
+
+    fn schema_version(&self) -> &str {
+        "fixture-v1"
+    }
+
+    async fn extract(&self, input: GraphExtractionInput) -> MemoryResult<GraphExtractionOutput> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(MemoryError::Extraction {
+                message: "transient graph extraction failure".to_string(),
+            });
+        }
+        PreferenceGraphExtractor.extract(input).await
+    }
+}
+
 #[async_trait]
 impl GroundingVerifier for SupportingVerifier {
     fn model(&self) -> &str {
@@ -143,6 +241,48 @@ async fn fixture_service_with_extractor(extractor: Arc<PreferenceExtractor>) -> 
             extractor.clone(),
             Arc::new(SupportingVerifier),
         ),
+        extractor,
+        database_path,
+    }
+}
+
+async fn fixture_graph_service() -> Fixture {
+    fixture_graph_service_with_extractor(Arc::new(PreferenceGraphExtractor)).await
+}
+
+async fn fixture_graph_service_with_extractor(graph_extractor: Arc<dyn GraphExtractor>) -> Fixture {
+    let temp = tempfile::tempdir().unwrap();
+    let database_path = temp.path().join("memory.sqlite");
+    let store = Arc::new(SqliteMemoryStore::new(&database_path));
+    let embedder = Arc::new(HashEmbedding::new(32));
+    let mut retrieval = RetrievalConfig::default();
+    retrieval.graph.enabled = true;
+    retrieval.graph.rerank_with_graph = true;
+    retrieval.graph.allow_graph_only = true;
+    retrieval.graph.max_graph_only_results = Some(3);
+    let manager = Arc::new(MemoryManager::with_retrieval_config(
+        store,
+        embedder.clone(),
+        retrieval,
+    ));
+    let registry = GraphTypeRegistry::new_default();
+    let graph_pipeline = Arc::new(GraphBuildPipeline::new(
+        GraphRepository::open(&database_path),
+        embedder,
+        graph_extractor,
+        registry,
+    ));
+    let idempotency = IdempotencyRepository::open(&database_path).await.unwrap();
+    let extractor = Arc::new(PreferenceExtractor::default());
+    Fixture {
+        _temp: temp,
+        service: MemoryService::new(
+            manager,
+            idempotency,
+            extractor.clone(),
+            Arc::new(SupportingVerifier),
+        )
+        .with_graph_memory(graph_pipeline, 2),
         extractor,
         database_path,
     }
@@ -214,6 +354,145 @@ async fn agents_for_same_user_share_but_other_users_are_isolated() {
         .unwrap()
         .memories
         .is_empty());
+}
+
+#[tokio::test]
+async fn enabled_graph_memory_builds_and_surfaces_grounded_facts() {
+    let fixture = fixture_graph_service().await;
+    fixture
+        .service
+        .ingest(&principal("t", "u", "agent-a"), preference_ingest())
+        .await
+        .unwrap();
+
+    let response = fixture
+        .service
+        .search(
+            &principal("t", "u", "agent-b"),
+            search("What does Alice like?"),
+        )
+        .await
+        .unwrap();
+
+    assert!(!response.memories.is_empty());
+    assert!(response
+        .memories
+        .iter()
+        .any(|memory| memory.graph_facts.as_array().is_some_and(|facts| {
+            facts.iter().any(|fact| {
+                fact.get("fact_text").and_then(serde_json::Value::as_str)
+                    == Some("Alice likes a window seat.")
+            })
+        })));
+}
+
+#[tokio::test]
+async fn graph_only_search_preserves_source_agent_and_user_scope() {
+    let fixture = fixture_graph_service().await;
+    let owner = principal("tenant-a", "alice", "agent-a");
+    fixture
+        .service
+        .ingest(&owner, preference_ingest())
+        .await
+        .unwrap();
+
+    let connection = rusqlite::Connection::open(&fixture.database_path).unwrap();
+    connection.execute("DELETE FROM memories", []).unwrap();
+    drop(connection);
+
+    let graph_only = fixture
+        .service
+        .search(&owner, search("What does Alice like?"))
+        .await
+        .unwrap();
+    assert_eq!(graph_only.memories.len(), 1);
+    assert_eq!(graph_only.memories[0].source_agent_id, "agent-a");
+    assert!(graph_only.memories[0]
+        .graph_facts
+        .as_array()
+        .is_some_and(|facts| !facts.is_empty()));
+
+    let other_user = principal("tenant-a", "bob", "agent-b");
+    assert!(fixture
+        .service
+        .search(&other_user, search("What does Alice like?"))
+        .await
+        .unwrap()
+        .memories
+        .is_empty());
+}
+
+#[tokio::test]
+async fn graph_ingest_retries_an_incomplete_build_without_duplicating_memory() {
+    let graph_extractor = Arc::new(FailOnceGraphExtractor {
+        calls: AtomicUsize::new(0),
+    });
+    let fixture = fixture_graph_service_with_extractor(graph_extractor.clone()).await;
+    let principal = principal("t", "u", "agent-a");
+
+    assert_eq!(
+        fixture
+            .service
+            .ingest(&principal, preference_ingest())
+            .await
+            .unwrap_err(),
+        ServiceError::Pipeline
+    );
+    let retry = fixture
+        .service
+        .ingest(&principal, preference_ingest())
+        .await
+        .unwrap();
+
+    assert_eq!(retry.memory_ids.len(), 1);
+    assert_eq!(graph_extractor.calls.load(Ordering::SeqCst), 2);
+    let response = fixture
+        .service
+        .search(&principal, search("What does Alice like?"))
+        .await
+        .unwrap();
+    assert_eq!(response.memories.len(), 1);
+    assert!(response.memories[0]
+        .graph_facts
+        .as_array()
+        .is_some_and(|facts| !facts.is_empty()));
+}
+
+#[tokio::test]
+async fn graph_ingest_retry_is_stable_when_another_agent_resumes_the_request() {
+    let graph_extractor = Arc::new(FailOnceGraphExtractor {
+        calls: AtomicUsize::new(0),
+    });
+    let fixture = fixture_graph_service_with_extractor(graph_extractor.clone()).await;
+    let first_agent = principal("t", "u", "agent-a");
+    let retrying_agent = principal("t", "u", "agent-b");
+
+    assert_eq!(
+        fixture
+            .service
+            .ingest(&first_agent, preference_ingest())
+            .await
+            .unwrap_err(),
+        ServiceError::Pipeline
+    );
+    let retry = fixture
+        .service
+        .ingest(&retrying_agent, preference_ingest())
+        .await
+        .unwrap();
+
+    assert_eq!(retry.memory_ids.len(), 1);
+    assert_eq!(graph_extractor.calls.load(Ordering::SeqCst), 2);
+    let response = fixture
+        .service
+        .search(&retrying_agent, search("What does Alice like?"))
+        .await
+        .unwrap();
+    assert_eq!(response.memories.len(), 1);
+    assert!(response.memories[0]
+        .graph_facts
+        .as_array()
+        .is_some_and(|facts| !facts.is_empty()));
 }
 
 #[tokio::test]

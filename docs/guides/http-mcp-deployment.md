@@ -48,6 +48,9 @@ Create `config/ram-a-mem.json`:
     },
     "case_library": {
       "enabled": true
+    },
+    "graph_memory": {
+      "enabled": false
     }
   },
   "http": {
@@ -106,6 +109,8 @@ Set secrets in the environment, not in config files:
 ```bash
 export RAM_A_XIAOO_TOKEN='replace-with-a-long-random-token'
 export LLM_API_KEY='replace-with-provider-key'
+# Required only when features.graph_memory.enabled is true.
+export GRAPH_LLM_API_KEY='replace-with-graph-provider-key'
 cargo run -p memory-mcp --bin ram-a-mem
 ```
 
@@ -125,6 +130,8 @@ RAM_A_MEM_CONFIG=/etc/ram-a/ram-a-mem.json ram-a-mem
 
 - `features.memory.enabled` controls `memory_search` and `memory_ingest`.
 - `features.case_library.enabled` controls `memory_case_search`.
+- `features.graph_memory.enabled` augments `memory_ingest` and `memory_search` with graph
+  construction and retrieval. It does not add a separate MCP tool.
 
 When a feature is disabled, the corresponding tools are hidden from `tools/list`.
 If a client still calls a disabled tool directly, RAM-A returns a structured disabled
@@ -133,6 +140,78 @@ tool error.
 If `features.case_library.enabled` is `true`, `case_library` must be configured.
 If `features.case_library.enabled` is omitted, RAM-A enables `memory_case_search` only
 when `case_library` is present.
+
+Graph memory is disabled by default. When enabled, `graph_memory` is required and the
+LLM credential is read from the configured environment variable. Graph records use the
+same principal-scoped SQLite database as personal memories; case-library storage remains
+separate.
+
+```json
+{
+  "features": {
+    "memory": {"enabled": true},
+    "graph_memory": {"enabled": true}
+  },
+  "graph_memory": {
+    "llm_api_key_env": "GRAPH_LLM_API_KEY",
+    "llm_base_url": "http://127.0.0.1:8000/v1",
+    "llm_model": "GLM-5.2",
+    "llm_timeout_ms": 60000,
+    "build_concurrency": 1,
+    "retrieval": {
+      "weight": 0.2,
+      "rerank_with_graph": false,
+      "allow_graph_only": false,
+      "max_graph_only_results": null,
+      "seed_limit": null,
+      "max_evidence_records_per_fact": null,
+      "fail_open": false
+    }
+  }
+}
+```
+
+To enable the configuration above, set the graph provider credential and switch the feature on:
+
+```bash
+export GRAPH_LLM_API_KEY='replace-with-graph-provider-key'
+# Change features.graph_memory.enabled to true in the JSON configuration.
+```
+
+Graph retrieval settings use these defaults and validation limits:
+
+- `weight`: `0.2`, must be between `0` and `1`.
+- `rerank_with_graph`, `allow_graph_only`, `fail_open`: `false`.
+- `max_graph_only_results`: unset means at most 20% of `top_k`, rounded up; when set it must
+  be non-zero and is capped by `top_k` at query time.
+- `seed_limit`: unset means `max(top_k * 10, 30)`; configured values must be non-zero and are
+  capped at `5000`.
+- `max_evidence_records_per_fact`: unset means `3`; configured values must be non-zero and are
+  capped at `100`.
+
+`features.memory.enabled` must also remain `true`: graph memory augments the existing memory
+  ingest and search tools. The supported combinations are `memory=true, graph=false` for the
+  ordinary vector/BM25 path and `memory=true, graph=true` for graph augmentation; enabling graph
+  while disabling memory is rejected. There is no per-tool graph switch.
+
+The graph feature is fail-closed at the API boundary by default: an enabled graph build or
+retrieval failure returns a retriable memory error instead of a successful response with
+incomplete graph behavior. Ingest uses a recoverable staged write rather than a distributed
+transaction. Atomic memories are persisted before graph augmentation starts, so a graph-build
+error does not roll back the atomic memories. Repeating the same idempotent ingest resumes the
+missing graph work without duplicating the atomic memories.
+
+Graph construction currently runs synchronously before a successful ingest response.
+`build_concurrency` bounds concurrent graph embedding and LLM extraction work during one ingest
+request; SQLite operations remain short, serialized transactions. Run one RAM-A service process
+per SQLite database. Multi-process workers sharing one database require a future persisted lease
+and heartbeat protocol. Deployments that need ingest latency independent of the graph provider
+should put ingestion behind an application queue; the current service deliberately favors a
+completed graph on every successful response.
+
+Provider base URLs are trusted operator configuration and intentionally support self-hosted
+services on loopback or private networks. Use HTTPS for remote providers and protect configuration
+write access: RAM-A sends the configured API credential to that endpoint.
 
 ## Model and embedding providers
 
