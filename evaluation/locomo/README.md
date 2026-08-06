@@ -208,12 +208,18 @@ Graph-specific environment variables:
 | `GRAPH_LLM_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible graph extraction base URL |
 | `GRAPH_LLM_TIMEOUT_MS` | `60000` | Graph extraction timeout |
 | `GRAPH_BUILD_CONCURRENCY` | `1` | Maximum concurrent graph-build records; increase gradually if the provider permits |
+| `MAX_GRAPH_CONTEXT_FACTS` | `3` | Maximum graph facts appended across the answer context; set to `0` for the no-fact control |
 
 When `MEMORY_BENCH_GRAPH=1`, the shell wrapper passes `--graph-build` to
 `memory-bench add` and `--graph` to `memory-bench search`. `GRAPH_LLM_MODEL`
 maps to the `memory-bench` `--graph-llm-model` flag.
 `GRAPH_BUILD_CONCURRENCY` maps only to add-stage `--graph-build-concurrency`; the default `1`
 preserves serial build behavior.
+`MAX_GRAPH_CONTEXT_FACTS` affects answer-context rendering only; it does not change graph
+construction, retrieval candidates, or ranking.
+The governed `locomo_run.py` entry point reads the same `MEMORY_BENCH_GRAPH` and `GRAPH_*`
+variables and emits the same add/search flags. Use that entry point for a frozen, resumable
+full A/B run; the shell wrapper remains a compatibility launcher for existing evaluation jobs.
 In the default `auto` memory-space mode, prepared LoCoMo records use
 `scope_id` values such as `path:$[0]`. If a graph build is resumed, completed
 graph runs are skipped, missing graph runs are built, and failed/running graph

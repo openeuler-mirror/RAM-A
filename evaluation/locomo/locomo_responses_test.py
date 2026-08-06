@@ -7,7 +7,11 @@ from types import SimpleNamespace
 from common.json_cache import JsonCache
 from locomo.locomo_adapter import prepare_locomo
 import locomo.locomo_responses as responses_module
-from locomo.locomo_responses import PreparedMemoryResponses, ResponseClient
+from locomo.locomo_responses import (
+    PreparedMemoryResponses,
+    ResponseClient,
+    format_context_groups,
+)
 
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "locomo_sample.json"
@@ -80,6 +84,63 @@ def test_prepared_extracted_answer_uses_atomic_claim_and_original_evidence() -> 
     assert answer["total_tokens"] == 12
 
 
+def test_prepared_answer_applies_explicit_graph_fact_limit() -> None:
+    dataset, prepared = _dataset_and_prepared()
+    query = _extracted_query()
+    query["results"][0]["metadata"]["graph_facts"] = [
+        {
+            "fact_id": "fact-1",
+            "predicate": "RELATED_TO",
+            "fact_text": "Alex left a notebook on the table.",
+        }
+    ]
+
+    control_responder = FakeResponder()
+    PreparedMemoryResponses(
+        "extracted",
+        responder=control_responder,
+        max_graph_context_facts=0,
+    ).answer_question(dataset, prepared, query)
+    treatment_responder = FakeResponder()
+    PreparedMemoryResponses(
+        "extracted",
+        responder=treatment_responder,
+        max_graph_context_facts=3,
+    ).answer_question(dataset, prepared, query)
+
+    control_context = "\n".join(control_responder.calls[0][2])
+    treatment_context = "\n".join(treatment_responder.calls[0][2])
+    assert "Matched graph facts" not in control_context
+    assert "[RELATED_TO] Alex left a notebook on the table." in treatment_context
+
+
+def test_locomo_speaker_groups_share_one_graph_fact_budget():
+    contexts = {
+        "Alex": [
+            {
+                "memory": "Alex: First.",
+                "timestamp": "day 1",
+                "score": 0.9,
+                "graph_facts": [{"fact_id": "fact-1", "fact_text": "Fact one."}],
+            }
+        ],
+        "Blair": [
+            {
+                "memory": "Blair: Second.",
+                "timestamp": "day 2",
+                "score": 0.8,
+                "graph_facts": [{"fact_id": "fact-2", "fact_text": "Fact two."}],
+            }
+        ],
+    }
+
+    rendered = format_context_groups(contexts, ("Alex", "Blair"), 1)
+
+    assert sum(text.count("\n- ") for values in rendered.values() for text in values) == 1
+    assert "Fact one." in rendered["Alex"][0]
+    assert "Fact two." not in rendered["Blair"][0]
+
+
 def test_prepared_category_five_does_not_call_answer_model() -> None:
     dataset, prepared = _dataset_and_prepared()
     query = {
@@ -114,6 +175,27 @@ def test_prepared_answer_cache_avoids_duplicate_model_call(tmp_path) -> None:
 
     assert first == second
     assert len(responder.calls) == 1
+
+
+def test_prepared_answer_cache_separates_graph_fact_limits(tmp_path) -> None:
+    dataset, prepared = _dataset_and_prepared()
+    responder = FakeResponder()
+    cache = JsonCache(tmp_path / "cache", version="answer-test-v1")
+
+    PreparedMemoryResponses(
+        "extracted",
+        responder=responder,
+        cache=cache,
+        max_graph_context_facts=0,
+    ).answer_question(dataset, prepared, _extracted_query())
+    PreparedMemoryResponses(
+        "extracted",
+        responder=responder,
+        cache=cache,
+        max_graph_context_facts=3,
+    ).answer_question(dataset, prepared, _extracted_query())
+
+    assert len(responder.calls) == 2
 
 
 def test_prepared_generate_preserves_query_order_and_groups_by_sample() -> None:

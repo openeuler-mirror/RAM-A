@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import re
 
+from common.graph_context import (
+    DEFAULT_MAX_GRAPH_CONTEXT_FACTS,
+    GraphFactContextRenderer,
+)
+
 
 ANSWER_SYSTEM = (
     "You are a personal assistant answering questions from retrieved memories. "
@@ -109,10 +114,16 @@ def format_answer_prompt(
     answer_prompt_version: str = ANSWER_PROMPT_VERSION_DEFAULT,
     memory_format: str = MEMORY_FORMAT_DEFAULT,
     show_scores: bool = False,
+    max_graph_context_facts: int = DEFAULT_MAX_GRAPH_CONTEXT_FACTS,
 ) -> str:
     validate_answer_prompt_version(answer_prompt_version)
     validate_memory_format(memory_format)
-    memories = format_memories(retrieved, memory_format=memory_format, show_scores=show_scores)
+    memories = format_memories(
+        retrieved,
+        memory_format=memory_format,
+        show_scores=show_scores,
+        max_graph_context_facts=max_graph_context_facts,
+    )
     return ANSWER_PROMPT_LME_TEMPLATE.format(
         question=question,
         question_date=question_date or "(not specified)",
@@ -126,12 +137,17 @@ def format_memories(
     retrieved: list[dict],
     memory_format: str = MEMORY_FORMAT_DEFAULT,
     show_scores: bool = False,
+    max_graph_context_facts: int = DEFAULT_MAX_GRAPH_CONTEXT_FACTS,
 ) -> str:
     validate_memory_format(memory_format)
     if not retrieved:
         return "(No relevant memories found)"
+    graph_renderer = GraphFactContextRenderer(max_facts=max_graph_context_facts)
     if memory_format == "compact":
-        return _format_memories_compact(retrieved)
+        return _format_memories_compact(
+            retrieved,
+            graph_renderer=graph_renderer,
+        )
 
     lines = []
     for index, item in enumerate(retrieved, start=1):
@@ -140,7 +156,7 @@ def format_memories(
         role = meta.get("role") or "unknown"
         memory_id = item.get("id") or "unknown"
         session_id = meta.get("session_id") or "unknown session"
-        text = item.get("text", "")
+        text = graph_renderer.enrich(item.get("text", ""), meta)
         header = (
             f"{index}. id={memory_id}; session={session_id}; "
             f"date={date}; role={role}"
@@ -169,13 +185,17 @@ def validate_memory_format(memory_format: str) -> None:
         )
 
 
-def _format_memories_compact(retrieved: list[dict]) -> str:
+def _format_memories_compact(
+    retrieved: list[dict],
+    *,
+    graph_renderer: GraphFactContextRenderer,
+) -> str:
     lines = []
     for index, item in enumerate(retrieved, start=1):
         meta = item.get("metadata") or {}
         date = meta.get("session_date") or "unknown date"
         role = meta.get("role") or "unknown"
-        text = _normalize_memory_text(item.get("text", ""))
+        text = graph_renderer.enrich(_normalize_memory_text(item.get("text", "")), meta)
         lines.append(f"[M{index}]\ndate: {date}\nrole: {role}\ncontent: {text}")
     return "\n\n".join(lines)
 

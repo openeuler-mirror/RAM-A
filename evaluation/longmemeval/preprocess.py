@@ -72,6 +72,7 @@ def preprocess(input_path: str, output_path: str, max_items: int | None = None) 
                         "has_answer": turn.get("has_answer", False),
                         "question_id": question_id,
                         "role": turn.get("role", ""),
+                        "speaker": turn.get("role", ""),
                     },
                 })
 

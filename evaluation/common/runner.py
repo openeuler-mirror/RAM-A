@@ -80,6 +80,9 @@ def run_search(
     batch_size: int = 64,
     graph: bool = False,
     graph_weight: float = 0.2,
+    graph_rerank: bool = False,
+    graph_allow_graph_only: bool = False,
+    graph_max_graph_only_results: int | None = None,
     graph_fail_open: bool = False,
     graph_memory_space_mode: str = "auto",
     graph_memory_space_field: str = "scope_id",
@@ -88,6 +91,14 @@ def run_search(
     graph_llm_model: str = "openai/gpt-4o-mini",
     graph_llm_base_url: str = "https://openrouter.ai/api/v1",
     graph_llm_timeout_ms: int | None = None,
+    rerank: bool = False,
+    rerank_provider: str = "openrouter",
+    rerank_model: str = "cohere/rerank-v3.5",
+    rerank_api_key_env: str = DEFAULT_API_KEY_ENV,
+    rerank_base_url: str = "https://openrouter.ai/api/v1",
+    rerank_input_k: int = 40,
+    rerank_timeout_ms: int | None = None,
+    rerank_fail_open: bool = False,
 ) -> None:
     """Run ``memory-bench search`` to execute queries and save results."""
     cmd = CARGO_BIN + [
@@ -100,6 +111,15 @@ def run_search(
     ]
     if graph:
         cmd.append("--graph")
+        if graph_rerank:
+            cmd.append("--graph-rerank")
+        if graph_allow_graph_only:
+            cmd.append("--graph-allow-graph-only")
+        if graph_max_graph_only_results is not None:
+            cmd.extend([
+                "--graph-max-graph-only-results",
+                str(graph_max_graph_only_results),
+            ])
         if graph_fail_open:
             cmd.append("--graph-fail-open")
         cmd.extend(_graph_common_args(
@@ -111,6 +131,16 @@ def run_search(
             graph_llm_model=graph_llm_model,
             graph_llm_base_url=graph_llm_base_url,
             graph_llm_timeout_ms=graph_llm_timeout_ms,
+        ))
+    if rerank:
+        cmd.extend(_rerank_args(
+            rerank_provider=rerank_provider,
+            rerank_model=rerank_model,
+            rerank_api_key_env=rerank_api_key_env,
+            rerank_base_url=rerank_base_url,
+            rerank_input_k=rerank_input_k,
+            rerank_timeout_ms=rerank_timeout_ms,
+            rerank_fail_open=rerank_fail_open,
         ))
     cmd.extend([
         "search",
@@ -144,6 +174,70 @@ def _graph_common_args(
     if graph_llm_timeout_ms is not None:
         args.extend(["--graph-llm-timeout-ms", str(graph_llm_timeout_ms)])
     return args
+
+
+def _rerank_args(
+    *,
+    rerank_provider: str,
+    rerank_model: str,
+    rerank_api_key_env: str,
+    rerank_base_url: str,
+    rerank_input_k: int,
+    rerank_timeout_ms: int | None,
+    rerank_fail_open: bool,
+) -> list[str]:
+    args = [
+        "--rerank",
+        "--rerank-provider", rerank_provider,
+        "--rerank-model", rerank_model,
+        "--rerank-api-key-env", rerank_api_key_env,
+        "--rerank-base-url", rerank_base_url,
+        "--rerank-input-k", str(rerank_input_k),
+    ]
+    if rerank_timeout_ms is not None:
+        args.extend(["--rerank-timeout-ms", str(rerank_timeout_ms)])
+    if rerank_fail_open:
+        args.append("--rerank-fail-open")
+    return args
+
+
+def validate_rerank_config(
+    *,
+    enabled: bool,
+    provider: str,
+    input_k: int,
+    timeout_ms: int | None,
+    search_mode: str = "hybrid",
+) -> None:
+    if not enabled:
+        return
+    if search_mode != "hybrid":
+        raise ValueError("--rerank requires --search-mode hybrid")
+    if provider != "openrouter":
+        raise ValueError("--rerank-provider must be openrouter")
+    if input_k < 0:
+        raise ValueError("--rerank-input-k must be non-negative")
+    if timeout_ms is not None and timeout_ms <= 0:
+        raise ValueError("--rerank-timeout-ms must be greater than 0")
+
+
+def validate_graph_search_config(
+    *,
+    graph: bool,
+    rerank: bool,
+    allow_graph_only: bool,
+    max_graph_only_results: int | None,
+) -> None:
+    if rerank and not graph:
+        raise ValueError("--graph-rerank requires --graph")
+    if allow_graph_only and not rerank:
+        raise ValueError("--graph-allow-graph-only requires --graph-rerank")
+    if max_graph_only_results is not None and not allow_graph_only:
+        raise ValueError(
+            "--graph-max-graph-only-results requires --graph-allow-graph-only"
+        )
+    if max_graph_only_results is not None and max_graph_only_results < 0:
+        raise ValueError("--graph-max-graph-only-results must be non-negative")
 
 
 def _run(cmd: list[str], label: str) -> None:

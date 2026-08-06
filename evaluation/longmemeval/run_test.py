@@ -461,10 +461,25 @@ def test_extracted_arm_routes_raw_and_indexed_prepared_to_correct_consumers(
         str(tmp_path / "grounding.json"),
         "--preflight",
         str(preflight),
+        "--rerank",
+        "--rerank-provider",
+        "openrouter",
+        "--rerank-model",
+        "cohere/rerank-v3.5",
+        "--rerank-api-key-env",
+        "RERANK_KEY",
+        "--rerank-base-url",
+        "https://rerank.example/v1",
+        "--rerank-input-k",
+        "80",
+        "--rerank-timeout-ms",
+        "30000",
+        "--rerank-fail-open",
     )
     run_dir.mkdir()
     (run_dir / "store.jsonl").write_text("partial\n", encoding="utf-8")
     calls = []
+    backend_configs = []
     prepared = {
         "schema_version": "benchmark-prepared-v1",
         "dataset": {"name": "longmemeval"},
@@ -514,7 +529,11 @@ def test_extracted_arm_routes_raw_and_indexed_prepared_to_correct_consumers(
     monkeypatch.setattr(longmemeval_run, "parse_args", lambda: args)
     monkeypatch.setattr(longmemeval_run, "run_stage", fake_stage, raising=False)
     monkeypatch.setattr(longmemeval.preprocess, "preprocess", fake_preprocess)
-    monkeypatch.setattr(common.backends, "create_backend", lambda config: FakeBackend())
+    monkeypatch.setattr(
+        common.backends,
+        "create_backend",
+        lambda config: backend_configs.append(config) or FakeBackend(),
+    )
     monkeypatch.setattr(longmemeval.eval_retrieval, "load_and_evaluate", fake_retrieval)
     monkeypatch.setattr(longmemeval.eval_qa, "load_and_evaluate_qa", fake_qa)
     monkeypatch.setattr(
@@ -554,9 +573,32 @@ def test_extracted_arm_routes_raw_and_indexed_prepared_to_correct_consumers(
         run_dir / "cache" / "memory-pipeline"
     )
     assert config["extraction_cache_version"] == config["configuration_hash"]
+    assert config["rerank"] is True
+    assert config["rerank_provider"] == "openrouter"
+    assert config["rerank_model"] == "cohere/rerank-v3.5"
+    assert config["rerank_api_key_env"] == "RERANK_KEY"
+    assert config["rerank_base_url"] == "https://rerank.example/v1"
+    assert config["rerank_input_k"] == 80
+    assert config["rerank_timeout_ms"] == 30000
+    assert config["rerank_fail_open"] is True
+    assert backend_configs[0].rerank is True
+    assert backend_configs[0].rerank_model == "cohere/rerank-v3.5"
+    assert backend_configs[0].rerank_api_key_env == "RERANK_KEY"
+    assert backend_configs[0].rerank_base_url == "https://rerank.example/v1"
+    assert backend_configs[0].rerank_input_k == 80
+    assert backend_configs[0].rerank_timeout_ms == 30000
+    assert backend_configs[0].rerank_fail_open is True
     run_meta = json.loads((run_dir / "run_meta.json").read_text(encoding="utf-8"))
     assert run_meta["phase"] == "pilot"
     assert run_meta["pipeline_phase"] == "all"
+    assert run_meta["rerank"] is True
+    assert run_meta["rerank_provider"] == "openrouter"
+    assert run_meta["rerank_model"] == "cohere/rerank-v3.5"
+    assert run_meta["rerank_api_key_env"] == "RERANK_KEY"
+    assert run_meta["rerank_base_url"] == "https://rerank.example/v1"
+    assert run_meta["rerank_input_k"] == 80
+    assert run_meta["rerank_timeout_ms"] == 30000
+    assert run_meta["rerank_fail_open"] is True
 
 
 def test_offline_extracted_arm_recovers_gold_source_turn_and_session(
@@ -667,3 +709,154 @@ def test_parser_accepts_graph_flags(monkeypatch):
     assert args.graph_llm_model == "openai/gpt-4o-mini"
     assert args.graph_llm_base_url == "https://openrouter.ai/api/v1"
     assert args.graph_llm_timeout_ms == 60000
+
+
+def test_parser_defaults_rerank_to_disabled(monkeypatch):
+    args = _parse(monkeypatch)
+
+    assert args.rerank is False
+    assert args.rerank_provider == "openrouter"
+    assert args.rerank_model == "cohere/rerank-v3.5"
+    assert args.rerank_api_key_env == "OPENROUTER_API_KEY"
+    assert args.rerank_base_url == "https://openrouter.ai/api/v1"
+    assert args.rerank_input_k == 40
+    assert args.rerank_timeout_ms is None
+    assert args.rerank_fail_open is False
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "message"),
+    [
+        (("--rerank-provider", "unsupported"), "--rerank-provider must be openrouter"),
+        (("--rerank-input-k", "-1"), "--rerank-input-k must be non-negative"),
+        (("--rerank-timeout-ms", "0"), "--rerank-timeout-ms must be greater than 0"),
+    ],
+)
+def test_validate_rejects_invalid_enabled_rerank_settings(monkeypatch, extra_args, message):
+    args = _parse(monkeypatch, "--rerank", *extra_args)
+
+    with pytest.raises(ValueError, match=message):
+        longmemeval_run.validate_experiment_args(args)
+
+
+def test_validate_accepts_zero_rerank_input_k(monkeypatch):
+    args = _parse(monkeypatch, "--rerank", "--rerank-input-k", "0")
+
+    longmemeval_run.validate_experiment_args(args)
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "message"),
+    [
+        (("--graph-rerank",), "--graph-rerank requires --graph"),
+        (
+            ("--graph", "--graph-allow-graph-only"),
+            "--graph-allow-graph-only requires --graph-rerank",
+        ),
+        (
+            ("--graph", "--graph-rerank", "--graph-max-graph-only-results", "4"),
+            "--graph-max-graph-only-results requires --graph-allow-graph-only",
+        ),
+        (
+            (
+                "--graph",
+                "--graph-rerank",
+                "--graph-allow-graph-only",
+                "--graph-max-graph-only-results",
+                "-1",
+            ),
+            "--graph-max-graph-only-results must be non-negative",
+        ),
+    ],
+)
+def test_validate_rejects_inert_graph_search_settings(monkeypatch, extra_args, message):
+    args = _parse(monkeypatch, *extra_args)
+
+    with pytest.raises(ValueError, match=message):
+        longmemeval_run.validate_experiment_args(args)
+
+
+def test_graph_settings_change_immutable_configuration(monkeypatch):
+    base = _parse(monkeypatch)
+    graph = _parse(
+        monkeypatch,
+        "--graph",
+        "--graph-weight",
+        "0.4",
+        "--graph-rerank",
+        "--graph-allow-graph-only",
+        "--graph-max-graph-only-results",
+        "6",
+        "--graph-fail-open",
+        "--graph-memory-space-mode",
+        "metadata-field",
+        "--graph-memory-space-field",
+        "tenant_id",
+    )
+
+    base_manifest = longmemeval_run.immutable_experiment_manifest(base, "impl", None)
+    graph_manifest = longmemeval_run.immutable_experiment_manifest(graph, "impl", None)
+
+    assert base_manifest != graph_manifest
+    assert graph_manifest["graph"] is True
+    assert graph_manifest["graph_weight"] == 0.4
+    assert graph_manifest["graph_rerank"] is True
+    assert graph_manifest["graph_allow_graph_only"] is True
+    assert graph_manifest["graph_max_graph_only_results"] == 6
+    assert graph_manifest["graph_fail_open"] is True
+    assert graph_manifest["graph_memory_space_mode"] == "metadata-field"
+    assert graph_manifest["graph_memory_space_field"] == "tenant_id"
+
+
+def test_parser_and_immutable_manifest_accept_rerank_overrides(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        "--rerank",
+        "--rerank-provider",
+        "openrouter",
+        "--rerank-model",
+        "cohere/rerank-v3.5",
+        "--rerank-api-key-env",
+        "RERANK_KEY",
+        "--rerank-base-url",
+        "https://rerank.example/v1",
+        "--rerank-input-k",
+        "80",
+        "--rerank-timeout-ms",
+        "30000",
+        "--rerank-fail-open",
+    )
+
+    manifest = longmemeval_run.immutable_experiment_manifest(
+        args,
+        "implementation-hash",
+        None,
+    )
+
+    assert manifest["rerank"] is True
+    assert manifest["rerank_provider"] == "openrouter"
+    assert manifest["rerank_model"] == "cohere/rerank-v3.5"
+    assert manifest["rerank_api_key_env"] == "RERANK_KEY"
+    assert manifest["rerank_base_url"] == "https://rerank.example/v1"
+    assert manifest["rerank_input_k"] == 80
+    assert manifest["rerank_timeout_ms"] == 30000
+    assert manifest["rerank_fail_open"] is True
+
+
+def test_graph_context_limit_is_not_part_of_retrieval_manifest(monkeypatch):
+    control = _parse(monkeypatch, "--max-graph-context-facts", "0")
+    treatment = _parse(monkeypatch, "--max-graph-context-facts", "3")
+
+    control_manifest = longmemeval_run.immutable_experiment_manifest(
+        control,
+        "implementation-hash",
+        None,
+    )
+    treatment_manifest = longmemeval_run.immutable_experiment_manifest(
+        treatment,
+        "implementation-hash",
+        None,
+    )
+
+    assert control_manifest == treatment_manifest
+    assert "max_graph_context_facts" not in control_manifest

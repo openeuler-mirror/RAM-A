@@ -77,13 +77,13 @@ def test_graph_fact_validity_formats_open_and_closed_time_bounds():
         format_graph_fact_validity(
             {"valid_from_ms": 1_780_304_400_000, "valid_to_ms": None}
         )
-        is None
+        == "valid from 2026-06-01T09:00:00Z"
     )
     assert (
         format_graph_fact_validity(
             {"valid_from_ms": None, "valid_to_ms": 1_780_308_000_000}
         )
-        is None
+        == "valid until 2026-06-01T10:00:00Z"
     )
     assert (
         format_graph_fact_validity(
@@ -206,5 +206,9 @@ def test_responses_reconstruct_context_from_prepared_raw_memory_path():
     assert (
         format_context_memory(contexts["Alex"][0])
         == "9:00 am on 1 June, 2026: Alex: Notebook on table.\n"
-        "Matched graph facts: RELATED_TO: Alex left a notebook on the table."
+        "Matched graph facts:\n- [RELATED_TO] Alex left a notebook on the table. "
+        "[valid from 2026-06-01T09:00:00Z]"
+    )
+    assert format_context_memory(contexts["Alex"][0], max_graph_context_facts=0) == (
+        "9:00 am on 1 June, 2026: Alex: Notebook on table."
     )

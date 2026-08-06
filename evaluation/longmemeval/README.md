@@ -118,6 +118,7 @@ python3 evaluation/longmemeval/run.py [options]
 | `--qa-top-k` | 10 | Memories used for QA |
 | `--answer-prompt-version` | `lme_default` | Prompt template version |
 | `--memory-format` | `full` | `full` or `compact` |
+| `--max-graph-context-facts` | 3 | Maximum graph facts appended across one answer context (0 = disabled) |
 | `--show-scores` | false | Include retrieval scores in prompt |
 | `--qa-output-tag` | *(auto)* | Override QA filename tag |
 | `--llm-thinking` | `default` | `default`/`enabled`/`disabled` |

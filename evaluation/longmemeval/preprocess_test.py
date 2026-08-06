@@ -130,6 +130,22 @@ def test_preprocess_memories_content():
         assert m2["metadata"]["question_id"] == "q002_abs"
 
 
+def test_preprocess_copies_turn_role_to_speaker_metadata():
+    """Ensure atomic extraction receives the turn's deterministic speaker."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, "input.json")
+        output_path = os.path.join(tmpdir, "output", "prepared.json")
+        _write_sample_input(input_path)
+
+        preprocess(input_path, output_path)
+
+        with open(output_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        assert data["memories"][0]["metadata"]["speaker"] == "user"
+        assert data["memories"][1]["metadata"]["speaker"] == "assistant"
+
+
 def test_preprocess_queries_content():
     """Verify 2 queries with filter.scope_id and task.correct_answer."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -216,6 +232,7 @@ def main():
         test_preprocess_outputs_json_file,
         test_preprocess_schema_version,
         test_preprocess_memories_content,
+        test_preprocess_copies_turn_role_to_speaker_metadata,
         test_preprocess_queries_content,
         test_preprocess_skips_empty_content,
     ]

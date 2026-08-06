@@ -198,10 +198,15 @@ shell 和离线 smoke 回归。如果任一检查失败，接入代码必须保�
 | `GRAPH_LLM_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible 图候选抽取 base URL |
 | `GRAPH_LLM_TIMEOUT_MS` | `60000` | 图候选抽取超时 |
 | `GRAPH_BUILD_CONCURRENCY` | `1` | 同时构图的最大记录数；需根据 provider 限流逐步提高 |
+| `MAX_GRAPH_CONTEXT_FACTS` | `3` | 每个问题的答案上下文最多附加的图事实总数；设为 `0` 可运行不注入图事实的控制组 |
 
 当 `MEMORY_BENCH_GRAPH=1` 时，shell wrapper 会给 `memory-bench add` 传入
 `--graph-build`，给 `memory-bench search` 传入 `--graph`。`GRAPH_LLM_MODEL`
 会映射为 `memory-bench` 的 `--graph-llm-model`。
+`MAX_GRAPH_CONTEXT_FACTS` 只控制答案上下文渲染，不改变构图、检索候选或排序。
+治理入口 `locomo_run.py` 读取同一组 `MEMORY_BENCH_GRAPH` 和 `GRAPH_*` 变量，并生成相同的
+add/search 参数。需要冻结配置、支持断点续跑的全量 A/B 实验应使用治理入口；shell wrapper
+继续作为已有评测任务的兼容启动方式。
 默认 `auto` memory-space 模式下，prepared LoCoMo 记录会使用 `path:$[0]`
 这类 `scope_id`。恢复 graph build 时，已 completed 的 graph run 会跳过，缺失的
 graph run 会补构，failed/running 的 graph run 会明确报错，避免半构图 benchmark

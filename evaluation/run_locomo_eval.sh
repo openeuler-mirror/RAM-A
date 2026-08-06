@@ -13,6 +13,7 @@ fi
 
 DATASET="${DATASET:-fixtures/locomo_sample.json}"
 TOP_K="${TOP_K:-30}"
+MAX_GRAPH_CONTEXT_FACTS="${MAX_GRAPH_CONTEXT_FACTS:-3}"
 RESUME="${RESUME:-0}"
 ANSWER_MODEL="${MODEL:-gpt-4o-mini}"
 JUDGE_MODEL="${JUDGE_MODEL:-${MODEL:-gpt-4o-mini}}"
@@ -169,7 +170,8 @@ score_results() {
     python3 locomo/locomo_metric.py \
         --input "$score_file" \
         --output-json "$metrics_file" \
-        --html-report "$report_file"
+        --html-report "$report_file" \
+        --quiet
     stage_done 6 7 "${result_name} metrics"
 }
 
@@ -205,6 +207,7 @@ write_meta() {
         --backend "$backend" \
         --phase "$phase" \
         --top-k "$TOP_K" \
+        --max-graph-context-facts "$MAX_GRAPH_CONTEXT_FACTS" \
         --run-dir "$backend_dir"
 }
 
@@ -300,6 +303,7 @@ run_memory_bench() {
     stage_start 4 7 "RAM-A answer"
     run_locomo_responses \
         --technique-type memory_bench --dataset "$DATASET" --input "$MEMORY_BENCH_RETRIEVAL" \
+        --max-graph-context-facts "$MAX_GRAPH_CONTEXT_FACTS" \
         --output "$MEMORY_BENCH_ANSWERS"
     stage_done 4 7 "RAM-A answer"
 

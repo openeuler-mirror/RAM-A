@@ -46,6 +46,7 @@ def test_run_locomo_eval_uses_locomo_entrypoints():
     assert 'RERANK_BASE_URL="${RERANK_BASE_URL:-https://openrouter.ai/api/v1}"' in content
     assert 'RERANK_INPUT_K="${RERANK_INPUT_K:-40}"' in content
     assert 'MEMORY_BENCH_GRAPH="${MEMORY_BENCH_GRAPH:-0}"' in content
+    assert 'MAX_GRAPH_CONTEXT_FACTS="${MAX_GRAPH_CONTEXT_FACTS:-3}"' in content
     assert 'MEMORY_BENCH_SEARCH_MODE="${MEMORY_BENCH_SEARCH_MODE:-hybrid}"' in content
     assert 'GRAPH_WEIGHT="${GRAPH_WEIGHT:-0.2}"' in content
     assert 'GRAPH_RERANK="${GRAPH_RERANK:-0}"' in content
@@ -82,11 +83,16 @@ def test_run_locomo_eval_uses_locomo_entrypoints():
     assert '--llm-base-url "$LLM_BASE_URL"' in content
     assert '--llm-thinking "$LLM_THINKING"' in content
     assert "python3 locomo/locomo_metric.py" in content
+    assert "--quiet" in content
     assert "python3 locomo/write_run_meta.py" in content
     assert "python3 locomo/locomo_report.py" in content
     assert "python3 locomo/locomo_experiments.py" in content
     assert "python3 locomo/locomo_retrieval.py" in content
     assert "run_locomo_responses" in content
+    assert '--max-graph-context-facts "$MAX_GRAPH_CONTEXT_FACTS"' in content
+    assert '--max-graph-context-facts "$MAX_GRAPH_CONTEXT_FACTS"' in content[
+        content.index("write_meta()") : content.index("write_combined_report()")
+    ]
     assert 'response_api_key="$(printenv "$LLM_API_KEY_ENV" || true)"' in content
     assert 'OPENAI_API_KEY="$response_api_key" OPENAI_BASE_URL="$LLM_BASE_URL" MODEL="$ANSWER_MODEL"' in content
     assert "python3 locomo/locomo_responses.py" in content

@@ -13,6 +13,7 @@ import locomo.locomo_run as locomo_run
 from locomo.locomo_adapter import prepare_locomo
 from locomo.locomo_run import (
     RunConfig,
+    build_add_command,
     build_extraction_command,
     build_search_command,
     config_hash,
@@ -61,6 +62,7 @@ def test_run_config_matches_approved_settings_without_serializing_secret(
         30,
     )
     assert config.answer_max_tokens == 512
+    assert config.max_graph_context_facts == 3
     serialized = json.dumps(config.public_manifest())
     assert "SECRET_CANARY" not in serialized
     assert config.public_manifest()["credential_env"] == "OPENROUTER_API_KEY"
@@ -93,6 +95,21 @@ def test_run_config_records_pair_and_explicit_policy_hash(monkeypatch, tmp_path)
     assert config.public_manifest()["promotion_policy_hash"] == locomo_run.file_sha256(policy)
     assert "pair_id" not in config.immutable_manifest()
     assert config.immutable_manifest()["promotion_policy_hash"] == locomo_run.file_sha256(policy)
+
+
+def test_graph_context_limit_is_answer_only_configuration(tmp_path):
+    common = {
+        "memory_mode": "raw",
+        "phase": "pilot",
+        "dataset": tmp_path / "locomo.json",
+        "run_dir": tmp_path / "run",
+    }
+    control = RunConfig(**common, max_graph_context_facts=0)
+    treatment = RunConfig(**common, max_graph_context_facts=3)
+
+    assert control.immutable_manifest() == treatment.immutable_manifest()
+    assert control.public_manifest()["max_graph_context_facts"] == 0
+    assert treatment.public_manifest()["max_graph_context_facts"] == 3
 
 
 def test_direct_script_launcher_can_import_shared_contracts() -> None:
@@ -259,6 +276,63 @@ def test_search_command_enables_resume_and_rerank(tmp_path) -> None:
     assert command[command.index("--top-k") + 1] == "30"
     assert command[command.index("--output") + 1] == str(search_results)
     assert command[command.index("--dataset") + 1] == str(indexed_prepared)
+
+
+def test_graph_commands_use_one_explicit_configuration(tmp_path) -> None:
+    config = RunConfig.from_env(
+        {
+            "MEMORY_MODE": "raw",
+            "PHASE": "pilot",
+            "DATASET": str(tmp_path / "locomo.json"),
+            "RUN_DIR": str(tmp_path / "run"),
+            "MEMORY_BENCH_GRAPH": "1",
+            "GRAPH_RERANK": "1",
+            "GRAPH_ALLOW_GRAPH_ONLY": "1",
+            "GRAPH_MAX_GRAPH_ONLY_RESULTS": "4",
+            "GRAPH_BUILD_CONCURRENCY": "3",
+        }
+    )
+    store = tmp_path / "run" / "store.sqlite"
+    prepared = tmp_path / "run" / "raw_prepared.json"
+    results = tmp_path / "run" / "search_results.json"
+
+    add = build_add_command(config, store, prepared)
+    search = build_search_command(config, store, prepared, results)
+
+    assert "--graph-build" in add
+    assert add[add.index("--graph-build-concurrency") + 1] == "3"
+    assert "--graph" in search
+    assert "--graph-rerank" in search
+    assert "--graph-allow-graph-only" in search
+    assert search[search.index("--graph-max-graph-only-results") + 1] == "4"
+    assert search[search.index("--graph-weight") + 1] == "0.2"
+    assert search[search.index("--graph-memory-space-field") + 1] == "scope_id"
+
+
+def test_graph_is_disabled_by_default(tmp_path, monkeypatch) -> None:
+    for name in (
+        "MEMORY_BENCH_GRAPH",
+        "GRAPH_WEIGHT",
+        "GRAPH_RERANK",
+        "GRAPH_ALLOW_GRAPH_ONLY",
+        "GRAPH_MAX_GRAPH_ONLY_RESULTS",
+        "GRAPH_FAIL_OPEN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    config = RunConfig.from_env(
+        {
+            "MEMORY_MODE": "raw",
+            "PHASE": "pilot",
+            "DATASET": str(tmp_path / "locomo.json"),
+            "RUN_DIR": str(tmp_path / "run"),
+        }
+    )
+    store = tmp_path / "run" / "store.sqlite"
+    prepared = tmp_path / "run" / "raw_prepared.json"
+    results = tmp_path / "run" / "search_results.json"
+
+    assert "--graph-build" not in build_add_command(config, store, prepared)
+    assert "--graph" not in build_search_command(config, store, prepared, results)
 
 
 def test_stage_resumes_only_when_hashes_and_outputs_match(tmp_path) -> None:

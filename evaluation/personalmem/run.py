@@ -34,6 +34,10 @@ from tqdm import tqdm
 EVALUATION_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(EVALUATION_ROOT))
 
+from common.graph_context import (  # noqa: E402
+    DEFAULT_MAX_GRAPH_CONTEXT_FACTS,
+    GraphFactContextRenderer,
+)
 from common.run_artifacts import (  # noqa: E402
     default_run_dir,
     ensure_dir,
@@ -49,6 +53,7 @@ from common.memory_ab import (  # noqa: E402
     validate_memory_ab_preflight,
 )
 from common.memory_ab_stage import run_stage  # noqa: E402
+from common.runner import validate_graph_search_config, validate_rerank_config  # noqa: E402
 from common.rust_memory_pipeline import (  # noqa: E402
     MemoryPipelineCommandConfig,
     build_memory_pipeline_command,
@@ -196,7 +201,10 @@ def main() -> int:
         search_code = run_search(args)
         if search_code != 0:
             return search_code
-        return run_eval(args)
+        eval_code = run_eval(args)
+        if eval_code == 0:
+            print(f"[done] PersonaMem pipeline | report={args.report}")
+        return eval_code
     if args.command == "official-pipeline":
         download_code = run_download(args)
         if download_code != 0:
@@ -212,7 +220,10 @@ def main() -> int:
         search_code = run_search(args)
         if search_code != 0:
             return search_code
-        return run_eval(args)
+        eval_code = run_eval(args)
+        if eval_code == 0:
+            print(f"[done] PersonaMem official-pipeline | report={args.report}")
+        return eval_code
     if args.command == "memory-ab-pipeline":
         args.dataset = resolve_indexed_dataset(args)
         stages = [run_add, run_search, run_eval]
@@ -222,6 +233,7 @@ def main() -> int:
             code = stage(args)
             if code != 0:
                 return code
+        print(f"[done] PersonaMem memory-ab-pipeline | report={args.report}")
         return 0
 
     parser.print_help()
@@ -265,6 +277,12 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
             "Set to 0 to keep full retrieved memories."
         ),
     )
+    parser.add_argument(
+        "--max-graph-context-facts",
+        default=DEFAULT_MAX_GRAPH_CONTEXT_FACTS,
+        type=int,
+        help="Maximum graph facts appended across one answer context; 0 disables rendering.",
+    )
     parser.add_argument("--max-retries", default=3, type=int)
     parser.add_argument("--retry-backoff-seconds", default=2.0, type=float)
     parser.add_argument("--resume", action="store_true")
@@ -278,6 +296,9 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--graph-build", action="store_true")
     parser.add_argument("--graph-build-concurrency", default=1, type=int)
     parser.add_argument("--graph-weight", default=0.2, type=float)
+    parser.add_argument("--graph-rerank", action="store_true")
+    parser.add_argument("--graph-allow-graph-only", action="store_true")
+    parser.add_argument("--graph-max-graph-only-results", type=int)
     parser.add_argument("--graph-fail-open", action="store_true")
     parser.add_argument(
         "--graph-memory-space-mode",
@@ -290,6 +311,14 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--graph-llm-model", default="openai/gpt-4o-mini")
     parser.add_argument("--graph-llm-base-url", default="https://openrouter.ai/api/v1")
     parser.add_argument("--graph-llm-timeout-ms", type=int)
+    parser.add_argument("--rerank", action="store_true")
+    parser.add_argument("--rerank-provider", default="openrouter")
+    parser.add_argument("--rerank-model", default="cohere/rerank-v3.5")
+    parser.add_argument("--rerank-api-key-env", default="OPENROUTER_API_KEY")
+    parser.add_argument("--rerank-base-url", default="https://openrouter.ai/api/v1")
+    parser.add_argument("--rerank-input-k", default=40, type=int)
+    parser.add_argument("--rerank-timeout-ms", type=int)
+    parser.add_argument("--rerank-fail-open", action="store_true")
     parser.add_argument("--model", default="baai/bge-m3")
     parser.add_argument("--dimensions", default=1024, type=int)
     parser.add_argument("--text-fields", default=DEFAULT_TEXT_FIELDS)
@@ -390,10 +419,25 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
 def validate_experiment_args(args: argparse.Namespace) -> None:
     if args.graph_build_concurrency < 1:
         raise ValueError("--graph-build-concurrency must be at least 1")
+    if args.max_graph_context_facts < 0:
+        raise ValueError("--max-graph-context-facts must be at least 0")
     if args.phase == "full" and args.frozen_config is None:
         raise ValueError("--frozen-config is required for full runs")
     if args.phase == "full" and args.promotion_policy is None:
         raise ValueError("--promotion-policy is required for full runs")
+    validate_rerank_config(
+        enabled=args.rerank,
+        provider=args.rerank_provider,
+        input_k=args.rerank_input_k,
+        timeout_ms=args.rerank_timeout_ms,
+        search_mode=args.search_mode,
+    )
+    validate_graph_search_config(
+        graph=args.graph,
+        rerank=args.graph_rerank,
+        allow_graph_only=args.graph_allow_graph_only,
+        max_graph_only_results=args.graph_max_graph_only_results,
+    )
     fixtures = (args.extractor_responses, args.grounding_responses)
     if any(value is not None for value in fixtures) and not all(
         value is not None for value in fixtures
@@ -421,6 +465,29 @@ def immutable_experiment_manifest(
         "bm25_weight": args.bm25_weight,
         "candidate_k": args.candidate_k,
         "top_k": args.top_k,
+        "graph": args.graph,
+        "graph_build": args.graph_build,
+        "graph_build_concurrency": args.graph_build_concurrency,
+        "graph_weight": args.graph_weight,
+        "graph_rerank": args.graph_rerank,
+        "graph_allow_graph_only": args.graph_allow_graph_only,
+        "graph_max_graph_only_results": args.graph_max_graph_only_results,
+        "graph_fail_open": args.graph_fail_open,
+        "graph_memory_space_mode": args.graph_memory_space_mode,
+        "graph_memory_space_field": args.graph_memory_space_field,
+        "graph_owner_id": args.graph_owner_id,
+        "graph_llm_api_key_env": args.graph_llm_api_key_env,
+        "graph_llm_model": args.graph_llm_model,
+        "graph_llm_base_url": args.graph_llm_base_url,
+        "graph_llm_timeout_ms": args.graph_llm_timeout_ms,
+        "rerank": args.rerank,
+        "rerank_provider": args.rerank_provider,
+        "rerank_model": args.rerank_model,
+        "rerank_api_key_env": args.rerank_api_key_env,
+        "rerank_base_url": args.rerank_base_url,
+        "rerank_input_k": args.rerank_input_k,
+        "rerank_timeout_ms": args.rerank_timeout_ms,
+        "rerank_fail_open": args.rerank_fail_open,
         "answer_model": args.answer_model,
         "answer_base_url": args.answer_base_url,
         "context_token_budget": args.context_token_budget,
@@ -716,7 +783,7 @@ def run_search(args: argparse.Namespace) -> int:
     if is_personamem_prepared_dataset(dataset):
         return run_personamem_scoped_search(args, dataset)
 
-    command = bench_base_command(args) + [
+    command = bench_search_command(args) + [
         "search",
         "--dataset",
         str(args.dataset),
@@ -749,7 +816,7 @@ def run_personamem_scoped_search(args: argparse.Namespace, dataset: Any) -> int:
         for index, question in enumerate(iterator):
             output_path = temp_dir_path / f"query_{index}.json"
             shared_context_id = str(question["shared_context_id"])
-            command = bench_base_command(args) + [
+            command = bench_search_command(args) + [
                 "search",
                 "--query",
                 str(question.get("question", "")),
@@ -978,6 +1045,15 @@ def run_eval(args: argparse.Namespace) -> int:
         error_report_href="errors.html",
         run_meta=run_meta,
     )
+    def format_metric(value: Any) -> str:
+        return "n/a" if value is None else f"{value:.4f}"
+
+    print(
+        "PersonaMem retrieval summary: "
+        f"hit_at_k={format_metric(report.get('hit_at_k'))} "
+        f"mrr={format_metric(report.get('mrr'))} "
+        f"queries={report.get('query_count', 'n/a')}"
+    )
     print(f"wrote PersonaMem report to {args.report}")
     print(f"wrote PersonaMem stage HTML report to {html_report_path}")
     print(f"wrote PersonaMem main HTML report to {main_report_path}")
@@ -1005,7 +1081,10 @@ def run_answer(args: argparse.Namespace) -> int:
     for index, result in enumerate(iterator, start=1):
         query_path = result.get("query_path", "")
         existing_response = existing_responses.get(query_path)
-        if should_skip_existing_response(existing_response):
+        if should_skip_existing_response(
+            existing_response,
+            max_graph_context_facts=args.max_graph_context_facts,
+        ):
             normalized = normalize_existing_response(existing_response)
             responses.append(normalized)
             skipped += 1
@@ -1016,7 +1095,10 @@ def run_answer(args: argparse.Namespace) -> int:
 
         answer_input = build_answer_input(result, dataset)
         errors = list(answer_input.errors)
-        retrieved_contexts = build_retrieved_contexts(result.get("results", []))
+        retrieved_contexts = build_retrieved_contexts(
+            result.get("results", []),
+            max_graph_context_facts=args.max_graph_context_facts,
+        )
         retrieved_contexts = apply_context_token_budget(
             retrieved_contexts,
             args.context_token_budget,
@@ -1071,6 +1153,7 @@ def run_answer(args: argparse.Namespace) -> int:
             "predicted_answer": predicted_answer,
             "answer_attempts": answer_attempts,
             "response_duration_ms": response_duration_ms,
+            "max_graph_context_facts": args.max_graph_context_facts,
         }
         if errors:
             item["error"] = "; ".join(errors)
@@ -1122,8 +1205,17 @@ def load_existing_responses(path: Path) -> dict[str, dict[str, Any]]:
     return responses
 
 
-def should_skip_existing_response(item: dict[str, Any] | None) -> bool:
+def should_skip_existing_response(
+    item: dict[str, Any] | None,
+    *,
+    max_graph_context_facts: int | None = None,
+) -> bool:
     if not item:
+        return False
+    if (
+        max_graph_context_facts is not None
+        and item.get("max_graph_context_facts") != max_graph_context_facts
+    ):
         return False
     return item.get("response") is not None and item.get("predicted_answer") is not None
 
@@ -1354,6 +1446,12 @@ def run_grade(args: argparse.Namespace) -> int:
         error_report_href="errors.html",
         run_meta=run_meta,
     )
+    print(
+        "PersonaMem QA summary: "
+        f"accuracy={summary['answer_acc']:.4f} "
+        f"valid_accuracy={summary['valid_answer_acc']:.4f} "
+        f"correct={summary['correct']}/{summary['total']}"
+    )
     print(f"wrote PersonaMem grades to {args.grades}")
     print(f"wrote PersonaMem grade CSV to {args.csv}")
     print(f"wrote PersonaMem grade stage HTML report to {html_report_path}")
@@ -1389,6 +1487,9 @@ def write_personamem_run_meta(args: argparse.Namespace, phase: str) -> dict[str,
         graph_build=getattr(args, "graph_build", False),
         graph_build_concurrency=getattr(args, "graph_build_concurrency", 1),
         graph_weight=getattr(args, "graph_weight", 0.2),
+        graph_rerank=getattr(args, "graph_rerank", False),
+        graph_allow_graph_only=getattr(args, "graph_allow_graph_only", False),
+        graph_max_graph_only_results=getattr(args, "graph_max_graph_only_results", None),
         graph_fail_open=getattr(args, "graph_fail_open", False),
         graph_memory_space_mode=getattr(args, "graph_memory_space_mode", "auto"),
         graph_memory_space_field=getattr(args, "graph_memory_space_field", "scope_id"),
@@ -1397,8 +1498,21 @@ def write_personamem_run_meta(args: argparse.Namespace, phase: str) -> dict[str,
         graph_llm_model=getattr(args, "graph_llm_model", "openai/gpt-4o-mini"),
         graph_llm_base_url=getattr(args, "graph_llm_base_url", "https://openrouter.ai/api/v1"),
         graph_llm_timeout_ms=getattr(args, "graph_llm_timeout_ms", None),
+        rerank=getattr(args, "rerank", False),
+        rerank_provider=getattr(args, "rerank_provider", "openrouter"),
+        rerank_model=getattr(args, "rerank_model", "cohere/rerank-v3.5"),
+        rerank_api_key_env=getattr(args, "rerank_api_key_env", "OPENROUTER_API_KEY"),
+        rerank_base_url=getattr(args, "rerank_base_url", "https://openrouter.ai/api/v1"),
+        rerank_input_k=getattr(args, "rerank_input_k", 40),
+        rerank_timeout_ms=getattr(args, "rerank_timeout_ms", None),
+        rerank_fail_open=getattr(args, "rerank_fail_open", False),
         answer_model=args.answer_model,
         context_token_budget=args.context_token_budget,
+        max_graph_context_facts=getattr(
+            args,
+            "max_graph_context_facts",
+            DEFAULT_MAX_GRAPH_CONTEXT_FACTS,
+        ),
         memory_mode=getattr(args, "memory_mode", None),
         experiment_phase=getattr(args, "phase", None),
         pair_id=getattr(args, "pair_id", None),
@@ -1485,6 +1599,39 @@ def bench_base_command(args: argparse.Namespace) -> list[str]:
         ])
         if args.graph_llm_timeout_ms is not None:
             command.extend(["--graph-llm-timeout-ms", str(args.graph_llm_timeout_ms)])
+    return command
+
+
+def bench_search_command(args: argparse.Namespace) -> list[str]:
+    command = bench_base_command(args)
+    if args.graph_rerank:
+        command.append("--graph-rerank")
+    if args.graph_allow_graph_only:
+        command.append("--graph-allow-graph-only")
+    if args.graph_max_graph_only_results is not None:
+        command.extend([
+            "--graph-max-graph-only-results",
+            str(args.graph_max_graph_only_results),
+        ])
+    if not args.rerank:
+        return command
+    command.extend([
+        "--rerank",
+        "--rerank-provider",
+        args.rerank_provider,
+        "--rerank-model",
+        args.rerank_model,
+        "--rerank-api-key-env",
+        args.rerank_api_key_env,
+        "--rerank-base-url",
+        args.rerank_base_url,
+        "--rerank-input-k",
+        str(args.rerank_input_k),
+    ])
+    if args.rerank_timeout_ms is not None:
+        command.extend(["--rerank-timeout-ms", str(args.rerank_timeout_ms)])
+    if args.rerank_fail_open:
+        command.append("--rerank-fail-open")
     return command
 
 
@@ -1633,9 +1780,14 @@ def parse_all_options_list(raw: Any) -> tuple[list[str], str | None]:
     return value, None
 
 
-def build_retrieved_contexts(results: Any) -> list[dict[str, Any]]:
+def build_retrieved_contexts(
+    results: Any,
+    *,
+    max_graph_context_facts: int = DEFAULT_MAX_GRAPH_CONTEXT_FACTS,
+) -> list[dict[str, Any]]:
     if not isinstance(results, list):
         return []
+    graph_renderer = GraphFactContextRenderer(max_facts=max_graph_context_facts)
     contexts = []
     for item in results:
         if not isinstance(item, dict):
@@ -1643,7 +1795,7 @@ def build_retrieved_contexts(results: Any) -> list[dict[str, Any]]:
         contexts.append(
             {
                 "id": item.get("id"),
-                "text": item.get("text", ""),
+                "text": graph_renderer.enrich(item.get("text", ""), item.get("metadata")),
                 "score": item.get("score"),
                 "metadata": item.get("metadata", {}),
             }

@@ -207,7 +207,10 @@ request; SQLite operations remain short, serialized transactions. Run one RAM-A 
 per SQLite database. Multi-process workers sharing one database require a future persisted lease
 and heartbeat protocol. Deployments that need ingest latency independent of the graph provider
 should put ingestion behind an application queue; the current service deliberately favors a
-completed graph on every successful response.
+completed graph on every successful response. Because graph construction is synchronous, a reverse
+proxy or load balancer in front of this endpoint must use request/read timeouts longer than the
+configured graph LLM timeout plus its retry backoff. SSE keep-alive settings do not replace that
+request timeout requirement for a tool call that is still being processed.
 
 Provider base URLs are trusted operator configuration and intentionally support self-hosted
 services on loopback or private networks. Use HTTPS for remote providers and protect configuration

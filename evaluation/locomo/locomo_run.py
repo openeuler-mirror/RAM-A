@@ -64,18 +64,47 @@ class RunConfig:
     rerank_input_k: int = 40
     top_k: int = 30
     answer_max_tokens: int = 512
+    max_graph_context_facts: int = 3
     max_candidate_tokens: int = 320
     max_window_tokens: int = 640
     context_before_messages: int = 2
     context_after_messages: int = 0
     base_url: str = OPENROUTER_BASE_URL
     credential_env: str = "OPENROUTER_API_KEY"
+    graph_enabled: bool = False
+    graph_weight: float = 0.2
+    graph_rerank: bool = False
+    graph_allow_graph_only: bool = False
+    graph_max_graph_only_results: int | None = None
+    graph_fail_open: bool = False
+    graph_memory_space_mode: str = "auto"
+    graph_memory_space_field: str = "scope_id"
+    graph_owner_id: str = "benchmark"
+    graph_llm_api_key_env: str = "OPENROUTER_API_KEY"
+    graph_llm_model: str = "openai/gpt-4o-mini"
+    graph_llm_base_url: str = OPENROUTER_BASE_URL
+    graph_llm_timeout_ms: int = 60000
+    graph_build_concurrency: int = 1
 
     def __post_init__(self) -> None:
         if self.memory_mode not in {"raw", "extracted"}:
             raise ValueError(f"unsupported MEMORY_MODE: {self.memory_mode}")
         if self.phase not in {"pilot", "full"}:
             raise ValueError(f"unsupported PHASE: {self.phase}")
+        if self.max_graph_context_facts < 0:
+            raise ValueError("MAX_GRAPH_CONTEXT_FACTS must be at least 0")
+        if self.graph_max_graph_only_results is not None and self.graph_max_graph_only_results < 0:
+            raise ValueError("GRAPH_MAX_GRAPH_ONLY_RESULTS must be non-negative")
+        if self.graph_build_concurrency < 1:
+            raise ValueError("GRAPH_BUILD_CONCURRENCY must be at least 1")
+        if self.graph_rerank and not self.graph_enabled:
+            raise ValueError("GRAPH_RERANK requires MEMORY_BENCH_GRAPH")
+        if self.graph_allow_graph_only and not self.graph_rerank:
+            raise ValueError("GRAPH_ALLOW_GRAPH_ONLY requires GRAPH_RERANK")
+        if self.graph_max_graph_only_results is not None and not self.graph_allow_graph_only:
+            raise ValueError(
+                "GRAPH_MAX_GRAPH_ONLY_RESULTS requires GRAPH_ALLOW_GRAPH_ONLY"
+            )
 
     @classmethod
     def from_env(cls, overrides: Mapping[str, str] | None = None) -> "RunConfig":
@@ -94,6 +123,7 @@ class RunConfig:
             )
         ).resolve()
         policy_path = values.get("PROMOTION_POLICY")
+        max_graph_only = values.get("GRAPH_MAX_GRAPH_ONLY_RESULTS", "")
         return cls(
             memory_mode=memory_mode,
             phase=phase,
@@ -103,6 +133,23 @@ class RunConfig:
             promotion_policy_hash=(
                 file_sha256(Path(policy_path).resolve()) if policy_path else None
             ),
+            max_graph_context_facts=int(values.get("MAX_GRAPH_CONTEXT_FACTS", "3")),
+            graph_enabled=_truthy(values.get("MEMORY_BENCH_GRAPH", "0")),
+            graph_weight=float(values.get("GRAPH_WEIGHT", "0.2")),
+            graph_rerank=_truthy(values.get("GRAPH_RERANK", "0")),
+            graph_allow_graph_only=_truthy(values.get("GRAPH_ALLOW_GRAPH_ONLY", "0")),
+            graph_max_graph_only_results=(
+                int(max_graph_only) if max_graph_only.strip() else None
+            ),
+            graph_fail_open=_truthy(values.get("GRAPH_FAIL_OPEN", "0")),
+            graph_memory_space_mode=values.get("GRAPH_MEMORY_SPACE_MODE", "auto"),
+            graph_memory_space_field=values.get("GRAPH_MEMORY_SPACE_FIELD", "scope_id"),
+            graph_owner_id=values.get("GRAPH_OWNER_ID", "benchmark"),
+            graph_llm_api_key_env=values.get("GRAPH_LLM_API_KEY_ENV", "OPENROUTER_API_KEY"),
+            graph_llm_model=values.get("GRAPH_LLM_MODEL", "openai/gpt-4o-mini"),
+            graph_llm_base_url=values.get("GRAPH_LLM_BASE_URL", OPENROUTER_BASE_URL),
+            graph_llm_timeout_ms=int(values.get("GRAPH_LLM_TIMEOUT_MS", "60000")),
+            graph_build_concurrency=int(values.get("GRAPH_BUILD_CONCURRENCY", "1")),
         )
 
     def public_manifest(self) -> dict[str, Any]:
@@ -117,7 +164,14 @@ class RunConfig:
 
     def immutable_manifest(self) -> dict[str, Any]:
         value = self.public_manifest()
-        for key in ("memory_mode", "phase", "dataset", "run_dir", "pair_id"):
+        for key in (
+            "memory_mode",
+            "phase",
+            "dataset",
+            "run_dir",
+            "pair_id",
+            "max_graph_context_facts",
+        ):
             value.pop(key, None)
         return value
 
@@ -245,8 +299,10 @@ def build_search_command(
     queries from the output file and only re-search the rest, instead of
     restarting all queries from scratch.
     """
-    return [
-        *memory_bench_base_command(config, store),
+    command = [*memory_bench_base_command(config, store)]
+    if config.graph_enabled:
+        command.extend(_graph_search_args(config))
+    command.extend([
         "--rerank",
         "--rerank-provider",
         "openrouter",
@@ -266,7 +322,54 @@ def build_search_command(
         "--output",
         str(search_results),
         "--resume",
+    ])
+    return command
+
+
+def build_add_command(
+    config: RunConfig,
+    store: Path,
+    indexed_prepared: Path,
+) -> list[str]:
+    command = [*memory_bench_base_command(config, store)]
+    if config.graph_enabled:
+        command.extend([
+            "--graph-build",
+            "--graph-build-concurrency",
+            str(config.graph_build_concurrency),
+        ])
+        command.extend(_graph_common_args(config))
+    command.extend(["add", "--dataset", str(indexed_prepared)])
+    return command
+
+
+def _graph_common_args(config: RunConfig) -> list[str]:
+    return [
+        "--graph-weight", str(config.graph_weight),
+        "--graph-memory-space-mode", config.graph_memory_space_mode,
+        "--graph-memory-space-field", config.graph_memory_space_field,
+        "--graph-owner-id", config.graph_owner_id,
+        "--graph-llm-api-key-env", config.graph_llm_api_key_env,
+        "--graph-llm-model", config.graph_llm_model,
+        "--graph-llm-base-url", config.graph_llm_base_url,
+        "--graph-llm-timeout-ms", str(config.graph_llm_timeout_ms),
     ]
+
+
+def _graph_search_args(config: RunConfig) -> list[str]:
+    args = ["--graph", *_graph_common_args(config)]
+    if config.graph_rerank:
+        args.append("--graph-rerank")
+    if config.graph_allow_graph_only:
+        args.append("--graph-allow-graph-only")
+    if config.graph_max_graph_only_results is not None:
+        args.extend([
+            "--graph-max-graph-only-results",
+            str(config.graph_max_graph_only_results),
+        ])
+    if config.graph_fail_open:
+        args.append("--graph-fail-open")
+    return args
 
 
 def run_arm(config: RunConfig) -> None:
@@ -351,12 +454,7 @@ def run_arm(config: RunConfig) -> None:
         f"store-{config.memory_mode}-{source_digest[:10]}-"
         f"{configuration_digest[:10]}.sqlite"
     )
-    add_command = [
-        *memory_bench_base_command(config, store),
-        "add",
-        "--dataset",
-        str(indexed_prepared),
-    ]
+    add_command = build_add_command(config, store, indexed_prepared)
     run_stage(
         "add",
         add_command,
@@ -430,6 +528,8 @@ def run_arm(config: RunConfig) -> None:
             str(config.run_dir / "cache" / "answer"),
             "--cache-version",
             configuration_digest,
+            "--max-graph-context-facts",
+            str(config.max_graph_context_facts),
         ],
         (responses, answer_stats),
         manifest,
@@ -476,11 +576,13 @@ def run_arm(config: RunConfig) -> None:
             str(qa_metrics),
             "--html-report",
             str(qa_report),
+            "--quiet",
         ],
         (qa_metrics, qa_report),
         manifest,
         inputs=(judged,),
     )
+    print(f"[done] LoCoMo {config.memory_mode} arm | metrics={qa_metrics} report={qa_report}")
 
 
 def implementation_hash() -> str:

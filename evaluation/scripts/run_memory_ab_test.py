@@ -88,44 +88,10 @@ def _args(dataset: str, phase: str, tmp_path: Path) -> argparse.Namespace:
 
 
 def _write_personalmem_prepared_fixture(path: Path) -> int:
-    from personalmem.run import build_prepared_schema_v1
-
     fixtures = Path(__file__).resolve().parents[1] / "fixtures"
-    sample = json.loads(
-        (fixtures / "personalmem_sample.json").read_text(encoding="utf-8")
-    )
-    scope_id = "personalmem-sample"
-    legacy = {
-        "source": "bowen-upenn/PersonaMem",
-        "conversation": [
-            {
-                "id": f"{scope_id}:{index}",
-                "shared_context_id": scope_id,
-                "speaker": message["speaker"],
-                "text": message["text"],
-            }
-            for index, message in enumerate(sample["conversation"])
-        ],
-        "questions": [
-            {
-                "question_id": f"personalmem-q-{index}",
-                "shared_context_id": scope_id,
-                "question_type": "persona",
-                "topic": "preference",
-                "question": question["question"],
-                "answer": question["answer"],
-                "correct_answer": "(a)",
-                "all_options": [
-                    f"(a) {question['answer']}",
-                    "(b) None of the above.",
-                ],
-            }
-            for index, question in enumerate(sample["questions"])
-        ],
-    }
-    prepared = build_prepared_schema_v1(legacy, "fixture")
-    path.write_text(json.dumps(prepared), encoding="utf-8")
-    return len(prepared["queries"])
+    from personalmem.prepare_fixture import prepare_fixture
+
+    return prepare_fixture(fixtures / "personalmem_sample.json", path)
 
 
 @pytest.mark.parametrize(

@@ -273,6 +273,7 @@ python evaluation/personalmem/run.py add \
 | `--answer-base-url` | `https://openrouter.ai/api/v1` | OpenAI-compatible base URL |
 | `--answer-api-key-env` | `OPENROUTER_API_KEY` | Env var for answer API key |
 | `--context-token-budget` | 2000 | Max tokens of context in answer prompts (0 = unlimited) |
+| `--max-graph-context-facts` | 3 | Maximum graph facts appended across one answer context (0 = disabled) |
 | `--run-dir` | *(auto)* | Output to `outputs/personalmem/<timestamp>_<memory-mode>/` |
 | `--resume` | false | Skip steps whose output already exists |
 | `--size` | `32k` | Official split (`32k`, `128k`, `1M`) |
