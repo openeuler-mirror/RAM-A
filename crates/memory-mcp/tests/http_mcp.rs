@@ -7,11 +7,13 @@ use axum::body::{to_bytes, Body};
 use axum::http::{header, Request, StatusCode};
 use axum::response::Response;
 use axum::Router;
+use memory_cases::{build_service, CaseServiceOptions};
 use memory_core::{HashEmbedding, MemoryManager, SqliteMemoryStore};
 use memory_mcp::{
-    create_http_router, AuthConfig, EmbeddingProviderKind, FeatureFlags,
-    GraphMemoryRetrievalConfig, HttpConfig, HttpRuntime, IdempotencyRepository, LimitsConfig,
-    MemoryService, ProvidersConfig, ServerConfig, StorageConfig, TokenAuthenticator, TokenConfig,
+    create_http_router, AuthConfig, CaseLibraryConfig, DynCaseSearchProvider,
+    EmbeddedCaseSearchProvider, EmbeddingProviderKind, FeatureFlags, GraphMemoryRetrievalConfig,
+    HttpConfig, HttpRuntime, IdempotencyRepository, LimitsConfig, MemoryService, ProvidersConfig,
+    ServerConfig, StorageConfig, TokenAuthenticator, TokenConfig,
 };
 use memory_pipeline::error::Result as PipelineResult;
 use memory_pipeline::extraction::{ExtractionBatch, MemoryExtractor, ModelUsage, SCHEMA_VERSION};
@@ -179,6 +181,7 @@ async fn fixture_router_with_schema(
         providers_ready,
         initialize_memory_schema,
         FeatureFlags::all(),
+        None,
     )
     .await
 }
@@ -191,6 +194,7 @@ async fn fixture_router_with_features(features: FeatureFlags) -> Fixture {
         true,
         true,
         features,
+        None,
     )
     .await
 }
@@ -202,6 +206,7 @@ async fn fixture_router_with_schema_and_features(
     providers_ready: bool,
     initialize_memory_schema: bool,
     features: FeatureFlags,
+    case_search: Option<DynCaseSearchProvider>,
 ) -> Fixture {
     std::env::set_var("RAM_A_HTTP_MCP_TEST_TOKEN", TOKEN);
     std::env::set_var("RAM_A_HTTP_MCP_BOB_TEST_TOKEN", BOB_TOKEN);
@@ -256,7 +261,7 @@ async fn fixture_router_with_schema_and_features(
         ..HttpConfig::default()
     };
     let cancellation_token = tokio_util::sync::CancellationToken::new();
-    let runtime = HttpRuntime::with_cancellation_token(
+    let mut runtime = HttpRuntime::with_cancellation_token(
         service,
         Arc::new(authenticator),
         database_path.clone(),
@@ -264,6 +269,9 @@ async fn fixture_router_with_schema_and_features(
         cancellation_token.clone(),
     )
     .with_features(features);
+    if let Some(case_search) = case_search {
+        runtime = runtime.with_case_search_provider(case_search);
+    }
     Fixture {
         app: create_http_router(runtime, &http, &limits),
         extract_started,
@@ -746,7 +754,7 @@ async fn agent_header_must_match_and_every_mcp_response_has_a_request_id() {
 }
 
 #[tokio::test]
-async fn initialized_session_negotiates_fixed_protocol_and_lists_exactly_three_tools() {
+async fn initialized_session_negotiates_fixed_protocol_and_lists_all_memory_and_case_tools() {
     let fixture = fixture_router().await;
     let (session_id, initialized) = initialize(&fixture.app).await;
     assert_eq!(
@@ -773,7 +781,17 @@ async fn initialized_session_negotiates_fixed_protocol_and_lists_exactly_three_t
     names.sort();
     assert_eq!(
         names,
-        vec!["memory_case_search", "memory_ingest", "memory_search"]
+        vec![
+            "memory_case_delete",
+            "memory_case_prepare_delete",
+            "memory_case_prepare_update",
+            "memory_case_prepare_upload",
+            "memory_case_search",
+            "memory_case_update",
+            "memory_case_upload",
+            "memory_ingest",
+            "memory_search"
+        ]
     );
 }
 
@@ -797,13 +815,25 @@ async fn disabled_memory_feature_hides_memory_tools_and_returns_structured_error
         .unwrap();
     assert_eq!(listed.status(), StatusCode::OK);
     let listed = response_json(listed).await;
-    let names = listed["result"]["tools"]
+    let mut names = listed["result"]["tools"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|tool| tool["name"].as_str().unwrap())
+        .map(|tool| tool["name"].as_str().unwrap().to_owned())
         .collect::<Vec<_>>();
-    assert_eq!(names, vec!["memory_case_search"]);
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "memory_case_delete",
+            "memory_case_prepare_delete",
+            "memory_case_prepare_update",
+            "memory_case_prepare_upload",
+            "memory_case_search",
+            "memory_case_update",
+            "memory_case_upload"
+        ]
+    );
 
     let called = call_tool(
         &fixture.app,
@@ -1023,6 +1053,307 @@ async fn missing_case_search_permission_is_rejected_with_http_forbidden() {
     assert!(denied.headers().contains_key("x-request-id"));
     let body = to_bytes(denied.into_body(), 1024).await.unwrap();
     assert_eq!(body.as_ref(), b"forbidden");
+}
+
+#[tokio::test]
+async fn case_document_mutation_tools_require_cases_write_permission() {
+    let read_only =
+        fixture_router_with_permissions(&["cases:read"], LimitsConfig::default()).await;
+    let (read_only_session, _) = initialize(&read_only.app).await;
+    let denied = call_tool(
+        &read_only.app,
+        &read_only_session,
+        108,
+        "memory_case_prepare_delete",
+        json!({
+            "document_id": "dns-case",
+            "deletion_reason": "The case is obsolete."
+        }),
+    )
+    .await;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let body = to_bytes(denied.into_body(), 1024).await.unwrap();
+    assert_eq!(body.as_ref(), b"forbidden");
+
+    let writer = fixture_router_with_permissions(&["cases:write"], LimitsConfig::default()).await;
+    let (writer_session, _) = initialize(&writer.app).await;
+    let accepted_by_transport = call_tool(
+        &writer.app,
+        &writer_session,
+        109,
+        "memory_case_prepare_update",
+        json!({
+            "document_id": "dns-case",
+            "file_name": "dns-case.md",
+            "diagnosis_summary": "The previous recovery procedure is incomplete.",
+            "content": "# Updated DNS procedure"
+        }),
+    )
+    .await;
+    assert_eq!(accepted_by_transport.status(), StatusCode::OK);
+    let accepted_by_transport = response_json(accepted_by_transport).await;
+    assert_eq!(accepted_by_transport["result"]["isError"], json!(true));
+    assert_eq!(
+        accepted_by_transport["result"]["structuredContent"]["code"],
+        json!("CASE_NOT_CONFIGURED")
+    );
+}
+
+#[tokio::test]
+async fn mcp_upload_update_and_delete_flow_reaches_the_embedded_case_library() {
+    let case_temp = TempDir::new().unwrap();
+    let case_service = build_service(&CaseServiceOptions {
+        rag_store: case_temp.path().join("cases.sqlite"),
+        memory_store: case_temp.path().join("case-index.sqlite"),
+        embedding_provider: memory_cases::EmbeddingProviderKind::Hash,
+        embedding_api_key_env: "UNUSED_CASE_EMBEDDING_KEY".to_owned(),
+        embedding_base_url: "http://127.0.0.1:1/v1".to_owned(),
+        embedding_model: "hash".to_owned(),
+        embedding_dimensions: 32,
+        chunk_size: 64,
+        summary_llm_model: None,
+        summary_llm_api_key_env: "UNUSED_CASE_SUMMARY_KEY".to_owned(),
+        summary_llm_base_url: "http://127.0.0.1:1/v1".to_owned(),
+        summary_llm_timeout_ms: 1_000,
+    })
+    .unwrap();
+    let case_provider: DynCaseSearchProvider = Arc::new(EmbeddedCaseSearchProvider::new(
+        case_service.clone(),
+        "ops".to_owned(),
+        &[CaseLibraryConfig {
+            name: "ops".to_owned(),
+            dataset_id: "ops-cases".to_owned(),
+            tenant_ids: vec!["tenant-a".to_owned()],
+        }],
+    ));
+    let fixture = fixture_router_with_schema_and_features(
+        &["cases:read", "cases:write"],
+        LimitsConfig::default(),
+        Duration::ZERO,
+        true,
+        true,
+        FeatureFlags::all(),
+        Some(case_provider),
+    )
+    .await;
+    let (session_id, _) = initialize(&fixture.app).await;
+
+    let upload_proposal = call_tool(
+        &fixture.app,
+        &session_id,
+        110,
+        "memory_case_prepare_upload",
+        json!({
+            "library": "ops",
+            "document_id": "dns-case",
+            "file_name": "dns-case.md",
+            "diagnosis_summary": "The DNS resolver returned a stale cached record.",
+            "content": "# DNS failure\n\nFlush mcpolddnsneedle from the resolver cache."
+        }),
+    )
+    .await;
+    assert_eq!(upload_proposal.status(), StatusCode::OK);
+    let upload_proposal = response_json(upload_proposal).await;
+    assert_eq!(upload_proposal["result"]["isError"], json!(false));
+    assert_eq!(
+        upload_proposal["result"]["structuredContent"]["operation"],
+        json!("upload")
+    );
+    assert_eq!(
+        upload_proposal["result"]["structuredContent"]["document_id"],
+        json!("dns-case")
+    );
+    assert!(case_service.list_datasets().unwrap().datasets.is_empty());
+    let upload_token = upload_proposal["result"]["structuredContent"]["confirmation_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let unconfirmed = call_tool(
+        &fixture.app,
+        &session_id,
+        111,
+        "memory_case_upload",
+        json!({"confirmation_token": upload_token, "user_confirmed": false}),
+    )
+    .await;
+    assert_eq!(unconfirmed.status(), StatusCode::OK);
+    let unconfirmed = response_json(unconfirmed).await;
+    assert_eq!(
+        unconfirmed["result"]["structuredContent"]["code"],
+        json!("CASE_USER_CONFIRMATION_REQUIRED")
+    );
+    assert!(case_service.list_datasets().unwrap().datasets.is_empty());
+
+    let uploaded = call_tool(
+        &fixture.app,
+        &session_id,
+        112,
+        "memory_case_upload",
+        json!({"confirmation_token": upload_token, "user_confirmed": true}),
+    )
+    .await;
+    assert_eq!(uploaded.status(), StatusCode::OK);
+    let uploaded = response_json(uploaded).await;
+    assert_eq!(uploaded["result"]["isError"], json!(false));
+    assert_eq!(
+        uploaded["result"]["structuredContent"]["ingestion_status"],
+        json!("pending")
+    );
+    assert!(case_service.run_next_ingestion_task().await.unwrap());
+
+    let old_search = call_tool(
+        &fixture.app,
+        &session_id,
+        113,
+        "memory_case_search",
+        json!({"query": "mcpolddnsneedle", "library": "ops", "top_k": 5}),
+    )
+    .await;
+    let old_search = response_json(old_search).await;
+    assert_eq!(
+        old_search["result"]["structuredContent"]["references"][0]["document_id"],
+        json!("dns-case")
+    );
+
+    let update_proposal = call_tool(
+        &fixture.app,
+        &session_id,
+        114,
+        "memory_case_prepare_update",
+        json!({
+            "library": "ops",
+            "document_id": "dns-case",
+            "file_name": "dns-case.md",
+            "diagnosis_summary": "The initial mitigation did not restart the resolver.",
+            "content": "# Updated DNS recovery\n\nRestart mcpnewdnsneedle after validation."
+        }),
+    )
+    .await;
+    assert_eq!(update_proposal.status(), StatusCode::OK);
+    let update_proposal = response_json(update_proposal).await;
+    assert_eq!(update_proposal["result"]["isError"], json!(false));
+    assert_eq!(
+        update_proposal["result"]["structuredContent"]["operation"],
+        json!("update")
+    );
+    let update_token = update_proposal["result"]["structuredContent"]["confirmation_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let updated = call_tool(
+        &fixture.app,
+        &session_id,
+        115,
+        "memory_case_update",
+        json!({"confirmation_token": update_token, "user_confirmed": true}),
+    )
+    .await;
+    assert_eq!(updated.status(), StatusCode::OK);
+    let updated = response_json(updated).await;
+    assert_eq!(updated["result"]["isError"], json!(false));
+    assert!(case_service.run_next_ingestion_task().await.unwrap());
+
+    let new_search = call_tool(
+        &fixture.app,
+        &session_id,
+        116,
+        "memory_case_search",
+        json!({"query": "mcpnewdnsneedle", "library": "ops", "top_k": 5}),
+    )
+    .await;
+    let new_search = response_json(new_search).await;
+    assert!(new_search["result"]["structuredContent"]["references"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("mcpnewdnsneedle"));
+
+    let delete_proposal = call_tool(
+        &fixture.app,
+        &session_id,
+        117,
+        "memory_case_prepare_delete",
+        json!({
+            "library": "ops",
+            "document_id": "dns-case",
+            "deletion_reason": "The recovery procedure is obsolete and should not be suggested."
+        }),
+    )
+    .await;
+    assert_eq!(delete_proposal.status(), StatusCode::OK);
+    let delete_proposal = response_json(delete_proposal).await;
+    assert_eq!(delete_proposal["result"]["isError"], json!(false));
+    assert_eq!(
+        delete_proposal["result"]["structuredContent"]["operation"],
+        json!("delete")
+    );
+    assert_eq!(
+        delete_proposal["result"]["structuredContent"]["document_id"],
+        json!("dns-case")
+    );
+    let delete_token = delete_proposal["result"]["structuredContent"]["confirmation_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let unconfirmed_delete = call_tool(
+        &fixture.app,
+        &session_id,
+        118,
+        "memory_case_delete",
+        json!({"confirmation_token": delete_token, "user_confirmed": false}),
+    )
+    .await;
+    assert_eq!(unconfirmed_delete.status(), StatusCode::OK);
+    let unconfirmed_delete = response_json(unconfirmed_delete).await;
+    assert_eq!(
+        unconfirmed_delete["result"]["structuredContent"]["code"],
+        json!("CASE_USER_CONFIRMATION_REQUIRED")
+    );
+    assert_eq!(
+        case_service
+            .list_documents("ops-cases")
+            .unwrap()
+            .documents
+            .len(),
+        1
+    );
+
+    let deleted = call_tool(
+        &fixture.app,
+        &session_id,
+        119,
+        "memory_case_delete",
+        json!({"confirmation_token": delete_token, "user_confirmed": true}),
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::OK);
+    let deleted = response_json(deleted).await;
+    assert_eq!(deleted["result"]["isError"], json!(false));
+    assert_eq!(
+        deleted["result"]["structuredContent"]["deleted"],
+        json!(true)
+    );
+    assert!(case_service
+        .list_documents("ops-cases")
+        .unwrap()
+        .documents
+        .is_empty());
+
+    let deleted_search = call_tool(
+        &fixture.app,
+        &session_id,
+        120,
+        "memory_case_search",
+        json!({"query": "mcpnewdnsneedle", "library": "ops", "top_k": 5}),
+    )
+    .await;
+    let deleted_search = response_json(deleted_search).await;
+    assert_eq!(
+        deleted_search["result"]["structuredContent"]["references"],
+        json!([])
+    );
 }
 
 #[tokio::test]
@@ -1547,6 +1878,8 @@ fn production_runtime_config_resolves_memory_and_case_library_feature_switches()
           "case_library": {
             "rag_store": "cases.sqlite",
             "index_store": "cases-index.sqlite",
+            "api_token_env": "RAM_A_CASES_ADMIN_TOKEN",
+            "ingestion_poll_ms": 250,
             "embedding_provider": "hash",
             "embedding_model": "hash",
             "embedding_dimensions": 1024,
@@ -1569,6 +1902,12 @@ fn production_runtime_config_resolves_memory_and_case_library_feature_switches()
             case_library: true
         }
     );
+    let case_library = enabled_case_library.case_library.as_ref().unwrap();
+    assert_eq!(
+        case_library.api_token_env.as_deref(),
+        Some("RAM_A_CASES_ADMIN_TOKEN")
+    );
+    assert_eq!(case_library.ingestion_poll_ms, 250);
     assert!(enabled_case_library.validate_runtime().is_ok());
 }
 

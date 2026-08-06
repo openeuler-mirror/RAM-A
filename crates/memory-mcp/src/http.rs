@@ -638,6 +638,12 @@ enum RequestedTool {
     Ingest,
     Search,
     CaseSearch,
+    CasePrepareUpload,
+    CaseUpload,
+    CasePrepareUpdate,
+    CaseUpdate,
+    CasePrepareDelete,
+    CaseDelete,
 }
 
 #[derive(Clone, Copy)]
@@ -654,6 +660,12 @@ impl RequestedTool {
             Self::Ingest => "memory_ingest",
             Self::Search => "memory_search",
             Self::CaseSearch => "memory_case_search",
+            Self::CasePrepareUpload => "memory_case_prepare_upload",
+            Self::CaseUpload => "memory_case_upload",
+            Self::CasePrepareUpdate => "memory_case_prepare_update",
+            Self::CaseUpdate => "memory_case_update",
+            Self::CasePrepareDelete => "memory_case_prepare_delete",
+            Self::CaseDelete => "memory_case_delete",
         }
     }
 
@@ -662,6 +674,12 @@ impl RequestedTool {
             Self::Ingest => "memory:write",
             Self::Search => "memory:read",
             Self::CaseSearch => "cases:read",
+            Self::CasePrepareUpload
+            | Self::CaseUpload
+            | Self::CasePrepareUpdate
+            | Self::CaseUpdate
+            | Self::CasePrepareDelete
+            | Self::CaseDelete => "cases:write",
         }
     }
 }
@@ -701,6 +719,18 @@ async fn requested_operation(
             Some("memory_ingest") => RequestedOperation::Tool(RequestedTool::Ingest),
             Some("memory_search") => RequestedOperation::Tool(RequestedTool::Search),
             Some("memory_case_search") => RequestedOperation::Tool(RequestedTool::CaseSearch),
+            Some("memory_case_prepare_upload") => {
+                RequestedOperation::Tool(RequestedTool::CasePrepareUpload)
+            }
+            Some("memory_case_upload") => RequestedOperation::Tool(RequestedTool::CaseUpload),
+            Some("memory_case_prepare_update") => {
+                RequestedOperation::Tool(RequestedTool::CasePrepareUpdate)
+            }
+            Some("memory_case_update") => RequestedOperation::Tool(RequestedTool::CaseUpdate),
+            Some("memory_case_prepare_delete") => {
+                RequestedOperation::Tool(RequestedTool::CasePrepareDelete)
+            }
+            Some("memory_case_delete") => RequestedOperation::Tool(RequestedTool::CaseDelete),
             _ => RequestedOperation::Other,
         },
     )

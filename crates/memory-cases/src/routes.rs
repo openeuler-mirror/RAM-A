@@ -1,7 +1,5 @@
-use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::Result;
 use axum::{
     extract::{Multipart, Path, Request, State},
     http::{header, HeaderValue, StatusCode},
@@ -10,7 +8,6 @@ use axum::{
     routing::{get, post, put},
     Json, Router,
 };
-use serde::Serialize;
 use subtle::ConstantTimeEq;
 
 use crate::error::{AppError, AppResult};
@@ -33,7 +30,9 @@ impl ApiAuthState {
     }
 }
 
-pub async fn serve(bind: SocketAddr, service: Arc<RagService>, bearer_token: String) -> Result<()> {
+/// Builds the authenticated case-management API for embedding in an owning
+/// HTTP service such as `ram-a-mem`.
+pub fn create_api_router(service: Arc<RagService>, bearer_token: String) -> Router {
     let api = Router::new()
         .route("/api/v1/datasets", post(create_dataset).get(list_datasets))
         .route(
@@ -51,15 +50,9 @@ pub async fn serve(bind: SocketAddr, service: Arc<RagService>, bearer_token: Str
         )
         .route("/api/v1/datasets/:dataset_id/search", post(search_dataset))
         .route("/api/v1/chat/completions", post(chat_completion));
-    let app = Router::new()
-        .route("/health", get(health))
+    Router::new()
         .merge(protect_api_routes(api, ApiAuthState::new(bearer_token)))
-        .with_state(service);
-
-    let listener = tokio::net::TcpListener::bind(bind).await?;
-    println!("memory-cases API listening on http://{bind}");
-    axum::serve(listener, app).await?;
-    Ok(())
+        .with_state(service)
 }
 
 fn protect_api_routes<S>(router: Router<S>, auth: ApiAuthState) -> Router<S>
@@ -85,15 +78,6 @@ async fn authorize_api(State(auth): State<ApiAuthState>, request: Request, next:
         .headers_mut()
         .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
     response
-}
-
-#[derive(Serialize)]
-struct HealthResponse {
-    status: &'static str,
-}
-
-async fn health() -> Json<HealthResponse> {
-    Json(HealthResponse { status: "ok" })
 }
 
 async fn create_dataset(

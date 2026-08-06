@@ -8,7 +8,7 @@ benchmark runner, and reproducible evaluation scripts.
 
 - `memory-core`: core long-term memory API and storage implementations.
 - `memory-bench`: CLI runner for ingesting benchmark records and searching top-k memories.
-- `memory-cases`: local case knowledge service for storing, indexing, and retrieving case documents.
+- `memory-cases`: embeddable case-library engine for storing, indexing, and retrieving case documents.
 - Default local storage: SQLite.
 - Default retrieval mode: hybrid dense embedding retrieval plus BM25 text retrieval.
 - Embedding providers: OpenAI-compatible embeddings, including self-hosted `/v1/embeddings`
@@ -20,7 +20,7 @@ benchmark runner, and reproducible evaluation scripts.
 crates/
   memory-core/       # core memory API, record model, stores, retrieval
   memory-bench/      # benchmark CLI
-  memory-cases/      # case API, ingestor, chunk store, and search index
+  memory-cases/      # embeddable case API, ingestion worker, chunk store, and search index
 
 evaluation/
   common/            # shared evaluation helpers, metrics, reports, backends
@@ -103,16 +103,16 @@ pub struct SearchMemoryRequest {
 See [docs/design/memory-cases-storage-split.md](docs/design/memory-cases-storage-split.md) for
 table ownership and index semantics.
 
-`memory-cases` defaults to local hash embeddings for offline and demo use. Use
-`--embedding-provider openai_compatible` with `--embedding-base-url`, `--embedding-model`,
-`--embedding-api-key-env`, and `--embedding-dimensions` when a real embedding service is
-available. The endpoint must be OpenAI-compatible and expose `/v1/embeddings`; this includes
-self-hosted embedding services.
+`memory-cases` defaults to local hash embeddings for offline and demo use. Configure
+`case_library.embedding_provider` as `openai_compatible` together with its base URL, model,
+API key environment name, and dimensions when a real embedding service is available. The
+endpoint must be OpenAI-compatible and expose `/v1/embeddings`; this includes self-hosted
+embedding services.
 
 Keep the case-library search index in a separate SQLite file from RAM-A personal long-term
 memory for demos and deployments. Sharing one SQLite index is only suitable for narrow smoke
-tests because two services can contend on SQLite writer locks and case reindex/reset flows
-should not touch user memories. If a shared `memory-core` SQLite index is intentionally used,
+tests because independent storage operations can contend on SQLite writer locks and case
+reindex/reset flows should not touch user memories. If a shared `memory-core` SQLite index is intentionally used,
 use one embedding profile per search scope. RAM-A stores embedding profile metadata on new
 records and rejects same-scope profile mismatches, because two providers can have the same
 vector dimensions but incompatible semantic spaces.
@@ -301,6 +301,8 @@ field changes listed below.
     "rag_store": "data/memory-cases.sqlite",
     "index_store": "data/memory-cases-index.sqlite",
     "source_dir": "crates/memory-cases/test/accuracy_docs",
+    "api_token_env": "RAM_A_CASES_ADMIN_TOKEN",
+    "ingestion_poll_ms": 1000,
     "embedding_provider": "hash",
     "embedding_model": "hash",
     "embedding_dimensions": 1024,
@@ -338,10 +340,12 @@ Change these fields before deployment:
 - `RAM_A_XIAOO_TOKEN`: environment variable name that contains the RAM-A bearer token.
 - `tenant_id`, `user_id`, `agent_id`: identity scope for memory isolation.
 - `permissions`: include `memory:read`, `memory:write`, and optionally `cases:read`.
+  Grant `cases:write` only to trusted MCP principals allowed to prepare and confirm case writes.
 - `features.memory.enabled`: expose or hide RAM-A personal long-term memory tools
   (`memory_search`, `memory_ingest`).
-- `features.case_library.enabled`: expose or hide the operational case-library tool
-  (`memory_case_search`). If this is `true`, `case_library` must also be configured.
+- `features.case_library.enabled`: expose or hide the case-library tools
+  (`memory_case_search`, all `memory_case_prepare_*` tools, and the upload, update, and delete
+  confirmation tools). If this is `true`, `case_library` must also be configured.
 - `features.graph_memory.enabled`: augment `memory_ingest` and `memory_search` with graph
   construction and retrieval. Keep this `false` unless the top-level `graph_memory` settings
   and `GRAPH_LLM_API_KEY` are configured.
@@ -357,6 +361,10 @@ Change these fields before deployment:
   from `storage.database_path`.
 - `case_library.source_dir`: optional local directory of `.md`/`.txt` documents. When set,
   `ram-a-mem` imports new files into the default case-library dataset on startup.
+- `case_library.api_token_env`: optional environment variable containing the dedicated
+  administrator token for the case-management REST API. Omit it to keep that API disabled.
+- `case_library.ingestion_poll_ms`: polling interval for the ingestion worker embedded in
+  `ram-a-mem`. The worker continuously processes document create/update tasks.
 - `case_library.embedding_provider`: case-library retrieval embedding provider. It can be
   `hash` for demos or `openai_compatible` for a real/self-hosted embedding service.
 
@@ -377,6 +385,7 @@ Start RAM-A memory service:
 
 ```bash
 export RAM_A_XIAOO_TOKEN='replace-with-long-random-token'
+export RAM_A_CASES_ADMIN_TOKEN='replace-with-a-separate-admin-token'
 export LLM_API_KEY='replace-with-llm-provider-key'
 # Required only when features.graph_memory.enabled is true.
 export GRAPH_LLM_API_KEY='replace-with-graph-provider-key'
@@ -393,6 +402,11 @@ RAM_A_MEM_CONFIG=/etc/ram-a/ram-a-mem.json ram-a-mem
 Do not point `case_library.index_store` at `storage.database_path`; case index rebuilds and
 personal long-term memories must remain isolated even though both capabilities are served
 from the same `ram-a-mem` process and HTTP port.
+
+When `case_library.api_token_env` is configured, `ram-a-mem` also serves the authenticated
+case-management API under `/api/v1`. Creating or updating a document enqueues an ingestion
+task; the background worker in the same process parses, chunks, and indexes it. Do not start
+a separate `memory-cases --api` or `memory-cases --ingestor` process.
 
 ### MCP client config
 
@@ -441,6 +455,52 @@ are:
   "case library" or name the tool.
   It searches an authorized case library when `case_library` is configured and the token has
   `cases:read`.
+- `memory_case_prepare_upload`: after diagnosis, stage a proposed UTF-8 Markdown/text case
+  without writing it, and return a proposal plus a one-time confirmation token.
+- `memory_case_prepare_update`: stage a proposed replacement for an existing case without
+  writing it, and return the same confirmation information.
+- `memory_case_prepare_delete`: stage the proposed deletion of an existing case, including a
+  required deletion reason, without removing anything.
+- `memory_case_upload`: consume a prepared upload token after explicit user confirmation and
+  return a generated ingestion task ID.
+- `memory_case_update`: consume a prepared update token after explicit user confirmation;
+  the replacement is indexed asynchronously by the in-process ingestion worker.
+- `memory_case_delete`: consume a prepared delete token after explicit user confirmation and
+  immediately remove the document, source file, tasks, chunks, and search records.
+
+All six mutation tools require `cases:write`. Preparation accepts `library` rather than
+`dataset_id`, so the server keeps dataset selection and tenant authorization under configuration
+control. After diagnosis, prepare an upload with arguments such as:
+
+```json
+{
+  "library": "ops",
+  "document_id": "dns-case-001",
+  "file_name": "dns-failure.md",
+  "name": "DNS failure recovery",
+  "diagnosis_summary": "The local resolver held a stale record; flushing it restored DNS.",
+  "content": "# DNS failure\n\nFlush the resolver cache and verify the upstream DNS server."
+}
+```
+
+Prepare a deletion with the exact document ID and a reason that xiaoO can show to the user:
+
+```json
+{
+  "library": "ops",
+  "document_id": "dns-case-001",
+  "deletion_reason": "This case is obsolete and its remediation is no longer safe."
+}
+```
+
+The preparation call does not modify the case library. The client must display its proposal and
+ask the user, then end the turn. Only after a later explicit confirmation may it call the matching
+final tool with `{"confirmation_token":"...","user_confirmed":true}`. Tokens expire after ten
+minutes, are bound to tenant/user/agent and operation, are single-use, and are lost on service
+restart. Upload and update return `ingestion_status: "pending"`, and the background worker in
+`ram-a-mem` processes those tasks automatically. Delete completes synchronously and returns
+`deleted: true`. `case_library.api_token_env` is not required for these MCP tools—it only
+controls the separate REST management API.
 
 If the client model does not reliably choose the case-library tool by itself, add the prompt
 snippet in [`plugins/mcp/case-tool-instruction.md`](plugins/mcp/case-tool-instruction.md) to
