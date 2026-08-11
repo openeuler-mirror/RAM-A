@@ -361,17 +361,41 @@ impl RagService {
         let Some(task) = self.repo.lease_next_pending_task()? else {
             return Ok(false);
         };
+        let started = std::time::Instant::now();
+        tracing::info!(
+            event = "ram_a.case.ingestion.task.started",
+            task_id = task.id,
+            dataset_id = task.dataset_id,
+            document_id = task.document_id
+        );
 
         match self.ingest_task(&task).await {
             Ok(chunk_count) => {
                 self.repo
                     .complete_task(&task.id, &task.document_id, chunk_count)?;
+                tracing::info!(
+                    event = "ram_a.case.ingestion.task.completed",
+                    task_id = task.id,
+                    dataset_id = task.dataset_id,
+                    document_id = task.document_id,
+                    chunk_count,
+                    latency_ms = started.elapsed().as_millis() as u64
+                );
             }
             Err(error) => {
                 let message = error.to_string();
                 self.repo
                     .fail_task(&task.id, &task.document_id, &message)
                     .with_context(|| format!("failed to mark task {} failed", task.id))?;
+                tracing::error!(
+                    event = "ram_a.case.ingestion.task.failed",
+                    task_id = task.id,
+                    dataset_id = task.dataset_id,
+                    document_id = task.document_id,
+                    error_kind = "ingest",
+                    retriable = true,
+                    latency_ms = started.elapsed().as_millis() as u64
+                );
                 return Err(error);
             }
         }
@@ -456,15 +480,19 @@ impl RagService {
                             "llm",
                         );
                     }
-                    eprintln!(
-                        "summary LLM returned no usable summary for {}; using offline document summary",
-                        document.name
+                    tracing::warn!(
+                        event = "ram_a.case.ingestion.degraded",
+                        stage = "summary",
+                        fallback = "offline",
+                        error_kind = "empty_summary"
                     );
                 }
-                Err(error) => {
-                    eprintln!(
-                        "summary LLM failed for {}: {error}; using offline document summary",
-                        document.name
+                Err(_error) => {
+                    tracing::warn!(
+                        event = "ram_a.case.ingestion.degraded",
+                        stage = "summary",
+                        fallback = "offline",
+                        error_kind = "provider"
                     );
                 }
             }

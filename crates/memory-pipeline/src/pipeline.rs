@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -65,14 +66,75 @@ pub async fn run_memory_pipeline<E: MemoryExtractor + ?Sized, V: GroundingVerifi
             "max_memory_chars must be positive".into(),
         ));
     }
-    let (messages, normalization_issues) = normalize_prepared_memories(prepared)?;
+    let mut stage_started = Instant::now();
+    tracing::info!(
+        event = "ram_a.memory.ingest.stage.started",
+        stage = "normalize"
+    );
+    let (messages, normalization_issues) =
+        normalize_prepared_memories(prepared).inspect_err(|_error| {
+            tracing::error!(
+                event = "ram_a.memory.ingest.stage.failed",
+                stage = "normalize",
+                error_code = "PIPELINE_NORMALIZE_FAILED",
+                retriable = false,
+                elapsed_ms = stage_started.elapsed().as_millis() as u64
+            );
+        })?;
+    tracing::info!(
+        event = "ram_a.memory.ingest.stage.completed",
+        stage = "normalize",
+        message_count = messages.len(),
+        issue_count = normalization_issues.len(),
+        elapsed_ms = stage_started.elapsed().as_millis() as u64
+    );
     let lookup = messages
         .iter()
         .cloned()
         .map(|message| (message.id.clone(), message))
         .collect::<HashMap<_, _>>();
-    let episodes = build_episodes(&messages, &config.episode)?;
-    let windows = build_windows(&episodes, &lookup, &config.window)?;
+    stage_started = Instant::now();
+    tracing::info!(
+        event = "ram_a.memory.ingest.stage.started",
+        stage = "episode_build",
+        message_count = messages.len()
+    );
+    let episodes = build_episodes(&messages, &config.episode).inspect_err(|_error| {
+        tracing::error!(
+            event = "ram_a.memory.ingest.stage.failed",
+            stage = "episode_build",
+            error_code = "PIPELINE_EPISODE_FAILED",
+            retriable = false,
+            elapsed_ms = stage_started.elapsed().as_millis() as u64
+        );
+    })?;
+    tracing::info!(
+        event = "ram_a.memory.ingest.stage.completed",
+        stage = "episode_build",
+        episode_count = episodes.len(),
+        elapsed_ms = stage_started.elapsed().as_millis() as u64
+    );
+    stage_started = Instant::now();
+    tracing::info!(
+        event = "ram_a.memory.ingest.stage.started",
+        stage = "window_build",
+        episode_count = episodes.len()
+    );
+    let windows = build_windows(&episodes, &lookup, &config.window).inspect_err(|_error| {
+        tracing::error!(
+            event = "ram_a.memory.ingest.stage.failed",
+            stage = "window_build",
+            error_code = "PIPELINE_WINDOW_FAILED",
+            retriable = false,
+            elapsed_ms = stage_started.elapsed().as_millis() as u64
+        );
+    })?;
+    tracing::info!(
+        event = "ram_a.memory.ingest.stage.completed",
+        stage = "window_build",
+        window_count = windows.len(),
+        elapsed_ms = stage_started.elapsed().as_millis() as u64
+    );
     let mut extracted = Vec::new();
     let mut supported = Vec::new();
     let mut rejected = normalization_issues;
@@ -88,16 +150,52 @@ pub async fn run_memory_pipeline<E: MemoryExtractor + ?Sized, V: GroundingVerifi
     let mut verification_latency = 0.0;
     let mut grounding_counts: BTreeMap<String, usize> = BTreeMap::new();
 
-    for window in &windows {
+    for (window_index, window) in windows.iter().enumerate() {
+        let unit_started = Instant::now();
+        tracing::info!(
+            event = "ram_a.memory.ingest.stage.started",
+            stage = "extract",
+            completed_units = window_index,
+            total_units = windows.len()
+        );
         let extraction_result = extract(window, &lookup, extractor, cache).await;
         let (batch, cached) = match extraction_result {
             Ok(value) => value,
-            Err(error) if config.fail_fast => return Err(error),
+            Err(error) if config.fail_fast => {
+                tracing::error!(
+                    event = "ram_a.memory.ingest.stage.failed",
+                    stage = "extract",
+                    error_code = "PIPELINE_EXTRACT_FAILED",
+                    retriable = true,
+                    completed_units = window_index,
+                    total_units = windows.len(),
+                    elapsed_ms = unit_started.elapsed().as_millis() as u64
+                );
+                return Err(error);
+            }
             Err(error) => {
+                tracing::warn!(
+                    event = "ram_a.memory.ingest.stage.failed",
+                    stage = "extract",
+                    error_code = "PIPELINE_EXTRACT_FAILED",
+                    retriable = true,
+                    completed_units = window_index,
+                    total_units = windows.len(),
+                    elapsed_ms = unit_started.elapsed().as_millis() as u64
+                );
                 rejected.push(runtime_issue("extract", window, &error, ""));
                 continue;
             }
         };
+        tracing::info!(
+            event = "ram_a.memory.ingest.stage.completed",
+            stage = "extract",
+            raw_candidate_count = batch.raw_memories.len(),
+            cache_hit = cached,
+            completed_units = window_index + 1,
+            total_units = windows.len(),
+            elapsed_ms = unit_started.elapsed().as_millis() as u64
+        );
         if cached {
             extraction_cache_hits += 1
         } else {
@@ -110,18 +208,64 @@ pub async fn run_memory_pipeline<E: MemoryExtractor + ?Sized, V: GroundingVerifi
             empty_windows += 1;
             continue;
         }
+        let validation_started = Instant::now();
+        tracing::info!(
+            event = "ram_a.memory.ingest.stage.started",
+            stage = "extraction_validate",
+            candidate_count = batch.raw_memories.len(),
+            completed_units = window_index,
+            total_units = windows.len()
+        );
         let validation =
             validate_extraction(&batch.raw_memories, window, &lookup, &config.validation);
+        tracing::info!(
+            event = "ram_a.memory.ingest.stage.completed",
+            stage = "extraction_validate",
+            valid_count = validation.valid.len(),
+            rejected_count = validation.rejected.len(),
+            quarantined_count = validation.quarantined.len(),
+            completed_units = window_index + 1,
+            total_units = windows.len(),
+            elapsed_ms = validation_started.elapsed().as_millis() as u64
+        );
         rejected.extend(validation.rejected);
         quarantined.extend(validation.quarantined);
         if validation.valid.is_empty() {
             continue;
         }
+        let verify_started = Instant::now();
+        tracing::info!(
+            event = "ram_a.memory.ingest.stage.started",
+            stage = "verify",
+            candidate_count = validation.valid.len(),
+            completed_units = window_index,
+            total_units = windows.len()
+        );
         let grounding_result = verify(window, &validation.valid, &lookup, verifier, cache).await;
         let (grounding, cached) = match grounding_result {
             Ok(value) => value,
-            Err(error) if config.fail_fast => return Err(error),
+            Err(error) if config.fail_fast => {
+                tracing::error!(
+                    event = "ram_a.memory.ingest.stage.failed",
+                    stage = "verify",
+                    error_code = "PIPELINE_VERIFY_FAILED",
+                    retriable = true,
+                    completed_units = window_index,
+                    total_units = windows.len(),
+                    elapsed_ms = verify_started.elapsed().as_millis() as u64
+                );
+                return Err(error);
+            }
             Err(error) => {
+                tracing::warn!(
+                    event = "ram_a.memory.ingest.stage.failed",
+                    stage = "verify",
+                    error_code = "PIPELINE_VERIFY_FAILED",
+                    retriable = true,
+                    completed_units = window_index,
+                    total_units = windows.len(),
+                    elapsed_ms = verify_started.elapsed().as_millis() as u64
+                );
                 quarantined.extend(
                     validation
                         .valid
@@ -131,6 +275,15 @@ pub async fn run_memory_pipeline<E: MemoryExtractor + ?Sized, V: GroundingVerifi
                 continue;
             }
         };
+        tracing::info!(
+            event = "ram_a.memory.ingest.stage.completed",
+            stage = "verify",
+            result_count = grounding.results.len(),
+            cache_hit = cached,
+            completed_units = window_index + 1,
+            total_units = windows.len(),
+            elapsed_ms = verify_started.elapsed().as_millis() as u64
+        );
         if cached {
             verification_cache_hits += 1
         } else {
@@ -168,8 +321,20 @@ pub async fn run_memory_pipeline<E: MemoryExtractor + ?Sized, V: GroundingVerifi
             }
         }
     }
+    stage_started = Instant::now();
+    tracing::info!(
+        event = "ram_a.memory.ingest.stage.started",
+        stage = "aggregate",
+        supported_count = supported.len()
+    );
     crate::writer::attach_source_observations(&mut supported, &lookup);
     let accepted = aggregate_exact_memories(&supported);
+    tracing::info!(
+        event = "ram_a.memory.ingest.stage.completed",
+        stage = "aggregate",
+        accepted_count = accepted.len(),
+        elapsed_ms = stage_started.elapsed().as_millis() as u64
+    );
     let (coverage, duplication) = candidate_span_metrics(&messages, &windows);
     let source_memory_counts = source_counts(&lookup, &accepted, true);
     let source_evidence_counts = source_counts(&lookup, &accepted, false);

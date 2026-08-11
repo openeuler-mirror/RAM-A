@@ -20,6 +20,8 @@ pub struct ServerConfig {
     #[serde(default)]
     pub providers: Option<ProvidersConfig>,
     #[serde(default)]
+    pub retrieval: RetrievalServiceConfig,
+    #[serde(default)]
     pub case_library: Option<CaseLibraryServiceConfig>,
     #[serde(default)]
     pub graph_memory: Option<GraphMemoryServiceConfig>,
@@ -339,6 +341,143 @@ pub struct ProvidersConfig {
     pub max_retries: usize,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RetrievalServiceConfig {
+    pub mode: memory_core::SearchMode,
+    pub embedding_weight: f32,
+    pub bm25_weight: f32,
+    pub candidate_k: Option<usize>,
+    pub rerank: RerankServiceConfig,
+}
+
+impl Default for RetrievalServiceConfig {
+    fn default() -> Self {
+        let defaults = memory_core::RetrievalConfig::default();
+        Self {
+            mode: defaults.mode,
+            embedding_weight: defaults.embedding_weight,
+            bm25_weight: defaults.bm25_weight,
+            candidate_k: defaults.candidate_k,
+            rerank: RerankServiceConfig::default(),
+        }
+    }
+}
+
+impl RetrievalServiceConfig {
+    pub fn core_config(
+        &self,
+        graph: memory_core::GraphRetrievalConfig,
+    ) -> memory_core::RetrievalConfig {
+        memory_core::RetrievalConfig {
+            mode: self.mode,
+            embedding_weight: self.embedding_weight,
+            bm25_weight: self.bm25_weight,
+            candidate_k: self.candidate_k,
+            graph,
+            rerank: self.rerank.core_config(),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.mode == memory_core::SearchMode::Graph {
+            anyhow::bail!(
+                "retrieval mode graph is not supported by the MCP service; enable graph_memory augmentation instead"
+            );
+        }
+        if self
+            .candidate_k
+            .is_some_and(|value| !(1..=500).contains(&value))
+        {
+            anyhow::bail!("retrieval candidate_k must be between 1 and 500");
+        }
+        if self.mode == memory_core::SearchMode::Hybrid {
+            let weights = [self.embedding_weight, self.bm25_weight];
+            if weights
+                .iter()
+                .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
+                || (weights.iter().sum::<f32>() - 1.0).abs() > 1e-6
+            {
+                anyhow::bail!(
+                    "hybrid retrieval weights must be finite, between 0 and 1, and sum to 1"
+                );
+            }
+        }
+        self.rerank.validate(self.mode)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RerankServiceConfig {
+    pub enabled: bool,
+    pub provider: memory_core::RerankProvider,
+    pub model: String,
+    pub api_key_env: Option<String>,
+    pub base_url: String,
+    pub input_k: usize,
+    pub timeout_ms: Option<u64>,
+    pub fail_open: bool,
+}
+
+impl Default for RerankServiceConfig {
+    fn default() -> Self {
+        let defaults = memory_core::RerankConfig::default();
+        Self {
+            enabled: defaults.enabled,
+            provider: defaults.provider,
+            model: defaults.model,
+            api_key_env: Some(defaults.api_key_env),
+            base_url: defaults.base_url,
+            input_k: defaults.input_k,
+            timeout_ms: defaults.timeout_ms,
+            fail_open: defaults.fail_open,
+        }
+    }
+}
+
+impl RerankServiceConfig {
+    pub fn core_config(&self) -> memory_core::RerankConfig {
+        memory_core::RerankConfig {
+            enabled: self.enabled,
+            provider: self.provider,
+            model: self.model.clone(),
+            api_key_env: self.api_key_env.clone().unwrap_or_default(),
+            base_url: self.base_url.clone(),
+            input_k: self.input_k,
+            timeout_ms: self.timeout_ms,
+            fail_open: self.fail_open,
+        }
+    }
+
+    fn validate(&self, mode: memory_core::SearchMode) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if mode != memory_core::SearchMode::Hybrid {
+            anyhow::bail!("rerank requires retrieval mode hybrid");
+        }
+        if self.model.trim().is_empty() || self.base_url.trim().is_empty() {
+            anyhow::bail!("rerank model and base_url must not be empty");
+        }
+        if self
+            .api_key_env
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            anyhow::bail!("rerank API key environment name must not be empty");
+        }
+        validate_provider_base_url(&self.base_url, "rerank base URL")?;
+        if !(1..=500).contains(&self.input_k) {
+            anyhow::bail!("rerank input_k must be between 1 and 500");
+        }
+        if self.timeout_ms == Some(0) {
+            anyhow::bail!("rerank timeout_ms must be non-zero when configured");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum EmbeddingProviderKind {
     #[default]
@@ -595,6 +734,7 @@ impl ServerConfig {
 
     pub fn validate_runtime(&self) -> Result<()> {
         self.http.validate_bind()?;
+        self.retrieval.validate()?;
         if self.features.case_library.enabled == Some(true) && self.case_library.is_none() {
             anyhow::bail!("case_library feature requires case_library configuration");
         }
@@ -725,7 +865,10 @@ fn validate_provider_base_url(value: &str, label: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_provider_base_url;
+    use super::{
+        validate_provider_base_url, RerankServiceConfig, RetrievalServiceConfig, ServerConfig,
+    };
+    use memory_core::SearchMode;
 
     #[test]
     fn provider_base_url_rejects_credentials_query_and_fragment() {
@@ -745,6 +888,76 @@ mod tests {
     fn provider_base_url_allows_trusted_http_endpoints() {
         assert!(validate_provider_base_url("http://127.0.0.1:8080/v1", "provider").is_ok());
         assert!(validate_provider_base_url("https://example.com/v1", "provider").is_ok());
+    }
+
+    #[test]
+    fn retrieval_defaults_preserve_current_hybrid_behavior() {
+        let config = RetrievalServiceConfig::default();
+        assert_eq!(config.mode, SearchMode::Hybrid);
+        assert_eq!(config.embedding_weight, 0.7);
+        assert_eq!(config.bm25_weight, 0.3);
+        assert_eq!(config.candidate_k, None);
+        assert!(!config.rerank.enabled);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn retrieval_parses_openrouter_compatible_local_rerank_without_auth() {
+        let config: RetrievalServiceConfig = serde_json::from_value(serde_json::json!({
+            "mode": "hybrid",
+            "embedding_weight": 0.6,
+            "bm25_weight": 0.4,
+            "candidate_k": 120,
+            "rerank": {
+                "enabled": true,
+                "provider": "openrouter",
+                "model": "local-reranker",
+                "api_key_env": null,
+                "base_url": "http://127.0.0.1:8081/v1",
+                "input_k": 40,
+                "timeout_ms": 5000,
+                "fail_open": true
+            }
+        }))
+        .expect("parse retrieval config");
+
+        assert!(config.validate().is_ok());
+        assert_eq!(config.rerank.api_key_env, None);
+        let core = config.core_config(memory_core::GraphRetrievalConfig::default());
+        assert!(core.rerank.enabled);
+        assert_eq!(core.rerank.model, "local-reranker");
+    }
+
+    #[test]
+    fn retrieval_rejects_invalid_weights_and_non_hybrid_rerank() {
+        let invalid_weights = RetrievalServiceConfig {
+            embedding_weight: 0.8,
+            bm25_weight: 0.3,
+            ..RetrievalServiceConfig::default()
+        };
+        assert!(invalid_weights.validate().is_err());
+
+        let dense_rerank = RetrievalServiceConfig {
+            mode: SearchMode::Dense,
+            rerank: RerankServiceConfig {
+                enabled: true,
+                ..RerankServiceConfig::default()
+            },
+            ..RetrievalServiceConfig::default()
+        };
+        assert!(dense_rerank.validate().is_err());
+    }
+
+    #[test]
+    fn packaged_rpm_example_matches_server_schema() {
+        let config: ServerConfig =
+            serde_json::from_str(include_str!("../../../plugins/mcp/ram-a-mem.json"))
+                .expect("packaged config parses");
+
+        assert!(config.validate_runtime().is_ok());
+        assert_eq!(config.retrieval.mode, SearchMode::Hybrid);
+        assert_eq!(config.retrieval.embedding_weight, 0.7);
+        assert_eq!(config.retrieval.bm25_weight, 0.3);
     }
 }
 

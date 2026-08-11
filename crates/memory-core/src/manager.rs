@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -336,9 +337,21 @@ impl MemoryManager {
         }
 
         let sqlite_store = self.sqlite_store_for_mode(SearchMode::Bm25)?;
+        let stage_started = Instant::now();
+        tracing::info!(
+            event = "ram_a.memory.search.stage.started",
+            stage = "bm25_retrieve",
+            candidate_limit = request.top_k
+        );
         let candidates = sqlite_store
             .bm25_candidates(query, request.filter.as_ref(), request.top_k)
             .await?;
+        tracing::info!(
+            event = "ram_a.memory.search.stage.completed",
+            stage = "bm25_retrieve",
+            candidate_count = candidates.len(),
+            elapsed_ms = stage_started.elapsed().as_millis() as u64
+        );
         self.fuse_optional_graph_channel(&request, candidates, request.top_k)
             .await
     }
@@ -355,7 +368,20 @@ impl MemoryManager {
 
         // This is an explicit evaluation/serving mode: do not fall back to raw-memory
         // candidates, so graph recall can be measured independently from dense/BM25.
-        self.graph_candidates(&request, request.top_k).await
+        let stage_started = Instant::now();
+        tracing::info!(
+            event = "ram_a.memory.search.stage.started",
+            stage = "graph_retrieve",
+            candidate_limit = request.top_k
+        );
+        let candidates = self.graph_candidates(&request, request.top_k).await?;
+        tracing::info!(
+            event = "ram_a.memory.search.stage.completed",
+            stage = "graph_retrieve",
+            candidate_count = candidates.len(),
+            elapsed_ms = stage_started.elapsed().as_millis() as u64
+        );
+        Ok(candidates)
     }
 
     async fn search_many_hybrid_with_progress<F>(
@@ -400,21 +426,67 @@ impl MemoryManager {
         }
 
         let candidate_k = self.retrieval_config.candidate_limit(request.top_k);
+        let mut stage_started = Instant::now();
+        tracing::info!(
+            event = "ram_a.memory.search.stage.started",
+            stage = "query_embedding",
+            provider = "openai_compatible",
+            model = self.embedder.model_name(),
+            dimensions = self.embedder.dimensions()
+        );
         let query_embedding = self.embedder.embed_one(query).await?;
+        tracing::info!(
+            event = "ram_a.memory.search.stage.completed",
+            stage = "query_embedding",
+            dimensions = query_embedding.len(),
+            elapsed_ms = stage_started.elapsed().as_millis() as u64
+        );
         on_embedded(1);
+        stage_started = Instant::now();
+        tracing::info!(
+            event = "ram_a.memory.search.stage.started",
+            stage = "dense_retrieve",
+            candidate_limit = candidate_k
+        );
         let dense_candidates = self
             .dense_candidates(&query_embedding, request.filter.as_ref(), candidate_k)
             .await?;
+        tracing::info!(
+            event = "ram_a.memory.search.stage.completed",
+            stage = "dense_retrieve",
+            candidate_count = dense_candidates.len(),
+            elapsed_ms = stage_started.elapsed().as_millis() as u64
+        );
         let sqlite_store = self.sqlite_store_for_mode(SearchMode::Hybrid)?;
+        stage_started = Instant::now();
+        tracing::info!(
+            event = "ram_a.memory.search.stage.started",
+            stage = "bm25_retrieve",
+            candidate_limit = candidate_k
+        );
         let bm25_candidates = sqlite_store
             .bm25_candidates(query, request.filter.as_ref(), candidate_k)
             .await?;
+        tracing::info!(
+            event = "ram_a.memory.search.stage.completed",
+            stage = "bm25_retrieve",
+            candidate_count = bm25_candidates.len(),
+            elapsed_ms = stage_started.elapsed().as_millis() as u64
+        );
 
         let result_limit = if self.retrieval_config.rerank.enabled {
             self.retrieval_config.rerank.input_limit(request.top_k)
         } else {
             request.top_k
         };
+        stage_started = Instant::now();
+        tracing::info!(
+            event = "ram_a.memory.search.stage.started",
+            stage = "hybrid_fuse",
+            embedding_weight = self.retrieval_config.embedding_weight,
+            bm25_weight = self.retrieval_config.bm25_weight,
+            result_limit
+        );
         let candidates = fuse_hybrid_candidates(
             dense_candidates,
             bm25_candidates,
@@ -422,13 +494,62 @@ impl MemoryManager {
             self.retrieval_config.embedding_weight,
             self.retrieval_config.bm25_weight,
         );
-        let candidates = self
-            .fuse_optional_graph_channel(&request, candidates, result_limit)
-            .await?;
+        tracing::info!(
+            event = "ram_a.memory.search.stage.completed",
+            stage = "hybrid_fuse",
+            candidate_count = candidates.len(),
+            elapsed_ms = stage_started.elapsed().as_millis() as u64
+        );
+        let candidates = if self.retrieval_config.graph.enabled {
+            stage_started = Instant::now();
+            tracing::info!(
+                event = "ram_a.memory.search.stage.started",
+                stage = "graph_augment",
+                candidate_count = candidates.len(),
+                result_limit
+            );
+            let candidates = self
+                .fuse_optional_graph_channel(&request, candidates, result_limit)
+                .await?;
+            tracing::info!(
+                event = "ram_a.memory.search.stage.completed",
+                stage = "graph_augment",
+                candidate_count = candidates.len(),
+                elapsed_ms = stage_started.elapsed().as_millis() as u64
+            );
+            candidates
+        } else {
+            candidates
+        };
 
         if self.retrieval_config.rerank.enabled {
-            self.rerank_candidates(query, candidates, request.top_k)
+            stage_started = Instant::now();
+            tracing::info!(
+                event = "ram_a.memory.search.stage.started",
+                stage = "rerank",
+                candidate_count = candidates.len(),
+                top_k = request.top_k,
+                model = self.retrieval_config.rerank.model
+            );
+            let results = self
+                .rerank_candidates(query, candidates, request.top_k)
                 .await
+                .inspect_err(|_error| {
+                    tracing::error!(
+                        event = "ram_a.memory.search.stage.failed",
+                        stage = "rerank",
+                        error_code = "RERANK_FAILED",
+                        retriable = true,
+                        elapsed_ms = stage_started.elapsed().as_millis() as u64
+                    );
+                })?;
+            tracing::info!(
+                event = "ram_a.memory.search.stage.completed",
+                stage = "rerank",
+                result_count = results.len(),
+                elapsed_ms = stage_started.elapsed().as_millis() as u64
+            );
+            Ok(results)
         } else {
             Ok(candidates)
         }
@@ -456,6 +577,13 @@ impl MemoryManager {
                 Ok(results)
             }
             Err(_error) if self.retrieval_config.rerank.fail_open => {
+                tracing::warn!(
+                    event = "ram_a.memory.search.degraded",
+                    stage = "rerank",
+                    error_code = "RERANK_FAILED",
+                    fallback = "hybrid",
+                    candidate_count = candidates.len()
+                );
                 candidates.truncate(top_k);
                 Ok(candidates)
             }

@@ -154,14 +154,29 @@ impl EmbeddingProvider for OpenRouterEmbedding {
                 Ok(embeddings) => return Ok(embeddings),
                 Err(error) if error.retryable && attempt < EMBEDDING_MAX_ATTEMPTS => {
                     let backoff = retry_backoff(attempt);
-                    eprintln!(
-                        "OpenRouter embedding attempt {attempt}/{EMBEDDING_MAX_ATTEMPTS} failed: {}; retrying in {}s",
-                        error.summary(),
-                        backoff.as_secs()
+                    tracing::warn!(
+                        event = "ram_a.provider.retry",
+                        provider_kind = "embedding",
+                        provider = "openai_compatible",
+                        model = self.model,
+                        operation = "embed",
+                        attempt,
+                        max_attempts = EMBEDDING_MAX_ATTEMPTS,
+                        backoff_ms = backoff.as_millis() as u64,
+                        error_kind = retry_error_kind(&error.message)
                     );
                     tokio::time::sleep(backoff).await;
                 }
                 Err(error) => {
+                    tracing::error!(
+                        event = "ram_a.provider.failed",
+                        provider_kind = "embedding",
+                        provider = "openai_compatible",
+                        model = self.model,
+                        operation = "embed",
+                        attempts = attempt,
+                        error_kind = retry_error_kind(&error.message)
+                    );
                     return Err(MemoryError::Embedding {
                         message: error.message,
                     });
@@ -187,10 +202,24 @@ impl EmbeddingAttemptError {
             message,
         }
     }
+}
 
-    fn summary(&self) -> String {
-        preview_body(&self.message)
+fn retry_error_kind(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    for (needle, kind) in [
+        ("http 429", "http_429"),
+        ("http 503", "http_503"),
+        ("http 502", "http_502"),
+        ("http 504", "http_504"),
+        ("timed out", "timeout"),
+        ("decode failed", "decode"),
+        ("failed to read", "read"),
+    ] {
+        if lower.contains(needle) {
+            return kind;
+        }
     }
+    "request"
 }
 
 #[derive(Debug, Deserialize)]

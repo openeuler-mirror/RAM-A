@@ -8,7 +8,7 @@ use memory_cases::{import_documents_from_dir, CaseServiceOptions};
 use memory_core::graph::{GraphTypeRegistry, LlmGraphExtractor, OpenAiCompatibleGraphLlmClient};
 use memory_core::{
     sqlite::GraphRepository, EmbeddingProvider, GraphBuildPipeline, HashEmbedding, MemoryManager,
-    OpenRouterEmbedding, RetrievalConfig, SqliteMemoryStore,
+    OpenRouterEmbedding, OpenRouterReranker, RerankProvider, SqliteMemoryStore,
 };
 use memory_mcp::{
     create_http_router, EmbeddingProviderKind, HttpRuntime, IdempotencyRepository, MemoryService,
@@ -18,6 +18,9 @@ use memory_pipeline::client::OpenAiCompatibleClient;
 use memory_pipeline::extraction::{LlmMemoryExtractor, MemoryExtractor};
 use memory_pipeline::grounding::{GroundingVerifier, LlmGroundingVerifier};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use uuid::Uuid;
 
 use memory_mcp::EmbeddedCaseSearchProvider;
 
@@ -30,6 +33,8 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    init_tracing()?;
+    let startup_run_id = Uuid::new_v4().to_string();
     let args = Args::parse();
     let config_path = resolve_config_path(args.config)?;
     let config = ServerConfig::load(&config_path)?;
@@ -53,6 +58,23 @@ async fn main() -> Result<()> {
         .providers
         .as_ref()
         .context("validated provider configuration is unavailable")?;
+    tracing::info!(
+        event = "ram_a.startup.configured",
+        startup_run_id = %startup_run_id,
+        memory_enabled = features.memory,
+        case_library_enabled = features.case_library,
+        graph_memory_enabled = config.features.graph_memory.enabled,
+        retrieval_mode = ?config.retrieval.mode,
+        embedding_weight = config.retrieval.embedding_weight,
+        bm25_weight = config.retrieval.bm25_weight,
+        candidate_k = ?config.retrieval.candidate_k,
+        embedding_provider = ?providers.embedding_provider,
+        embedding_model = providers.embedding_model,
+        embedding_dimensions = providers.embedding_dimensions,
+        rerank_enabled = config.retrieval.rerank.enabled,
+        rerank_provider = ?config.retrieval.rerank.provider,
+        rerank_model = config.retrieval.rerank.model
+    );
     let provider_key = resolve_secret_env(&providers.api_key_env)?;
     let embedder: Arc<dyn EmbeddingProvider> = match providers.embedding_provider {
         EmbeddingProviderKind::OpenAiCompatible => {
@@ -89,20 +111,46 @@ async fn main() -> Result<()> {
         model_client,
         &providers.verifier_model,
     ));
-    let mut retrieval_config = RetrievalConfig::default();
-    if features.memory && config.features.graph_memory.enabled {
-        retrieval_config.graph = config
+    let graph_retrieval = if features.memory && config.features.graph_memory.enabled {
+        config
             .graph_memory
             .as_ref()
             .context("enabled graph_memory feature requires graph_memory configuration")?
             .retrieval
-            .core_config();
-    }
-    let manager = Arc::new(MemoryManager::with_retrieval_config(
-        memory_store,
-        embedder.clone(),
-        retrieval_config,
-    ));
+            .core_config()
+    } else {
+        memory_core::GraphRetrievalConfig::default()
+    };
+    let retrieval_config = config.retrieval.core_config(graph_retrieval);
+    let manager = if retrieval_config.rerank.enabled {
+        let rerank_api_key = config
+            .retrieval
+            .rerank
+            .api_key_env
+            .as_deref()
+            .map(resolve_secret_env)
+            .transpose()?;
+        let reranker = match retrieval_config.rerank.provider {
+            RerankProvider::OpenRouter => {
+                Arc::new(OpenRouterReranker::from_config_with_optional_api_key(
+                    rerank_api_key,
+                    &retrieval_config.rerank,
+                ))
+            }
+        };
+        Arc::new(MemoryManager::with_retrieval_config_and_reranker(
+            memory_store,
+            embedder.clone(),
+            retrieval_config,
+            reranker,
+        ))
+    } else {
+        Arc::new(MemoryManager::with_retrieval_config(
+            memory_store,
+            embedder.clone(),
+            retrieval_config,
+        ))
+    };
     let mut service = MemoryService::new(manager, idempotency, extractor, verifier);
     if features.memory && config.features.graph_memory.enabled {
         let graph = config
@@ -183,13 +231,29 @@ async fn main() -> Result<()> {
                 .find(|library| library.name == case_library.default_library)
                 .map(|library| library.dataset_id.as_str())
                 .context("default case library mapping is unavailable")?;
-            let imported = import_documents_from_dir(&case_service, default_dataset_id, source_dir)
-                .await
-                .context("failed to import configured case library documents")?;
-            eprintln!(
-                "case library imported {imported} new documents from {}",
-                source_dir.display()
+            let ingestion_started = std::time::Instant::now();
+            tracing::info!(
+                event = "ram_a.case.ingestion.started",
+                startup_run_id = %startup_run_id,
+                dataset_id = default_dataset_id,
+                source_dir = %source_dir.display(),
+                provider = ?case_library.embedding_provider,
+                model = case_library.embedding_model,
+                dimensions = case_library.embedding_dimensions
             );
+            let ingestion_span = tracing::info_span!(
+                "ram_a.case.ingestion",
+                startup_run_id = %startup_run_id,
+                dataset_id = default_dataset_id
+            );
+            let imported = import_documents_from_dir(&case_service, default_dataset_id, source_dir)
+                .instrument(ingestion_span)
+                .await
+                .inspect_err(|_error| {
+                    tracing::error!(event = "ram_a.case.ingestion.failed", startup_run_id = %startup_run_id, dataset_id = default_dataset_id, error_kind = "import", retriable = true, latency_ms = ingestion_started.elapsed().as_millis() as u64);
+                })
+                .context("failed to import configured case library documents")?;
+            tracing::info!(event = "ram_a.case.ingestion.completed", startup_run_id = %startup_run_id, dataset_id = default_dataset_id, document_count = imported, latency_ms = ingestion_started.elapsed().as_millis() as u64);
         }
         let case_search = EmbeddedCaseSearchProvider::new(
             case_service,
@@ -204,10 +268,20 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(config.http.socket_address())
         .await
         .context("failed to bind HTTP listener")?;
+    tracing::info!(event = "ram_a.startup.listening", startup_run_id = %startup_run_id, bind_address = %config.http.socket_address());
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(cancellation_token))
         .await
         .context("HTTP server failed")
+}
+
+fn init_tracing() -> Result<()> {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().json())
+        .try_init()
+        .context("failed to initialize structured logging")
 }
 
 fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {

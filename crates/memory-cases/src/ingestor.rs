@@ -12,8 +12,12 @@ pub async fn run(service: Arc<RagService>, poll_ms: u64) -> Result<()> {
         match service.run_next_ingestion_task().await {
             Ok(true) => {}
             Ok(false) => sleep(poll_interval).await,
-            Err(error) => {
-                eprintln!("ingestion task failed: {error}");
+            Err(_error) => {
+                tracing::error!(
+                    event = "ram_a.case.ingestion.failed",
+                    error_kind = "task",
+                    retriable = true
+                );
                 sleep(poll_interval).await;
             }
         }

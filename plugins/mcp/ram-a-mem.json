@@ -68,6 +68,22 @@
     "timeout_seconds": 120,
     "max_retries": 3
   },
+  "retrieval": {
+    "mode": "hybrid",
+    "candidate_k": 100,
+    "embedding_weight": 0.7,
+    "bm25_weight": 0.3,
+    "rerank": {
+      "enabled": false,
+      "provider": "openrouter",
+      "model": "cohere/rerank-v3.5",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "base_url": "https://openrouter.ai/api/v1",
+      "input_k": 40,
+      "timeout_ms": 30000,
+      "fail_open": false
+    }
+  },
   "case_library": {
     "rag_store": "data/memory-cases.sqlite",
     "index_store": "data/memory-cases-index.sqlite",

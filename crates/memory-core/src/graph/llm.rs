@@ -14,7 +14,6 @@ use super::{
 
 const LLM_MAX_ATTEMPTS: usize = 5;
 const DEFAULT_LLM_TIMEOUT_SECS: u64 = 60;
-const ERROR_BODY_PREVIEW_MAX_CHARS: usize = 1000;
 const MAX_GRAPH_LLM_RESPONSE_BYTES: usize = 256 * 1024;
 
 pub const GRAPH_EXTRACTION_PROMPT_VERSION: &str = "graph-extraction-prompt-v6";
@@ -168,15 +167,30 @@ impl GraphLlmClient for OpenAiCompatibleGraphLlmClient {
                 Ok(response) => return Ok(response),
                 Err(error) if error.retryable && attempt < LLM_MAX_ATTEMPTS => {
                     let backoff = retry_backoff(attempt);
-                    eprintln!(
-                        "graph LLM attempt {attempt}/{LLM_MAX_ATTEMPTS} failed: {}; retrying in {}s",
-                        error.summary(),
-                        backoff.as_secs()
+                    tracing::warn!(
+                        event = "ram_a.provider.retry",
+                        provider_kind = "graph_llm",
+                        provider = "openai_compatible",
+                        model = self.model,
+                        operation = "extract_graph",
+                        attempt,
+                        max_attempts = LLM_MAX_ATTEMPTS,
+                        backoff_ms = backoff.as_millis() as u64,
+                        error_kind = graph_llm_error_kind(&error.message)
                     );
                     tokio::time::sleep(backoff).await;
                     last_error = Some(error.message);
                 }
                 Err(error) => {
+                    tracing::error!(
+                        event = "ram_a.provider.failed",
+                        provider_kind = "graph_llm",
+                        provider = "openai_compatible",
+                        model = self.model,
+                        operation = "extract_graph",
+                        attempts = attempt,
+                        error_kind = graph_llm_error_kind(&error.message)
+                    );
                     return Err(MemoryError::Extraction {
                         message: error.message,
                     });
@@ -188,6 +202,23 @@ impl GraphLlmClient for OpenAiCompatibleGraphLlmClient {
             message: last_error
                 .unwrap_or_else(|| "graph LLM request failed without an error".to_string()),
         })
+    }
+}
+
+fn graph_llm_error_kind(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("http 429") {
+        "http_429"
+    } else if lower.contains("http 503") {
+        "http_503"
+    } else if lower.contains("decode failed") || lower.contains("invalid json") {
+        "decode"
+    } else if lower.contains("failed to read") {
+        "read"
+    } else if lower.contains("timed out") {
+        "timeout"
+    } else {
+        "request"
     }
 }
 
@@ -851,10 +882,6 @@ impl LlmAttemptError {
             message,
         }
     }
-
-    fn summary(&self) -> String {
-        preview_body(&self.message)
-    }
 }
 
 fn strip_json_fence(text: &str) -> &str {
@@ -874,10 +901,6 @@ fn strip_json_fence(text: &str) -> &str {
         return trimmed;
     };
     body[..end].trim()
-}
-
-fn preview_body(body: &str) -> String {
-    body.chars().take(ERROR_BODY_PREVIEW_MAX_CHARS).collect()
 }
 
 fn pretty_json(value: &serde_json::Value) -> String {
