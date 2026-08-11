@@ -238,6 +238,63 @@ def test_compact_memory_format_records_version_and_simplifies_context():
         assert saved[0]["memory_format"] == "compact"
 
 
+def test_graph_fact_context_limit_is_explicit_for_full_and_compact_formats():
+    retrieved = [
+        {
+            "id": "q001_s0_t0",
+            "text": "I enjoy live music.",
+            "metadata": {
+                "session_date": "2023/05/15",
+                "role": "user",
+                "graph_facts": [
+                    {
+                        "fact_id": "fact-1",
+                        "predicate": "LIKES",
+                        "fact_text": "The user likes jazz.",
+                    }
+                ],
+            },
+            "score": 0.9,
+        }
+    ]
+
+    control = format_memories(retrieved, max_graph_context_facts=0)
+    full = format_memories(retrieved, max_graph_context_facts=3)
+    compact = format_memories(
+        retrieved,
+        memory_format="compact",
+        max_graph_context_facts=3,
+    )
+
+    expected = "Matched graph facts:\n- [LIKES] The user likes jazz."
+    assert expected not in control
+    assert expected in full
+    assert expected in compact
+
+
+def test_graph_fact_context_limit_is_global_across_retrieved_memories():
+    retrieved = [
+        {
+            "id": f"memory-{index}",
+            "text": f"Memory {index}.",
+            "metadata": {
+                "graph_facts": [
+                    {
+                        "fact_id": f"fact-{index}",
+                        "predicate": "RELATED_TO",
+                        "fact_text": f"Graph fact {index}.",
+                    }
+                ]
+            },
+        }
+        for index in range(5)
+    ]
+
+    rendered = format_memories(retrieved, max_graph_context_facts=3)
+
+    assert rendered.count("\n- [RELATED_TO]") == 3
+
+
 def test_compute_qa_metrics_by_type():
     metrics = compute_qa_metrics(
         [
@@ -365,6 +422,7 @@ def test_load_and_evaluate_resume_complete_results_without_api_key():
                     "correct": True,
                     "generated_answer": "45 minutes",
                     "judge_response": "yes",
+                    "max_graph_context_facts": 3,
                     "answerer": {"latency_ms": 1, "total_tokens": 10, "prompt_tokens": 8},
                     "judge": {"latency_ms": 2, "total_tokens": 3},
                 },
@@ -374,11 +432,25 @@ def test_load_and_evaluate_resume_complete_results_without_api_key():
                     "correct": False,
                     "generated_answer": "Not enough information.",
                     "judge_response": "no",
+                    "max_graph_context_facts": 3,
                     "answerer": {"latency_ms": 1, "total_tokens": 10, "prompt_tokens": 8},
                     "judge": {"latency_ms": 2, "total_tokens": 3},
                 },
             ],
             open(results_path, "w", encoding="utf-8"),
+        )
+
+        # Create results with the current prompt hash before checking that a
+        # complete run can resume without an API key.
+        evaluate_qa(
+            search_results=_search_results(),
+            prepared=_prepared(),
+            output_results_path=results_path,
+            output_metrics_path=metrics_path,
+            answerer_client=FakeClient(["45 minutes", "Not enough information."]),
+            judge_client=FakeClient(["yes", "no"]),
+            answerer_model="answerer",
+            judge_model="judge",
         )
 
         old_key = os.environ.pop("OPENROUTER_API_KEY", None)

@@ -104,6 +104,17 @@ def print_scores(category_scores, overall_scores):
     print(f"latency_p95_seconds{'':<13} {format_optional(overall_scores['latency_p95_seconds'])}")
 
 
+def print_summary(overall_scores):
+    print(
+        "LoCoMo metrics summary: "
+        f"llm_score={overall_scores['llm_score']:.4f} "
+        f"f1_score={overall_scores['f1_score']:.4f} "
+        f"bleu_score={overall_scores['bleu_score']:.4f} "
+        f"scored={overall_scores['count']} "
+        f"skipped={overall_scores['skipped_count']}"
+    )
+
+
 def build_report(input_file, category_scores, overall_scores, items):
     return {
         "dataset": "locomo",
@@ -325,11 +336,18 @@ def main():
     )
     parser.add_argument("--output-json", type=Path, help="Optional path to save aggregate metrics JSON.")
     parser.add_argument("--html-report", type=Path, help="Optional path to save aggregate metrics HTML.")
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress the detailed score table; output artifacts are still reported.",
+    )
     args = parser.parse_args()
 
     items = load_items(args.input)
     category_scores, overall_scores = aggregate_scores(items)
-    print_scores(category_scores, overall_scores)
+    print_summary(overall_scores)
+    if not args.quiet:
+        print_scores(category_scores, overall_scores)
     report = build_report(args.input, category_scores, overall_scores, items)
     if args.output_json:
         write_json_report(args.output_json, report)

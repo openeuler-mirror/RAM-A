@@ -100,6 +100,16 @@ python3 evaluation/longmemeval/run.py [options]
 | `--context-before-messages` | 2 | Previous messages included as context |
 | `--context-after-messages` | 0 | Following messages included as context |
 | `--extractor-responses` / `--grounding-responses` | *(none)* | Paired response maps for fully offline extraction |
+| **Graph memory** | | |
+| `--graph-build` | false | Build graph memory during add |
+| `--graph-build-concurrency` | 1 | Maximum concurrent graph builds; raise gradually within provider limits |
+| `--graph` | false | Enable graph retrieval during search |
+| `--graph-weight` | 0.2 | Graph retrieval fusion weight |
+| `--graph-fail-open` | false | Fall back to non-graph retrieval if graph search fails |
+| `--graph-memory-space-mode` | `auto` | Memory-space derivation mode |
+| `--graph-llm-api-key-env` | `OPENROUTER_API_KEY` | Env var for graph extraction API key |
+| `--graph-llm-model` | `openai/gpt-4o-mini` | Graph extraction model |
+| `--graph-llm-base-url` | `https://openrouter.ai/api/v1` | OpenAI-compatible graph extraction base URL |
 | **QA stage** | | |
 | `--answerer-model` | `openai/gpt-4o-mini` | Answer generation model |
 | `--judge-model` | `openai/gpt-4o-mini` | LLM-as-judge model |
@@ -108,6 +118,7 @@ python3 evaluation/longmemeval/run.py [options]
 | `--qa-top-k` | 10 | Memories used for QA |
 | `--answer-prompt-version` | `lme_default` | Prompt template version |
 | `--memory-format` | `full` | `full` or `compact` |
+| `--max-graph-context-facts` | 3 | Maximum graph facts appended across one answer context (0 = disabled) |
 | `--show-scores` | false | Include retrieval scores in prompt |
 | `--qa-output-tag` | *(auto)* | Override QA filename tag |
 | `--llm-thinking` | `default` | `default`/`enabled`/`disabled` |
@@ -139,6 +150,12 @@ python3 evaluation/longmemeval/run.py --phase pilot --pipeline-phase all \
   --judge-model openai/gpt-4o-mini \
   --llm-api-key-env OPENROUTER_API_KEY \
   --llm-base-url https://openrouter.ai/api/v1
+
+# Graph memory retrieval
+python3 evaluation/longmemeval/run.py \
+  --graph-build \
+  --graph \
+  --graph-llm-model openai/gpt-4o-mini
 ```
 
 A governed `--phase full` run additionally requires both `--frozen-config` and
@@ -173,6 +190,9 @@ python3 evaluation/longmemeval/run.py --memory-mode extracted --resume
 python3 evaluation/longmemeval/run.py --resume \
   --run-dir outputs/longmemeval/<your-run-dir>
 ```
+
+Resume still invokes `memory-bench add --resume`: existing memories are skipped and
+incomplete graph records are rebuilt before search resumes.
 
 Automatic resume discovery is scoped to `--memory-mode`; a raw arm never
 selects an extracted run, and vice versa.

@@ -18,6 +18,12 @@ EVALUATION_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(EVALUATION_ROOT))
 
 from common.json_cache import JsonCache
+from common.graph_context import (
+    DEFAULT_MAX_GRAPH_CONTEXT_FACTS,
+    GraphFactContextRenderer,
+    enrich_text_with_graph_facts,
+    format_graph_fact_validity,
+)
 from locomo.locomo_provenance import query_ref, render_contexts
 
 load_dotenv(".env")
@@ -151,16 +157,29 @@ class ResponseClient:
 
 
 class MemoryBenchResponses:
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        max_graph_context_facts=DEFAULT_MAX_GRAPH_CONTEXT_FACTS,
+    ):
         self.responder = ResponseClient()
+        self.max_graph_context_facts = max_graph_context_facts
 
     @staticmethod
-    def retrieve_context(dataset, sample_index, conversation, results):
+    def retrieve_context(
+        dataset,
+        sample_index,
+        conversation,
+        results,
+        *,
+        include_retrieval_order=False,
+    ):
         speaker_a = conversation["speaker_a"]
         speaker_b = conversation["speaker_b"]
         contexts = {speaker_a: [], speaker_b: []}
+        ordered_contexts = []
         for result in results:
-            path = (result.get("metadata") or {}).get("path", "")
+            path = result_raw_path(result)
             match = RESULT_PATH_RE.match(path)
             if not match:
                 continue
@@ -174,17 +193,20 @@ class MemoryBenchResponses:
             except (IndexError, KeyError, TypeError):
                 continue
             memory_text = result.get("text", message.get("text", ""))
-            contexts.get(message.get("speaker"), contexts[speaker_a]).append(
-                {
-                    "memory": f"{message.get('speaker', 'Unknown')}: {memory_text}",
-                    "timestamp": timestamp,
-                    "score": round(float(result.get("score", 0.0)), 2),
-                }
-            )
+            memory = {
+                "memory": f"{message.get('speaker', 'Unknown')}: {memory_text}",
+                "timestamp": timestamp,
+                "score": round(float(result.get("score", 0.0)), 2),
+                "graph_facts": result_graph_facts(result),
+            }
+            contexts.get(message.get("speaker"), contexts[speaker_a]).append(memory)
+            ordered_contexts.append(memory)
+        if include_retrieval_order:
+            return contexts, ordered_contexts
         return contexts
 
     def answer_question(self, dataset, query_output):
-        match = QUERY_PATH_RE.match(query_output.get("query_path", ""))
+        match = QUERY_PATH_RE.match(query_raw_path(query_output))
         if not match:
             raise ValueError(f"Unsupported memory-bench query path: {query_output.get('query_path')!r}")
         sample_index, question_index = (int(value) for value in match.groups())
@@ -192,7 +214,13 @@ class MemoryBenchResponses:
         conversation = dataset[sample_index]["conversation"]
         speaker_a = conversation["speaker_a"]
         speaker_b = conversation["speaker_b"]
-        contexts = self.retrieve_context(dataset, sample_index, conversation, query_output.get("results", []))
+        contexts, ordered_contexts = self.retrieve_context(
+            dataset,
+            sample_index,
+            conversation,
+            query_output.get("results", []),
+            include_retrieval_order=True,
+        )
 
         response = ""
         response_time = 0.0
@@ -201,11 +229,17 @@ class MemoryBenchResponses:
         # LOCOMO QA score. It needs a separate abstention rubric before we ask
         # the answer model to handle it.
         if int(question_item.get("category", -1)) != 5:
+            formatted_contexts = format_context_groups(
+                contexts,
+                (speaker_a, speaker_b),
+                self.max_graph_context_facts,
+                ordered_contexts=ordered_contexts,
+            )
             response, response_time, token_usage = self.responder.answer(
                 speaker_a,
                 speaker_b,
-                [f"{m['timestamp']}: {m['memory']}" for m in contexts[speaker_a]],
-                [f"{m['timestamp']}: {m['memory']}" for m in contexts[speaker_b]],
+                formatted_contexts[speaker_a],
+                formatted_contexts[speaker_b],
                 question_item.get("question", ""),
             )
 
@@ -247,12 +281,19 @@ class MemoryBenchResponses:
 class PreparedMemoryResponses:
     """Answer LoCoMo queries from prepared raw or extracted memory results."""
 
-    def __init__(self, mode, responder=None, cache=None):
+    def __init__(
+        self,
+        mode,
+        responder=None,
+        cache=None,
+        max_graph_context_facts=DEFAULT_MAX_GRAPH_CONTEXT_FACTS,
+    ):
         if mode not in {"raw", "extracted"}:
             raise ValueError(f"unsupported memory mode: {mode}")
         self.mode = mode
         self.responder = responder or ResponseClient()
         self.cache = cache
+        self.max_graph_context_facts = max_graph_context_facts
 
     def answer_question(self, dataset, prepared_source, query_output):
         ref = query_ref(query_output)
@@ -272,11 +313,17 @@ class PreparedMemoryResponses:
         token_usage = {}
 
         if int(question.get("category", -1)) != 5:
+            formatted_contexts = format_context_groups(
+                contexts,
+                (speaker_a, speaker_b),
+                self.max_graph_context_facts,
+            )
             cache_key = [
                 "locomo_answer_v1",
                 self.mode,
                 query_id,
-                contexts,
+                formatted_contexts,
+                self.max_graph_context_facts,
                 question.get("question", ""),
                 self.responder.model,
                 0.0,
@@ -294,14 +341,8 @@ class PreparedMemoryResponses:
                 response, response_time, token_usage = self.responder.answer(
                     speaker_a,
                     speaker_b,
-                    [
-                        f"{memory['timestamp']}: {memory['memory']}"
-                        for memory in contexts[speaker_a]
-                    ],
-                    [
-                        f"{memory['timestamp']}: {memory['memory']}"
-                        for memory in contexts[speaker_b]
-                    ],
+                    formatted_contexts[speaker_a],
+                    formatted_contexts[speaker_b],
                     question.get("question", ""),
                 )
                 if self.cache is not None:
@@ -379,6 +420,104 @@ def _answer_record(
     return answer
 
 
+def query_raw_path(query_output):
+    metadata = query_output.get("metadata") or {}
+    return str(metadata.get("raw_query_path") or query_output.get("query_path", ""))
+
+
+def result_raw_path(result):
+    metadata = result.get("metadata") or {}
+    return str(metadata.get("raw_memory_path") or metadata.get("path", ""))
+
+
+def result_graph_facts(result):
+    metadata = result.get("metadata") or {}
+    raw_facts = metadata.get("graph_facts") or []
+    if not isinstance(raw_facts, list):
+        return []
+
+    graph_facts = []
+    seen = set()
+    for raw_fact in raw_facts:
+        if not isinstance(raw_fact, dict):
+            continue
+        fact_text = raw_fact.get("fact_text")
+        if not isinstance(fact_text, str) or not fact_text.strip():
+            continue
+        fact_id = raw_fact.get("fact_id")
+        dedup_key = fact_id if isinstance(fact_id, str) and fact_id else fact_text.strip()
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+        graph_facts.append(
+            {
+                "fact_id": fact_id,
+                "fact_text": fact_text.strip(),
+                "predicate": raw_fact.get("predicate"),
+                "score": raw_fact.get("score"),
+                "subject": raw_fact.get("subject"),
+                "object": raw_fact.get("object"),
+                "valid_from_ms": raw_fact.get("valid_from_ms"),
+                "valid_to_ms": raw_fact.get("valid_to_ms"),
+                "recorded_at_ms": raw_fact.get("recorded_at_ms"),
+            }
+        )
+    return graph_facts
+
+
+def format_context_memory(
+    memory,
+    max_graph_context_facts=DEFAULT_MAX_GRAPH_CONTEXT_FACTS,
+    *,
+    graph_renderer=None,
+):
+    formatted = f"{memory['timestamp']}: {memory['memory']}"
+    if graph_renderer is not None:
+        return graph_renderer.enrich(
+            formatted,
+            {"graph_facts": memory.get("graph_facts")},
+        )
+    return enrich_text_with_graph_facts(
+        formatted,
+        {"graph_facts": memory.get("graph_facts")},
+        max_facts=max_graph_context_facts,
+    )
+
+
+def format_context_groups(
+    contexts,
+    speakers,
+    max_graph_context_facts,
+    *,
+    ordered_contexts=None,
+):
+    """Render grouped LoCoMo memories in original retrieval-rank order."""
+    graph_renderer = GraphFactContextRenderer(max_facts=max_graph_context_facts)
+    if ordered_contexts is None:
+        ordered = []
+        sequence = 0
+        for speaker in speakers:
+            for memory in contexts[speaker]:
+                rank = memory.get("rank")
+                if isinstance(rank, int):
+                    order = (0, rank, sequence)
+                else:
+                    order = (1, -float(memory.get("score", 0.0)), sequence)
+                ordered.append((*order, memory))
+                sequence += 1
+        ordered_contexts = [memory for _, _, _, memory in sorted(ordered)]
+    rendered_by_identity = {}
+    for memory in ordered_contexts:
+        rendered_by_identity[id(memory)] = format_context_memory(
+            memory,
+            graph_renderer=graph_renderer,
+        )
+    return {
+        speaker: [rendered_by_identity[id(memory)] for memory in contexts[speaker]]
+        for speaker in speakers
+    }
+
+
 class Mem0Responses:
     def __init__(self):
         self.responder = ResponseClient()
@@ -440,7 +579,15 @@ def main():
         required=True,
         help="Path to save response records for locomo_eval.py.",
     )
+    parser.add_argument(
+        "--max-graph-context-facts",
+        type=int,
+        default=DEFAULT_MAX_GRAPH_CONTEXT_FACTS,
+        help="Maximum graph facts appended across one answer context; 0 disables rendering.",
+    )
     args = parser.parse_args()
+    if args.max_graph_context_facts < 0:
+        parser.error("--max-graph-context-facts must be at least 0")
 
     if args.technique_type in {"memory_bench", "prepared_memory"} and args.dataset is None:
         parser.error(f"--dataset is required when --technique-type {args.technique_type}")
@@ -469,9 +616,12 @@ def main():
         answers = PreparedMemoryResponses(
             args.memory_mode,
             cache=cache,
+            max_graph_context_facts=args.max_graph_context_facts,
         ).generate(dataset, prepared_source, search_results)
     elif args.technique_type == "memory_bench":
-        answers = MemoryBenchResponses().generate(args.dataset, search_results)
+        answers = MemoryBenchResponses(
+            max_graph_context_facts=args.max_graph_context_facts,
+        ).generate(args.dataset, search_results)
     else:
         raise ValueError(f"Invalid technique type: {args.technique_type}")
     args.output.parent.mkdir(parents=True, exist_ok=True)

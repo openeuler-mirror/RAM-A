@@ -5,7 +5,71 @@ use serde_json::{json, Map, Value};
 use crate::canonical::{canonical_json, stable_hash};
 use crate::episode::parse_time;
 use crate::error::{PipelineError, Result};
-use crate::models::{AtomicMemory, EvidenceRef};
+use crate::models::{AtomicMemory, EvidenceRef, NormalizedMessage};
+
+pub fn attach_source_observations(
+    memories: &mut [AtomicMemory],
+    messages: &HashMap<String, NormalizedMessage>,
+) {
+    for memory in memories {
+        let mut evidence_indexes = HashMap::new();
+        let mut evidence_groups: Vec<(String, Vec<EvidenceRef>)> = Vec::new();
+        for evidence in &memory.evidence {
+            let index = *evidence_indexes
+                .entry(evidence.message_id.clone())
+                .or_insert_with(|| {
+                    evidence_groups.push((evidence.message_id.clone(), Vec::new()));
+                    evidence_groups.len() - 1
+                });
+            evidence_groups[index].1.push(evidence.clone());
+        }
+        let mut source_observations = Vec::new();
+        for (message_id, evidence_refs) in evidence_groups {
+            let Some(message) = messages.get(&message_id) else {
+                continue;
+            };
+            let mut source_observation = observation_with_evidence(memory, &evidence_refs);
+            if !message.timestamp.is_empty() {
+                source_observation.insert("observed_at".into(), json!(message.timestamp));
+            }
+            if let Some(speaker) = source_speaker(memory, Some(message)) {
+                source_observation.insert("speaker".into(), json!(speaker));
+            }
+            if !message.session_id.is_empty() {
+                source_observation.insert("session_id".into(), json!(message.session_id));
+            }
+            if let Some(turn_index) = message.turn_index {
+                source_observation.insert("turn_index".into(), json!(turn_index));
+            }
+            source_observations.push(source_observation);
+        }
+        if source_observations.is_empty() {
+            let mut source_observation = observation(memory);
+            if let Some(speaker) = source_speaker(memory, None) {
+                source_observation.insert("speaker".into(), json!(speaker));
+            }
+            source_observations.push(source_observation);
+        }
+        extend_observations(&mut memory.observation_refs, &source_observations);
+    }
+}
+
+fn source_speaker<'a>(
+    memory: &'a AtomicMemory,
+    message: Option<&'a NormalizedMessage>,
+) -> Option<&'a str> {
+    message
+        .map(|message| message.speaker.trim())
+        .filter(|speaker| !speaker.is_empty())
+        .or_else(|| {
+            memory
+                .subject
+                .get("source_speaker")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|speaker| !speaker.is_empty())
+        })
+}
 
 pub fn aggregate_exact_memories(memories: &[AtomicMemory]) -> Vec<AtomicMemory> {
     let mut output: Vec<AtomicMemory> = Vec::new();
@@ -35,13 +99,18 @@ pub fn aggregate_exact_memories(memories: &[AtomicMemory]) -> Vec<AtomicMemory> 
             "mem-{}",
             stable_hash(&[json!(memory.scope_id), memory.canonical_content()])
         );
-        memory.observed_at = memory
+        let latest_observation = memory
             .observation_refs
             .iter()
-            .filter_map(|value| value.get("observed_at").and_then(Value::as_str))
-            .max_by(|left, right| compare_observed_at(left, right))
-            .unwrap_or("")
-            .to_owned();
+            .max_by(|left, right| {
+                compare_observed_at(observation_time(left), observation_time(right))
+            })
+            .cloned();
+        if let Some(observation) = latest_observation {
+            memory.observed_at = observation_time(&observation).to_owned();
+            memory.source_episode_id = observation_text(&observation, "source_episode_id");
+            memory.source_window_id = observation_text(&observation, "source_window_id");
+        }
     }
     output
 }
@@ -55,6 +124,21 @@ fn compare_observed_at(left: &str, right: &str) -> std::cmp::Ordering {
         (None, Some(_)) => std::cmp::Ordering::Less,
         (None, None) => left.cmp(right),
     }
+}
+
+fn observation_time(observation: &Map<String, Value>) -> &str {
+    observation
+        .get("observed_at")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
+fn observation_text(observation: &Map<String, Value>, key: &str) -> String {
+    observation
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 pub fn make_prepared_output(
@@ -77,13 +161,20 @@ pub fn make_prepared_output(
 }
 
 fn observation(memory: &AtomicMemory) -> Map<String, Value> {
+    observation_with_evidence(memory, &memory.evidence)
+}
+
+fn observation_with_evidence(
+    memory: &AtomicMemory,
+    evidence: &[EvidenceRef],
+) -> Map<String, Value> {
     Map::from_iter([
         ("source_episode_id".into(), json!(memory.source_episode_id)),
         ("source_window_id".into(), json!(memory.source_window_id)),
         ("observed_at".into(), json!(memory.observed_at)),
         (
             "evidence_refs".into(),
-            serde_json::to_value(&memory.evidence).expect("serializable evidence"),
+            serde_json::to_value(evidence).expect("serializable evidence"),
         ),
     ])
 }
@@ -157,6 +248,23 @@ fn memory_record(memory: &AtomicMemory) -> Value {
     ]);
     if let Some(confidence) = &memory.model_confidence {
         metadata.insert("model_confidence".into(), confidence.clone());
+    }
+    if let Some(observation) = memory
+        .observation_refs
+        .iter()
+        .max_by(|left, right| compare_observed_at(observation_time(left), observation_time(right)))
+    {
+        for key in ["speaker", "session_id", "turn_index"] {
+            if let Some(value) = observation.get(key) {
+                metadata.insert(key.into(), value.clone());
+            }
+        }
+    }
+    if let Some(observed_at) = parse_time(&memory.observed_at) {
+        let timestamp_ms = observed_at.timestamp_millis();
+        if timestamp_ms >= 0 {
+            metadata.insert("observed_at_ms".into(), json!(timestamp_ms as u64));
+        }
     }
     json!({"id": memory.id, "text": memory.text, "metadata": metadata})
 }

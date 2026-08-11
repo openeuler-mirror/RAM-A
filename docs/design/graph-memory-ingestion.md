@@ -27,7 +27,7 @@ feature reference：只描述已经接入的行为、状态流转和错误语义
 | `owner_id` | 记忆空间拥有者；已有空间的 owner 不匹配时拒绝写入。 |
 | `idempotency_key` | 调用方提供的幂等键，避免重复提交同一条原文。 |
 | `text` | 原始记忆文本；保存时保留原文，只用 `trim()` 判断是否为空。 |
-| `metadata` | 调用方附带的结构化信息，原样序列化保存。 |
+| `metadata` | 调用方附带的结构化信息，原样序列化保存。可选 `graph_source_entity = {name, entity_type}` 用于声明原文作者/来源实体；它会形成 provenance link，不会生成 fact。 |
 | `session_id` / `session_sequence` | 可选的 session 内顺序信息。 |
 | `source_kind` / `source_ref` | 来源类型和来源引用。 |
 | `content_role` | 文本角色，例如 user、assistant 或 system 派生内容。 |
@@ -124,6 +124,11 @@ journal_mode = WAL
 ```
 
 `:memory:` 数据库不会启用 WAL，避免内存数据库测试环境产生不兼容行为。
+
+当前默认图类型注册版本为 `graph-type-registry-v2`，并要求来源实体
+`graph_source_entity` 才能建立 provenance link。由旧版本构建、没有来源实体链路的图数据库
+不能直接视为等价的 v2 图；部署新版本前应重建 graph store，或执行经过验证的回填迁移，不能
+在检索时静默退回未约束的图检索。
 
 ## 7. 测试覆盖
 

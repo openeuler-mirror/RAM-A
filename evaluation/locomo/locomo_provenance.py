@@ -111,6 +111,7 @@ def render_contexts(
                     "memory_id": str(result.get("id") or ""),
                     "evidence_id": evidence_id,
                     "quote": str(evidence_ref.get("quote") or ""),
+                    "graph_facts": (result.get("metadata") or {}).get("graph_facts"),
                 }
             )
     return contexts

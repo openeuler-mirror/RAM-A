@@ -315,6 +315,13 @@ def test_fixture_mode_requires_paired_response_maps(tmp_path):
         personalmem_run.validate_experiment_args(args)
 
 
+def test_graph_build_concurrency_must_be_positive():
+    args = _parse("pipeline", "--graph-build-concurrency", "0")
+
+    with pytest.raises(ValueError, match="graph-build-concurrency"):
+        personalmem_run.validate_experiment_args(args)
+
+
 def test_full_mode_requires_frozen_config_and_promotion_policy():
     args = _parse("pipeline", "--phase", "full")
 
@@ -344,6 +351,25 @@ def test_raw_and_extracted_arms_share_immutable_settings():
     assert raw_manifest == extracted_manifest
     assert raw_manifest["promotion_policy_hash"] == "b" * 64
     assert raw_manifest["implementation_hash"] == "a" * 64
+
+
+def test_graph_context_limit_is_not_part_of_retrieval_manifest():
+    control = _parse("pipeline", "--max-graph-context-facts", "0")
+    treatment = _parse("pipeline", "--max-graph-context-facts", "3")
+
+    control_manifest = personalmem_run.immutable_experiment_manifest(
+        control,
+        "a" * 64,
+        "b" * 64,
+    )
+    treatment_manifest = personalmem_run.immutable_experiment_manifest(
+        treatment,
+        "a" * 64,
+        "b" * 64,
+    )
+
+    assert control_manifest == treatment_manifest
+    assert "max_graph_context_facts" not in control_manifest
 
 
 def test_answer_retry_settings_are_part_of_immutable_manifest():
@@ -809,3 +835,403 @@ def test_raw_run_meta_records_raw_dataset_as_indexed_dataset(tmp_path):
 
     assert meta["source_path"] == str(raw_dataset)
     assert meta["indexed_dataset"] == str(raw_dataset)
+
+
+def test_parser_accepts_graph_flags():
+    parser = personalmem_run.build_parser()
+
+    args = parser.parse_args([
+        "search",
+        "--dataset",
+        "data.json",
+        "--graph",
+        "--graph-build",
+        "--graph-build-concurrency",
+        "4",
+        "--graph-weight",
+        "0.4",
+        "--graph-rerank",
+        "--graph-allow-graph-only",
+        "--graph-max-graph-only-results",
+        "6",
+        "--graph-fail-open",
+        "--graph-memory-space-mode",
+        "metadata-field",
+        "--graph-memory-space-field",
+        "tenant_id",
+        "--graph-owner-id",
+        "bench-owner",
+        "--graph-llm-api-key-env",
+        "GRAPH_KEY",
+        "--graph-llm-model",
+        "openai/gpt-4o-mini",
+        "--graph-llm-base-url",
+        "https://openrouter.ai/api/v1",
+        "--graph-llm-timeout-ms",
+        "60000",
+    ])
+
+    assert args.graph is True
+    assert args.graph_build is True
+    assert args.graph_build_concurrency == 4
+    assert args.graph_weight == 0.4
+    assert args.graph_rerank is True
+    assert args.graph_allow_graph_only is True
+    assert args.graph_max_graph_only_results == 6
+    assert args.graph_fail_open is True
+    assert args.graph_memory_space_mode == "metadata-field"
+    assert args.graph_memory_space_field == "tenant_id"
+    assert args.graph_owner_id == "bench-owner"
+    assert args.graph_llm_api_key_env == "GRAPH_KEY"
+    assert args.graph_llm_model == "openai/gpt-4o-mini"
+    assert args.graph_llm_base_url == "https://openrouter.ai/api/v1"
+    assert args.graph_llm_timeout_ms == 60000
+
+
+def test_parser_exposes_default_off_rerank_settings():
+    args = _parse("search", "--dataset", "data.json")
+
+    assert args.rerank is False
+    assert args.rerank_provider == "openrouter"
+    assert args.rerank_model == "cohere/rerank-v3.5"
+    assert args.rerank_api_key_env == "OPENROUTER_API_KEY"
+    assert args.rerank_base_url == "https://openrouter.ai/api/v1"
+    assert args.rerank_input_k == 40
+    assert args.rerank_timeout_ms is None
+    assert args.rerank_fail_open is False
+    personalmem_run.apply_default_paths(args)
+    assert personalmem_run.bench_search_command(args) == personalmem_run.bench_base_command(args)
+    assert "--rerank" not in personalmem_run.bench_search_command(args)
+
+
+@pytest.mark.parametrize("search_mode", ["dense", "bm25"])
+def test_validate_rejects_rerank_outside_hybrid_search(search_mode):
+    args = _parse("search", "--rerank", "--search-mode", search_mode)
+
+    with pytest.raises(ValueError, match="--rerank requires --search-mode hybrid"):
+        personalmem_run.validate_experiment_args(args)
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "message"),
+    [
+        (("--rerank-provider", "unsupported"), "--rerank-provider must be openrouter"),
+        (("--rerank-input-k", "-1"), "--rerank-input-k must be non-negative"),
+        (("--rerank-timeout-ms", "0"), "--rerank-timeout-ms must be greater than 0"),
+    ],
+)
+def test_validate_rejects_invalid_enabled_rerank_settings(extra_args, message):
+    args = _parse("search", "--rerank", *extra_args)
+
+    with pytest.raises(ValueError, match=message):
+        personalmem_run.validate_experiment_args(args)
+
+
+def test_validate_accepts_zero_rerank_input_k():
+    args = _parse("search", "--rerank", "--rerank-input-k", "0")
+
+    personalmem_run.validate_experiment_args(args)
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "message"),
+    [
+        (("--graph-rerank",), "--graph-rerank requires --graph"),
+        (
+            ("--graph", "--graph-allow-graph-only"),
+            "--graph-allow-graph-only requires --graph-rerank",
+        ),
+        (
+            ("--graph", "--graph-rerank", "--graph-max-graph-only-results", "4"),
+            "--graph-max-graph-only-results requires --graph-allow-graph-only",
+        ),
+        (
+            (
+                "--graph",
+                "--graph-rerank",
+                "--graph-allow-graph-only",
+                "--graph-max-graph-only-results",
+                "-1",
+            ),
+            "--graph-max-graph-only-results must be non-negative",
+        ),
+    ],
+)
+def test_validate_rejects_inert_graph_search_settings(extra_args, message):
+    args = _parse("search", *extra_args)
+
+    with pytest.raises(ValueError, match=message):
+        personalmem_run.validate_experiment_args(args)
+
+
+def test_bench_search_command_includes_enabled_rerank_before_search(tmp_path):
+    args = _parse(
+        "search",
+        "--dataset",
+        str(tmp_path / "data.json"),
+        "--rerank",
+        "--rerank-provider",
+        "openrouter",
+        "--rerank-model",
+        "cohere/rerank-v3.5",
+        "--rerank-api-key-env",
+        "RERANK_KEY",
+        "--rerank-base-url",
+        "https://rerank.example/v1",
+        "--rerank-input-k",
+        "64",
+        "--rerank-timeout-ms",
+        "12000",
+        "--rerank-fail-open",
+    )
+    personalmem_run.apply_default_paths(args)
+
+    command = personalmem_run.bench_search_command(args) + ["search"]
+
+    assert command.count("--rerank") == 1
+    assert command[command.index("--rerank-provider") + 1] == "openrouter"
+    assert command[command.index("--rerank-model") + 1] == "cohere/rerank-v3.5"
+    assert command[command.index("--rerank-api-key-env") + 1] == "RERANK_KEY"
+    assert command[command.index("--rerank-base-url") + 1] == "https://rerank.example/v1"
+    assert command[command.index("--rerank-input-k") + 1] == "64"
+    assert command[command.index("--rerank-timeout-ms") + 1] == "12000"
+    assert "--rerank-fail-open" in command
+    assert command.index("--rerank") < command.index("search")
+
+
+def test_scoped_search_passes_rerank_before_search_and_keeps_context_filter(
+    monkeypatch,
+    tmp_path,
+):
+    args = _parse(
+        "search",
+        "--dataset",
+        str(tmp_path / "prepared.json"),
+        "--output",
+        str(tmp_path / "search_results.json"),
+        "--rerank",
+    )
+    personalmem_run.apply_default_paths(args)
+    dataset = {
+        "schema_version": "benchmark-prepared-v1",
+        "questions": [
+            {
+                "question_id": "question-1",
+                "shared_context_id": "context-a",
+                "question": "What does the user prefer?",
+            },
+            {
+                "question_id": "question-2",
+                "shared_context_id": "context-b",
+                "question": "What does the user avoid?",
+            },
+        ],
+    }
+    commands = []
+
+    def fake_run(command, cwd, *, quiet=False):
+        commands.append(command)
+        output_path = Path(command[command.index("--output") + 1])
+        output_path.write_text(
+            json.dumps([{"query": "", "results": []}]),
+            encoding="utf-8",
+        )
+        return 0
+
+    monkeypatch.setattr(personalmem_run, "run_command", fake_run)
+
+    assert personalmem_run.run_personamem_scoped_search(args, dataset) == 0
+    assert len(commands) == 2
+    for command, shared_context_id in zip(commands, ("context-a", "context-b")):
+        assert "--rerank" in command
+        assert command.index("--rerank") < command.index("search")
+        filter_value = command[command.index("--filter") + 1]
+        assert json.loads(filter_value) == {"shared_context_id": shared_context_id}
+
+
+def test_rerank_settings_are_frozen_and_written_to_run_meta(tmp_path):
+    args = _parse(
+        "search",
+        "--dataset",
+        str(tmp_path / "data.json"),
+        "--run-dir",
+        str(tmp_path / "run"),
+        "--rerank",
+        "--rerank-model",
+        "cohere/rerank-v3.5",
+        "--rerank-input-k",
+        "64",
+    )
+    personalmem_run.apply_default_paths(args)
+    manifest = personalmem_run.immutable_experiment_manifest(
+        args,
+        "a" * 64,
+        "b" * 64,
+    )
+    meta = write_personamem_run_meta(args, phase="retrieval")
+
+    for settings in (manifest, meta):
+        assert settings["rerank"] is True
+        assert settings["rerank_provider"] == "openrouter"
+        assert settings["rerank_model"] == "cohere/rerank-v3.5"
+        assert settings["rerank_api_key_env"] == "OPENROUTER_API_KEY"
+        assert settings["rerank_base_url"] == "https://openrouter.ai/api/v1"
+        assert settings["rerank_input_k"] == 64
+        assert settings["rerank_fail_open"] is False
+    assert manifest["rerank_timeout_ms"] is None
+    assert "rerank_timeout_ms" not in meta
+
+
+def test_bench_search_command_includes_graph_search_flags(tmp_path):
+    parser = personalmem_run.build_parser()
+    args = parser.parse_args([
+        "search",
+        "--dataset",
+        str(tmp_path / "data.json"),
+        "--graph",
+        "--graph-weight",
+        "0.4",
+        "--graph-rerank",
+        "--graph-allow-graph-only",
+        "--graph-max-graph-only-results",
+        "6",
+        "--graph-fail-open",
+        "--graph-memory-space-mode",
+        "metadata-field",
+        "--graph-memory-space-field",
+        "tenant_id",
+    ])
+    personalmem_run.apply_default_paths(args)
+
+    command = personalmem_run.bench_search_command(args)
+
+    assert "--graph" in command
+    assert "--graph-fail-open" in command
+    assert "--graph-rerank" in command
+    assert "--graph-allow-graph-only" in command
+    assert command[command.index("--graph-max-graph-only-results") + 1] == "6"
+    assert "--graph-weight" in command
+    assert "0.4" in command
+    assert "--graph-memory-space-mode" in command
+    assert "metadata-field" in command
+    assert "--graph-memory-space-field" in command
+    assert "tenant_id" in command
+
+
+def test_retrieved_contexts_apply_explicit_graph_fact_limit():
+    results = [
+        {
+            "id": "memory-1",
+            "text": "I enjoy live music.",
+            "score": 0.9,
+            "metadata": {
+                "graph_facts": [
+                    {
+                        "fact_id": "fact-1",
+                        "predicate": "LIKES",
+                        "fact_text": "The user likes jazz.",
+                    }
+                ]
+            },
+        }
+    ]
+
+    control = personalmem_run.build_retrieved_contexts(
+        results,
+        max_graph_context_facts=0,
+    )
+    treatment = personalmem_run.build_retrieved_contexts(
+        results,
+        max_graph_context_facts=3,
+    )
+
+    assert control[0]["text"] == "I enjoy live music."
+    assert treatment[0]["text"] == (
+        "I enjoy live music.\nMatched graph facts:\n- [LIKES] The user likes jazz."
+    )
+
+
+def test_retrieved_contexts_share_one_graph_fact_budget():
+    results = [
+        {
+            "id": f"memory-{index}",
+            "text": f"Memory {index}.",
+            "metadata": {
+                "graph_facts": [
+                    {"fact_id": f"fact-{index}", "fact_text": f"Fact {index}."}
+                ]
+            },
+        }
+        for index in range(5)
+    ]
+
+    contexts = personalmem_run.build_retrieved_contexts(
+        results,
+        max_graph_context_facts=3,
+    )
+
+    assert sum(context["text"].count("\n- ") for context in contexts) == 3
+
+
+def test_answer_resume_rejects_a_different_graph_fact_limit():
+    response = {
+        "response": "A",
+        "predicted_answer": "A",
+        "max_graph_context_facts": 0,
+    }
+
+    assert personalmem_run.should_skip_existing_response(
+        response,
+        max_graph_context_facts=0,
+    )
+    assert not personalmem_run.should_skip_existing_response(
+        response,
+        max_graph_context_facts=3,
+    )
+
+
+def test_run_add_passes_graph_build_concurrency(monkeypatch, tmp_path):
+    parser = personalmem_run.build_parser()
+    args = parser.parse_args([
+        "add",
+        "--dataset",
+        str(tmp_path / "data.json"),
+        "--graph-build",
+        "--graph-build-concurrency",
+        "4",
+        "--resume",
+    ])
+    personalmem_run.apply_default_paths(args)
+    captured = {}
+
+    def fake_run(command, cwd, *, quiet=False):
+        captured["command"] = command
+        return 0
+
+    monkeypatch.setattr(personalmem_run, "run_command", fake_run)
+
+    assert personalmem_run.run_add(args) == 0
+    command = captured["command"]
+    assert command[command.index("--graph-build-concurrency") + 1] == "4"
+    assert command.index("--graph-build-concurrency") < command.index("add")
+    assert "--resume" in command[command.index("add"):]
+
+
+def test_run_add_omits_enabled_rerank(monkeypatch, tmp_path):
+    args = _parse(
+        "add",
+        "--dataset",
+        str(tmp_path / "data.json"),
+        "--rerank",
+    )
+    personalmem_run.apply_default_paths(args)
+    captured = {}
+
+    def fake_run(command, cwd, *, quiet=False):
+        captured["command"] = command
+        return 0
+
+    monkeypatch.setattr(personalmem_run, "run_command", fake_run)
+
+    assert personalmem_run.run_add(args) == 0
+    assert "--rerank" not in captured["command"]

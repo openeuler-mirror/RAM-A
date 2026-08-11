@@ -68,6 +68,10 @@ pub fn initialize_schema(connection: &Connection) -> MemoryResult<()> {
         CREATE INDEX IF NOT EXISTS idx_graph_entities_space_name
         ON graph_entities(memory_space_id, normalized_name, status);
 
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_entities_active_identity
+        ON graph_entities(memory_space_id, entity_type, normalized_name)
+        WHERE status = 'active' AND deleted_at_ms IS NULL;
+
         CREATE VIRTUAL TABLE IF NOT EXISTS graph_entity_fts
         USING fts5(id UNINDEXED, memory_space_id UNINDEXED, canonical_name);
 
@@ -87,6 +91,31 @@ pub fn initialize_schema(connection: &Connection) -> MemoryResult<()> {
 
         CREATE VIRTUAL TABLE IF NOT EXISTS graph_entity_alias_fts
         USING fts5(id UNINDEXED, memory_space_id UNINDEXED, display_alias);
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_entity_aliases_active_identity
+        ON graph_entity_aliases(memory_space_id, entity_id, normalized_alias)
+        WHERE deleted_at_ms IS NULL;
+
+        CREATE TABLE IF NOT EXISTS graph_record_entity_links (
+            id TEXT NOT NULL,
+            memory_space_id TEXT NOT NULL,
+            memory_record_id TEXT NOT NULL,
+            entity_id TEXT NOT NULL,
+            link_kind TEXT NOT NULL,
+            extraction_run_id TEXT,
+            created_at_ms INTEGER NOT NULL,
+            PRIMARY KEY (id),
+            UNIQUE (memory_space_id, memory_record_id, entity_id, link_kind),
+            FOREIGN KEY (memory_record_id, memory_space_id)
+                REFERENCES graph_memory_records(id, memory_space_id),
+            FOREIGN KEY (entity_id, memory_space_id)
+                REFERENCES graph_entities(id, memory_space_id),
+            FOREIGN KEY (extraction_run_id)
+                REFERENCES graph_extraction_runs(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_graph_record_entity_links_entity
+        ON graph_record_entity_links(memory_space_id, entity_id, memory_record_id);
 
         CREATE TABLE IF NOT EXISTS graph_facts (
             id TEXT NOT NULL,
@@ -119,6 +148,10 @@ pub fn initialize_schema(connection: &Connection) -> MemoryResult<()> {
 
         CREATE INDEX IF NOT EXISTS idx_graph_facts_object_status
         ON graph_facts(memory_space_id, object_entity_id, status);
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_facts_active_dedup
+        ON graph_facts(memory_space_id, dedup_key)
+        WHERE status = 'active' AND retired_at_ms IS NULL AND dedup_key IS NOT NULL;
 
         CREATE VIRTUAL TABLE IF NOT EXISTS graph_fact_fts
         USING fts5(id UNINDEXED, memory_space_id UNINDEXED, fact_text);
@@ -162,6 +195,14 @@ fn initialize_evidence_and_run_schema(connection: &Connection) -> MemoryResult<(
             FOREIGN KEY (memory_record_id, memory_space_id)
                 REFERENCES graph_memory_records(id, memory_space_id)
         );
+
+        CREATE INDEX IF NOT EXISTS idx_graph_fact_evidence_groups_fact
+        ON graph_fact_evidence_groups(memory_space_id, fact_id)
+        WHERE deleted_at_ms IS NULL;
+
+        CREATE INDEX IF NOT EXISTS idx_graph_fact_evidence_group
+        ON graph_fact_evidence(memory_space_id, evidence_group_id)
+        WHERE deleted_at_ms IS NULL;
 
         CREATE TABLE IF NOT EXISTS graph_fact_links (
             id TEXT NOT NULL,
@@ -252,6 +293,7 @@ fn initialize_evidence_and_run_schema(connection: &Connection) -> MemoryResult<(
             error_message TEXT,
             created_at_ms INTEGER NOT NULL,
             completed_at_ms INTEGER,
+            UNIQUE (memory_space_id, ingestion_run_id, attempt_number),
             FOREIGN KEY (ingestion_run_id, memory_space_id)
                 REFERENCES graph_ingestion_runs(id, memory_space_id)
         );

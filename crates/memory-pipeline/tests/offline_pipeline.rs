@@ -98,6 +98,15 @@ async fn static_pipeline_writes_prepared_output_and_audit_bundle() {
         run.prepared["memories"][0]["metadata"]["memory_kind"],
         "extracted_memory"
     );
+    assert_eq!(run.prepared["memories"][0]["metadata"]["speaker"], "Alice");
+    assert_eq!(run.prepared["memories"][0]["metadata"]["session_id"], "s1");
+    assert!(run.prepared["memories"][0]["metadata"]
+        .get("turn_index")
+        .is_none());
+    assert_eq!(
+        run.prepared["memories"][0]["metadata"]["observed_at_ms"],
+        1_784_023_200_000i64
+    );
     assert!(run.prepared["memories"][0]["id"]
         .as_str()
         .unwrap()

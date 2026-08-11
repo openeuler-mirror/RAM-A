@@ -85,12 +85,24 @@ cd evaluation
 # 下载 data/locomo/locomo10.json 后运行完整 LoCoMo
 DATASET=../data/locomo/locomo10.json ./run_locomo_eval.sh memory_bench
 
+# 图记忆模式：add 阶段构图，search 阶段开启 graph retrieval。
+# 需要 OPENROUTER_API_KEY 用于嵌入和图候选抽取。
+MEMORY_BENCH_GRAPH=1 \
+GRAPH_LLM_MODEL=openai/gpt-4o-mini \
+DATASET=../data/locomo/locomo10.json \
+./run_locomo_eval.sh memory_bench
+
 # mem0 后端
 ./run_locomo_eval.sh mem0
 ```
 
 Shell 脚本自动运行完整 7 阶段流水线。
 输出写入仓库根目录 `outputs/locomo/<RUN_ID>/<backend>/`。
+RAM-A 后端会先把原始 LoCoMo 文件转换为统一的 `benchmark-prepared-v1`
+格式，写到 `outputs/locomo/<RUN_ID>/ram-a/prepared.json`。prepared memory
+会在 metadata 中保留 `raw_memory_path`、`session_timestamp`、`observed_at_ms`
+等 LoCoMo 字段，让图抽取可以拿到观察时间，同时避免在 `memory-bench` 主逻辑中加入
+LoCoMo 专门解析。
 
 可选的 mem0 对比实现位于 `evaluation/locomo/backends/mem0/`。
 
@@ -167,6 +179,38 @@ normalized message、episode、window、accepted/rejected/quarantined memory 和
 raw，包含恰好 1,540 个计分问题，满足全部 category 下限，并通过完整 Python、Rust、
 shell 和离线 smoke 回归。如果任一检查失败，接入代码必须保持未提交，通过
 `comparison.html` 和 pipeline artifact 诊断，也不能把该结果登记为新 baseline。
+
+图记忆相关环境变量：
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `MEMORY_BENCH_GRAPH` | `0` | 设为 `1` 后给 RAM-A add/search 传入 graph 参数 |
+| `GRAPH_WEIGHT` | `0.2` | graph retrieval 融合权重 |
+| `GRAPH_RERANK` | `0` | 设为 `1` 后使用加权倒数排名融合 |
+| `GRAPH_ALLOW_GRAPH_ONLY` | `0` | 设为 `1` 后允许加入 graph-only 证据记录 |
+| `GRAPH_MAX_GRAPH_ONLY_RESULTS` | *（top-k 的 20%）* | 最终结果中 graph-only 记录数量上限 |
+| `GRAPH_FAIL_OPEN` | `0` | 设为 `1` 后 graph search 失败时退化为非 graph 检索 |
+| `GRAPH_MEMORY_SPACE_MODE` | `auto` | `memory-bench` 推导 memory space 的方式 |
+| `GRAPH_MEMORY_SPACE_FIELD` | `scope_id` | `metadata-field` 模式使用的 metadata/filter 字段 |
+| `GRAPH_OWNER_ID` | `benchmark` | graph memory owner id |
+| `GRAPH_LLM_API_KEY_ENV` | `OPENROUTER_API_KEY` | 图候选抽取 API key 所在环境变量 |
+| `GRAPH_LLM_MODEL` | `openai/gpt-4o-mini` | 图候选抽取模型 |
+| `GRAPH_LLM_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible 图候选抽取 base URL |
+| `GRAPH_LLM_TIMEOUT_MS` | `60000` | 图候选抽取超时 |
+| `GRAPH_BUILD_CONCURRENCY` | `1` | 同时构图的最大记录数；需根据 provider 限流逐步提高 |
+| `MAX_GRAPH_CONTEXT_FACTS` | `3` | 每个问题的答案上下文最多附加的图事实总数；设为 `0` 可运行不注入图事实的控制组 |
+
+当 `MEMORY_BENCH_GRAPH=1` 时，shell wrapper 会给 `memory-bench add` 传入
+`--graph-build`，给 `memory-bench search` 传入 `--graph`。`GRAPH_LLM_MODEL`
+会映射为 `memory-bench` 的 `--graph-llm-model`。
+`MAX_GRAPH_CONTEXT_FACTS` 只控制答案上下文渲染，不改变构图、检索候选或排序。
+治理入口 `locomo_run.py` 读取同一组 `MEMORY_BENCH_GRAPH` 和 `GRAPH_*` 变量，并生成相同的
+add/search 参数。需要冻结配置、支持断点续跑的全量 A/B 实验应使用治理入口；shell wrapper
+继续作为已有评测任务的兼容启动方式。
+默认 `auto` memory-space 模式下，prepared LoCoMo 记录会使用 `path:$[0]`
+这类 `scope_id`。恢复 graph build 时，已 completed 的 graph run 会跳过，缺失的
+graph run 会补构，failed/running 的 graph run 会明确报错，避免半构图 benchmark
+静默成功。
 
 ## 流水线阶段
 

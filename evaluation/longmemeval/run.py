@@ -31,6 +31,7 @@ from common.memory_ab import (  # noqa: E402
     validate_memory_ab_preflight,
 )
 from common.memory_ab_stage import run_stage  # noqa: E402
+from common.runner import validate_graph_search_config, validate_rerank_config  # noqa: E402
 from common.rust_memory_pipeline import (  # noqa: E402
     MemoryPipelineCommandConfig,
     build_memory_pipeline_command,
@@ -70,6 +71,7 @@ def build_qa_tag(args) -> str:
     parts.append(args.answer_prompt_version)
     if args.memory_format != "full":
         parts.append(args.memory_format)
+    parts.append(f"gf{args.max_graph_context_facts}")
     parts.append(f"k{args.qa_top_k}")
     return "_".join(parts)
 
@@ -130,6 +132,115 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         default=64,
         help="Number of texts per embedding batch for add/search (default: 64)",
+    )
+    parser.add_argument(
+        "--graph",
+        action="store_true",
+        help="Enable graph retrieval channel for memory-bench search",
+    )
+    parser.add_argument(
+        "--graph-build",
+        action="store_true",
+        help="Build graph memory during memory-bench add",
+    )
+    parser.add_argument(
+        "--graph-build-concurrency",
+        type=int,
+        default=1,
+        help="Maximum concurrent graph-build records (default: 1)",
+    )
+    parser.add_argument(
+        "--graph-weight",
+        type=float,
+        default=0.2,
+        help="Graph retrieval fusion weight for memory-bench search (default: 0.2)",
+    )
+    parser.add_argument("--graph-rerank", action="store_true")
+    parser.add_argument("--graph-allow-graph-only", action="store_true")
+    parser.add_argument("--graph-max-graph-only-results", type=int)
+    parser.add_argument(
+        "--graph-fail-open",
+        action="store_true",
+        help="Fall back to non-graph search if graph retrieval fails",
+    )
+    parser.add_argument(
+        "--graph-memory-space-mode",
+        choices=["auto", "metadata-field", "path-prefix"],
+        default="auto",
+        help="How memory-bench derives graph memory_space_id (default: auto)",
+    )
+    parser.add_argument(
+        "--graph-memory-space-field",
+        default="scope_id",
+        help="Metadata/filter field used as graph memory space in metadata-field mode",
+    )
+    parser.add_argument(
+        "--graph-owner-id",
+        default="benchmark",
+        help="Graph memory owner_id for memory-bench graph build",
+    )
+    parser.add_argument(
+        "--graph-llm-api-key-env",
+        default="OPENROUTER_API_KEY",
+        help="Environment variable holding the graph extraction LLM API key",
+    )
+    parser.add_argument(
+        "--graph-llm-model",
+        default="openai/gpt-4o-mini",
+        help="OpenAI-compatible chat model used for graph extraction",
+    )
+    parser.add_argument(
+        "--graph-llm-base-url",
+        default="https://openrouter.ai/api/v1",
+        help="OpenAI-compatible graph extraction base URL",
+    )
+    parser.add_argument(
+        "--graph-llm-timeout-ms",
+        type=int,
+        default=None,
+        help="Optional graph extraction LLM timeout in milliseconds",
+    )
+    parser.add_argument(
+        "--rerank",
+        action="store_true",
+        help="Enable the reranker for final retrieval ordering",
+    )
+    parser.add_argument(
+        "--rerank-provider",
+        default="openrouter",
+        help="Reranker provider (default: openrouter)",
+    )
+    parser.add_argument(
+        "--rerank-model",
+        default="cohere/rerank-v3.5",
+        help="Reranker model (default: cohere/rerank-v3.5)",
+    )
+    parser.add_argument(
+        "--rerank-api-key-env",
+        default="OPENROUTER_API_KEY",
+        help="Environment variable holding the reranker API key",
+    )
+    parser.add_argument(
+        "--rerank-base-url",
+        default="https://openrouter.ai/api/v1",
+        help="OpenAI-compatible reranker base URL",
+    )
+    parser.add_argument(
+        "--rerank-input-k",
+        type=int,
+        default=40,
+        help="Candidate count passed to the reranker (default: 40)",
+    )
+    parser.add_argument(
+        "--rerank-timeout-ms",
+        type=int,
+        default=None,
+        help="Optional reranker timeout in milliseconds",
+    )
+    parser.add_argument(
+        "--rerank-fail-open",
+        action="store_true",
+        help="Keep the pre-rerank ordering when reranking fails",
     )
     parser.add_argument(
         "--resume",
@@ -232,6 +343,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Retrieved memory rendering format for QA (default: full)",
     )
     parser.add_argument(
+        "--max-graph-context-facts",
+        type=int,
+        default=3,
+        help="Maximum graph facts appended across one answer context; 0 disables rendering.",
+    )
+    parser.add_argument(
         "--show-scores",
         action="store_true",
         help="Include retrieval scores in the answerer prompt (default: hidden)",
@@ -300,10 +417,26 @@ def build_run_paths(args: argparse.Namespace) -> RunPaths:
 
 
 def validate_experiment_args(args: argparse.Namespace) -> None:
+    if args.graph_build_concurrency < 1:
+        raise ValueError("--graph-build-concurrency must be at least 1")
+    if args.max_graph_context_facts < 0:
+        raise ValueError("--max-graph-context-facts must be at least 0")
     if args.phase == "full" and args.frozen_config is None:
         raise ValueError("--frozen-config is required for full runs")
     if args.phase == "full" and args.promotion_policy is None:
         raise ValueError("--promotion-policy is required for full runs")
+    validate_rerank_config(
+        enabled=args.rerank,
+        provider=args.rerank_provider,
+        input_k=args.rerank_input_k,
+        timeout_ms=args.rerank_timeout_ms,
+    )
+    validate_graph_search_config(
+        graph=args.graph,
+        rerank=args.graph_rerank,
+        allow_graph_only=args.graph_allow_graph_only,
+        max_graph_only_results=args.graph_max_graph_only_results,
+    )
     fixtures = (args.extractor_responses, args.grounding_responses)
     if any(value is not None for value in fixtures) and not all(
         value is not None for value in fixtures
@@ -370,6 +503,29 @@ def immutable_experiment_manifest(
         "embedding_dimensions": args.dimensions,
         "embedding_batch_size": args.embedding_batch_size,
         "retrieval_top_k": max(args.retrieval_top_k, args.qa_top_k),
+        "graph": args.graph,
+        "graph_build": args.graph_build,
+        "graph_build_concurrency": args.graph_build_concurrency,
+        "graph_weight": args.graph_weight,
+        "graph_rerank": args.graph_rerank,
+        "graph_allow_graph_only": args.graph_allow_graph_only,
+        "graph_max_graph_only_results": args.graph_max_graph_only_results,
+        "graph_fail_open": args.graph_fail_open,
+        "graph_memory_space_mode": args.graph_memory_space_mode,
+        "graph_memory_space_field": args.graph_memory_space_field,
+        "graph_owner_id": args.graph_owner_id,
+        "graph_llm_api_key_env": args.graph_llm_api_key_env,
+        "graph_llm_model": args.graph_llm_model,
+        "graph_llm_base_url": args.graph_llm_base_url,
+        "graph_llm_timeout_ms": args.graph_llm_timeout_ms,
+        "rerank": args.rerank,
+        "rerank_provider": args.rerank_provider,
+        "rerank_model": args.rerank_model,
+        "rerank_api_key_env": args.rerank_api_key_env,
+        "rerank_base_url": args.rerank_base_url,
+        "rerank_input_k": args.rerank_input_k,
+        "rerank_timeout_ms": args.rerank_timeout_ms,
+        "rerank_fail_open": args.rerank_fail_open,
         "answerer_model": args.answerer_model,
         "judge_model": args.judge_model,
         "llm_base_url": args.llm_base_url,
@@ -487,6 +643,7 @@ def _validate_qa_meta(
         "answer_prompt_version",
         "memory_format",
         "show_scores",
+        "max_graph_context_facts",
     ]
     for field in _CONFIG_FIELDS:
         current = getattr(args, field, None)
@@ -663,14 +820,35 @@ def main() -> None:
             api_key_env=args.api_key_env,
             batch_size=args.embedding_batch_size,
             top_k=retrieval_top_k,
+            graph=args.graph,
+            graph_build=args.graph_build,
+            graph_build_concurrency=args.graph_build_concurrency,
+            resume=args.resume,
+            graph_weight=args.graph_weight,
+            graph_rerank=args.graph_rerank,
+            graph_allow_graph_only=args.graph_allow_graph_only,
+            graph_max_graph_only_results=args.graph_max_graph_only_results,
+            graph_fail_open=args.graph_fail_open,
+            graph_memory_space_mode=args.graph_memory_space_mode,
+            graph_memory_space_field=args.graph_memory_space_field,
+            graph_owner_id=args.graph_owner_id,
+            graph_llm_api_key_env=args.graph_llm_api_key_env,
+            graph_llm_model=args.graph_llm_model,
+            graph_llm_base_url=args.graph_llm_base_url,
+            graph_llm_timeout_ms=args.graph_llm_timeout_ms,
+            rerank=args.rerank,
+            rerank_provider=args.rerank_provider,
+            rerank_model=args.rerank_model,
+            rerank_api_key_env=args.rerank_api_key_env,
+            rerank_base_url=args.rerank_base_url,
+            rerank_input_k=args.rerank_input_k,
+            rerank_timeout_ms=args.rerank_timeout_ms,
+            rerank_fail_open=args.rerank_fail_open,
         ))
 
         # --- Step 2: Add memories to store ---
-        if args.resume and backend.persists_local_store and store_path.exists():
-            print("[run] Skipping add (store exists)")
-        else:
-            print("[run] Running add...")
-            backend.add(indexed_prepared_path)
+        print("[run] Running add...")
+        backend.add(indexed_prepared_path)
 
         # --- Step 3: Search ---
         if args.resume and os.path.isfile(search_results_path):
@@ -769,6 +947,7 @@ def main() -> None:
             answer_prompt_version=args.answer_prompt_version,
             memory_format=args.memory_format,
             show_scores=args.show_scores,
+            max_graph_context_facts=args.max_graph_context_facts,
         )
 
         # Write QA-specific meta with artifact hashes
@@ -782,6 +961,7 @@ def main() -> None:
             "answer_prompt_version": args.answer_prompt_version,
             "memory_format": args.memory_format,
             "show_scores": args.show_scores,
+            "max_graph_context_facts": args.max_graph_context_facts,
             "prepared_sha256": file_sha256(indexed_prepared_path),
             "search_results_sha256": file_sha256(search_results_path),
             "qa_tag": qa_tag,
@@ -810,6 +990,29 @@ def main() -> None:
         "dimensions": args.dimensions,
         "embedding_type": args.embedding,
         "embedding_batch_size": args.embedding_batch_size,
+        "rerank": args.rerank,
+        "rerank_provider": args.rerank_provider,
+        "rerank_model": args.rerank_model,
+        "rerank_api_key_env": args.rerank_api_key_env,
+        "rerank_base_url": args.rerank_base_url,
+        "rerank_input_k": args.rerank_input_k,
+        "rerank_timeout_ms": args.rerank_timeout_ms,
+        "rerank_fail_open": args.rerank_fail_open,
+        "graph": args.graph,
+        "graph_build": args.graph_build,
+        "graph_build_concurrency": args.graph_build_concurrency,
+        "graph_weight": args.graph_weight,
+        "graph_rerank": args.graph_rerank,
+        "graph_allow_graph_only": args.graph_allow_graph_only,
+        "graph_max_graph_only_results": args.graph_max_graph_only_results,
+        "graph_fail_open": args.graph_fail_open,
+        "graph_memory_space_mode": args.graph_memory_space_mode,
+        "graph_memory_space_field": args.graph_memory_space_field,
+        "graph_owner_id": args.graph_owner_id,
+        "graph_llm_api_key_env": args.graph_llm_api_key_env,
+        "graph_llm_model": args.graph_llm_model,
+        "graph_llm_base_url": args.graph_llm_base_url,
+        "graph_llm_timeout_ms": args.graph_llm_timeout_ms,
         "retrieval_top_k": retrieval_top_k,
         "timestamp": timestamp,
         "max_questions": args.max_questions,
@@ -846,6 +1049,11 @@ def main() -> None:
             if args.pipeline_phase in ("qa", "all")
             else None
         ),
+        "max_graph_context_facts": (
+            args.max_graph_context_facts
+            if args.pipeline_phase in ("qa", "all")
+            else None
+        ),
     }
     with open(run_meta_path, "w", encoding="utf-8") as f:
         json.dump(run_meta, f, indent=2)
@@ -874,7 +1082,17 @@ def main() -> None:
         error_report_href="errors.html" if qa_metrics is not None else None,
     )
 
-    print(f"[run] Done!")
+    if metrics is not None:
+        session_overall = metrics.get("session", {}).get("overall", {})
+        turn_overall = metrics.get("turn", {}).get("overall", {})
+        print(
+            "LongMemEval retrieval summary: "
+            f"session_recall@10={session_overall.get('recall@10', 'n/a')} "
+            f"turn_recall@10={turn_overall.get('recall@10', 'n/a')} "
+            f"turn_mrr={turn_overall.get('mrr', 'n/a')}"
+        )
+
+    print(f"[done] LongMemEval pipeline")
     print(f"[run] Report:   {report_path}")
     if qa_metrics is not None:
         print(f"[run] Errors:   {error_report_path}")

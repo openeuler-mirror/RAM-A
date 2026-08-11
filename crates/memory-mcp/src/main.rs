@@ -5,8 +5,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use memory_cases::config::EmbeddingProviderKind as CaseEmbeddingProviderKind;
 use memory_cases::{import_documents_from_dir, CaseServiceOptions};
+use memory_core::graph::{GraphTypeRegistry, LlmGraphExtractor, OpenAiCompatibleGraphLlmClient};
 use memory_core::{
-    EmbeddingProvider, HashEmbedding, MemoryManager, OpenRouterEmbedding, SqliteMemoryStore,
+    sqlite::GraphRepository, EmbeddingProvider, GraphBuildPipeline, HashEmbedding, MemoryManager,
+    OpenRouterEmbedding, RetrievalConfig, SqliteMemoryStore,
 };
 use memory_mcp::{
     create_http_router, EmbeddingProviderKind, HttpRuntime, IdempotencyRepository, MemoryService,
@@ -87,8 +89,46 @@ async fn main() -> Result<()> {
         model_client,
         &providers.verifier_model,
     ));
-    let manager = Arc::new(MemoryManager::new(memory_store, embedder));
-    let service = MemoryService::new(manager, idempotency, extractor, verifier);
+    let mut retrieval_config = RetrievalConfig::default();
+    if features.memory && config.features.graph_memory.enabled {
+        retrieval_config.graph = config
+            .graph_memory
+            .as_ref()
+            .context("enabled graph_memory feature requires graph_memory configuration")?
+            .retrieval
+            .core_config();
+    }
+    let manager = Arc::new(MemoryManager::with_retrieval_config(
+        memory_store,
+        embedder.clone(),
+        retrieval_config,
+    ));
+    let mut service = MemoryService::new(manager, idempotency, extractor, verifier);
+    if features.memory && config.features.graph_memory.enabled {
+        let graph = config
+            .graph_memory
+            .as_ref()
+            .context("enabled graph_memory feature requires graph_memory configuration")?;
+        let graph_key = resolve_secret_env(&graph.llm_api_key_env)?;
+        let registry = GraphTypeRegistry::new_default();
+        let graph_client = OpenAiCompatibleGraphLlmClient::with_base_url(
+            graph_key,
+            graph.llm_base_url.clone(),
+            graph.llm_model.clone(),
+        )
+        .with_timeout_ms(Some(graph.llm_timeout_ms));
+        let graph_extractor = Arc::new(LlmGraphExtractor::new(
+            Arc::new(graph_client),
+            registry.clone(),
+        ));
+        let graph_pipeline = Arc::new(GraphBuildPipeline::new(
+            GraphRepository::open(&database_path),
+            embedder,
+            graph_extractor,
+            registry,
+        ));
+        service = service.with_graph_memory(graph_pipeline, graph.build_concurrency);
+    }
     let cancellation_token = CancellationToken::new();
     let runtime = HttpRuntime::with_cancellation_token(
         service,

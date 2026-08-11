@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use unicode_normalization::UnicodeNormalization;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GraphInputHashFields {
@@ -34,4 +35,33 @@ pub fn stable_input_hash(input: &GraphInputHashFields) -> String {
     let canonical = serde_json::to_string(&value)
         .expect("graph input hash fields must serialize to canonical JSON");
     uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, canonical.as_bytes()).to_string()
+}
+
+pub(crate) fn normalize_graph_text(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .nfc()
+        .collect::<String>()
+        .to_lowercase()
+        .nfc()
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_graph_text;
+
+    #[test]
+    fn normalize_graph_text_treats_canonically_equivalent_unicode_as_same_text() {
+        assert_eq!(
+            normalize_graph_text("café"),
+            normalize_graph_text("cafe\u{301}")
+        );
+        assert_eq!(
+            normalize_graph_text("München"),
+            normalize_graph_text("Mu\u{308}nchen")
+        );
+    }
 }

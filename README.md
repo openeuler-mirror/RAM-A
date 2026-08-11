@@ -86,6 +86,7 @@ pub struct SearchMemoryRequest {
     pub query: String,
     pub top_k: usize,
     pub filter: Option<serde_json::Value>,
+    pub graph_memory_space_id: Option<String>,
 }
 ```
 
@@ -161,6 +162,49 @@ cargo run -p memory-bench -- `
   --output outputs/bge_m3_top10.json
 ```
 
+Graph memory benchmark mode is opt-in. `--graph-build` builds the graph during `add`;
+`--graph` enables the graph retrieval channel during `search`. Graph extraction uses an
+OpenAI-compatible chat-completions endpoint; by default it reads the same
+`OPENROUTER_API_KEY` environment variable and uses OpenRouter.
+
+```powershell
+$env:OPENROUTER_API_KEY="your_openrouter_key"
+
+cargo run -p memory-bench -- `
+  --store data/locomo_graph.sqlite `
+  --embedding openrouter `
+  --model baai/bge-m3 `
+  --dimensions 1024 `
+  --graph-build `
+  --graph-llm-model openai/gpt-4o-mini `
+  add `
+  --dataset data/locomo/locomo10.json `
+  --text-fields text,content,message,memory
+
+cargo run -p memory-bench -- `
+  --store data/locomo_graph.sqlite `
+  --embedding openrouter `
+  --model baai/bge-m3 `
+  --dimensions 1024 `
+  --graph `
+  --graph-weight 0.2 `
+  search `
+  --dataset data/locomo/locomo10.json `
+  --query-fields question,query `
+  --top-k 10 `
+  --output outputs/locomo_graph_top10.json
+```
+
+In graph `auto` memory-space mode, prepared-schema datasets use `scope_id`, while raw
+top-level-array datasets use the top-level JSON path such as `path:$[0]`. Keep graph and
+baseline runs in separate SQLite files when comparing scores.
+
+For ad-hoc graph search with `--query`, pass the memory space through `--filter`, for example
+`--filter '{"scope_id":"scope-a"}'`; otherwise no graph memory space can be inferred from the
+single query path. With `--resume --graph-build`, existing MemoryRecords are still checked for
+graph build: completed graph runs are skipped, missing graph runs are built, and failed/running
+graph runs fail explicitly instead of being treated as successful.
+
 Do not commit API keys, local stores, downloaded datasets, or generated reports.
 
 ## RAM-A memory MCP service
@@ -217,6 +261,9 @@ field changes listed below.
     },
     "case_library": {
       "enabled": true
+    },
+    "graph_memory": {
+      "enabled": false
     }
   },
   "http": {
@@ -266,6 +313,22 @@ field changes listed below.
         "tenant_ids": ["tenant-local"]
       }
     ]
+  },
+  "graph_memory": {
+    "llm_api_key_env": "GRAPH_LLM_API_KEY",
+    "llm_base_url": "http://127.0.0.1:8000/v1",
+    "llm_model": "GLM-5.2",
+    "llm_timeout_ms": 60000,
+    "build_concurrency": 1,
+    "retrieval": {
+      "weight": 0.2,
+      "rerank_with_graph": false,
+      "allow_graph_only": false,
+      "max_graph_only_results": null,
+      "seed_limit": null,
+      "max_evidence_records_per_fact": null,
+      "fail_open": false
+    }
   }
 }
 ```
@@ -279,6 +342,9 @@ Change these fields before deployment:
   (`memory_search`, `memory_ingest`).
 - `features.case_library.enabled`: expose or hide the operational case-library tool
   (`memory_case_search`). If this is `true`, `case_library` must also be configured.
+- `features.graph_memory.enabled`: augment `memory_ingest` and `memory_search` with graph
+  construction and retrieval. Keep this `false` unless the top-level `graph_memory` settings
+  and `GRAPH_LLM_API_KEY` are configured.
 - `allowed_hosts`: host and port used by clients to reach RAM-A.
 - `storage.database_path`: RAM-A personal long-term memory SQLite path.
 - `providers.api_key_env`, `providers.base_url`, `extractor_model`, `verifier_model`:
@@ -312,6 +378,8 @@ Start RAM-A memory service:
 ```bash
 export RAM_A_XIAOO_TOKEN='replace-with-long-random-token'
 export LLM_API_KEY='replace-with-llm-provider-key'
+# Required only when features.graph_memory.enabled is true.
+export GRAPH_LLM_API_KEY='replace-with-graph-provider-key'
 
 cargo run -p memory-mcp --bin ram-a-mem
 ```

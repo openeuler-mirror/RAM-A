@@ -168,6 +168,7 @@ pub async fn run_memory_pipeline<E: MemoryExtractor + ?Sized, V: GroundingVerifi
             }
         }
     }
+    crate::writer::attach_source_observations(&mut supported, &lookup);
     let accepted = aggregate_exact_memories(&supported);
     let (coverage, duplication) = candidate_span_metrics(&messages, &windows);
     let source_memory_counts = source_counts(&lookup, &accepted, true);

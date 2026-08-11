@@ -214,6 +214,28 @@ and the small PersonaMem fixture through `evaluation/personalmem/run_test.py`.
 It makes no network calls. These fixtures validate orchestration only: no live
 PersonaMem score, treatment improvement, or promotion is claimed here.
 
+Run retrieval with graph memory enabled:
+
+```bash
+export OPENROUTER_API_KEY="your_openrouter_key"
+
+RUN_DIR=outputs/personalmem/$(date +%Y-%m-%dT%H%M%S)_graph
+python evaluation/personalmem/run.py official-pipeline \
+  --size 32k \
+  --top-k 10 \
+  --run-dir "$RUN_DIR" \
+  --embedding openrouter \
+  --model baai/bge-m3 \
+  --dimensions 1024 \
+  --graph-build \
+  --graph \
+  --graph-llm-model openai/gpt-4o-mini
+```
+
+`--graph-build` builds graph memory during add. `--graph` enables graph retrieval during
+search. Keep graph and non-graph runs in different `--run-dir` / `--store` paths when
+comparing scores.
+
 ## Commands
 
 Run add only:
@@ -251,6 +273,7 @@ python evaluation/personalmem/run.py add \
 | `--answer-base-url` | `https://openrouter.ai/api/v1` | OpenAI-compatible base URL |
 | `--answer-api-key-env` | `OPENROUTER_API_KEY` | Env var for answer API key |
 | `--context-token-budget` | 2000 | Max tokens of context in answer prompts (0 = unlimited) |
+| `--max-graph-context-facts` | 3 | Maximum graph facts appended across one answer context (0 = disabled) |
 | `--run-dir` | *(auto)* | Output to `outputs/personalmem/<timestamp>_<memory-mode>/` |
 | `--resume` | false | Skip steps whose output already exists |
 | `--size` | `32k` | Official split (`32k`, `128k`, `1M`) |
@@ -261,6 +284,12 @@ python evaluation/personalmem/run.py add \
 | `--indexed-dataset` | `outputs/personalmem_extracted_prepared.json` | Rust prepared output for the extracted arm |
 | `--frozen-config` | *(none)* | Frozen immutable manifest; required for `full` |
 | `--promotion-policy` | *(none)* | Policy whose hash is frozen; required for `full` |
+| `--graph-build` | false | Build graph memory during add |
+| `--graph-build-concurrency` | 1 | Maximum concurrent graph builds; raise gradually within provider limits |
+| `--graph` | false | Enable graph retrieval during search |
+| `--graph-weight` | 0.2 | Graph retrieval fusion weight |
+| `--graph-llm-api-key-env` | `OPENROUTER_API_KEY` | Env var for graph extraction API key |
+| `--graph-llm-model` | `openai/gpt-4o-mini` | Graph extraction model |
 
 Full list: `python evaluation/personalmem/run.py <command> --help`
 

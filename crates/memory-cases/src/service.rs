@@ -297,6 +297,9 @@ impl RagService {
                 query: build_search_query_text(query),
                 top_k: document_recall_candidate_top_k(request.top_k),
                 filter: Some(serde_json::json!({ "scope_id": dataset_id })),
+                graph_memory_space_id: None,
+                graph_target_subject: None,
+                graph_target_evidence_speaker: None,
             })
             .await?;
         let results = filter_unrelated_results(query, results);

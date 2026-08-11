@@ -8,6 +8,7 @@ diagnostic; QA accuracy is the headline metric.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -20,7 +21,8 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from common.llm_client import OpenAICompatibleClient
+from common.graph_context import DEFAULT_MAX_GRAPH_CONTEXT_FACTS  # noqa: E402
+from common.llm_client import OpenAICompatibleClient  # noqa: E402
 from longmemeval.error_analysis import (  # noqa: E402
     attach_error_analysis,
     classify_error,
@@ -60,6 +62,7 @@ def evaluate_qa(
     memory_format: str = MEMORY_FORMAT_DEFAULT,
     show_progress: bool = False,
     show_scores: bool = False,
+    max_graph_context_facts: int = DEFAULT_MAX_GRAPH_CONTEXT_FACTS,
 ) -> dict:
     _validate_answer_prompt_version(answer_prompt_version)
     _validate_memory_format(memory_format)
@@ -72,6 +75,7 @@ def evaluate_qa(
         "judge_model": judge_model,
         "qa_top_k": qa_top_k,
         "show_scores": show_scores,
+        "max_graph_context_facts": max_graph_context_facts,
     }
 
     qa_results = []
@@ -84,10 +88,31 @@ def evaluate_qa(
         qid = query["id"]
         search_result = results_by_id.get(qid, {"results": []})
         retrieved = search_result.get("results", [])[:qa_top_k]
+        question = query["text"]
+        question_type = (query.get("metadata") or {}).get("question_type", "unknown")
+        question_date = (query.get("metadata") or {}).get("question_date", "")
+        correct_answer = (query.get("task") or {}).get("correct_answer", "")
+        answer_prompt = format_answer_prompt(
+            question=question,
+            question_date=question_date,
+            retrieved=retrieved,
+            question_type=question_type,
+            answer_prompt_version=answer_prompt_version,
+            memory_format=memory_format,
+            show_scores=show_scores,
+            max_graph_context_facts=max_graph_context_facts,
+        )
+        prompt_hash = _prompt_hash(answer_prompt)
 
         if (
             qid in existing
-            and _is_complete_qa_result(existing[qid], answer_prompt_version, memory_format, expected_config)
+            and _is_complete_qa_result(
+                existing[qid],
+                answer_prompt_version,
+                memory_format,
+                expected_config,
+                expected_prompt_hash=prompt_hash,
+            )
         ):
             existing_item = dict(existing[qid])
             _attach_retrieval_diagnostics(existing_item, query, retrieved)
@@ -104,20 +129,6 @@ def evaluate_qa(
             )
             continue
 
-        question = query["text"]
-        question_type = (query.get("metadata") or {}).get("question_type", "unknown")
-        question_date = (query.get("metadata") or {}).get("question_date", "")
-        correct_answer = (query.get("task") or {}).get("correct_answer", "")
-
-        answer_prompt = format_answer_prompt(
-            question=question,
-            question_date=question_date,
-            retrieved=retrieved,
-            question_type=question_type,
-            answer_prompt_version=answer_prompt_version,
-            memory_format=memory_format,
-            show_scores=show_scores,
-        )
         answer = answerer_client.chat(
             model=answerer_model,
             messages=[
@@ -156,6 +167,8 @@ def evaluate_qa(
             "answer_prompt_version": answer_prompt_version,
             "memory_format": memory_format,
             "show_scores": show_scores,
+            "max_graph_context_facts": max_graph_context_facts,
+            "answer_prompt_hash": prompt_hash,
             "retrieved_count": len(retrieved),
             "answerer": {
                 "model": answerer_model,
@@ -193,6 +206,7 @@ def evaluate_qa(
         qa_results,
         answer_prompt_version=answer_prompt_version,
         memory_format=memory_format,
+        max_graph_context_facts=max_graph_context_facts,
     )
     _write_json(output_results_path, qa_results)
     _write_json(output_metrics_path, metrics)
@@ -203,6 +217,7 @@ def compute_qa_metrics(
     results: list[dict],
     answer_prompt_version: str | None = None,
     memory_format: str | None = None,
+    max_graph_context_facts: int | None = None,
 ) -> dict:
     attach_error_analysis(results)
     by_type: dict[str, list[dict]] = defaultdict(list)
@@ -211,10 +226,16 @@ def compute_qa_metrics(
 
     prompt_version = answer_prompt_version or _infer_answer_prompt_version(results)
     memory_format_value = memory_format or _infer_memory_format(results)
+    graph_fact_limit = (
+        max_graph_context_facts
+        if max_graph_context_facts is not None
+        else _infer_max_graph_context_facts(results)
+    )
     return {
         "num_questions": len(results),
         "answer_prompt_version": prompt_version,
         "memory_format": memory_format_value,
+        "max_graph_context_facts": graph_fact_limit,
         "overall": _summarize(results),
         "by_type": {qtype: _summarize(items) for qtype, items in sorted(by_type.items())},
         "diagnostics": _summarize_retrieval_diagnostics(results),
@@ -340,6 +361,7 @@ def load_and_evaluate_qa(
     answer_prompt_version: str = ANSWER_PROMPT_VERSION_DEFAULT,
     memory_format: str = MEMORY_FORMAT_DEFAULT,
     show_scores: bool = False,
+    max_graph_context_facts: int = DEFAULT_MAX_GRAPH_CONTEXT_FACTS,
 ) -> dict:
     _validate_answer_prompt_version(answer_prompt_version)
     _validate_memory_format(memory_format)
@@ -353,10 +375,11 @@ def load_and_evaluate_qa(
         "judge_model": judge_model,
         "qa_top_k": qa_top_k,
         "show_scores": show_scores,
+        "max_graph_context_facts": max_graph_context_facts,
     }
 
     if resume and _has_complete_existing_results(
-        output_results_path, prepared, answer_prompt_version, memory_format,
+        output_results_path, search_results, prepared, answer_prompt_version, memory_format,
         expected_config=expected_config,
     ):
         client = _ExistingResultsOnlyClient()
@@ -382,6 +405,7 @@ def load_and_evaluate_qa(
         memory_format=memory_format,
         show_progress=True,
         show_scores=show_scores,
+        max_graph_context_facts=max_graph_context_facts,
     )
 
 
@@ -492,6 +516,7 @@ def _load_existing_results(path: str) -> dict[str, dict]:
 
 def _has_complete_existing_results(
     path: str,
+    search_results: list[dict],
     prepared: dict,
     answer_prompt_version: str,
     memory_format: str,
@@ -501,10 +526,23 @@ def _has_complete_existing_results(
     if not existing:
         return False
     query_ids = [query.get("id") for query in prepared.get("queries", [])]
+    results_by_id = {item["query_id"]: item for item in search_results}
     return bool(query_ids) and all(
         query_id in existing
         and _is_complete_qa_result(
-            existing[query_id], answer_prompt_version, memory_format, expected_config
+            existing[query_id],
+            answer_prompt_version,
+            memory_format,
+            expected_config,
+            expected_prompt_hash=_prompt_hash_for_query(
+                next(query for query in prepared["queries"] if query.get("id") == query_id),
+                results_by_id.get(query_id, {"results": []}).get("results", []),
+                answer_prompt_version,
+                memory_format,
+                expected_config.get("show_scores", False),
+                expected_config.get("max_graph_context_facts", DEFAULT_MAX_GRAPH_CONTEXT_FACTS),
+                expected_config.get("qa_top_k", 10),
+            ),
         )
         for query_id in query_ids
     )
@@ -515,6 +553,7 @@ def _is_complete_qa_result(
     answer_prompt_version: str,
     memory_format: str,
     expected_config: dict | None = None,
+    expected_prompt_hash: str | None = None,
 ) -> bool:
     base_check = (
         _matches_answer_prompt_version(item, answer_prompt_version)
@@ -525,6 +564,8 @@ def _is_complete_qa_result(
     )
     if not base_check or expected_config is None:
         return base_check
+    if expected_prompt_hash is not None and item.get("answer_prompt_hash") != expected_prompt_hash:
+        return False
     stored_model = (item.get("answerer") or {}).get("model", "")
     if stored_model and stored_model != expected_config.get("answerer_model"):
         return False
@@ -537,7 +578,37 @@ def _is_complete_qa_result(
     stored_show_scores = item.get("show_scores")
     if stored_show_scores is not None and stored_show_scores != expected_config.get("show_scores"):
         return False
+    stored_graph_fact_limit = item.get("max_graph_context_facts")
+    if stored_graph_fact_limit != expected_config.get("max_graph_context_facts"):
+        return False
     return True
+
+
+def _prompt_hash(prompt: str) -> str:
+    return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+
+
+def _prompt_hash_for_query(
+    query: dict,
+    retrieved: list[dict],
+    answer_prompt_version: str,
+    memory_format: str,
+    show_scores: bool,
+    max_graph_context_facts: int,
+    qa_top_k: int,
+) -> str:
+    metadata = query.get("metadata") or {}
+    prompt = format_answer_prompt(
+        question=query.get("text", ""),
+        question_date=metadata.get("question_date", ""),
+        retrieved=retrieved[:qa_top_k],
+        question_type=metadata.get("question_type", "unknown"),
+        answer_prompt_version=answer_prompt_version,
+        memory_format=memory_format,
+        show_scores=show_scores,
+        max_graph_context_facts=max_graph_context_facts,
+    )
+    return _prompt_hash(prompt)
 
 
 def _matches_answer_prompt_version(item: dict, answer_prompt_version: str) -> bool:
@@ -574,6 +645,18 @@ def _infer_memory_format(results: list[dict]) -> str:
     return "mixed"
 
 
+def _infer_max_graph_context_facts(results: list[dict]) -> int | str:
+    limits = {
+        item.get("max_graph_context_facts", 0)
+        for item in results
+    }
+    if not limits:
+        return DEFAULT_MAX_GRAPH_CONTEXT_FACTS
+    if len(limits) == 1:
+        return next(iter(limits))
+    return "mixed"
+
+
 class _ExistingResultsOnlyClient:
     def chat(self, *args: object, **kwargs: object) -> None:
         raise IncompleteResultsError(
@@ -586,6 +669,23 @@ def _write_json(path: str, data: object) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def print_qa_metrics_summary(metrics: dict, output_metrics_path: str) -> None:
+    overall = metrics.get("overall") or {}
+    print(
+        "LongMemEval QA summary: "
+        f"accuracy={float(overall.get('accuracy', 0.0)):.4f} "
+        f"correct={overall.get('correct', 0)}/{overall.get('total', 0)} "
+        f"avg_context_tokens={float(overall.get('avg_context_tokens', 0.0)):.1f}"
+    )
+    for question_type, values in sorted((metrics.get("by_type") or {}).items()):
+        print(
+            f"  {question_type}: "
+            f"{float(values.get('accuracy', 0.0)):.4f} "
+            f"({values.get('correct', 0)}/{values.get('total', 0)})"
+        )
+    print(f"QA metrics saved to {output_metrics_path}")
 
 
 def main() -> None:
@@ -615,7 +715,15 @@ def main() -> None:
         choices=MEMORY_FORMATS,
         default=MEMORY_FORMAT_DEFAULT,
     )
+    parser.add_argument(
+        "--max-graph-context-facts",
+        type=int,
+        default=DEFAULT_MAX_GRAPH_CONTEXT_FACTS,
+        help="Maximum graph facts appended across one answer context; 0 disables rendering.",
+    )
     args = parser.parse_args()
+    if args.max_graph_context_facts < 0:
+        parser.error("--max-graph-context-facts must be at least 0")
 
     metrics = load_and_evaluate_qa(
         search_results_path=args.search_results,
@@ -631,8 +739,9 @@ def main() -> None:
         resume=args.resume,
         answer_prompt_version=args.answer_prompt_version,
         memory_format=args.memory_format,
+        max_graph_context_facts=args.max_graph_context_facts,
     )
-    print(json.dumps(metrics, ensure_ascii=False, indent=2))
+    print_qa_metrics_summary(metrics, args.output_metrics)
 
 
 if __name__ == "__main__":

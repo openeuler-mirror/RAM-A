@@ -146,6 +146,12 @@ embedding 和小型 PersonaMem fixture，全程不访问网络。这些 fixture 
 | `--indexed-dataset` | `outputs/personalmem_extracted_prepared.json` | extracted arm 的 Rust prepared 输出 |
 | `--frozen-config` | *（无）* | 冻结 immutable manifest；`full` 必需 |
 | `--promotion-policy` | *（无）* | hash 被冻结的晋级策略；`full` 必需 |
+| `--graph-build` | false | add 阶段构建图记忆 |
+| `--graph-build-concurrency` | 1 | 同时构建的图记录上限；应根据服务商限流逐步提高 |
+| `--graph` | false | search 阶段开启 graph retrieval |
+| `--graph-weight` | 0.2 | graph retrieval 融合权重 |
+| `--graph-llm-api-key-env` | `OPENROUTER_API_KEY` | 图候选抽取 API key 环境变量 |
+| `--graph-llm-model` | `openai/gpt-4o-mini` | 图候选抽取模型 |
 
 完整参数列表：`python evaluation/personalmem/run.py <命令> --help`
 
@@ -173,6 +179,27 @@ python evaluation/personalmem/run.py grade --run-dir "$RUN_DIR" --resume
 
 `official-pipeline` 只运行下载、准备、写入、检索和检索评分；不会自动调用回答模型。需要最终 QA Accuracy 时，再运行 `answer` 和 `grade`。
 如果不显式传 `--run-dir`，脚本会自动创建时间戳目录；此时请从终端输出的 `report.html` 路径中确认后续要复用的目录。
+
+开启图记忆检索：
+
+```bash
+export OPENROUTER_API_KEY="your_openrouter_key"
+
+RUN_DIR=outputs/personalmem/$(date +%Y-%m-%dT%H%M%S)_graph
+python evaluation/personalmem/run.py official-pipeline \
+  --size 32k \
+  --top-k 10 \
+  --run-dir "$RUN_DIR" \
+  --embedding openrouter \
+  --model baai/bge-m3 \
+  --dimensions 1024 \
+  --graph-build \
+  --graph \
+  --graph-llm-model openai/gpt-4o-mini
+```
+
+`--graph-build` 在 add 阶段构建图记忆；`--graph` 在 search 阶段开启 graph retrieval。
+对比分数时，请让 graph 和非 graph 运行使用不同 `--run-dir` / `--store`。
 
 ## 一键式完整运行
 

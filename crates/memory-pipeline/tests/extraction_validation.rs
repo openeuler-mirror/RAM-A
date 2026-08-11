@@ -7,7 +7,9 @@ use memory_pipeline::models::AtomicMemory;
 use memory_pipeline::normalize::normalize_prepared_memories;
 use memory_pipeline::validation::{validate_extraction, ValidationConfig};
 use memory_pipeline::window::{build_windows, WindowConfig};
-use memory_pipeline::writer::aggregate_exact_memories;
+use memory_pipeline::writer::{
+    aggregate_exact_memories, attach_source_observations, make_prepared_output,
+};
 use serde_json::{json, Map, Value};
 
 fn setup() -> (
@@ -24,7 +26,8 @@ fn setup() -> (
                 "session_id": "s1",
                 "role": "user",
                 "speaker": "Alice",
-                "timestamp": "2026-07-21T10:00:00Z"
+                "timestamp": "2026-07-21T10:00:00Z",
+                "turn_index": 7
             }
         }]
     });
@@ -137,12 +140,25 @@ fn aggregation_compares_observation_times_as_instants() {
         source_window_id: window.into(),
         observation_refs: Vec::new(),
     };
-    let later = memory("2024-01-02T02:04:05Z", "window-1");
-    let earlier = memory("2024-01-02T03:04:05+08:00", "window-2");
+    let mut later = memory("2024-01-02T02:04:05Z", "window-1");
+    later.observation_refs = vec![Map::from_iter([
+        ("observed_at".into(), json!(later.observed_at)),
+        ("speaker".into(), json!("Alice")),
+        ("session_id".into(), json!("s2")),
+        ("turn_index".into(), json!(4)),
+    ])];
+    let mut earlier = memory("2024-01-02T03:04:05+08:00", "window-2");
+    earlier.observation_refs = vec![Map::from_iter([
+        ("observed_at".into(), json!(earlier.observed_at)),
+        ("speaker".into(), json!("Bob")),
+        ("session_id".into(), json!("s1")),
+        ("turn_index".into(), json!(2)),
+    ])];
 
     let aggregated = aggregate_exact_memories(&[later, earlier]);
 
     assert_eq!(aggregated[0].observed_at, "2024-01-02T02:04:05Z");
+    assert_eq!(aggregated[0].observation_refs.len(), 2);
 }
 
 #[test]
@@ -160,6 +176,19 @@ fn validation_uses_unicode_offsets_and_preserves_planned_modality() {
     assert_eq!(batch.valid[0].evidence[0].start_char, 1);
     assert_eq!(batch.valid[0].evidence[0].end_char, 6);
     assert_eq!(batch.valid[0].observed_at, "2026-07-21T10:00:00Z");
+    let mut valid = batch.valid.clone();
+    attach_source_observations(&mut valid, &lookup);
+    let prepared = make_prepared_output(
+        &json!({"schema_version": "benchmark-prepared-v1"}),
+        &valid,
+        &json!({}),
+    )
+    .unwrap();
+    let metadata = &prepared["memories"][0]["metadata"];
+    assert_eq!(metadata["speaker"], "Alice");
+    assert_eq!(metadata["session_id"], "s1");
+    assert_eq!(metadata["turn_index"], 7);
+    assert_eq!(metadata["observed_at_ms"], 1_784_628_000_000i64);
 }
 
 #[test]
@@ -228,9 +257,11 @@ fn observed_at_prefers_last_evidence_timestamp_including_context() {
         "memories": [
             {"id": "context", "text": "Alice moved.", "metadata": {
                 "scope_id": "u1", "session_id": "s1", "role": "user",
+                "speaker": "Alice", "turn_index": 4,
                 "timestamp": "2026-07-22T10:00:00Z"}},
             {"id": "candidate", "text": "She likes tea.", "metadata": {
                 "scope_id": "u1", "session_id": "s1", "role": "user",
+                "speaker": "Bob", "turn_index": 5,
                 "timestamp": "2026-07-21T10:00:00Z"}}
         ]
     });
@@ -261,13 +292,46 @@ fn observed_at_prefers_last_evidence_timestamp_including_context() {
         "modality": "asserted", "event_time": null, "attributes": {},
         "evidence": [
             {"message_id": "candidate", "quote": "likes tea", "evidence_role": "primary"},
+            {"message_id": "candidate", "quote": "She", "evidence_role": "supporting"},
             {"message_id": "context", "quote": "Alice moved", "evidence_role": "supporting"}
         ]
     });
 
-    let batch = validate_extraction(&[raw], window, &lookup, &ValidationConfig::default());
+    let mut batch = validate_extraction(&[raw], window, &lookup, &ValidationConfig::default());
 
     assert_eq!(batch.valid[0].observed_at, "2026-07-22T10:00:00Z");
+    attach_source_observations(&mut batch.valid, &lookup);
+    let observations = &batch.valid[0].observation_refs;
+    assert_eq!(observations.len(), 2);
+    let candidate = observations
+        .iter()
+        .find(|observation| observation["evidence_refs"][0]["message_id"] == "candidate")
+        .unwrap();
+    assert_eq!(candidate["speaker"], "Bob");
+    assert_eq!(candidate["turn_index"], 5);
+    assert_eq!(candidate["observed_at"], "2026-07-21T10:00:00Z");
+    assert_eq!(candidate["evidence_refs"].as_array().unwrap().len(), 2);
+    let context = observations
+        .iter()
+        .find(|observation| observation["evidence_refs"][0]["message_id"] == "context")
+        .unwrap();
+    assert_eq!(context["speaker"], "Alice");
+    assert_eq!(context["turn_index"], 4);
+    assert_eq!(context["observed_at"], "2026-07-22T10:00:00Z");
+    assert_eq!(context["evidence_refs"].as_array().unwrap().len(), 1);
+
+    let aggregated = aggregate_exact_memories(&batch.valid);
+    let prepared = make_prepared_output(
+        &json!({"schema_version": "benchmark-prepared-v1"}),
+        &aggregated,
+        &json!({}),
+    )
+    .unwrap();
+    let metadata = &prepared["memories"][0]["metadata"];
+    assert_eq!(metadata["speaker"], "Alice");
+    assert_eq!(metadata["turn_index"], 4);
+    assert_eq!(metadata["observed_at"], "2026-07-22T10:00:00Z");
+    assert_eq!(metadata["observed_at_ms"], 1_784_714_400_000_i64);
 }
 
 #[test]

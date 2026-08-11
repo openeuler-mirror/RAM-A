@@ -16,6 +16,25 @@
     },
     "case_library": {
       "enabled": true
+    },
+    "graph_memory": {
+      "enabled": false
+    }
+  },
+  "graph_memory": {
+    "llm_api_key_env": "GRAPH_LLM_API_KEY",
+    "llm_base_url": "http://127.0.0.1:8000/v1",
+    "llm_model": "GLM-5.2",
+    "llm_timeout_ms": 60000,
+    "build_concurrency": 1,
+    "retrieval": {
+      "weight": 0.2,
+      "rerank_with_graph": false,
+      "allow_graph_only": false,
+      "max_graph_only_results": null,
+      "seed_limit": null,
+      "max_evidence_records_per_fact": null,
+      "fail_open": false
     }
   },
   "http": {

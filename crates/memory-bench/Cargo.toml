@@ -11,3 +11,7 @@ memory-core = { path = "../memory-core" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+tempfile = "3.9"

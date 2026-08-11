@@ -85,12 +85,27 @@ cd evaluation
 # Full LoCoMo benchmark after downloading data/locomo/locomo10.json
 DATASET=../data/locomo/locomo10.json ./run_locomo_eval.sh memory_bench
 
+# Graph memory mode. This builds graph memory during add and enables graph retrieval
+# during search. It needs OPENROUTER_API_KEY for embeddings and graph extraction.
+MEMORY_BENCH_GRAPH=1 \
+GRAPH_LLM_MODEL=openai/gpt-4o-mini \
+DATASET=../data/locomo/locomo10.json \
+./run_locomo_eval.sh memory_bench
+
 # mem0 backend
 ./run_locomo_eval.sh mem0
 ```
 
 The shell script runs the full 7-stage pipeline.
 Outputs are written to repository-root `outputs/locomo/<RUN_ID>/<backend>/`.
+For the RAM-A backend, the wrapper first converts the raw LoCoMo file into
+`outputs/locomo/<RUN_ID>/ram-a/prepared.json` using the unified
+`benchmark-prepared-v1` schema. The prepared memories preserve LoCoMo-specific
+fields such as `raw_memory_path`, `session_timestamp`, and `observed_at_ms` in
+metadata so graph extraction can use observation time without adding LoCoMo
+parsing logic to `memory-bench`. When a turn has a speaker, the adapter also maps it to the
+generic `metadata.graph_source_entity` contract, so graph provenance can link the source record
+to its author without treating the author link as a fact.
 
 The optional mem0 comparison implementation lives under `evaluation/locomo/backends/mem0/`.
 
@@ -175,6 +190,41 @@ Rust, shell, and offline smoke regression suite. If any check fails, keep the
 integration code uncommitted and use `comparison.html` plus pipeline artifacts
 for diagnosis; do not record the run as a new baseline.
 
+Graph-specific environment variables:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `MEMORY_BENCH_GRAPH` | `0` | Set to `1` to pass graph flags to RAM-A add/search |
+| `GRAPH_WEIGHT` | `0.2` | Graph retrieval fusion weight |
+| `GRAPH_RERANK` | `0` | Set to `1` to apply weighted reciprocal rank fusion |
+| `GRAPH_ALLOW_GRAPH_ONLY` | `0` | Set to `1` to admit graph-only evidence records |
+| `GRAPH_MAX_GRAPH_ONLY_RESULTS` | *(20% of top-k)* | Maximum graph-only records in the final result |
+| `GRAPH_FAIL_OPEN` | `0` | Set to `1` to fall back to non-graph retrieval if graph search fails |
+| `GRAPH_MEMORY_SPACE_MODE` | `auto` | Memory-space derivation mode for `memory-bench` |
+| `GRAPH_MEMORY_SPACE_FIELD` | `scope_id` | Metadata/filter field used when mode is `metadata-field` |
+| `GRAPH_OWNER_ID` | `benchmark` | Graph memory owner id |
+| `GRAPH_LLM_API_KEY_ENV` | `OPENROUTER_API_KEY` | Env var containing graph extraction API key |
+| `GRAPH_LLM_MODEL` | `openai/gpt-4o-mini` | Graph extraction model |
+| `GRAPH_LLM_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible graph extraction base URL |
+| `GRAPH_LLM_TIMEOUT_MS` | `60000` | Graph extraction timeout |
+| `GRAPH_BUILD_CONCURRENCY` | `1` | Maximum concurrent graph-build records; increase gradually if the provider permits |
+| `MAX_GRAPH_CONTEXT_FACTS` | `3` | Maximum graph facts appended across the answer context; set to `0` for the no-fact control |
+
+When `MEMORY_BENCH_GRAPH=1`, the shell wrapper passes `--graph-build` to
+`memory-bench add` and `--graph` to `memory-bench search`. `GRAPH_LLM_MODEL`
+maps to the `memory-bench` `--graph-llm-model` flag.
+`GRAPH_BUILD_CONCURRENCY` maps only to add-stage `--graph-build-concurrency`; the default `1`
+preserves serial build behavior.
+`MAX_GRAPH_CONTEXT_FACTS` affects answer-context rendering only; it does not change graph
+construction, retrieval candidates, or ranking.
+The governed `locomo_run.py` entry point reads the same `MEMORY_BENCH_GRAPH` and `GRAPH_*`
+variables and emits the same add/search flags. Use that entry point for a frozen, resumable
+full A/B run; the shell wrapper remains a compatibility launcher for existing evaluation jobs.
+In the default `auto` memory-space mode, prepared LoCoMo records use
+`scope_id` values such as `path:$[0]`. If a graph build is resumed, completed
+graph runs are skipped, missing graph runs are built, and failed/running graph
+runs fail explicitly instead of silently producing a partial graph benchmark.
+
 ## Pipeline Stages
 
 ```
@@ -194,6 +244,10 @@ python3 locomo/locomo_retrieval.py \
   --dataset fixtures/locomo_sample.json --input search_results.json \
   --input-format memory-bench --output-json retrieval_metrics.json \
   --html-report retrieval_report.html
+
+python3 graph_audit.py \
+  --store ../outputs/locomo/<RUN_ID>/ram-a/store.sqlite \
+  --output ../outputs/locomo/<RUN_ID>/ram-a/graph_audit.json
 
 python3 locomo/locomo_responses.py \
   --technique-type memory_bench --dataset fixtures/locomo_sample.json \

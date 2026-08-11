@@ -86,6 +86,16 @@ pub struct EntityAlias {
     pub deleted_at_ms: Option<u64>,
 }
 
+/// A caller-declared entity that authored or otherwise originated a source record.
+///
+/// This is provenance, not an extracted fact. Callers may provide it in record
+/// metadata as `graph_source_entity` with `name` and `entity_type` fields.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GraphSourceEntity {
+    pub name: String,
+    pub entity_type: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EntityAliasEvidence {
     pub id: String,
@@ -273,7 +283,27 @@ pub struct FactContextUnit {
     pub path: Vec<String>,
     pub score: f32,
     pub status: FactStatus,
-    pub valid_time: Option<(u64, u64)>,
+    pub valid_from_ms: Option<u64>,
+    pub valid_to_ms: Option<u64>,
+    pub recorded_at_ms: u64,
+}
+
+/// A source record matched directly inside the graph store.
+///
+/// This is deliberately separate from `FactContextUnit`: it preserves an
+/// unextracted source as graph evidence without presenting it as a fact.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EvidenceRecordContextUnit {
+    pub record: GraphMemoryRecord,
+    pub path: Vec<String>,
+    pub score: f32,
+    pub match_kind: EvidenceRecordMatchKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceRecordMatchKind {
+    Lexical,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -282,6 +312,7 @@ pub struct ContextBundle {
     pub memory_space_id: String,
     pub reference_time_ms: u64,
     pub fact_context_units: Vec<FactContextUnit>,
+    pub evidence_record_context_units: Vec<EvidenceRecordContextUnit>,
     pub records: Vec<GraphMemoryRecord>,
     pub entities: Vec<Entity>,
     pub facts: Vec<Fact>,
