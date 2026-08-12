@@ -16,13 +16,13 @@ adapter -> raw prepared -> 可选原子记忆抽取/grounding -> add
 
 | 配置 | 含义 |
 |---|---|
-| `execution = "ab"` | 运行 raw 和 extracted 两个 arm，比较原始记忆与原子记忆 |
-| `execution = "single"` | 只运行一个 arm，必须设置 `memory_mode = "raw"` 或 `"extracted"` |
-| `mode = "normal"` | 普通可复现实验，不做 promotion 晋级判断 |
-| `mode = "strict"` | 严格 A/B 晋级实验，必须提供 promotion policy |
-| `phase = "full"` | 当前统一入口支持的正式全量模式 |
+| `execution = "ab"` | 一次运行两个版本：`raw`（原始记忆）和 `extracted`（原子记忆），用于比较两种记忆准备方式。两边共用同一套 graph、retrieval 和 rerank 配置。 |
+| `execution = "single"` | 只运行一个版本；必须另外设置 `memory_mode = "raw"` 或 `"extracted"`。适合验证某一套固定配置。 |
+| `mode = "normal"` | 普通评测：生成结果和指标，不判断是否达到晋级门槛。日常 full/smoke 使用此模式。 |
+| `mode = "strict"` | 严格评测：在 A/B 结果上执行 promotion policy；只有已有评审过的 policy 时使用。 |
+| `phase = "full"` | 全量评测模式；当前统一入口不需要先运行 pilot。 |
 
-`ab` 不是 graph/no-graph 或 rerank/no-rerank 对比。它比较 raw 和 extracted，两个 arm 使用同一套 graph、retrieval 和 rerank 配置。研究图或 rerank 增量时，应复制配置，只改变对应开关。
+`ab` 只比较 `raw` 和 `extracted`，不能在同一次运行中配置成“无图 vs 有图”或“无 rerank vs 有 rerank”。这类增量实验需要复制配置文件，分别将 `graph.enabled` 或 `rerank.enabled` 设置为不同值，然后用 `single` 各运行一次。
 
 ## 2. 创建 Python 环境
 
@@ -74,11 +74,17 @@ test -f "$PERSONALMEM_DATASET"
 test -f "$LONGMEMEVAL_DATASET"
 ```
 
-只跑一个数据集时至少设置对应变量；建议三个变量都设置，避免切换数据集时遗漏。
+只跑一个数据集时只需设置对应变量。`test -f` 只检查文件是否存在，不会读取或上传数据。
 
 ## 5. 配置文件
 
-默认模板是 `evaluation/configs/benchmark-full.toml`。通常只需要修改数据集路径和 provider 环境变量：
+默认模板是 `evaluation/configs/benchmark-full.toml`。文件中的注释说明每个字段的用途、模板值和系统默认值。通常只需要：
+
+1. 设置数据集环境变量；
+2. 设置 `OPENROUTER_API_KEY`；
+3. 直接运行命令。
+
+不需要为了普通 full 运行修改模型、权重或图参数。
 
 ```toml
 [dataset.locomo]
@@ -91,21 +97,23 @@ file = "${PERSONALMEM_DATASET}"
 file = "${LONGMEMEVAL_DATASET}"
 ```
 
-实验时常改的字段：
+确实要做对照实验时，常用字段如下：
 
 | 字段 | 作用 |
 |---|---|
-| `run.execution` | `ab` 跑 raw/extracted；`single` 跑一个 arm |
-| `run.memory_mode` | 仅 `single` 使用，值为 `raw` 或 `extracted` |
-| `run.mode` | 普通运行用 `normal`；严格晋级用 `strict` |
-| `run.pair_id` | 本次实验标识，建议每次实验使用新值 |
-| `graph.enabled` | search 是否启用图检索 |
-| `graph.build_enabled` | add 是否构建图记忆 |
-| `rerank.enabled` | 是否启用外部 rerank |
-| `retrieval.top_k` | 最终返回的记忆数量 |
-| `answer.qa_top_k` | 回答阶段使用的检索结果数量 |
+| `run.execution` | `ab` 比较 raw/extracted；`single` 只运行一个版本。默认 `ab`。 |
+| `run.memory_mode` | 仅 `single` 使用，值为 `raw` 或 `extracted`；无默认值。 |
+| `run.mode` | `normal` 记录指标；`strict` 执行晋级策略。默认 `normal`。 |
+| `run.pair_id` | 运行标识；模板默认 `graph-full-v1`，新实验建议改成新名称。 |
+| `graph.enabled` | search 是否加入图候选；系统默认关闭，模板开启。 |
+| `graph.build_enabled` | add 时是否构建图；系统默认关闭，模板开启。 |
+| `rerank.enabled` | 是否调用外部 rerank；系统默认关闭，模板开启。 |
+| `retrieval.top_k` | 最终返回数量；系统默认 `10`，模板为 `30`。 |
+| `retrieval.candidate_k` | 候选池大小；未设置时为 `max(top_k × 5, 100)`，模板为 `150`。 |
+| `answer.qa_top_k` | 传给答案模型的检索结果数量；模板为 `10`。 |
+| `graph.max_context_facts` | 答案阶段最多补充的图事实数量；模板为 `3`。 |
 
-公平比较时不要随意修改 embedding 模型、维度、Hybrid 权重、`candidate_k`、`top_k`、answer/judge 模型。API key 不写入配置文件。
+公平比较时，A/B 两次运行必须保持 embedding 模型、维度、Hybrid 权重、`candidate_k`、`top_k`、answer/judge 模型一致，只改变要研究的一个开关。API key 只放环境变量，不写入配置文件。
 
 ## 6. 推荐 full 命令
 
@@ -210,17 +218,15 @@ PY
 
 常见文件：`retrieval_metrics.json`（召回）、`qa_metrics.json`（BLEU/F1/LLM score/token/延迟）、`metrics.json`（数据集专用汇总）、`run_manifest.json`（配置和数据 hash）以及 HTML 详细报告。
 
-## 11. 常见问题和提交边界
+## 11. 常见问题
 
 - `missing API key env ...`：重新在当前 shell 执行 `export`；激活 venv 不会恢复环境变量。
 - 数据集不存在：确认 `${LOCOMO_DATASET}` 等变量指向真实文件。
 - graph memory space 无法推导：prepared 数据需要对应的 `scope_id` 元数据，不能关闭校验掩盖空间隔离缺失。
 - 远程服务 429：客户端会重试；最终失败时使用 runner 支持的 resume 机制，不要把未完成结果当作正式分数。
-- 不提交完整数据集、store/SQLite、search results、responses、cache 和大型 HTML。
+- 429 或网络超时：这是远程 provider 限流或网络问题，不代表图逻辑失败；等待重试结束。最终失败时，保留运行目录并使用 runner 支持的 resume 机制。
+- 不要把未完成运行目录中的指标当作正式结果；确认存在最终 metrics JSON 后再记录分数。
 
-提交前执行：
+完整数据集、store/SQLite、search results、responses、cache 和大型 HTML 只保存在本地，不作为评测命令的必需输入，也不应提交到 Git。
 
-```bash
-git status --short
-git diff --check
-```
+`git status --short` 和 `git diff --check` 是代码贡献者提交前的检查，不是普通 benchmark 用户必须执行的步骤。

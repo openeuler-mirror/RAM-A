@@ -1,76 +1,77 @@
-# Full benchmark configuration. Values are intentionally explicit so that the
-# run manifest can be reproduced from this file directly.
+# Full benchmark configuration.
+# Values below are the recommended reproducible benchmark settings.
+# API keys are read from environment variables; never put key values here.
 
 [run]
-phase = "full"
-mode = "normal" # use "strict" only for a reviewed A/B promotion run
-execution = "ab"
-pair_id = "graph-full-v1"
-output_root = "../../outputs/memory-ab"
-# Optional in normal mode; set PROMOTION_POLICY and uncomment for strict A/B.
+phase = "full"                    # benchmark phase; current value is the only supported full run
+mode = "normal"                   # normal: record results; strict: enforce promotion policy
+execution = "ab"                  # ab: raw vs extracted; single: run one memory mode
+pair_id = "graph-full-v1"         # label for this run; use a new value for a new experiment
+output_root = "../../outputs/memory-ab" # output directory, relative to this config file
+# Only strict A/B runs need a promotion policy.
 # promotion_policy = "${PROMOTION_POLICY}"
 
 [dataset.locomo]
-file = "${LOCOMO_DATASET}"
+file = "${LOCOMO_DATASET}"        # set LOCOMO_DATASET in the shell
 
 [dataset.personalmem]
-file = "${PERSONALMEM_DATASET}"
+file = "${PERSONALMEM_DATASET}"   # must be benchmark-prepared-v1 for A/B runs
 
 [dataset.longmemeval]
-file = "${LONGMEMEVAL_DATASET}"
+file = "${LONGMEMEVAL_DATASET}"   # prepared/oracle file supported by the runner
 
 [memory]
-extraction_model = "openai/gpt-4o-mini"
-verifier_model = "openai/gpt-4o-mini"
-max_candidate_tokens = 320
-max_window_tokens = 640
-context_before_messages = 2
-context_after_messages = 0
+extraction_model = "openai/gpt-4o-mini" # atomic-memory extraction model
+verifier_model = "openai/gpt-4o-mini"    # extraction grounding/verifier model
+max_candidate_tokens = 320               # extraction candidate budget
+max_window_tokens = 640                   # extraction window budget
+context_before_messages = 2               # preceding messages supplied as context
+context_after_messages = 0                # following messages supplied as context
 
 [embedding]
-provider = "openrouter"
-api_key_env = "OPENROUTER_API_KEY"
-model = "baai/bge-m3"
-dimensions = 1024
+provider = "openrouter"                 # embedding provider
+api_key_env = "OPENROUTER_API_KEY"       # environment variable containing the key
+model = "baai/bge-m3"                    # recommended benchmark embedding model
+dimensions = 1024                         # vector dimension required by the model
 
 [retrieval]
-mode = "hybrid"
-embedding_weight = 0.7
-bm25_weight = 0.3
-candidate_k = 150
-top_k = 30
+mode = "hybrid"                          # dense + BM25; default is hybrid
+embedding_weight = 0.7                    # dense contribution; default 0.7
+bm25_weight = 0.3                         # BM25 contribution; default 0.3
+candidate_k = 150                         # candidate pool; unset default is max(top_k*5, 100)
+top_k = 30                                # final retrieval results; system default is 10
 
 [graph]
-enabled = true
-build_enabled = true
-build_concurrency = 1
-weight = 0.2
-rerank = false
-allow_graph_only = false
-max_context_facts = 3
-memory_space_mode = "auto"
-memory_space_field = "scope_id"
-owner_id = "benchmark"
-llm_model = "openai/gpt-4o-mini"
-llm_api_key_env = "OPENROUTER_API_KEY"
-llm_base_url = "https://openrouter.ai/api/v1"
-llm_timeout_ms = 60000
+enabled = true                            # include graph candidates during search; default false
+build_enabled = true                      # build graph data during add; default false
+build_concurrency = 1                     # concurrent graph builds; default 1
+weight = 0.2                              # graph fusion weight; default 0.2
+rerank = false                            # include graph candidates in rerank; default false
+allow_graph_only = false                  # allow graph-only results; default false
+max_context_facts = 3                     # maximum graph facts added to answer context
+memory_space_mode = "auto"                # derive graph memory space from prepared data
+memory_space_field = "scope_id"           # prepared metadata field used for isolation
+owner_id = "benchmark"                   # graph memory-space owner
+llm_model = "openai/gpt-4o-mini"          # graph extraction model
+llm_api_key_env = "OPENROUTER_API_KEY"   # environment variable containing the graph key
+llm_base_url = "https://openrouter.ai/api/v1" # graph LLM endpoint
+llm_timeout_ms = 60000                    # graph LLM request timeout
 
 [rerank]
-enabled = true
-provider = "openrouter"
-api_key_env = "OPENROUTER_API_KEY"
-model = "cohere/rerank-v3.5"
-base_url = "https://openrouter.ai/api/v1"
-input_k = 40
+enabled = true                            # rerank the retrieved candidate pool
+provider = "openrouter"                  # rerank provider
+api_key_env = "OPENROUTER_API_KEY"       # environment variable containing the key
+model = "cohere/rerank-v3.5"              # recommended benchmark reranker
+base_url = "https://openrouter.ai/api/v1" # rerank endpoint
+input_k = 40                              # rerank input candidates; default 40
 
 [answer]
-model = "openai/gpt-4o-mini"
-api_key_env = "OPENROUTER_API_KEY"
-base_url = "https://openrouter.ai/api/v1"
-qa_top_k = 10
+model = "openai/gpt-4o-mini"              # answer-generation model
+api_key_env = "OPENROUTER_API_KEY"       # environment variable containing the key
+base_url = "https://openrouter.ai/api/v1" # answer endpoint
+qa_top_k = 10                             # retrieved memories supplied to answer model
 
 [judge]
-model = "openai/gpt-4o-mini"
-api_key_env = "OPENROUTER_API_KEY"
-base_url = "https://openrouter.ai/api/v1"
+model = "openai/gpt-4o-mini"              # answer judge model
+api_key_env = "OPENROUTER_API_KEY"       # environment variable containing the key
+base_url = "https://openrouter.ai/api/v1" # judge endpoint
