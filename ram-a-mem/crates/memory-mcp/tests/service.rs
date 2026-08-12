@@ -276,16 +276,13 @@ async fn fixture_graph_service_with_extractor(graph_extractor: Arc<dyn GraphExtr
     ));
     let idempotency = IdempotencyRepository::open(&database_path).await.unwrap();
     let extractor = Arc::new(PreferenceExtractor::default());
+    let verifier = Arc::new(SupportingVerifier::default());
     Fixture {
         _temp: temp,
-        service: MemoryService::new(
-            manager,
-            idempotency,
-            extractor.clone(),
-            Arc::new(SupportingVerifier),
-        )
-        .with_graph_memory(graph_pipeline, 2),
+        service: MemoryService::new(manager, idempotency, extractor.clone(), verifier.clone())
+            .with_graph_memory(graph_pipeline, 2),
         extractor,
+        verifier,
         database_path,
     }
 }

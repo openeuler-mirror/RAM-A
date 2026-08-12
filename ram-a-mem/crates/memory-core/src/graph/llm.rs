@@ -856,6 +856,18 @@ fn validate_json_content(content: &str) -> Result<(), LlmAttemptError> {
 async fn read_bounded_response_body(
     response: &mut reqwest::Response,
 ) -> Result<String, LlmAttemptError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_GRAPH_LLM_RESPONSE_BYTES as u64)
+    {
+        return Err(LlmAttemptError {
+            retryable: false,
+            message: format!(
+                "graph LLM response body exceeds {MAX_GRAPH_LLM_RESPONSE_BYTES} byte limit"
+            ),
+        });
+    }
+
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|error| {
         LlmAttemptError::retryable(format!("failed to read graph LLM response body: {error}"))

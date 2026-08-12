@@ -1164,6 +1164,63 @@ mod tests {
     }
 
     #[test]
+    fn retrieval_candidate_and_rerank_limits_accept_boundaries() {
+        for candidate_k in [1, 500] {
+            let config = RetrievalServiceConfig {
+                candidate_k: Some(candidate_k),
+                ..RetrievalServiceConfig::default()
+            };
+            assert!(config.validate().is_ok(), "candidate_k={candidate_k}");
+        }
+
+        for input_k in [1, 500] {
+            let config = RetrievalServiceConfig {
+                rerank: RerankServiceConfig {
+                    enabled: true,
+                    input_k,
+                    timeout_ms: Some(1),
+                    ..RerankServiceConfig::default()
+                },
+                ..RetrievalServiceConfig::default()
+            };
+            assert!(config.validate().is_ok(), "input_k={input_k}");
+        }
+    }
+
+    #[test]
+    fn retrieval_rejects_candidate_and_rerank_values_outside_limits() {
+        for candidate_k in [0, 501] {
+            let config = RetrievalServiceConfig {
+                candidate_k: Some(candidate_k),
+                ..RetrievalServiceConfig::default()
+            };
+            assert!(config.validate().is_err(), "candidate_k={candidate_k}");
+        }
+
+        for input_k in [0, 501] {
+            let config = RetrievalServiceConfig {
+                rerank: RerankServiceConfig {
+                    enabled: true,
+                    input_k,
+                    ..RerankServiceConfig::default()
+                },
+                ..RetrievalServiceConfig::default()
+            };
+            assert!(config.validate().is_err(), "input_k={input_k}");
+        }
+
+        let zero_timeout = RetrievalServiceConfig {
+            rerank: RerankServiceConfig {
+                enabled: true,
+                timeout_ms: Some(0),
+                ..RerankServiceConfig::default()
+            },
+            ..RetrievalServiceConfig::default()
+        };
+        assert!(zero_timeout.validate().is_err());
+    }
+
+    #[test]
     fn packaged_rpm_example_matches_server_schema() {
         let config = packaged_config();
 
