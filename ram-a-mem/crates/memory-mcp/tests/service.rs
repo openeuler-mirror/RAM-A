@@ -718,8 +718,8 @@ async fn search_filters_type_and_event_time_after_scoped_retrieval() {
         query: "window trip".to_string(),
         top_k: 10,
         memory_types: vec!["event".to_string()],
-        event_time_from: Some("2026-07-31T00:00:00Z".to_string()),
-        event_time_to: Some("2026-08-02T00:00:00Z".to_string()),
+        event_time_from: Some("2026-08-01T00:00:00Z".to_string()),
+        event_time_to: Some("2026-08-01T00:00:00Z".to_string()),
     };
     let result = fixture.service.search(&principal, request).await.unwrap();
     assert_eq!(result.memories.len(), 1);

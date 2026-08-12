@@ -188,3 +188,112 @@ async fn candidate_coverage_excludes_context_only_sources() {
 
     assert_eq!(run.stats["candidate_source_coverage"], 1.0);
 }
+
+#[tokio::test]
+async fn fail_fast_controls_extraction_and_grounding_failures() {
+    let source = prepared();
+    let config = PipelineConfig::default();
+    let (messages, _) = normalize_prepared_memories(&source).unwrap();
+    let episodes = build_episodes(&messages, &config.episode).unwrap();
+    let lookup = messages
+        .into_iter()
+        .map(|message| (message.id.clone(), message))
+        .collect::<HashMap<_, _>>();
+    let window = build_windows(&episodes, &lookup, &config.window)
+        .unwrap()
+        .remove(0);
+
+    let missing_extraction = StaticMemoryExtractor::new(HashMap::new());
+    let empty_verifier = StaticGroundingVerifier::new(HashMap::new());
+    assert!(
+        run_memory_pipeline(&source, &config, &missing_extraction, &empty_verifier, None,)
+            .await
+            .is_err()
+    );
+
+    let best_effort = PipelineConfig {
+        fail_fast: false,
+        ..config.clone()
+    };
+    let extraction_run = run_memory_pipeline(
+        &source,
+        &best_effort,
+        &missing_extraction,
+        &empty_verifier,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(extraction_run.rejected[0].stage, "extract");
+
+    let extractor = StaticMemoryExtractor::new(HashMap::from([(
+        window.id,
+        json!({"schema_version": "atomic_memory_v1", "memories": [raw_memory()]}),
+    )]));
+    assert!(
+        run_memory_pipeline(&source, &config, &extractor, &empty_verifier, None)
+            .await
+            .is_err()
+    );
+
+    let grounding_run =
+        run_memory_pipeline(&source, &best_effort, &extractor, &empty_verifier, None)
+            .await
+            .unwrap();
+    assert_eq!(grounding_run.quarantined[0].stage, "grounding");
+    assert!(grounding_run.accepted_memories.is_empty());
+}
+
+#[tokio::test]
+async fn only_supported_grounding_results_are_accepted() {
+    for status in ["PARTIALLY_SUPPORTED", "UNSUPPORTED", "UNCERTAIN"] {
+        let source = prepared();
+        let config = PipelineConfig::default();
+        let (messages, _) = normalize_prepared_memories(&source).unwrap();
+        let episodes = build_episodes(&messages, &config.episode).unwrap();
+        let lookup = messages
+            .into_iter()
+            .map(|message| (message.id.clone(), message))
+            .collect::<HashMap<_, _>>();
+        let window = build_windows(&episodes, &lookup, &config.window)
+            .unwrap()
+            .remove(0);
+        let candidate = validate_extraction(
+            &[raw_memory()],
+            &window,
+            &lookup,
+            &ValidationConfig::default(),
+        )
+        .valid
+        .remove(0);
+        let extractor = StaticMemoryExtractor::new(HashMap::from([(
+            window.id,
+            json!({"schema_version": "atomic_memory_v1", "memories": [raw_memory()]}),
+        )]));
+        let verifier = StaticGroundingVerifier::new(HashMap::from([(candidate.id, json!(status))]));
+
+        let run = run_memory_pipeline(&source, &config, &extractor, &verifier, None)
+            .await
+            .unwrap();
+
+        assert!(run.accepted_memories.is_empty());
+        assert_eq!(run.quarantined.len(), 1);
+        assert_eq!(run.quarantined[0].details["status"], status);
+    }
+}
+
+#[tokio::test]
+async fn zero_max_memory_chars_is_rejected() {
+    let mut config = PipelineConfig::default();
+    config.validation.max_memory_chars = 0;
+    let extractor = StaticMemoryExtractor::new(HashMap::new());
+    let verifier = StaticGroundingVerifier::new(HashMap::new());
+
+    let error = run_memory_pipeline(&prepared(), &config, &extractor, &verifier, None)
+        .await
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("max_memory_chars must be positive"));
+}

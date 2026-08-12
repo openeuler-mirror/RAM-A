@@ -173,14 +173,21 @@ fn ingest_rejects_an_empty_message_list_or_duplicate_ids() {
 
 #[test]
 fn ingest_rejects_too_many_messages() {
-    let request = IngestRequest {
+    let exact_limit = IngestRequest {
+        conversation_id: "conversation-1".to_owned(),
+        messages: (0..100)
+            .map(|index| valid_message(&format!("message-{index}")))
+            .collect(),
+    };
+    let over_limit = IngestRequest {
         conversation_id: "conversation-1".to_owned(),
         messages: (0..101)
             .map(|index| valid_message(&format!("message-{index}")))
             .collect(),
     };
 
-    assert!(request.validate().is_err());
+    assert!(exact_limit.validate().is_ok());
+    assert!(over_limit.validate().is_err());
 }
 
 #[test]
