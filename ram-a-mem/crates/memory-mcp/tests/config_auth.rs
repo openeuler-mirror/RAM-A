@@ -5,7 +5,8 @@ use memory_mcp::{
     AuthConfig, CaseDocumentDeleteRequest, CaseDocumentUpdateRequest, CaseDocumentUploadRequest,
     CaseLibraryConfig, CaseMutationConfirmationRequest, CaseSearchRequest, CaseServiceConfig,
     IngestMessage, IngestRequest, Principal, SearchRequest, ServerConfig, TokenAuthenticator,
-    TokenConfig,
+    TokenConfig, MAX_CASE_LIBRARY_CHARS, MAX_CONVERSATION_ID_CHARS, MAX_MESSAGE_ID_CHARS,
+    MAX_SPEAKER_CHARS,
 };
 use schemars::schema_for;
 use serde_json::json;
@@ -126,6 +127,33 @@ fn ingest_rejects_empty_or_noncanonical_ids() {
     for message_id in ["", " message-1", "message-1 "] {
         let mut request = valid_ingest();
         request.messages[0].id = message_id.to_owned();
+        assert!(request.validate().is_err());
+    }
+}
+
+#[test]
+fn ingest_validates_identifier_and_speaker_character_limits() {
+    let mut exact_limit = valid_ingest();
+    exact_limit.conversation_id = "界".repeat(MAX_CONVERSATION_ID_CHARS);
+    exact_limit.messages[0].id = "信".repeat(MAX_MESSAGE_ID_CHARS);
+    exact_limit.messages[0].speaker = Some("人".repeat(MAX_SPEAKER_CHARS));
+    assert!(exact_limit.validate().is_ok());
+
+    let mut conversation_too_long = valid_ingest();
+    conversation_too_long.conversation_id = "界".repeat(MAX_CONVERSATION_ID_CHARS + 1);
+    assert!(conversation_too_long.validate().is_err());
+
+    let mut message_id_too_long = valid_ingest();
+    message_id_too_long.messages[0].id = "信".repeat(MAX_MESSAGE_ID_CHARS + 1);
+    assert!(message_id_too_long.validate().is_err());
+
+    let mut speaker_too_long = valid_ingest();
+    speaker_too_long.messages[0].speaker = Some("人".repeat(MAX_SPEAKER_CHARS + 1));
+    assert!(speaker_too_long.validate().is_err());
+
+    for speaker in ["", " Alice", "Alice "] {
+        let mut request = valid_ingest();
+        request.messages[0].speaker = Some(speaker.to_owned());
         assert!(request.validate().is_err());
     }
 }
@@ -342,6 +370,48 @@ fn case_document_mutations_accept_safe_text_files_and_reject_unsafe_content() {
     let mut unconfirmed = confirmed;
     unconfirmed.user_confirmed = false;
     assert!(unconfirmed.validate().is_err());
+}
+
+#[test]
+fn case_search_validates_library_character_limit() {
+    let mut exact_limit = valid_case_search();
+    exact_limit.library = Some("库".repeat(MAX_CASE_LIBRARY_CHARS));
+    assert!(exact_limit.validate().is_ok());
+
+    let mut over_limit = valid_case_search();
+    over_limit.library = Some("库".repeat(MAX_CASE_LIBRARY_CHARS + 1));
+    assert!(over_limit.validate().is_err());
+}
+
+#[test]
+fn tool_schemas_publish_string_and_collection_limits() {
+    let ingest_schema = serde_json::to_value(schema_for!(IngestRequest)).unwrap();
+    assert_eq!(
+        ingest_schema["properties"]["conversation_id"]["maxLength"],
+        MAX_CONVERSATION_ID_CHARS
+    );
+    assert_eq!(
+        ingest_schema["properties"]["messages"]["maxItems"],
+        memory_mcp::MAX_INGEST_MESSAGES
+    );
+    assert_eq!(
+        ingest_schema["$defs"]["IngestMessage"]["properties"]["id"]["maxLength"],
+        MAX_MESSAGE_ID_CHARS
+    );
+    assert_eq!(
+        ingest_schema["$defs"]["IngestMessage"]["properties"]["speaker"]["maxLength"],
+        MAX_SPEAKER_CHARS
+    );
+    assert_eq!(
+        ingest_schema["$defs"]["IngestMessage"]["properties"]["text"]["maxLength"],
+        memory_mcp::MAX_MESSAGE_TEXT_CHARS
+    );
+
+    let case_schema = serde_json::to_value(schema_for!(CaseSearchRequest)).unwrap();
+    assert_eq!(
+        case_schema["properties"]["library"]["maxLength"],
+        MAX_CASE_LIBRARY_CHARS
+    );
 }
 
 #[test]

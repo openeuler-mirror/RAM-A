@@ -6,6 +6,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub const MAX_INGEST_MESSAGES: usize = 100;
+pub const MAX_CONVERSATION_ID_CHARS: usize = 255;
+pub const MAX_MESSAGE_ID_CHARS: usize = 255;
+pub const MAX_SPEAKER_CHARS: usize = 255;
 pub const MAX_MESSAGE_TEXT_CHARS: usize = 32_000;
 pub const MAX_QUERY_CHARS: usize = 32_000;
 pub const MAX_TOP_K: usize = 100;
@@ -16,6 +19,7 @@ pub const MAX_CASE_FILE_NAME_CHARS: usize = 255;
 pub const MAX_CASE_DOCUMENT_NAME_CHARS: usize = 512;
 pub const MAX_CASE_DIAGNOSIS_CHARS: usize = 8_000;
 pub const MAX_CASE_DELETION_REASON_CHARS: usize = 2_000;
+pub const MAX_CASE_LIBRARY_CHARS: usize = 255;
 
 const ALLOWED_ROLES: [&str; 4] = ["user", "assistant", "system", "tool"];
 const ALLOWED_MEMORY_TYPES: [&str; 7] = [
@@ -31,13 +35,19 @@ const ALLOWED_MEMORY_TYPES: [&str; 7] = [
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct IngestRequest {
+    #[schemars(length(max = MAX_CONVERSATION_ID_CHARS))]
     pub conversation_id: String,
+    #[schemars(length(max = MAX_INGEST_MESSAGES))]
     pub messages: Vec<IngestMessage>,
 }
 
 impl IngestRequest {
     pub fn validate(&self) -> Result<()> {
-        validate_id("conversation_id", &self.conversation_id)?;
+        validate_bounded_id(
+            "conversation_id",
+            &self.conversation_id,
+            MAX_CONVERSATION_ID_CHARS,
+        )?;
         if self.messages.is_empty() {
             bail!("messages must not be empty");
         }
@@ -47,7 +57,7 @@ impl IngestRequest {
 
         let mut message_ids = HashSet::with_capacity(self.messages.len());
         for message in &self.messages {
-            validate_id("message id", &message.id)?;
+            validate_bounded_id("message id", &message.id, MAX_MESSAGE_ID_CHARS)?;
             if !message_ids.insert(message.id.as_str()) {
                 bail!("message IDs must be unique");
             }
@@ -59,6 +69,9 @@ impl IngestRequest {
             }
             if !ALLOWED_ROLES.contains(&message.role.as_str()) {
                 bail!("message role is not allowed");
+            }
+            if let Some(speaker) = &message.speaker {
+                validate_bounded_id("message speaker", speaker, MAX_SPEAKER_CHARS)?;
             }
             if let Some(timestamp) = &message.timestamp {
                 validate_rfc3339("message timestamp", timestamp)?;
@@ -72,9 +85,12 @@ impl IngestRequest {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct IngestMessage {
+    #[schemars(length(max = MAX_MESSAGE_ID_CHARS))]
     pub id: String,
     pub role: String,
+    #[schemars(length(max = MAX_SPEAKER_CHARS))]
     pub speaker: Option<String>,
+    #[schemars(length(max = MAX_MESSAGE_TEXT_CHARS))]
     pub text: String,
     pub timestamp: Option<String>,
     #[serde(default = "default_candidate")]
@@ -84,6 +100,7 @@ pub struct IngestMessage {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchRequest {
+    #[schemars(length(max = MAX_QUERY_CHARS))]
     pub query: String,
     #[serde(default = "default_top_k")]
     pub top_k: usize,
@@ -125,8 +142,10 @@ impl SearchRequest {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaseSearchRequest {
+    #[schemars(length(max = MAX_QUERY_CHARS))]
     pub query: String,
     #[serde(default)]
+    #[schemars(length(max = MAX_CASE_LIBRARY_CHARS))]
     pub library: Option<String>,
     #[serde(default = "default_case_top_k")]
     pub top_k: usize,
@@ -144,7 +163,7 @@ impl CaseSearchRequest {
             bail!("top_k must be between 1 and {MAX_CASE_TOP_K}");
         }
         if let Some(library) = &self.library {
-            validate_id("library", library)?;
+            validate_bounded_id("library", library, MAX_CASE_LIBRARY_CHARS)?;
         }
         Ok(())
     }
@@ -342,6 +361,14 @@ fn case_document_mime_type(file_name: &str) -> Option<&'static str> {
 fn validate_id(field: &str, value: &str) -> Result<()> {
     if value.is_empty() || value.trim() != value {
         bail!("{field} must be non-empty and must not have surrounding whitespace");
+    }
+    Ok(())
+}
+
+fn validate_bounded_id(field: &str, value: &str, max_chars: usize) -> Result<()> {
+    validate_id(field, value)?;
+    if value.chars().count() > max_chars {
+        bail!("{field} must contain at most {max_chars} characters");
     }
     Ok(())
 }

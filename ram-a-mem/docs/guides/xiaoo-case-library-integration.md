@@ -77,8 +77,8 @@ RAM-A 服务端不会主动判断用户意图或自动触发工具。xiaoO 建�
 ```
 
 - `query` 必填，最多 32000 个 Unicode 字符。
-- `library` 可选；省略时使用服务端 `default_library`。它是公开别名，不是
-  `dataset_id`。
+- `library` 可选，最多 255 个 Unicode 字符；省略时使用服务端 `default_library`。
+  它是公开别名，不是 `dataset_id`。
 - `top_k` 可选，默认 `5`，范围 `1..20`。
 
 返回示例：
