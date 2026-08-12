@@ -67,14 +67,14 @@ def validate_pair_contract(
 ) -> dict[str, Any]:
     if raw["memory_mode"] != "raw" or extracted["memory_mode"] != "extracted":
         raise ValueError("paired arms must declare raw and extracted memory modes")
-    for key in (
-        "source_hash",
-        "configuration_hash",
-        "implementation_hash",
-        "preflight_hash",
-    ):
+    for key in ("source_hash", "configuration_hash", "implementation_hash"):
         if not raw.get(key) or raw[key] != extracted.get(key):
             raise ValueError(f"raw/extracted {key} mismatch")
+    raw_preflight = raw.get("preflight_hash")
+    extracted_preflight = extracted.get("preflight_hash")
+    if raw_preflight or extracted_preflight:
+        if not raw_preflight or raw_preflight != extracted_preflight:
+            raise ValueError("raw/extracted preflight_hash mismatch")
     queries = raw_prepared.get("queries")
     if not isinstance(queries, list) or queries != extracted_prepared.get("queries"):
         raise ValueError("raw/extracted prepared queries differ")
@@ -85,20 +85,6 @@ def validate_pair_contract(
         "query_count": len(ids),
         "configuration_hash": raw["configuration_hash"],
     }
-
-
-def validate_frozen_manifest(current_immutable: dict[str, Any], frozen_path: Path) -> None:
-    frozen = json.loads(Path(frozen_path).read_text(encoding="utf-8"))
-    actual = {key: frozen.get(key) for key in current_immutable}
-    if actual != current_immutable:
-        differing = sorted(
-            key
-            for key in current_immutable
-            if actual.get(key) != current_immutable[key]
-        )
-        raise ValueError(
-            "frozen configuration mismatch for fields: " + ", ".join(differing)
-        )
 
 
 def validate_memory_ab_preflight(

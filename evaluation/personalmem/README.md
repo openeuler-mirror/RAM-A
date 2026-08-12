@@ -170,7 +170,7 @@ An existing store without a memory-mode marker is treated as a legacy raw
 store: run it explicitly with `--memory-mode raw` once to claim it. The
 extracted arm rejects such a store; use a new store path for extracted memory.
 
-Prepare the shared raw input once, then run a pilot pair:
+Prepare the shared raw input once, then run a full pair:
 
 ```bash
 python evaluation/personalmem/run.py prepare \
@@ -179,13 +179,13 @@ python evaluation/personalmem/run.py prepare \
 
 python evaluation/personalmem/run.py pipeline \
   --dataset outputs/personalmem/pair-001/raw_prepared.json \
-  --memory-mode raw --phase pilot --pair-id pair-001 \
+  --memory-mode raw --phase full --pair-id pair-001 \
   --run-dir outputs/personalmem/pair-001/raw
 
 python evaluation/personalmem/run.py pipeline \
   --dataset outputs/personalmem/pair-001/raw_prepared.json \
   --indexed-dataset outputs/personalmem/pair-001/extracted/extracted_prepared.json \
-  --memory-mode extracted --phase pilot --pair-id pair-001 \
+  --memory-mode extracted --phase full --pair-id pair-001 \
   --run-dir outputs/personalmem/pair-001/extracted \
   --extraction-model openai/gpt-4o-mini \
   --verifier-model openai/gpt-4o-mini
@@ -196,15 +196,13 @@ aggregation, and prepared output to the shared Rust `memory-pipeline`. Python
 only adapts PersonaMem data and orchestrates the existing add/search/eval/
 answer/grade stages.
 
-A governed full run additionally requires both flags below:
+Strict runs additionally require a promotion policy:
 
 ```text
---phase full --frozen-config path/to/frozen-config.json \
---promotion-policy path/to/promotion-policy.json
+--phase full --promotion-policy path/to/promotion-policy.json
 ```
 
-The runner validates the frozen immutable fields and promotion-policy hash
-before dataset/extraction stages, provider clients, or run-directory writes.
+The runner validates the policy before dataset/extraction stages and provider clients.
 Use the same `--memory-mode`, `--dataset`, `--indexed-dataset`, extraction
 settings, and `--run-dir` again for later `answer` and `grade` commands.
 
@@ -279,11 +277,10 @@ python evaluation/personalmem/run.py add \
 | `--size` | `32k` | Official split (`32k`, `128k`, `1M`) |
 | `--limit-questions` | 0 | Cap questions for smoke tests |
 | `--memory-mode` | `raw` | Index raw turns or Rust-produced extracted memories |
-| `--phase` | `pilot` | Experiment governance phase: `pilot` or `full` |
+| `--phase` | `full` | Benchmark phase |
 | `--pair-id` | `standalone` | Identity shared by the paired arms |
 | `--indexed-dataset` | `outputs/personalmem_extracted_prepared.json` | Rust prepared output for the extracted arm |
-| `--frozen-config` | *(none)* | Frozen immutable manifest; required for `full` |
-| `--promotion-policy` | *(none)* | Policy whose hash is frozen; required for `full` |
+| `--promotion-policy` | *(none)* | Promotion policy; required in strict mode |
 | `--graph-build` | false | Build graph memory during add |
 | `--graph-build-concurrency` | 1 | Maximum concurrent graph builds; raise gradually within provider limits |
 | `--graph` | false | Enable graph retrieval during search |

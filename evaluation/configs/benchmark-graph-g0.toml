@@ -1,0 +1,77 @@
+# Full benchmark configuration. Values are intentionally explicit so that the
+# run manifest can be reproduced from this file directly.
+
+[run]
+phase = "full"
+mode = "normal" # use "strict" only for a reviewed A/B promotion run
+execution = "single"
+memory_mode = "raw"
+pair_id = "graph-unified-g0"
+output_root = "../../outputs/memory-ab"
+# Optional in normal mode; set PROMOTION_POLICY and uncomment for strict A/B.
+# promotion_policy = "${PROMOTION_POLICY}"
+
+[dataset.locomo]
+file = "${LOCOMO_DATASET}"
+
+[dataset.personalmem]
+file = "${PERSONALMEM_DATASET}"
+
+[dataset.longmemeval]
+file = "${LONGMEMEVAL_DATASET}"
+
+[memory]
+extraction_model = "openai/gpt-4o-mini"
+verifier_model = "openai/gpt-4o-mini"
+max_candidate_tokens = 320
+max_window_tokens = 640
+context_before_messages = 2
+context_after_messages = 0
+
+[embedding]
+provider = "openrouter"
+api_key_env = "OPENROUTER_API_KEY"
+model = "baai/bge-m3"
+dimensions = 1024
+
+[retrieval]
+mode = "hybrid"
+embedding_weight = 0.7
+bm25_weight = 0.3
+candidate_k = 150
+top_k = 30
+
+[graph]
+enabled = true
+build_enabled = true
+build_concurrency = 1
+weight = 0.2
+rerank = false
+allow_graph_only = false
+max_context_facts = 3
+memory_space_mode = "auto"
+memory_space_field = "scope_id"
+owner_id = "benchmark"
+llm_model = "openai/gpt-4o-mini"
+llm_api_key_env = "OPENROUTER_API_KEY"
+llm_base_url = "https://openrouter.ai/api/v1"
+llm_timeout_ms = 60000
+
+[rerank]
+enabled = false
+provider = "openrouter"
+api_key_env = "OPENROUTER_API_KEY"
+model = "cohere/rerank-v3.5"
+base_url = "https://openrouter.ai/api/v1"
+input_k = 40
+
+[answer]
+model = "openai/gpt-4o-mini"
+api_key_env = "OPENROUTER_API_KEY"
+base_url = "https://openrouter.ai/api/v1"
+qa_top_k = 10
+
+[judge]
+model = "openai/gpt-4o-mini"
+api_key_env = "OPENROUTER_API_KEY"
+base_url = "https://openrouter.ai/api/v1"

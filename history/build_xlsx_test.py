@@ -33,6 +33,8 @@ EXPECTED_RUN_IDS = {
         "v3 +rerank\ncohere-v3.5\n2026-07-08",
         "v4 A/B fresh raw\n+rerank\n2026-07-16",
         "v5 A/B extracted\n+rerank\n2026-07-16",
+        "locomo-raw-59ba28e03223e14e",
+        "locomo-extracted-0756fa66cf3bb0a6",
     ],
 }
 
@@ -151,6 +153,17 @@ def test_existing_history_round_trips_to_expected_columns(tmp_path: Path) -> Non
     ] == EXPECTED_RUN_IDS["longmemeval"]
 
 
+def test_build_workbooks_allows_missing_dataset_history_files(tmp_path: Path) -> None:
+    records_root = tmp_path / "records"
+    records_root.mkdir()
+    source = RECORDS_ROOT / "locomo.jsonl"
+    (records_root / source.name).write_bytes(source.read_bytes())
+
+    build_workbooks(tmp_path / "workbooks", records_root=records_root)
+
+    assert (tmp_path / "workbooks" / "benchmarks.xlsx").is_file()
+
+
 def test_task6_nested_records_populate_ab_conditions_and_locomo_metrics(
     tmp_path: Path,
 ) -> None:
@@ -214,7 +227,7 @@ def test_task6_nested_records_populate_ab_conditions_and_locomo_metrics(
     [
         ("PersonaMem", 4, "QA Accuracy (4-option)", "0.00%"),
         ("LongMemEval", 3, "Retrieval turn MRR", "0.00"),
-        ("LoCoMo", 5, "Question count (excl. cat5)", "#,##0"),
+        ("LoCoMo", 7, "Question count (excl. cat5)", "#,##0"),
     ],
 )
 def test_existing_workbook_layout_styles_and_future_columns_are_preserved(

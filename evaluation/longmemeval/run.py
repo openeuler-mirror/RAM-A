@@ -27,7 +27,6 @@ from common.config import DATASET_DIR, OUTPUTS_DIR  # noqa: E402
 from common.memory_ab import (  # noqa: E402
     canonical_sha256,
     ensure_run_mode,
-    validate_frozen_manifest,
     validate_memory_ab_preflight,
 )
 from common.memory_ab_stage import run_stage  # noqa: E402
@@ -266,9 +265,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--phase",
-        choices=("pilot", "full"),
-        default="pilot",
-        help="Experiment governance phase (default: pilot)",
+        choices=("full",),
+        default="full",
+        help="Experiment run phase (full benchmark)",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("normal", "strict"),
+        default="normal",
+        help="normal records the run; strict enables governance checks",
     )
     parser.add_argument(
         "--pipeline-phase",
@@ -277,7 +282,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Pipeline stages to run (default: retrieval)",
     )
     parser.add_argument("--pair-id", default="standalone")
-    parser.add_argument("--frozen-config", type=Path)
     parser.add_argument("--promotion-policy", type=Path)
     parser.add_argument("--preflight", type=Path)
     parser.add_argument("--extraction-model", default="openai/gpt-4o-mini")
@@ -358,39 +362,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Override auto-generated QA output tag (default: auto from model/prompt/k)",
     )
-    raw_argv = list(sys.argv[1:] if argv is None else argv)
-    rewritten, legacy_phase = _rewrite_legacy_phase(raw_argv)
-    if legacy_phase and any(
-        item == "--pipeline-phase" or item.startswith("--pipeline-phase=")
-        for item in raw_argv
-    ):
-        parser.error(
-            "legacy --phase retrieval|qa|all cannot be combined with "
-            "--pipeline-phase"
-        )
-    if legacy_phase:
-        print(
-            "[run] Warning: --phase retrieval|qa|all is deprecated; "
-            "use --pipeline-phase instead.",
-            file=sys.stderr,
-        )
-    return parser.parse_args(rewritten)
-
-
-def _rewrite_legacy_phase(argv: list[str]) -> tuple[list[str], bool]:
-    rewritten = list(argv)
-    legacy = False
-    for index, item in enumerate(rewritten):
-        if item == "--phase" and index + 1 < len(rewritten):
-            if rewritten[index + 1] in {"retrieval", "qa", "all"}:
-                rewritten[index] = "--pipeline-phase"
-                legacy = True
-        elif item.startswith("--phase="):
-            value = item.partition("=")[2]
-            if value in {"retrieval", "qa", "all"}:
-                rewritten[index] = f"--pipeline-phase={value}"
-                legacy = True
-    return rewritten, legacy
+    return parser.parse_args(sys.argv[1:] if argv is None else argv)
 
 
 def build_run_paths(args: argparse.Namespace) -> RunPaths:
@@ -421,9 +393,10 @@ def validate_experiment_args(args: argparse.Namespace) -> None:
         raise ValueError("--graph-build-concurrency must be at least 1")
     if args.max_graph_context_facts < 0:
         raise ValueError("--max-graph-context-facts must be at least 0")
-    if args.phase == "full" and args.frozen_config is None:
-        raise ValueError("--frozen-config is required for full runs")
-    if args.phase == "full" and args.promotion_policy is None:
+    mode = getattr(args, "mode", "normal")
+    if mode not in {"normal", "strict"}:
+        raise ValueError("--mode must be normal or strict")
+    if mode == "strict" and args.phase == "full" and args.promotion_policy is None:
         raise ValueError("--promotion-policy is required for full runs")
     validate_rerank_config(
         enabled=args.rerank,
@@ -690,8 +663,6 @@ def main() -> None:
         implementation_digest,
         promotion_policy_digest,
     )
-    if args.phase == "full":
-        validate_frozen_manifest(immutable, args.frozen_config)
     preflight_digest = (
         validate_memory_ab_preflight(
             args.preflight,
@@ -725,6 +696,7 @@ def main() -> None:
         "source_path": str(dataset_path),
         "run_dir": str(run_dir),
         "phase": args.phase,
+        "mode": args.mode,
         "pipeline_phase": args.pipeline_phase,
         "memory_mode": args.memory_mode,
         "pair_id": args.pair_id,

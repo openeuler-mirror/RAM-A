@@ -115,18 +115,18 @@ def test_run_locomo_eval_shell_syntax_is_valid():
     subprocess.run(["bash", "-n", str(script)], check=True)
 
 
-def test_memory_ab_runner_has_paired_modes_and_frozen_config_contract():
+def test_memory_ab_runner_has_paired_modes_and_full_phase_contract():
     script = EVALUATION_ROOT / "run_locomo_memory_ab.sh"
     content = script.read_text(encoding="utf-8")
 
-    assert 'PHASE="${PHASE:-pilot}"' in content
+    assert 'PHASE="${PHASE:-full}"' in content
     assert 'MEMORY_MODE=raw "$PYTHON_BIN" locomo/locomo_run.py' in content
     assert 'MEMORY_MODE=extracted "$PYTHON_BIN" locomo/locomo_run.py' in content
     assert 'locomo/locomo_compare.py' in content
     assert 'OPENROUTER_API_KEY' in content
-    assert 'FROZEN_CONFIG' in content
-    assert 'locomo/locomo_preflight.py' in content
-    assert 'export PREFLIGHT_PATH' in content
+    assert 'FROZEN_CONFIG' not in content
+    assert 'locomo/locomo_preflight.py' not in content
+    assert 'PREFLIGHT_PATH' not in content
     assert '. ./.env' in content
 
 

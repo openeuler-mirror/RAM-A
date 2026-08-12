@@ -12,7 +12,6 @@ from common.memory_ab import (
     ensure_run_mode,
     ensure_store_mode,
     file_sha256,
-    validate_frozen_manifest,
     validate_memory_ab_preflight,
     validate_pair_contract,
 )
@@ -21,7 +20,7 @@ from common.memory_ab import (
 def _config(memory_mode: str, run_dir: Path) -> dict[str, object]:
     return ExperimentArmConfig(
         dataset="locomo",
-        phase="pilot",
+        phase="full",
         memory_mode=memory_mode,
         source_path=run_dir / "source.json",
         run_dir=run_dir,
@@ -36,7 +35,7 @@ def _config(memory_mode: str, run_dir: Path) -> dict[str, object]:
 def test_experiment_arm_manifest_hashes_only_immutable_configuration(tmp_path):
     config = ExperimentArmConfig(
         dataset="locomo",
-        phase="pilot",
+        phase="full",
         memory_mode="raw",
         source_path=tmp_path / "locomo.json",
         run_dir=tmp_path / "raw",
@@ -47,7 +46,7 @@ def test_experiment_arm_manifest_hashes_only_immutable_configuration(tmp_path):
 
     assert manifest == {
         "dataset": "locomo",
-        "phase": "pilot",
+        "phase": "full",
         "memory_mode": "raw",
         "source_path": str(tmp_path / "locomo.json"),
         "run_dir": str(tmp_path / "raw"),
@@ -133,25 +132,6 @@ def test_pair_contract_rejects_missing_or_duplicated_query_ids(tmp_path, queries
             {"queries": queries},
             {"queries": queries},
         )
-
-
-def test_frozen_manifest_compares_only_current_immutable_fields(tmp_path):
-    frozen = tmp_path / "frozen.json"
-    frozen.write_text(
-        json.dumps({"top_k": 30, "model": "bge-m3", "phase": "pilot"}),
-        encoding="utf-8",
-    )
-
-    validate_frozen_manifest({"top_k": 30, "model": "bge-m3"}, frozen)
-
-
-def test_frozen_manifest_rejects_changed_immutable_field(tmp_path):
-    frozen = tmp_path / "frozen.json"
-    frozen.write_text(json.dumps({"top_k": 29, "model": "bge-m3"}), encoding="utf-8")
-    with pytest.raises(
-        ValueError, match="frozen configuration mismatch for fields: top_k"
-    ):
-        validate_frozen_manifest({"top_k": 30, "model": "bge-m3"}, frozen)
 
 
 def test_run_directory_rejects_switching_memory_mode(tmp_path):

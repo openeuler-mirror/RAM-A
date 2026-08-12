@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 import scripts.run_memory_ab as memory_ab_runner
-from scripts.run_memory_ab import build_dataset_commands, build_parser, run_pair
+from scripts.run_memory_ab import build_dataset_commands, build_parser, run_pair, run_single
 
 
 class FakeRunner:
@@ -72,11 +72,11 @@ def _args(dataset: str, phase: str, tmp_path: Path) -> argparse.Namespace:
     return argparse.Namespace(
         dataset=dataset,
         phase=phase,
+        mode="strict",
         pair_id="pair-1",
         dataset_file=source,
         output_root=tmp_path / "outputs",
         promotion_policy=policy,
-        frozen_config=None,
         history_root=tmp_path / "history",
         python_executable="python",
         embedding="hash",
@@ -84,7 +84,50 @@ def _args(dataset: str, phase: str, tmp_path: Path) -> argparse.Namespace:
         grounding_responses=None,
         resume=False,
         arm_args=[],
+        execution="ab",
+        memory_mode=None,
     )
+
+
+def test_normal_mode_forwards_mode_without_preflight_gate(
+    tmp_path: Path,
+) -> None:
+    args = _args("longmemeval", "full", tmp_path)
+    args.mode = "normal"
+
+    commands = build_dataset_commands(args)
+
+    assert "--mode" in commands.raw.argv
+    assert commands.raw.argv[commands.raw.argv.index("--mode") + 1] == "normal"
+    assert "--mode" in commands.extracted.argv
+    assert commands.extracted.argv[commands.extracted.argv.index("--mode") + 1] == "normal"
+
+
+def test_normal_mode_skips_heavy_preflight_gate(tmp_path: Path) -> None:
+    args = _args("longmemeval", "full", tmp_path)
+    args.mode = "normal"
+    args.promotion_policy = None
+    runner = ArtifactRunner(args, {"complete": False})
+
+    comparison = run_pair(args, runner=runner)
+
+    assert comparison == {"complete": False}
+    assert runner.stage_names == ["raw", "extracted", "compare"]
+
+
+@pytest.mark.parametrize("memory_mode", ("raw", "extracted"))
+def test_single_mode_runs_only_selected_arm(tmp_path: Path, memory_mode: str) -> None:
+    args = _args("longmemeval", "full", tmp_path)
+    args.mode = "normal"
+    args.execution = "single"
+    args.memory_mode = memory_mode
+    args.promotion_policy = None
+    runner = FakeRunner()
+
+    run_single(args, runner=runner)
+
+    assert runner.stage_names == [memory_mode]
+
 
 
 def _write_personalmem_prepared_fixture(path: Path) -> int:
@@ -105,7 +148,7 @@ def _write_personalmem_prepared_fixture(path: Path) -> int:
 def test_selectors_reject_path_traversal_components(
     tmp_path: Path, field: str, value: str
 ) -> None:
-    args = _args("locomo", "pilot", tmp_path)
+    args = _args("locomo", "full", tmp_path)
     setattr(args, field, value)
 
     with pytest.raises(ValueError):
@@ -197,7 +240,7 @@ def test_unified_pair_runs_offline_fixture_arms_and_comparison(
     tmp_path: Path,
 ) -> None:
     fixtures = Path(__file__).resolve().parents[1] / "fixtures"
-    args = _args(dataset, "pilot", tmp_path)
+    args = _args(dataset, "full", tmp_path)
     if dataset == "personalmem":
         question_count = _write_personalmem_prepared_fixture(args.dataset_file)
         args.arm_args = [
@@ -230,12 +273,11 @@ def test_unified_pair_runs_offline_fixture_arms_and_comparison(
     commands = build_dataset_commands(args)
 
     assert runner.stages[-3:] == ["raw", "extracted", "compare"]
-    assert comparison["complete"] is True
+    assert comparison["complete"] is False
     assert comparison["promotion"]["passed"] is False
     assert commands.comparison_path.is_file()
     assert commands.comparison_html_path.is_file()
     assert not commands.history_artifact_path.exists()
-    assert not commands.frozen_path.exists()
     raw_dir = commands.pair_dir / "raw"
     extracted_dir = commands.pair_dir / "extracted"
     for run_dir in (raw_dir, extracted_dir):
@@ -261,7 +303,7 @@ def test_unified_pair_rejects_pipeline_phase_override(
     dataset: str,
     tmp_path: Path,
 ) -> None:
-    args = _args(dataset, "pilot", tmp_path)
+    args = _args(dataset, "full", tmp_path)
     args.arm_args = ["--pipeline-phase", "retrieval"]
 
     with pytest.raises(ValueError, match="pipeline-phase"):
@@ -273,7 +315,7 @@ def test_unified_pair_commands_explicitly_bind_pipeline_phase_all(
     dataset: str,
     tmp_path: Path,
 ) -> None:
-    commands = build_dataset_commands(_args(dataset, "pilot", tmp_path))
+    commands = build_dataset_commands(_args(dataset, "full", tmp_path))
 
     for command in (commands.raw, commands.extracted):
         phase_index = command.argv.index("--pipeline-phase") + 1
@@ -284,7 +326,6 @@ def test_unified_pair_commands_explicitly_bind_pipeline_phase_all(
     "override",
     (
         "--dataset-f=other.json",
-        "--frozen-c=other.json",
         "--memory-m=extracted",
         "--pair-i=other-pair",
         "--ph=full",
@@ -298,7 +339,8 @@ def test_unified_pair_rejects_governance_option_abbreviations(
     override: str,
     tmp_path: Path,
 ) -> None:
-    args = _args("longmemeval", "pilot", tmp_path)
+    args = _args("longmemeval", "full", tmp_path)
+    args.mode = "normal"
     args.arm_args = [override]
 
     with pytest.raises(ValueError, match="unified A/B runner owns"):
@@ -306,7 +348,7 @@ def test_unified_pair_rejects_governance_option_abbreviations(
 
 
 def test_longmemeval_immutable_manifest_binds_pipeline_phase(tmp_path: Path) -> None:
-    args = _args("longmemeval", "pilot", tmp_path)
+    args = _args("longmemeval", "full", tmp_path)
     commands = build_dataset_commands(args)
 
     manifest = memory_ab_runner._arm_immutable_manifest("longmemeval", commands.raw)
@@ -314,123 +356,82 @@ def test_longmemeval_immutable_manifest_binds_pipeline_phase(tmp_path: Path) -> 
     assert manifest["pipeline_phase"] == "all"
 
 
-def test_pilot_rejects_external_frozen_config_without_deleting_it(
+def test_full_pair_runs_without_config_snapshot(
     tmp_path: Path,
 ) -> None:
-    args = _args("personalmem", "pilot", tmp_path)
-    external_frozen = tmp_path / "external-frozen.json"
-    external_frozen.write_text("stale\n", encoding="utf-8")
-    args.frozen_config = external_frozen
+    args = _args("longmemeval", "full", tmp_path)
+    args.mode = "normal"
+    args.promotion_policy = None
+    runner = ArtifactRunner(
+        args,
+        {"complete": True},
+        history_records=[
+            {
+                "schema_version": "memory-ab-history-v1",
+                "pair_id": args.pair_id,
+                "run_id": "raw-run",
+                "dataset": args.dataset,
+                "split": "test",
+                "memory_mode": "raw",
+                "phase": "full",
+                "source_hash": "source",
+                "code_hash": "code",
+                "configuration_hash": "config",
+                "preflight_hash": None,
+                "policy_hash": None,
+                "governance_mode": "normal",
+                "configuration": {},
+                "metrics": {},
+                "promotion_status": "not_evaluated",
+                "promotion_reasons": [],
+                "artifact_path": "/artifacts/raw",
+            },
+            {
+                "schema_version": "memory-ab-history-v1",
+                "pair_id": args.pair_id,
+                "run_id": "extracted-run",
+                "dataset": args.dataset,
+                "split": "test",
+                "memory_mode": "extracted",
+                "phase": "full",
+                "source_hash": "source",
+                "code_hash": "code",
+                "configuration_hash": "config",
+                "preflight_hash": None,
+                "policy_hash": None,
+                "governance_mode": "normal",
+                "configuration": {},
+                "metrics": {},
+                "promotion_status": "not_evaluated",
+                "promotion_reasons": [],
+                "artifact_path": "/artifacts/extracted",
+            },
+        ],
+    )
 
-    with pytest.raises(ValueError, match="frozen-config"):
-        build_dataset_commands(args)
+    comparison = run_pair(args, runner=runner)
 
-    assert external_frozen.read_text(encoding="utf-8") == "stale\n"
-
-
-def test_full_pair_validates_frozen_config_before_running_any_command(
-    tmp_path: Path,
-) -> None:
-    runner = FakeRunner()
-
-    with pytest.raises(ValueError, match="frozen"):
-        run_pair(_args("longmemeval", "full", tmp_path), runner=runner)
-
-    assert runner.calls == []
+    assert comparison == {"complete": True}
+    assert runner.stage_names == ["raw", "extracted", "compare"]
 
 
 def test_invalid_promotion_policy_is_rejected_before_preflight_or_arms(
     tmp_path: Path,
 ) -> None:
-    args = _args("personalmem", "pilot", tmp_path)
+    args = _args("personalmem", "full", tmp_path)
     args.promotion_policy.write_text("{}\n", encoding="utf-8")
     commands = build_dataset_commands(args)
-    commands.frozen_path.parent.mkdir(parents=True, exist_ok=True)
-    commands.frozen_path.write_text("stale\n", encoding="utf-8")
     runner = FakeRunner()
 
     with pytest.raises((KeyError, ValueError), match="promotion|schema"):
         run_pair(args, runner=runner)
 
     assert runner.calls == []
-    assert not commands.frozen_path.exists()
-
-
-def test_full_rejects_frozen_policy_or_implementation_mismatch_before_commands(
-    tmp_path: Path,
-) -> None:
-    args = _args("longmemeval", "full", tmp_path)
-    frozen = tmp_path / "frozen.json"
-    frozen.write_text(
-        '{"promotion_policy_hash":"stale","implementation_hash":"stale"}\n',
-        encoding="utf-8",
-    )
-    args.frozen_config = frozen
-    runner = FakeRunner()
-
-    with pytest.raises(ValueError, match="frozen.*(policy|implementation)"):
-        run_pair(args, runner=runner)
-
-    assert runner.calls == []
-
-
-def test_full_requires_complete_dataset_immutable_manifest_before_commands(
-    tmp_path: Path,
-) -> None:
-    args = _args("longmemeval", "full", tmp_path)
-    from common.memory_ab import file_sha256
-
-    frozen = tmp_path / "frozen.json"
-    frozen.write_text(
-        json.dumps(
-            {
-                "implementation_hash": memory_ab_runner._implementation_hash(
-                    "longmemeval"
-                ),
-                "promotion_policy_hash": file_sha256(args.promotion_policy),
-            }
-        ),
-        encoding="utf-8",
-    )
-    args.frozen_config = frozen
-    runner = FakeRunner()
-
-    with pytest.raises(ValueError, match="frozen configuration mismatch"):
-        run_pair(args, runner=runner)
-
-    assert runner.calls == []
-
-
-def test_full_frozen_gate_precedes_dataset_file_access(tmp_path: Path) -> None:
-    from common.memory_ab import file_sha256
-
-    args = _args("longmemeval", "full", tmp_path)
-    args.dataset_file = tmp_path / "missing-dataset.json"
-    args.frozen_config = tmp_path / "frozen.json"
-    args.frozen_config.write_text(
-        json.dumps(
-            {
-                "implementation_hash": memory_ab_runner._implementation_hash(
-                    "longmemeval"
-                ),
-                "promotion_policy_hash": file_sha256(args.promotion_policy),
-            }
-        ),
-        encoding="utf-8",
-    )
-    runner = FakeRunner()
-
-    with pytest.raises(ValueError, match="frozen configuration mismatch"):
-        run_pair(args, runner=runner)
-
-    assert runner.calls == []
-
-
 def test_comparison_runs_only_after_both_arms_complete(tmp_path: Path) -> None:
     runner = FakeRunner(fail_on="extracted")
 
     with pytest.raises(subprocess.CalledProcessError):
-        run_pair(_args("personalmem", "pilot", tmp_path), runner=runner)
+        run_pair(_args("personalmem", "full", tmp_path), runner=runner)
 
     assert "raw" in runner.stage_names
     assert "extracted" in runner.stage_names
@@ -438,7 +439,7 @@ def test_comparison_runs_only_after_both_arms_complete(tmp_path: Path) -> None:
 
 
 def test_preflight_finishes_before_raw_and_extracted_arms(tmp_path: Path) -> None:
-    args = _args("personalmem", "pilot", tmp_path)
+    args = _args("personalmem", "full", tmp_path)
     commands = build_dataset_commands(args)
 
     assert commands.raw.stage == "raw"
@@ -453,7 +454,7 @@ def test_preflight_finishes_before_raw_and_extracted_arms(tmp_path: Path) -> Non
 
 
 def test_locomo_registry_binds_explicit_policy_to_arms_and_comparison(tmp_path: Path) -> None:
-    args = _args("locomo", "pilot", tmp_path)
+    args = _args("locomo", "full", tmp_path)
 
     commands = build_dataset_commands(args)
 
@@ -484,7 +485,7 @@ def test_cli_forwards_arguments_after_separator_without_forwarding_separator(
             "--dataset",
             "longmemeval",
             "--phase",
-            "pilot",
+            "full",
             "--pair-id",
             "pair-1",
             "--dataset-file",
@@ -526,40 +527,6 @@ def test_dataset_implementation_hash_covers_unified_orchestrator(
     assert module.implementation_hash() != before
 
 
-def test_pilot_freezes_only_after_passing_comparison(tmp_path: Path) -> None:
-    args = _args("personalmem", "pilot", tmp_path)
-    commands = build_dataset_commands(args)
-    runner = ArtifactRunner(
-        args,
-        {"complete": True, "promotion": {"passed": True, "reasons": []}},
-    )
-
-    run_pair(args, runner=runner)
-
-    assert runner.stage_names[-3:] == ["raw", "extracted", "compare"]
-    assert commands.frozen_path.is_file()
-    assert __import__("json").loads(
-        commands.frozen_path.read_text(encoding="utf-8")
-    )["preflight_hash"] == "preflight"
-    assert not commands.history_artifact_path.exists()
-
-
-def test_failed_pilot_does_not_freeze_or_append_history(tmp_path: Path) -> None:
-    args = _args("longmemeval", "pilot", tmp_path)
-    commands = build_dataset_commands(args)
-    commands.frozen_path.parent.mkdir(parents=True, exist_ok=True)
-    commands.frozen_path.write_text("stale\n", encoding="utf-8")
-    runner = ArtifactRunner(
-        args,
-        {"complete": True, "promotion": {"passed": False, "reasons": ["floor"]}},
-    )
-
-    run_pair(args, runner=runner)
-
-    assert not commands.frozen_path.exists()
-    assert not (args.history_root / "records" / "longmemeval.jsonl").exists()
-
-
 def _history_records(pair_id: str, *, passed: bool) -> list[dict]:
     shared = {
         "schema_version": "memory-ab-history-v1",
@@ -572,6 +539,7 @@ def _history_records(pair_id: str, *, passed: bool) -> list[dict]:
         "configuration_hash": "config",
         "preflight_hash": "preflight",
         "policy_hash": "policy",
+        "governance_mode": "strict",
         "configuration": {},
         "metrics": {},
     }
@@ -600,15 +568,7 @@ def test_complete_failed_full_pair_is_appended_after_comparison(
     tmp_path: Path,
 ) -> None:
     args = _args("personalmem", "full", tmp_path)
-    frozen = tmp_path / "frozen.json"
-    args.frozen_config = frozen
     commands = build_dataset_commands(args)
-    frozen.write_text(
-        json.dumps(
-            memory_ab_runner._arm_immutable_manifest("personalmem", commands.raw)
-        ),
-        encoding="utf-8",
-    )
     records = _history_records(args.pair_id, passed=False)
     runner = ArtifactRunner(
         args,

@@ -111,8 +111,7 @@ The optional mem0 comparison implementation lives under `evaluation/locomo/backe
 
 ## Grounded Atomic-Memory A/B
 
-The governed entrypoint supersedes the shell wrapper for new paired runs. Save
-this exact frozen LoCoMo policy before the pilot:
+For a strict full comparison, save this exact LoCoMo policy:
 
 ```json
 {"schema_version":"locomo-promotion-v1","historical_overall":{"operator":">","threshold":0.4065},"fresh_raw_overall":{"operator":">"},"scored_count":1540,"category_floors":{"1":0.1999,"2":0.4161,"3":0.2717,"4":0.4509},"regression_suite_required":true}
@@ -120,21 +119,14 @@ this exact frozen LoCoMo policy before the pilot:
 
 ```bash
 PYTHONPATH=evaluation evaluation/.venv/bin/python evaluation/scripts/run_memory_ab.py \
-  --dataset locomo --phase pilot --pair-id locomo-v4 \
-  --dataset-file data/locomo/locomo10.json \
-  --promotion-policy /absolute/path/locomo-policy.json
-
-PYTHONPATH=evaluation evaluation/.venv/bin/python evaluation/scripts/run_memory_ab.py \
   --dataset locomo --phase full --pair-id locomo-v4 \
   --dataset-file data/locomo/locomo10.json \
-  --promotion-policy /absolute/path/locomo-policy.json \
-  --frozen-config evaluation/outputs/memory-ab/locomo/pilot/locomo-v4/frozen_config.json
+  --promotion-policy /absolute/path/locomo-policy.json
 ```
 
-The policy bytes are hashed into both arm configs and the frozen manifest.
-Pilot produces no history. A complete full pair is recorded even if promotion
-fails, while only a passing treatment can become a baseline. The commands above
-describe the live protocol; they do not claim a live result until run manually.
+The policy bytes are recorded in both arm configs. An incomplete pair produces no
+history. A complete full pair is recorded even if promotion fails, while only a
+passing treatment can become a baseline.
 
 `run_locomo_memory_ab.sh` evaluates memory features 2 and 4 without changing the
 answer prompt. The paired arms are:
@@ -157,19 +149,11 @@ cd evaluation
 export OPENROUTER_API_KEY="<new-rotated-key>"
 
 PYTHON_BIN=../.venv/bin/python \
-PHASE=pilot RUN_DIR=outputs/locomo-memory-ab/pilot \
-./run_locomo_memory_ab.sh
-
-PYTHON_BIN=../.venv/bin/python \
-PHASE=full \
-FROZEN_CONFIG=outputs/locomo-memory-ab/pilot/frozen_config.json \
-RUN_DIR=outputs/locomo-memory-ab/full \
+PHASE=full RUN_DIR=outputs/locomo-memory-ab/full \
 ./run_locomo_memory_ab.sh
 ```
 
-Pilot is fixed to conversation index 0. A passing pilot freezes the model,
-window, retrieval, and rerank configuration in `frozen_config.json`; full runs
-reject any mismatch before a model call. The fixed models are
+The fixed models are
 `openai/gpt-4o-mini` for extraction, grounding, answer, and judge;
 `baai/bge-m3` (1,024 dimensions) for embeddings; and
 `cohere/rerank-v3.5` for reranking. Hybrid weights are 0.7/0.3, candidate K is
@@ -218,8 +202,8 @@ preserves serial build behavior.
 `MAX_GRAPH_CONTEXT_FACTS` affects answer-context rendering only; it does not change graph
 construction, retrieval candidates, or ranking.
 The governed `locomo_run.py` entry point reads the same `MEMORY_BENCH_GRAPH` and `GRAPH_*`
-variables and emits the same add/search flags. Use that entry point for a frozen, resumable
-full A/B run; the shell wrapper remains a compatibility launcher for existing evaluation jobs.
+variables and emits the same add/search flags. Use that entry point when you need the
+dataset-specific full-run metadata; the shell wrapper remains a convenience launcher.
 In the default `auto` memory-space mode, prepared LoCoMo records use
 `scope_id` values such as `path:$[0]`. If a graph build is resumed, completed
 graph runs are skipped, missing graph runs are built, and failed/running graph

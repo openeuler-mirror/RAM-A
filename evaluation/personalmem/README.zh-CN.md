@@ -82,7 +82,7 @@ python evaluation/personalmem/run.py <命令> [选项]
 `--memory-mode raw` 运行一次以完成认领。extracted arm 会拒绝这类 store；请为
 extracted memory 使用新的 store 路径。
 
-先准备一次共享 raw 输入，再运行 pilot pair：
+先准备一次共享 raw 输入，再运行 full pair：
 
 ```bash
 python evaluation/personalmem/run.py prepare \
@@ -91,13 +91,13 @@ python evaluation/personalmem/run.py prepare \
 
 python evaluation/personalmem/run.py pipeline \
   --dataset outputs/personalmem/pair-001/raw_prepared.json \
-  --memory-mode raw --phase pilot --pair-id pair-001 \
+  --memory-mode raw --phase full --pair-id pair-001 \
   --run-dir outputs/personalmem/pair-001/raw
 
 python evaluation/personalmem/run.py pipeline \
   --dataset outputs/personalmem/pair-001/raw_prepared.json \
   --indexed-dataset outputs/personalmem/pair-001/extracted/extracted_prepared.json \
-  --memory-mode extracted --phase pilot --pair-id pair-001 \
+  --memory-mode extracted --phase full --pair-id pair-001 \
   --run-dir outputs/personalmem/pair-001/extracted \
   --extraction-model openai/gpt-4o-mini \
   --verifier-model openai/gpt-4o-mini
@@ -110,12 +110,11 @@ prepared output 全部交给共享 Rust `memory-pipeline`。Python 只负责 Per
 受治理的 full run 还必须同时提供：
 
 ```text
---phase full --frozen-config path/to/frozen-config.json \
---promotion-policy path/to/promotion-policy.json
+--phase full --promotion-policy path/to/promotion-policy.json
 ```
 
-runner 会在数据集/提取阶段、provider client 构造或 run-dir 写入之前校验冻结的
-immutable fields 与 promotion-policy hash。后续执行 `answer` 和 `grade` 时，应继续
+runner 会在数据集/提取阶段、provider client 构造或 run-dir 写入之前校验运行配置与
+promotion-policy hash。后续执行 `answer` 和 `grade` 时，应继续
 传入相同的 `--memory-mode`、`--dataset`、`--indexed-dataset`、提取设置和
 `--run-dir`。
 
@@ -141,11 +140,10 @@ embedding 和小型 PersonaMem fixture，全程不访问网络。这些 fixture 
 | `--size` | `32k` | 官方切分（`32k`、`128k`、`1M`） |
 | `--limit-questions` | 0 | 限制问题数量用于冒烟测试 |
 | `--memory-mode` | `raw` | 索引 raw turn 或 Rust 生成的 extracted memory |
-| `--phase` | `pilot` | 实验治理阶段：`pilot` 或 `full` |
+| `--phase` | `full` | benchmark 阶段 |
 | `--pair-id` | `standalone` | 两个配对 arm 共用的标识 |
 | `--indexed-dataset` | `outputs/personalmem_extracted_prepared.json` | extracted arm 的 Rust prepared 输出 |
-| `--frozen-config` | *（无）* | 冻结 immutable manifest；`full` 必需 |
-| `--promotion-policy` | *（无）* | hash 被冻结的晋级策略；`full` 必需 |
+| `--promotion-policy` | *（无）* | 晋级策略；strict 模式必需 |
 | `--graph-build` | false | add 阶段构建图记忆 |
 | `--graph-build-concurrency` | 1 | 同时构建的图记录上限；应根据服务商限流逐步提高 |
 | `--graph` | false | search 阶段开启 graph retrieval |

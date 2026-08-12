@@ -76,10 +76,9 @@ python3 evaluation/longmemeval/run.py [options]
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--memory-mode` | `raw` | Index `raw` turns or Rust-produced `extracted` memories |
-| `--phase` | `pilot` | Experiment governance phase: `pilot` or `full` |
+| `--phase` | `full` | Benchmark phase |
 | `--pipeline-phase` | `retrieval` | Execute `retrieval`, `qa`, or `all` stages |
 | `--pair-id` | `standalone` | Stable identifier shared by paired arms |
-| `--frozen-config` | *(none)* | Frozen immutable manifest; required for `full` |
 | `--promotion-policy` | *(none)* | Promotion policy hashed into the manifest; required for `full` |
 | `--backend` | `RAM-A` | RAM-A backend key |
 | `--embedding` | `openrouter` | `openrouter` or `hash` |
@@ -125,10 +124,6 @@ python3 evaluation/longmemeval/run.py [options]
 
 Full list: `python3 evaluation/longmemeval/run.py --help`
 
-For compatibility, legacy `--phase retrieval|qa|all` (including
-`--phase=value`) is rewritten to `--pipeline-phase` with a deprecation warning.
-Combining that legacy spelling with an explicit `--pipeline-phase` is an error.
-
 ## Quick Smoke Test
 
 ```bash
@@ -144,8 +139,8 @@ export OPENROUTER_API_KEY="your-key"
 # Retrieval only
 python3 evaluation/longmemeval/run.py
 
-# Retrieval + QA pilot arm
-python3 evaluation/longmemeval/run.py --phase pilot --pipeline-phase all \
+# Retrieval + QA full run
+python3 evaluation/longmemeval/run.py --phase full --pipeline-phase all \
   --answerer-model openai/gpt-4o-mini \
   --judge-model openai/gpt-4o-mini \
   --llm-api-key-env OPENROUTER_API_KEY \
@@ -158,9 +153,8 @@ python3 evaluation/longmemeval/run.py \
   --graph-llm-model openai/gpt-4o-mini
 ```
 
-A governed `--phase full` run additionally requires both `--frozen-config` and
-`--promotion-policy`. Their immutable fields and policy hash are validated
-before preprocessing or constructing any embedding/chat client.
+A strict governed run additionally requires `--promotion-policy`, which is
+validated before preprocessing or constructing any embedding/chat client.
 
 ## Fully Offline Extracted Fixture
 
@@ -171,7 +165,7 @@ does not require an API key and does not produce an official benchmark score.
 python3 evaluation/longmemeval/run.py \
   --dataset-file "$PWD/evaluation/fixtures/longmemeval_sample.json" \
   --run-dir /tmp/longmemeval-extracted-offline \
-  --memory-mode extracted --phase pilot --pipeline-phase retrieval \
+  --memory-mode extracted --phase full --pipeline-phase retrieval \
   --pair-id offline-longmemeval \
   --extractor-responses "$PWD/evaluation/fixtures/longmemeval_memory_extractor_responses.json" \
   --grounding-responses "$PWD/evaluation/fixtures/longmemeval_memory_grounding_responses.json" \

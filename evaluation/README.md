@@ -4,6 +4,8 @@
 
 Entry point for benchmarking the RAM-A memory system. This file is a usage guide; dataset-specific parameters and staged commands live in each dataset README.
 
+For the complete setup-to-full-benchmark workflow, see the [Chinese benchmark operation guide](BENCHMARK_GUIDE.zh-CN.md).
+
 ## Datasets
 
 | Dataset | Focus | Questions | Source / download | Local placement |
@@ -84,6 +86,30 @@ python3 evaluation/longmemeval/run.py \
 # LoCoMo (full pipeline)
 cd evaluation && ./run_locomo_eval.sh memory_bench
 ```
+
+## Unified Configuration Runner
+
+The three dataset runners remain dataset-specific, while one TOML file can define the
+model, embedding, retrieval, graph, rerank, answer, and output settings for a run. The
+default `normal` mode is a reproducible benchmark run: it records the config and dataset
+hashes. Use `strict` only for a governed promotion/A-B run with an explicit
+promotion policy.
+
+```bash
+source evaluation/.venv/bin/activate
+export OPENROUTER_API_KEY="..."
+export LOCOMO_DATASET="/absolute/path/locomo10.json"
+export PERSONALMEM_DATASET="/absolute/path/personalmem-prepared.json"
+export LONGMEMEVAL_DATASET="/absolute/path/longmemeval_oracle.json"
+
+PYTHONPATH=evaluation python evaluation/run_benchmark.py \
+  --config evaluation/configs/benchmark-full.toml \
+  --dataset locomo
+```
+
+Replace `locomo` with `personalmem` or `longmemeval` to run another dataset. `${...}`
+values are environment variable names only; API keys are never written to the config or
+run manifest. Full datasets and generated artifacts remain outside Git.
 
 ## Grounded Memory Preparation (Features 2 and 4)
 
@@ -222,26 +248,25 @@ or another artifact system.
 
 ## Governed raw/extracted pairs
 
-Use the unified entrypoint for PersonaMem, LongMemEval, or LoCoMo promotion
-experiments. Create the explicit policy JSON before the pilot; PersonaMem and
-LongMemEval use `memory-ab-promotion-v1` with dotted metric paths and the exact
-authoritative full-run counts in `completeness_counts`. A passing pilot writes
-its frozen manifest only after both arms and comparison succeed.
+Use the unified entrypoint for PersonaMem, LongMemEval, or LoCoMo experiments.
+Normal mode runs the full pair directly and records reproducibility metadata.
+Strict promotion comparisons require an explicit policy. Both normal and strict
+modes run the full dataset directly; smoke fixtures are the small-sample validation
+path.
 
 ```bash
 cargo build -p memory-pipeline
 export MEMORY_PIPELINE_BIN="$PWD/target/debug/memory-pipeline"
 
 PYTHONPATH=evaluation evaluation/.venv/bin/python evaluation/scripts/run_memory_ab.py \
-  --dataset personalmem --phase pilot --pair-id personalmem-32k-v1 \
+  --dataset personalmem --phase full --mode normal --pair-id personalmem-32k-v1 \
   --dataset-file data/personalmem/prepared/personalmem_32k.json \
   --promotion-policy /absolute/path/personalmem-policy.json
 
 PYTHONPATH=evaluation evaluation/.venv/bin/python evaluation/scripts/run_memory_ab.py \
-  --dataset personalmem --phase full --pair-id personalmem-32k-v1 \
+  --dataset personalmem --phase full --mode strict --pair-id personalmem-32k-v1 \
   --dataset-file data/personalmem/prepared/personalmem_32k.json \
-  --promotion-policy /absolute/path/personalmem-policy.json \
-  --frozen-config evaluation/outputs/memory-ab/personalmem/pilot/personalmem-32k-v1/frozen_config.json
+  --promotion-policy /absolute/path/personalmem-policy.json
 ```
 
 Replace `personalmem` and the dataset path with `longmemeval` or `locomo` for
@@ -252,10 +277,9 @@ dataset-bound preflight artifact and records its SHA-256 in `config.json`.
 
 Artifacts live under
 `evaluation/outputs/memory-ab/<dataset>/<phase>/<pair-id>/`, with independent
-`raw/` and `extracted/` stores plus `preflight.json`, `comparison.json`, and
-`comparison.html`. Pilot and incomplete pairs never update history. A complete
-full pair appends raw then extracted to `history/records/<dataset>.jsonl` and
-regenerates XLSX; a failed promotion is still recorded as failed and is not a
+`raw/` and `extracted/` stores plus `comparison.json` and `comparison.html`.
+A complete full pair appends raw then extracted to `history/records/<dataset>.jsonl`
+and regenerates XLSX; a failed promotion is still recorded as failed and is not a
 baseline. Live full scores or promotion are not claimed until that controlled
 command is run manually with real providers.
 

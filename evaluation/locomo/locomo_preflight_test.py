@@ -49,7 +49,7 @@ def test_preflight_failure_is_persisted_but_not_accepted(tmp_path) -> None:
 
     path = tmp_path / "preflight.json"
     report = run_preflight(path, "/venv/bin/python", runner=one_failure)
-    config = RunConfig("raw", "pilot", tmp_path / "data.json", tmp_path / "run")
+    config = RunConfig("raw", "full", tmp_path / "data.json", tmp_path / "run")
 
     assert report["passed"] is False
     with pytest.raises(ValueError, match="preflight did not pass"):
@@ -68,7 +68,7 @@ def test_preflight_rejects_implementation_hash_tampering(tmp_path) -> None:
     }
     path = tmp_path / "preflight.json"
     path.write_text(json.dumps(report), encoding="utf-8")
-    config = RunConfig("raw", "pilot", tmp_path / "data.json", tmp_path / "run")
+    config = RunConfig("raw", "full", tmp_path / "data.json", tmp_path / "run")
 
     with pytest.raises(ValueError, match="implementation hash"):
         validate_preflight(config, path)
@@ -78,7 +78,7 @@ def test_preflight_validation_does_not_depend_on_package_import_path(
     monkeypatch,
     tmp_path,
 ) -> None:
-    config = RunConfig("raw", "pilot", tmp_path / "data.json", tmp_path / "run")
+    config = RunConfig("raw", "full", tmp_path / "data.json", tmp_path / "run")
     report = {
         "schema_version": "locomo-preflight-v1",
         "passed": True,
@@ -103,7 +103,7 @@ def test_preflight_validation_does_not_depend_on_package_import_path(
 
 
 def test_locomo_accepts_unified_memory_ab_preflight(tmp_path) -> None:
-    config = RunConfig("raw", "pilot", tmp_path / "data.json", tmp_path / "run")
+    config = RunConfig("raw", "full", tmp_path / "data.json", tmp_path / "run")
     report = {
         "schema_version": "memory-ab-preflight-v1",
         "dataset": "locomo",

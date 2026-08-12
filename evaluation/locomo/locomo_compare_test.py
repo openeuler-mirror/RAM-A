@@ -7,11 +7,12 @@ from locomo.locomo_compare import (
     build_comparison,
     main,
     maybe_write_history_record,
-    pilot_checks,
     promotion_checks,
     validate_arm_contract,
     validate_paired_query_ids,
     write_html_report,
+    _matching_mode,
+    _validate_governance_mode,
 )
 
 
@@ -44,42 +45,6 @@ def test_full_gate_uses_strict_overall_and_exact_category_thresholds() -> None:
     assert all(item["passed"] for item in passing)
 
 
-def test_pilot_rejects_category_drop_below_point_zero_five() -> None:
-    report = {
-        "phase": "pilot",
-        "fresh_raw": {
-            "overall": {"llm_score": 0.40},
-            "by_category": {"1": {"llm_score": 0.50}},
-        },
-        "treatment": {
-            "overall": {"llm_score": 0.41},
-            "by_category": {"1": {"llm_score": 0.4499}},
-        },
-        "pipeline": {
-            "candidate_source_coverage": 1.0,
-            "window_count": 2,
-            "empty_extraction_windows": 0,
-            "accepted_memory_count": 2,
-            "raw_candidate_count": 2,
-            "quarantined_count": 0,
-            "grounding_status_counts": {"SUPPORTED": 2},
-        },
-        "retrieval": {
-            "treatment": {"overall": {"avg_expanded_source_turns": 1.0}}
-        },
-    }
-
-    checks = {item["name"]: item for item in pilot_checks(report)}
-
-    assert checks["treatment_beats_raw"]["passed"] is True
-    assert checks["category_1_delta"]["passed"] is False
-    assert all(
-        item["passed"]
-        for name, item in checks.items()
-        if name != "category_1_delta"
-    )
-
-
 def test_paired_query_validation_rejects_duplicates_or_different_order() -> None:
     raw = {"0": [{"query_id": "S0:Q0"}, {"query_id": "S0:Q1"}]}
     duplicate = {"0": [{"query_id": "S0:Q0"}, {"query_id": "S0:Q0"}]}
@@ -106,6 +71,24 @@ def test_paired_query_validation_ignores_parallel_group_completion_order() -> No
     validate_paired_query_ids(raw, treatment)
 
 
+def test_governance_mode_is_explicit_and_must_match_policy() -> None:
+    raw = {"mode": "normal"}
+    treatment = {"mode": "normal"}
+
+    mode = _matching_mode(raw, treatment)
+    _validate_governance_mode(mode, None)
+
+    with pytest.raises(ValueError, match="must not receive"):
+        _validate_governance_mode(mode, {})
+
+
+def test_governance_mode_rejects_mismatched_or_unreviewed_pairs() -> None:
+    with pytest.raises(ValueError, match="mode mismatch"):
+        _matching_mode({"mode": "normal"}, {"mode": "strict"})
+    with pytest.raises(ValueError, match="requires a promotion policy"):
+        _validate_governance_mode("strict", None)
+
+
 def test_build_comparison_reports_full_heldout_and_cost_unavailable() -> None:
     raw = {
         "0": [_judged("S0:Q0", 1, 0)],
@@ -126,7 +109,7 @@ def test_build_comparison_reports_full_heldout_and_cost_unavailable() -> None:
     }
 
     report = build_comparison(
-        "pilot",
+        "full",
         raw,
         treatment,
         {"overall": {"evidence_hit_at_k": 0.5}},
@@ -138,7 +121,7 @@ def test_build_comparison_reports_full_heldout_and_cost_unavailable() -> None:
     assert report["fresh_raw"]["overall"]["llm_score"] == 0.5
     assert report["treatment"]["overall"]["llm_score"] == 1.0
     assert report["fresh_raw"]["held_out"]["overall"]["count"] == 1
-    assert report["promotion"]["passed"] is True
+    assert report["promotion"]["passed"] is False
     assert report["cost"]["reported_total_tokens"] == 60
     assert report["cost"]["estimated_cost_usd"] is None
     assert report["cost"]["reason"] == "provider cost was not available"
@@ -183,7 +166,6 @@ def test_arm_contract_requires_matching_config_and_authoritative_scored_queries(
             raw_judged,
             treatment_judged,
         )
-
     treatment_config["configuration_hash"] = "config"
     with pytest.raises(ValueError, match="authoritative scored query ids"):
         validate_arm_contract(
@@ -196,6 +178,32 @@ def test_arm_contract_requires_matching_config_and_authoritative_scored_queries(
         )
 
 
+def test_normal_arm_contract_allows_missing_preflight_hash() -> None:
+    queries = [{"id": "S0:Q0", "task": {"category": 1}}]
+    prepared = {"schema_version": "benchmark-prepared-v1", "queries": queries}
+    judged = {"0": [{"query_id": "S0:Q0"}]}
+    raw_config = {
+        "memory_mode": "raw",
+        "mode": "normal",
+        "source_hash": "source",
+        "configuration_hash": "config",
+        "implementation_hash": "impl",
+        "preflight_hash": None,
+    }
+    extracted_config = {**raw_config, "memory_mode": "extracted"}
+
+    contract = validate_arm_contract(
+        raw_config,
+        extracted_config,
+        prepared,
+        prepared,
+        judged,
+        judged,
+    )
+
+    assert contract["query_count"] == 1
+
+
 def test_html_report_contains_separate_audit_tables(tmp_path) -> None:
     raw = {"0": [_judged("S0:Q0", 1, 0)]}
     treatment = {"0": [_judged("S0:Q0", 1, 1)]}
@@ -206,7 +214,7 @@ def test_html_report_contains_separate_audit_tables(tmp_path) -> None:
         "quarantined_count": 0,
     }
     report = build_comparison(
-        "pilot",
+        "full",
         raw,
         treatment,
         {"overall": {"evidence_hit_at_k": 0.25, "evidence_mrr": 0.125}},
@@ -258,16 +266,15 @@ def test_complete_failed_full_pair_writes_common_history_without_mutating_report
     assert records[0]["split"] == "locomo10"
 
 
-@pytest.mark.parametrize(("phase", "count"), [("pilot", 1540), ("full", 1539)])
-def test_pilot_or_incomplete_pair_does_not_write_common_history(
-    tmp_path, phase: str, count: int
+def test_incomplete_pair_does_not_write_common_history(
+    tmp_path
 ) -> None:
     output = tmp_path / "history_record.json"
     output.write_text("stale", encoding="utf-8")
 
     written = maybe_write_history_record(
         output,
-        _common_history_report(phase=phase, count=count, passed=True),
+        _common_history_report(phase="full", count=1539, passed=True),
     )
 
     assert written is False
@@ -281,7 +288,7 @@ def test_cli_rejects_comparison_history_path_collision_before_reading(tmp_path) 
         main(
             [
                 "--phase",
-                "pilot",
+                "full",
                 "--raw-dir",
                 str(tmp_path / "missing-raw"),
                 "--treatment-dir",

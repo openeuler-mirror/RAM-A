@@ -4,6 +4,8 @@
 
 RAM-A 记忆系统的评估流水线总览。这里是使用指南入口；各数据集的完整参数和分阶段命令见对应子目录 README。
 
+从环境搭建到 full benchmark 的推荐操作顺序，请先阅读[统一 Benchmark 操作指南](BENCHMARK_GUIDE.zh-CN.md)。
+
 ## 数据集
 
 | 数据集 | 关注点 | 问题数 | 来源 / 下载 | 本地放置位置 |
@@ -83,6 +85,28 @@ python3 evaluation/longmemeval/run.py \
 # LoCoMo（完整流水线）
 cd evaluation && ./run_locomo_eval.sh memory_bench
 ```
+
+### 统一配置运行
+
+三个数据集仍由各自 runner 负责数据适配和评测，但可以用一个 TOML 配置统一指定本次
+实验的模型、向量、检索、图、rerank、回答模型和输出目录。`normal` 是普通可复现实验，
+配置和数据 hash 会写入运行目录的 `run_manifest.json`。只有需要晋级/严格 A/B 审计时
+才使用 `mode = "strict"`，并提供 promotion policy。
+
+```bash
+source evaluation/.venv/bin/activate
+export OPENROUTER_API_KEY="..."
+export LOCOMO_DATASET="/absolute/path/locomo10.json"
+export PERSONALMEM_DATASET="/absolute/path/personalmem-prepared.json"
+export LONGMEMEVAL_DATASET="/absolute/path/longmemeval_oracle.json"
+
+PYTHONPATH=evaluation python evaluation/run_benchmark.py \
+  --config evaluation/configs/benchmark-full.toml \
+  --dataset locomo
+```
+
+将最后一个参数替换为 `personalmem` 或 `longmemeval` 即可运行对应数据集。配置中的
+`${...}` 只引用环境变量名，不保存 API key；完整数据集和运行产物仍不提交到 Git。
 
 ## 有证据约束的记忆预处理（特性 2 和 4）
 
@@ -204,35 +228,33 @@ cargo run -p memory-bench -- \
 
 ## 受治理的 raw/extracted 配对实验
 
-PersonaMem、LongMemEval、LoCoMo 的晋级实验统一使用下面的入口。Pilot 前必须先写好显式
-policy JSON；PersonaMem 和 LongMemEval 使用 `memory-ab-promotion-v1`，指标路径必须是
-dotted path，并在 `completeness_counts` 中提前写入所选 full 数据集的权威计数。只有两臂
-和 comparison 都成功且 pilot 检查通过后，才会写 frozen manifest。
+PersonaMem、LongMemEval、LoCoMo 的实验统一使用下面的入口。normal 模式直接运行 full，
+并记录可复现元数据；strict 晋级对比才需要显式 policy。normal 和 strict 都直接运行
+full 数据集，小样本验证统一使用 smoke fixture。
 
 ```bash
 cargo build -p memory-pipeline
 export MEMORY_PIPELINE_BIN="$PWD/target/debug/memory-pipeline"
 
 PYTHONPATH=evaluation evaluation/.venv/bin/python evaluation/scripts/run_memory_ab.py \
-  --dataset personalmem --phase pilot --pair-id personalmem-32k-v1 \
+  --dataset personalmem --phase full --mode normal --pair-id personalmem-32k-v1 \
   --dataset-file data/personalmem/prepared/personalmem_32k.json \
   --promotion-policy /absolute/path/personalmem-policy.json
 
 PYTHONPATH=evaluation evaluation/.venv/bin/python evaluation/scripts/run_memory_ab.py \
-  --dataset personalmem --phase full --pair-id personalmem-32k-v1 \
+  --dataset personalmem --phase full --mode strict --pair-id personalmem-32k-v1 \
   --dataset-file data/personalmem/prepared/personalmem_32k.json \
-  --promotion-policy /absolute/path/personalmem-policy.json \
-  --frozen-config evaluation/outputs/memory-ab/personalmem/pilot/personalmem-32k-v1/frozen_config.json
+  --promotion-policy /absolute/path/personalmem-policy.json
 ```
 
 运行其他 registry 时替换 `--dataset` 和数据文件即可；`--` 后面的参数会原样传给两臂。
 任何 arm 启动前，入口会运行并记录 Python suite、Rust workspace test、Clippy 和
-`git diff --check`。每个 arm 会自行验证 dataset-bound preflight，并在 `config.json`
-中写入其真实 SHA-256。
+`git diff --check`。每个 arm 会在 `config.json` 中写入真实 SHA-256；strict 模式还会
+验证并记录 dataset-bound preflight。
 
 制品位于 `evaluation/outputs/memory-ab/<dataset>/<phase>/<pair-id>/`，`raw/` 与
-`extracted/` 使用独立 store，目录还包含 `preflight.json`、`comparison.json` 和
-`comparison.html`。Pilot 和不完整 pair 永不写 history；完整 full pair 才按 raw、
+`extracted/` 使用独立 store，目录还包含 `comparison.json` 和
+`comparison.html`。不完整 pair 永不写 history；完整 full pair 才按 raw、
 extracted 顺序追加到 `history/records/<dataset>.jsonl` 并重新生成 XLSX。晋级失败的完整
 full pair 仍以 failed 状态记录，但不能成为 baseline。在人工用真实 provider 完成受控
 full command 之前，不宣称 live 分数或晋级结果。

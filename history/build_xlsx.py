@@ -215,6 +215,8 @@ CONFIGURATION_ALIASES = {
 def load_records(path: Path) -> list[dict[str, Any]]:
     """Load one versioned JSON object per non-empty line from *path*."""
     path = Path(path)
+    if not path.is_file():
+        return []
     records: list[dict[str, Any]] = []
     with path.open(encoding="utf-8") as stream:
         for line_number, line in enumerate(stream, start=1):
@@ -271,8 +273,6 @@ def _is_completed_full_pair(records: list[dict[str, Any]]) -> bool:
         "source_hash",
         "code_hash",
         "configuration_hash",
-        "preflight_hash",
-        "policy_hash",
         "artifact_path",
     )
     if any(
@@ -284,6 +284,18 @@ def _is_completed_full_pair(records: list[dict[str, Any]]) -> bool:
         or not isinstance(record.get("metrics"), dict)
         or not isinstance(record.get("promotion_reasons"), list)
         for record in records
+    ):
+        return False
+    governance_mode = raw.get("governance_mode", "strict")
+    extracted_governance_mode = extracted.get("governance_mode", "strict")
+    if governance_mode not in {"normal", "strict"} or extracted_governance_mode != governance_mode:
+        return False
+    if governance_mode == "strict" and any(
+        not record.get(key) for record in records for key in ("preflight_hash", "policy_hash")
+    ):
+        return False
+    if governance_mode == "normal" and any(
+        record.get(key) for record in records for key in ("preflight_hash", "policy_hash")
     ):
         return False
     shared = (
@@ -298,6 +310,13 @@ def _is_completed_full_pair(records: list[dict[str, Any]]) -> bool:
     )
     if any(raw[key] != extracted[key] for key in shared):
         return False
+    if governance_mode == "normal":
+        return (
+            raw.get("promotion_status") == "not_evaluated"
+            and extracted.get("promotion_status") == "not_evaluated"
+            and not raw["promotion_reasons"]
+            and not extracted["promotion_reasons"]
+        )
     if raw.get("promotion_status") != "reference" or raw["promotion_reasons"]:
         return False
     status = extracted.get("promotion_status")

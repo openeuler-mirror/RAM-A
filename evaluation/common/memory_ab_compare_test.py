@@ -91,7 +91,7 @@ def test_metric_paths_reject_missing_or_non_numeric_values(
 
 @pytest.mark.parametrize(
     ("phase", "complete"),
-    [("pilot", True), ("full", False)],
+    [("full", False)],
 )
 def test_history_records_require_a_completed_full_pair(
     phase: str, complete: bool
@@ -207,12 +207,65 @@ def test_history_record_contains_required_audit_fields() -> None:
         "configuration_hash": "config-sha",
         "preflight_hash": "preflight-sha",
         "policy_hash": "policy-sha",
+        "governance_mode": "strict",
         "configuration": {"top_k": 10},
         "metrics": {"qa": {"accuracy": 0.73}},
         "promotion_status": "passed",
         "promotion_reasons": [],
         "artifact_path": "s3://runs/extracted-run",
     }
+
+
+def test_history_record_portabilizes_repository_artifact_path() -> None:
+    comparison = _comparison()
+    comparison["treatment"]["artifact_path"] = (
+        "/home/example/RAM-A-gm-service-integration/outputs/memory-ab/pair/extracted"
+    )
+
+    record = build_history_record(comparison, "extracted")
+
+    assert record["artifact_path"] == "outputs/memory-ab/pair/extracted"
+
+
+def test_history_record_portabilizes_nested_retrieval_input_path() -> None:
+    comparison = _comparison()
+    comparison["treatment"]["metrics"] = {
+        "retrieval": {
+            "input": "/home/user/repo/outputs/memory-ab/pair/extracted/search_results.json",
+            "query": "keep this text",
+        }
+    }
+
+    record = build_history_record(comparison, "extracted")
+
+    assert (
+        record["metrics"]["retrieval"]["input"]
+        == "outputs/memory-ab/pair/extracted/search_results.json"
+    )
+    assert record["metrics"]["retrieval"]["query"] == "keep this text"
+
+
+def test_history_record_does_not_rewrite_unrelated_input_text() -> None:
+    comparison = _comparison()
+    comparison["treatment"]["metrics"] = {
+        "answer": {"input": "/home/user/outputs/not-a-path-field"},
+        "retrieval": {"query": "keep this text"},
+    }
+
+    record = build_history_record(comparison, "extracted")
+
+    assert record["metrics"]["answer"]["input"] == "/home/user/outputs/not-a-path-field"
+
+
+def test_history_record_uses_last_outputs_component() -> None:
+    comparison = _comparison()
+    comparison["treatment"]["artifact_path"] = (
+        "/home/user/outputs/archive/outputs/memory-ab/pair/extracted"
+    )
+
+    record = build_history_record(comparison, "extracted")
+
+    assert record["artifact_path"] == "outputs/memory-ab/pair/extracted"
 
 
 def test_history_record_rejects_missing_required_value() -> None:
