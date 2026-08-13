@@ -101,20 +101,15 @@ Text:     .txt / .text / .log
 
 ### 2.3 启动服务和入库
 
-脚本先启动 API：
+脚本会生成一份临时 `ram-a-mem` 配置，然后启动唯一的服务进程：
 
 ```bash
-cargo run -p memory-cases -- --api \
-  --bind 127.0.0.1:${PORT} \
-  --rag-store "$RAG_STORE" \
-  --memory-store "$MEMORY_STORE" \
-  --embedding-provider "${MEMORY_CASES_EMBEDDING_PROVIDER:-hash}" \
-  --embedding-api-key-env "${MEMORY_CASES_EMBEDDING_API_KEY_ENV:-OPENAI_API_KEY}" \
-  --embedding-base-url "${MEMORY_CASES_EMBEDDING_BASE_URL:-https://api.openai.com/v1}" \
-  --embedding-model "${MEMORY_CASES_EMBEDDING_MODEL:-text-embedding-3-small}" \
-  --embedding-dimensions "${MEMORY_CASES_EMBEDDING_DIMENSIONS:-256}" \
-  --chunk-size "$CHUNK_SIZE"
+cargo run -p memory-mcp --bin ram-a-mem -- --config "$CONFIG_FILE"
 ```
+
+临时配置通过 `case_library.rag_store`、`case_library.index_store`、
+`case_library.api_token_env` 和 `case_library.ingestion_poll_ms` 同时启用案例管理 API
+与进程内 ingestion worker。
 
 然后创建固定 dataset：
 
@@ -124,17 +119,9 @@ dataset_id = qa-eval-dataset
 
 接着逐个上传文档。每个文档都会带固定的 `document_id` 和 `task_id`，方便后续轮询任务状态。
 
-上传完成后再启动 ingestor：
-
-```bash
-cargo run -p memory-cases -- --ingestor \
-  --rag-store "$RAG_STORE" \
-  --memory-store "$MEMORY_STORE" \
-  --chunk-size "$CHUNK_SIZE" \
-  --poll-ms 100
-```
-
-脚本会轮询所有 task，直到它们变成 `completed`。如果任一 task 失败，会打印 API 和 ingestor 的最近日志。
+文档上传会创建 pending task；`ram-a-mem` 中常驻的 ingestion worker 自动消费这些
+任务。脚本会轮询所有 task，直到它们变成 `completed`。如果任一 task 失败，会打印
+统一服务日志。
 
 ### 2.4 检查 chunks
 

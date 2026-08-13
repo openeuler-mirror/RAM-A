@@ -1,5 +1,4 @@
 mod chunker;
-pub mod config;
 pub mod error;
 pub mod ingestor;
 mod llm;
@@ -20,12 +19,17 @@ use memory_core::{
     SearchMode, SqliteMemoryStore,
 };
 
-use crate::config::EmbeddingProviderKind;
 use crate::llm::DocumentSummaryClient;
 use crate::model::{CreateDatasetRequest, CreateDocumentFileRequest};
 use crate::repo::RagRepository;
 use crate::service::{RagConfig, RagService};
 use crate::token_counter::{Cl100kTokenCounter, TokenCounter};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EmbeddingProviderKind {
+    Hash,
+    OpenAiCompatible,
+}
 
 #[derive(Clone, Debug)]
 pub struct CaseServiceOptions {
@@ -119,7 +123,7 @@ pub async fn import_documents_from_dir(
         let bytes = tokio::fs::read(&path)
             .await
             .with_context(|| format!("failed to read case document {}", path.display()))?;
-        let response = service
+        service
             .create_document(
                 dataset_id,
                 CreateDocumentFileRequest {
@@ -133,12 +137,6 @@ pub async fn import_documents_from_dir(
             )
             .await
             .with_context(|| format!("failed to create case document {}", path.display()))?;
-        while service
-            .run_next_ingestion_task()
-            .await
-            .with_context(|| format!("failed to ingest case document {}", response.document_id))?
-        {
-        }
         imported = imported.saturating_add(1);
     }
 

@@ -10,13 +10,15 @@ files by default so the ownership boundary is explicit.
 
 ## Runtime Paths
 
-| Argument | Default | Purpose |
+| `ram-a-mem` configuration | Default | Purpose |
 | --- | --- | --- |
-| `--rag-store` | `data/memory-cases.sqlite` | Business DB for datasets, documents, tasks, and chunks |
-| `--memory-store` | `data/memory-cases-index.sqlite` | Retrieval index DB for memory text, FTS rows, and vectors |
+| `case_library.rag_store` | `data/memory-cases.sqlite` | Business DB for datasets, documents, tasks, and chunks |
+| `case_library.index_store` | `data/memory-cases-index.sqlite` | Retrieval index DB for memory text, FTS rows, and vectors |
 
-API and ingestor processes must use the same pair of `--rag-store` and `--memory-store`
-paths. `memory-cases` does not provide a single-file store argument.
+`memory-cases` is a library embedded by `ram-a-mem`; it no longer owns a standalone API or
+ingestor process. The case-management API and ingestion worker share one in-process
+`RagService` and therefore always use the same configured store pair. There is no
+single-file case store setting.
 
 ## Table Ownership
 
@@ -54,8 +56,10 @@ vector spaces. Shared SQLite index deployment is not recommended for concurrent 
 
 ## Ingestion Flow
 
-1. API writes uploaded file metadata and a pending task to the Business DB.
-2. Ingestor leases a pending task from `rag_tasks`.
+1. The case-management API embedded in `ram-a-mem` writes uploaded file metadata and a
+   pending task to the Business DB.
+2. The background ingestion task in the same `ram-a-mem` process leases a pending task
+   from `rag_tasks`.
 3. Ingestor parses the source file and writes processed chunks into `rag_chunks`.
 4. Ingestor builds memory records from those chunks:
    - one record per chunk, with `record_kind = "chunk"`;

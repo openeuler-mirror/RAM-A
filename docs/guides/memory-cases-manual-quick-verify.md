@@ -2,7 +2,7 @@
 
 案例仓库：[openeuler/witty-ops-cases](https://atomgit.com/openeuler/witty-ops-cases)
 
-`crates/memory-cases/quick_start_verify.sh` 用于快速启动 `memory-cases`，导入一批案例文档，并进入交互问答，用来确认案例库的上传、解析、检索和引用返回是否可用。
+`crates/memory-cases/quick_start_verify.sh` 用于快速启动统一的 `ram-a-mem`，通过其内嵌案例 API 导入一批案例文档，并进入交互问答，用来确认上传、后台 ingestion、检索和引用返回是否可用。`memory-cases` 本身不再是独立进程。
 
 ## 快速使用
 
@@ -111,8 +111,8 @@ MEMORY_CASES_EMBEDDING_DIMENSIONS=1024 \
 
 推荐把 `MEMORY_CASES_MEMORY_STORE` 指向案例库自己的索引库，例如
 `data/memory-cases-index.sqlite`，不要和 RAM-A 长期记忆的
-`data/ram-a-memory.sqlite` 共用一个 SQLite 文件。分库可以避免两个服务并发读写时
-争用 SQLite 写锁，也能让案例库重建/清理索引时不影响用户长期记忆。
+`data/ram-a-memory.sqlite` 共用一个 SQLite 文件。分库可以隔离个人记忆和案例索引
+写入，也能让案例库重建/清理索引时不影响用户长期记忆。
 
 如果为了小规模 smoke test 故意共用同一个 SQLite 文件，案例库和 RAM-A MCP 必须
 使用同一套 embedding provider/base URL/model/API key 环境变量名和维度。
@@ -120,7 +120,7 @@ MEMORY_CASES_EMBEDDING_DIMENSIONS=1024 \
 下混用不同 profile；即使两个模型维度相同，也不能认为它们处于同一语义向量空间。
 
 脚本发出的 `/api/v1/*` 请求都会携带该 token。脚本不会打印 token。
-`/health` 可不带 token，其余 REST API 会拒绝未鉴权请求。
+统一健康端点 `/healthy` 可不带 token，其余案例 REST API 会拒绝未鉴权请求。
 
 ## 查看结果
 
@@ -157,9 +157,8 @@ MEMORY_CASES_KEEP_TMP=1 \
 kept tmp: /tmp/memory-cases-quick-verify.xxxxxx
 ```
 
-重点查看里面的两个日志：
+重点查看统一服务日志：
 
 ```text
 api.log
-ingestor.log
 ```

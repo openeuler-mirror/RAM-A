@@ -51,6 +51,9 @@ async fn unavailable_stub() -> StatusCode {
 }
 
 async fn spawn_stub(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+    // Keep loopback integration traffic out of any CI/container HTTP proxy.
+    std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
+    std::env::set_var("no_proxy", "127.0.0.1,localhost");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {

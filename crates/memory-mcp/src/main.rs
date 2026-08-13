@@ -3,8 +3,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use memory_cases::config::EmbeddingProviderKind as CaseEmbeddingProviderKind;
-use memory_cases::{import_documents_from_dir, CaseServiceOptions};
+use memory_cases::{
+    import_documents_from_dir, CaseServiceOptions,
+    EmbeddingProviderKind as CaseEmbeddingProviderKind,
+};
 use memory_core::graph::{GraphTypeRegistry, LlmGraphExtractor, OpenAiCompatibleGraphLlmClient};
 use memory_core::{
     sqlite::GraphRepository, EmbeddingProvider, GraphBuildPipeline, HashEmbedding, MemoryManager,
@@ -186,6 +188,12 @@ async fn main() -> Result<()> {
         cancellation_token.clone(),
     )
     .with_features(features);
+    let listener = tokio::net::TcpListener::bind(config.http.socket_address())
+        .await
+        .context("failed to bind HTTP listener")?;
+    let mut case_api_router = None;
+    let mut ingestion_worker = None;
+    let mut case_import_worker = None;
     let runtime = if features.case_library {
         let case_library = config
             .case_library
@@ -224,16 +232,27 @@ async fn main() -> Result<()> {
         };
         let case_service = memory_cases::build_service(&case_options)
             .context("failed to construct embedded case library")?;
+        let recovered = case_service
+            .recover_interrupted_ingestion_tasks()
+            .context("failed to recover interrupted case ingestion tasks")?;
+        if recovered > 0 {
+            tracing::info!(
+                event = "ram_a.case.ingestion.recovered",
+                startup_run_id = %startup_run_id,
+                recovered_task_count = recovered
+            );
+        }
         if let Some(source_dir) = case_library.source_dir.as_deref() {
             let default_dataset_id = case_library
                 .libraries
                 .iter()
                 .find(|library| library.name == case_library.default_library)
-                .map(|library| library.dataset_id.as_str())
+                .map(|library| library.dataset_id.clone())
                 .context("default case library mapping is unavailable")?;
             let ingestion_started = std::time::Instant::now();
             tracing::info!(
                 event = "ram_a.case.ingestion.started",
+                stage = "source_scan",
                 startup_run_id = %startup_run_id,
                 dataset_id = default_dataset_id,
                 source_dir = %source_dir.display(),
@@ -241,20 +260,59 @@ async fn main() -> Result<()> {
                 model = case_library.embedding_model,
                 dimensions = case_library.embedding_dimensions
             );
+            let source_dir = source_dir.to_owned();
+            let import_service = case_service.clone();
+            let import_startup_run_id = startup_run_id.clone();
             let ingestion_span = tracing::info_span!(
                 "ram_a.case.ingestion",
                 startup_run_id = %startup_run_id,
                 dataset_id = default_dataset_id
             );
-            let imported = import_documents_from_dir(&case_service, default_dataset_id, source_dir)
-                .instrument(ingestion_span)
-                .await
-                .inspect_err(|error| {
-                    tracing::error!(event = "ram_a.case.ingestion.failed", startup_run_id = %startup_run_id, dataset_id = default_dataset_id, error_kind = memory_cases::service::observable_error_kind(error), error = memory_cases::service::observable_error_summary(error), retriable = memory_cases::service::ingestion_error_retriable(error), latency_ms = ingestion_started.elapsed().as_millis() as u64);
-                })
-                .context("failed to import configured case library documents")?;
-            tracing::info!(event = "ram_a.case.ingestion.completed", startup_run_id = %startup_run_id, dataset_id = default_dataset_id, document_count = imported, latency_ms = ingestion_started.elapsed().as_millis() as u64);
+            case_import_worker = Some(tokio::spawn(
+                async move {
+                    match import_documents_from_dir(
+                        &import_service,
+                        &default_dataset_id,
+                        &source_dir,
+                    )
+                    .await
+                    {
+                        Ok(imported) => tracing::info!(
+                            event = "ram_a.case.ingestion.completed",
+                            stage = "source_scan",
+                            startup_run_id = %import_startup_run_id,
+                            dataset_id = default_dataset_id,
+                            queued_document_count = imported,
+                            latency_ms = ingestion_started.elapsed().as_millis() as u64
+                        ),
+                        Err(error) => tracing::error!(
+                            event = "ram_a.case.ingestion.failed",
+                            stage = "source_scan",
+                            startup_run_id = %import_startup_run_id,
+                            dataset_id = default_dataset_id,
+                            error_kind = memory_cases::service::observable_error_kind(&error),
+                            error = memory_cases::service::observable_error_summary(&error),
+                            retriable = memory_cases::service::ingestion_error_retriable(&error),
+                            latency_ms = ingestion_started.elapsed().as_millis() as u64
+                        ),
+                    }
+                }
+                .instrument(ingestion_span),
+            ));
         }
+        if let Some(api_token_env) = case_library.api_token_env.as_deref() {
+            let api_token =
+                resolve_canonical_secret_env(api_token_env, "case library API credential")?;
+            case_api_router = Some(memory_cases::routes::create_api_router(
+                case_service.clone(),
+                api_token,
+            ));
+        }
+        ingestion_worker = Some(tokio::spawn(memory_cases::ingestor::run_until_cancelled(
+            case_service.clone(),
+            case_library.ingestion_poll_ms,
+            cancellation_token.clone(),
+        )));
         let case_search = EmbeddedCaseSearchProvider::new(
             case_service,
             case_library.default_library.clone(),
@@ -264,15 +322,26 @@ async fn main() -> Result<()> {
     } else {
         runtime
     };
-    let app = create_http_router(runtime, &config.http, &config.limits);
-    let listener = tokio::net::TcpListener::bind(config.http.socket_address())
-        .await
-        .context("failed to bind HTTP listener")?;
+    let mut app = create_http_router(runtime, &config.http, &config.limits);
+    if let Some(case_api_router) = case_api_router {
+        app = app.merge(case_api_router);
+    }
     tracing::info!(event = "ram_a.startup.listening", startup_run_id = %startup_run_id, bind_address = %config.http.socket_address());
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(cancellation_token))
-        .await
-        .context("HTTP server failed")
+    let server_result = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(cancellation_token.clone()))
+        .await;
+    cancellation_token.cancel();
+    if let Some(case_import_worker) = case_import_worker {
+        case_import_worker
+            .await
+            .context("case library import worker failed to join")?;
+    }
+    if let Some(ingestion_worker) = ingestion_worker {
+        ingestion_worker
+            .await
+            .context("case ingestion worker failed to join")?;
+    }
+    server_result.context("HTTP server failed")
 }
 
 fn init_tracing() -> Result<()> {
@@ -315,6 +384,14 @@ fn resolve_secret_env(name: &str) -> Result<String> {
     })?;
     if value.is_empty() {
         anyhow::bail!("provider credential environment variable `{name}` is empty");
+    }
+    Ok(value)
+}
+
+fn resolve_canonical_secret_env(name: &str, label: &str) -> Result<String> {
+    let value = resolve_secret_env(name)?;
+    if value.trim().is_empty() || value.trim() != value {
+        anyhow::bail!("{label} environment variable `{name}` must be canonical and non-empty");
     }
     Ok(value)
 }

@@ -1125,7 +1125,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "clap",
  "memory-core",
  "reqwest",
  "rusqlite",
@@ -1135,6 +1134,7 @@ dependencies = [
  "tempfile",
  "tiktoken-rs",
  "tokio",
+ "tokio-util",
  "tower",
  "tracing",
  "uuid",

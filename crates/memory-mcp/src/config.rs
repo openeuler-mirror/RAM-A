@@ -299,6 +299,12 @@ pub struct CaseLibraryServiceConfig {
     pub index_store: PathBuf,
     #[serde(default)]
     pub source_dir: Option<PathBuf>,
+    /// Enables the case-management REST API when configured. The named
+    /// environment variable supplies its dedicated administrator bearer token.
+    #[serde(default)]
+    pub api_token_env: Option<String>,
+    #[serde(default = "default_case_ingestion_poll_ms")]
+    pub ingestion_poll_ms: u64,
     #[serde(default)]
     pub embedding_provider: EmbeddingProviderKind,
     #[serde(default)]
@@ -593,6 +599,16 @@ impl CaseLibraryServiceConfig {
                 anyhow::bail!("case library source_dir must not be empty");
             }
         }
+        if let Some(api_token_env) = self.api_token_env.as_deref() {
+            if api_token_env.trim().is_empty() || api_token_env.trim() != api_token_env {
+                anyhow::bail!(
+                    "case library API token environment name must be canonical and non-empty"
+                );
+            }
+        }
+        if self.ingestion_poll_ms == 0 {
+            anyhow::bail!("case library ingestion_poll_ms must be non-zero");
+        }
         if let Some(embedding_api_key_env) = self.embedding_api_key_env.as_deref() {
             if embedding_api_key_env.trim().is_empty() {
                 anyhow::bail!("case library embedding API key environment name must not be empty");
@@ -717,6 +733,10 @@ fn default_case_embedding_dimensions() -> usize {
 
 fn default_case_chunk_size() -> usize {
     160
+}
+
+fn default_case_ingestion_poll_ms() -> u64 {
+    1_000
 }
 
 fn default_summary_llm_timeout_ms() -> u64 {

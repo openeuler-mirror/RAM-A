@@ -88,6 +88,7 @@ impl RagService {
         dataset_id: &str,
         request: CreateDocumentFileRequest,
     ) -> Result<CreateDocumentResponse> {
+        validate_path_component("dataset id", dataset_id)?;
         self.ensure_dataset_exists(dataset_id)?;
 
         let document_id = request
@@ -101,6 +102,7 @@ impl RagService {
             .trim()
             .to_string();
         anyhow::ensure!(!document_id.is_empty(), "document id must not be empty");
+        validate_path_component("document id", &document_id)?;
         anyhow::ensure!(!task_id.is_empty(), "task id must not be empty");
         anyhow::ensure!(!request.bytes.is_empty(), "document file must not be empty");
 
@@ -153,6 +155,8 @@ impl RagService {
         document_id: &str,
         request: UpdateDocumentFileRequest,
     ) -> Result<UpdateDocumentResponse> {
+        validate_path_component("dataset id", dataset_id)?;
+        validate_path_component("document id", document_id)?;
         self.ensure_dataset_exists(dataset_id)?;
         let existing = self
             .repo
@@ -246,6 +250,8 @@ impl RagService {
         dataset_id: &str,
         document_id: &str,
     ) -> Result<DeleteDocumentResponse> {
+        validate_path_component("dataset id", dataset_id)?;
+        validate_path_component("document id", document_id)?;
         self.ensure_dataset_exists(dataset_id)?;
         let existing = self
             .repo
@@ -405,6 +411,11 @@ impl RagService {
         }
 
         Ok(true)
+    }
+
+    /// Returns interrupted or previously failed ingestion tasks to the queue.
+    pub fn recover_interrupted_ingestion_tasks(&self) -> Result<usize> {
+        self.repo.recover_running_tasks()
     }
 
     async fn ingest_task(&self, task: &IngestionTask) -> Result<usize> {
@@ -785,6 +796,18 @@ fn safe_file_name(file_name: &str) -> Result<String> {
         .trim();
     anyhow::ensure!(!file_name.is_empty(), "file name must not be empty");
     Ok(file_name.to_string())
+}
+
+fn validate_path_component(label: &str, value: &str) -> Result<()> {
+    anyhow::ensure!(
+        !value.is_empty() && value.trim() == value,
+        "{label} must be canonical and non-empty"
+    );
+    anyhow::ensure!(
+        value != "." && value != ".." && !value.contains('/') && !value.contains('\\'),
+        "{label} must not contain path components"
+    );
+    Ok(())
 }
 
 async fn remove_replaced_file(old_file_path: &str, new_file_path: &str) -> Result<()> {
@@ -2148,6 +2171,91 @@ mod tests {
             .into_iter()
             .map(|chunk| chunk.content)
             .collect()
+    }
+
+    #[tokio::test]
+    async fn document_storage_rejects_dataset_and_document_path_components() {
+        let (service, _temp) = test_service();
+        let invalid_missing_dataset = service
+            .create_document(
+                "../missing-dataset",
+                CreateDocumentFileRequest {
+                    id: Some("document-1".to_owned()),
+                    task_id: Some("invalid-dataset-task".to_owned()),
+                    name: "unsafe.txt".to_owned(),
+                    file_name: "unsafe.txt".to_owned(),
+                    mime_type: Some("text/plain".to_owned()),
+                    bytes: b"unsafe".to_vec(),
+                },
+            )
+            .await
+            .expect_err("invalid dataset id must be rejected before lookup");
+        assert_eq!(
+            invalid_missing_dataset.to_string(),
+            "dataset id must not contain path components"
+        );
+
+        service
+            .create_dataset(CreateDatasetRequest {
+                id: Some("dataset-1".to_owned()),
+                name: "Dataset".to_owned(),
+                description: None,
+            })
+            .unwrap();
+        let unsafe_document = service
+            .create_document(
+                "dataset-1",
+                CreateDocumentFileRequest {
+                    id: Some("../escaped-document".to_owned()),
+                    task_id: Some("unsafe-document-task".to_owned()),
+                    name: "unsafe.txt".to_owned(),
+                    file_name: "unsafe.txt".to_owned(),
+                    mime_type: Some("text/plain".to_owned()),
+                    bytes: b"unsafe".to_vec(),
+                },
+            )
+            .await;
+        assert!(unsafe_document.is_err());
+
+        let unsafe_delete_document = service
+            .delete_document("dataset-1", "../escaped-document")
+            .await
+            .expect_err("delete must reject an invalid document id");
+        assert_eq!(
+            unsafe_delete_document.to_string(),
+            "document id must not contain path components"
+        );
+
+        let unsafe_delete_dataset = service
+            .delete_document("../missing-dataset", "document-1")
+            .await
+            .expect_err("delete must reject an invalid dataset id before lookup");
+        assert_eq!(
+            unsafe_delete_dataset.to_string(),
+            "dataset id must not contain path components"
+        );
+
+        service
+            .create_dataset(CreateDatasetRequest {
+                id: Some("../escaped-dataset".to_owned()),
+                name: "Unsafe Dataset".to_owned(),
+                description: None,
+            })
+            .unwrap();
+        let unsafe_dataset = service
+            .create_document(
+                "../escaped-dataset",
+                CreateDocumentFileRequest {
+                    id: Some("document-1".to_owned()),
+                    task_id: Some("unsafe-dataset-task".to_owned()),
+                    name: "unsafe.txt".to_owned(),
+                    file_name: "unsafe.txt".to_owned(),
+                    mime_type: Some("text/plain".to_owned()),
+                    bytes: b"unsafe".to_vec(),
+                },
+            )
+            .await;
+        assert!(unsafe_dataset.is_err());
     }
 
     #[tokio::test]

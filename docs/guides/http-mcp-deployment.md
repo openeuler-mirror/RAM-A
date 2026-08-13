@@ -11,9 +11,9 @@ The service exposes one HTTP port:
 - `GET /healthy`
 - `GET /ready`
 
-`memory_case_search`, `memory_search`, and `memory_ingest` are MCP tools on the same
-`/mcp` endpoint. Do not start a separate `memory-cases` API for normal RAM-A memory
-deployment.
+`memory_case_search`, the three `memory_case_prepare_*` tools, the matching upload, update, and
+delete confirmation tools, `memory_search`, and `memory_ingest` are MCP tools on the same
+`/mcp` endpoint. Do not start a separate `memory-cases` process for normal RAM-A deployment.
 
 ## Config lookup
 
@@ -104,6 +104,8 @@ Create `config/ram-a-mem.json`:
     "rag_store": "data/memory-cases.sqlite",
     "index_store": "data/memory-cases-index.sqlite",
     "source_dir": "crates/memory-cases/test/accuracy_docs",
+    "api_token_env": "RAM_A_CASES_ADMIN_TOKEN",
+    "ingestion_poll_ms": 1000,
     "embedding_provider": "hash",
     "embedding_model": "hash",
     "embedding_dimensions": 1024,
@@ -124,6 +126,7 @@ Set secrets in the environment, not in config files:
 
 ```bash
 export RAM_A_XIAOO_TOKEN='replace-with-a-long-random-token'
+export RAM_A_CASES_ADMIN_TOKEN='replace-with-a-separate-admin-token'
 export LLM_API_KEY='replace-with-provider-key'
 # Required only when features.graph_memory.enabled is true.
 export GRAPH_LLM_API_KEY='replace-with-graph-provider-key'
@@ -145,7 +148,8 @@ RAM_A_MEM_CONFIG=/etc/ram-a/ram-a-mem.json ram-a-mem
 ## Feature switches
 
 - `features.memory.enabled` controls `memory_search` and `memory_ingest`.
-- `features.case_library.enabled` controls `memory_case_search`.
+- `features.case_library.enabled` controls `memory_case_search`, all
+  `memory_case_prepare_*` tools, and the matching upload, update, and delete tools.
 - `features.graph_memory.enabled` augments `memory_ingest` and `memory_search` with graph
   construction and retrieval. It does not add a separate MCP tool.
 
@@ -154,8 +158,18 @@ If a client still calls a disabled tool directly, RAM-A returns a structured dis
 tool error.
 
 If `features.case_library.enabled` is `true`, `case_library` must be configured.
-If `features.case_library.enabled` is omitted, RAM-A enables `memory_case_search` only
-when `case_library` is present.
+If `features.case_library.enabled` is omitted, RAM-A enables the case-library tools only when
+`case_library` is present.
+
+Case search requires `cases:read`. All prepare and final mutation tools require the separate
+`cases:write` permission; grant it only to trusted principals. After diagnosis, a prepare tool
+returns a proposal plus a ten-minute, identity-bound, single-use confirmation token without
+mutating the library. Upload/update preparation accepts UTF-8 Markdown/text content; delete
+preparation accepts an exact document ID and required deletion reason. The client must show the
+proposal and wait for a later explicit user confirmation before calling the matching final tool.
+Upload and update create pending ingestion tasks for the worker inside `ram-a-mem`; delete
+immediately removes the source file, tasks, chunks, and search records. The tools select a
+configured logical `library`, never a caller-controlled `dataset_id`.
 
 Graph memory is disabled by default. When enabled, `graph_memory` is required and the
 LLM credential is read from the configured environment variable. Graph records use the
@@ -346,6 +360,13 @@ served by the same `ram-a-mem` process and HTTP port.
 If `case_library.source_dir` is configured, `ram-a-mem` imports new `.md`, `.markdown`,
 `.mdx`, `.txt`, `.text`, and `.log` files from that directory into the default case-library
 dataset on startup. Existing documents with the same file name are skipped.
+
+If `case_library.api_token_env` is configured, the same `ram-a-mem` listener exposes the
+case-management REST API under `/api/v1`. The value of that environment variable is a
+dedicated administrator bearer token; it is intentionally separate from MCP user tokens.
+Document create and update requests enqueue ingestion tasks. The ingestion worker runs in
+the `ram-a-mem` Tokio runtime and polls according to `case_library.ingestion_poll_ms`, so no
+separate case API or ingestor process is required.
 
 ## Network boundary
 
