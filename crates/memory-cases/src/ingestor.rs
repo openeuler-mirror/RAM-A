@@ -4,7 +4,9 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::service::RagService;
+use crate::service::{
+    ingestion_error_retriable, observable_error_kind, observable_error_summary, RagService,
+};
 
 /// Continuously consumes pending case ingestion tasks until cancellation.
 ///
@@ -24,9 +26,21 @@ pub async fn run_until_cancelled(
             Ok(true) => {}
             Ok(false) => sleep_or_cancel(poll_interval, &cancellation_token).await,
             Err(error) => {
-                eprintln!("case ingestion task failed: {error}");
+                tracing::error!(
+                    event = "ram_a.case.ingestion.failed",
+                    stage = "task",
+                    error_kind = observable_error_kind(&error),
+                    error = %observable_error_summary(&error),
+                    retriable = ingestion_error_retriable(&error)
+                );
                 if let Err(recovery_error) = service.recover_interrupted_ingestion_tasks() {
-                    eprintln!("case ingestion task recovery failed: {recovery_error}");
+                    tracing::error!(
+                        event = "ram_a.case.ingestion.failed",
+                        stage = "recovery",
+                        error_kind = observable_error_kind(&recovery_error),
+                        error = %observable_error_summary(&recovery_error),
+                        retriable = ingestion_error_retriable(&recovery_error)
+                    );
                 }
                 sleep_or_cancel(poll_interval, &cancellation_token).await;
             }

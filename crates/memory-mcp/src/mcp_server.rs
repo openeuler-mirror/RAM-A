@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use memory_pipeline::extraction::MemoryExtractor;
 use memory_pipeline::grounding::GroundingVerifier;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -9,15 +11,17 @@ use rmcp::model::{
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{tool, tool_router, ErrorData as McpError, ServerHandler};
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use crate::{
     CaseDeleteProposalResponse, CaseDocumentDeleteRequest, CaseDocumentDeleteResponse,
     CaseDocumentMutationResponse, CaseDocumentUpdateRequest, CaseDocumentUploadRequest,
     CaseMutationConfirmationRequest, CaseMutationProposalResponse, CaseSearchRequest,
     CaseSearchResponse, CaseServiceError, DisabledCaseSearchProvider, DynCaseSearchProvider,
-    FeatureFlags, IngestRequest, IngestResponse, MemoryService, Principal, SearchRequest,
-    SearchResponse, ServiceError,
+    FeatureFlags, IngestRequest, IngestResponse, MemoryService, Principal, RequestId,
+    SearchRequest, SearchResponse, ServiceError,
 };
 
 pub type DynMemoryService = MemoryService<dyn MemoryExtractor, dyn GroundingVerifier>;
@@ -118,19 +122,54 @@ impl MemoryMcpServer {
         {
             return tool_error("FORBIDDEN", false);
         }
-        let result = tokio::select! {
-            biased;
-            _ = self.cancellation_token.cancelled() => {
-                return tool_error("CANCELLED", true);
+        let request_id = request_id(&parts);
+        let span = tool_span("memory_ingest", &request_id, principal);
+        async {
+            let started = Instant::now();
+            let message_count = request.messages.len();
+            let candidate_count = request
+                .messages
+                .iter()
+                .filter(|message| message.candidate)
+                .count();
+            tracing::info!(
+                event = "ram_a.memory.ingest.started",
+                message_count,
+                candidate_count
+            );
+            let result = tokio::select! {
+                biased;
+                _ = self.cancellation_token.cancelled() => {
+                    tracing::warn!(event = "ram_a.memory.ingest.failed", stage = "cancelled", error_code = "CANCELLED", retriable = true, latency_ms = started.elapsed().as_millis() as u64);
+                    return tool_error("CANCELLED", true);
+                }
+                result = self.service.ingest(principal, request) => result,
+            };
+            match result {
+                Ok(response) => {
+                    tracing::info!(event = "ram_a.memory.ingest.records", record_ids = ?response.memory_ids);
+                    tracing::info!(
+                        event = "ram_a.memory.ingest.completed",
+                        pipeline_run_id = %response.pipeline_run_id,
+                        record_count = response.memory_ids.len(),
+                        accepted_count = response.accepted_count,
+                        rejected_count = response.rejected_count,
+                        quarantined_count = response.quarantined_count,
+                        idempotency_hit = response.idempotency_hit,
+                        latency_ms = started.elapsed().as_millis() as u64
+                    );
+                    CallToolResult::structured(
+                        serde_json::to_value(response).expect("ingest response is serializable"),
+                    )
+                }
+                Err(error) => {
+                    tracing::error!(event = "ram_a.memory.ingest.failed", stage = "service", error_code = error.code(), retriable = error.retriable(), latency_ms = started.elapsed().as_millis() as u64);
+                    service_error(error)
+                }
             }
-            result = self.service.ingest(principal, request) => result,
-        };
-        match result {
-            Ok(response) => CallToolResult::structured(
-                serde_json::to_value(response).expect("ingest response is serializable"),
-            ),
-            Err(error) => service_error(error),
         }
+        .instrument(span)
+        .await
     }
 
     #[tool(
@@ -153,19 +192,35 @@ impl MemoryMcpServer {
         {
             return tool_error("FORBIDDEN", false);
         }
-        let result = tokio::select! {
-            biased;
-            _ = self.cancellation_token.cancelled() => {
-                return tool_error("CANCELLED", true);
+        let request_id = request_id(&parts);
+        let span = tool_span("memory_search", &request_id, principal);
+        async {
+            let started = Instant::now();
+            let top_k = request.top_k;
+            tracing::info!(event = "ram_a.memory.search.started", top_k);
+            let result = tokio::select! {
+                biased;
+                _ = self.cancellation_token.cancelled() => {
+                    tracing::warn!(event = "ram_a.memory.search.failed", stage = "cancelled", error_code = "CANCELLED", retriable = true, latency_ms = started.elapsed().as_millis() as u64);
+                    return tool_error("CANCELLED", true);
+                }
+                result = self.service.search(principal, request) => result,
+            };
+            match result {
+                Ok(response) => {
+                    tracing::info!(event = "ram_a.memory.search.completed", result_count = response.memories.len(), latency_ms = started.elapsed().as_millis() as u64);
+                    CallToolResult::structured(
+                        serde_json::to_value(response).expect("search response is serializable"),
+                    )
+                }
+                Err(error) => {
+                    tracing::error!(event = "ram_a.memory.search.failed", stage = "service", error_code = error.code(), retriable = error.retriable(), latency_ms = started.elapsed().as_millis() as u64);
+                    service_error(error)
+                }
             }
-            result = self.service.search(principal, request) => result,
-        };
-        match result {
-            Ok(response) => CallToolResult::structured(
-                serde_json::to_value(response).expect("search response is serializable"),
-            ),
-            Err(error) => service_error(error),
         }
+        .instrument(span)
+        .await
     }
 
     #[tool(
@@ -188,19 +243,34 @@ impl MemoryMcpServer {
         {
             return tool_error("FORBIDDEN", false);
         }
-        let result = tokio::select! {
-            biased;
-            _ = self.cancellation_token.cancelled() => {
-                return tool_error("CANCELLED", true);
+        let request_id = request_id(&parts);
+        let span = tool_span("memory_case_search", &request_id, principal);
+        async {
+            let started = Instant::now();
+            tracing::info!(event = "ram_a.case.search.started", top_k = request.top_k);
+            let result = tokio::select! {
+                biased;
+                _ = self.cancellation_token.cancelled() => {
+                    tracing::warn!(event = "ram_a.case.search.failed", stage = "cancelled", error_code = "CANCELLED", retriable = true, latency_ms = started.elapsed().as_millis() as u64);
+                    return tool_error("CANCELLED", true);
+                }
+                result = self.case_search.search(principal, request) => result,
+            };
+            match result {
+                Ok(response) => {
+                    tracing::info!(event = "ram_a.case.search.completed", result_count = response.references.len(), latency_ms = started.elapsed().as_millis() as u64);
+                    CallToolResult::structured(
+                        serde_json::to_value(response).expect("case search response is serializable"),
+                    )
+                }
+                Err(error) => {
+                    tracing::error!(event = "ram_a.case.search.failed", stage = "service", error_code = error.code(), retriable = error.retriable(), latency_ms = started.elapsed().as_millis() as u64);
+                    case_service_error(error)
+                }
             }
-            result = self.case_search.search(principal, request) => result,
-        };
-        match result {
-            Ok(response) => CallToolResult::structured(
-                serde_json::to_value(response).expect("case search response is serializable"),
-            ),
-            Err(error) => case_service_error(error),
         }
+        .instrument(span)
+        .await
     }
 
     #[tool(
@@ -412,6 +482,28 @@ impl MemoryMcpServer {
             Err(error) => case_service_error(error),
         }
     }
+}
+
+fn request_id(parts: &axum::http::request::Parts) -> String {
+    parts
+        .extensions
+        .get::<RequestId>()
+        .map(|request_id| request_id.0.clone())
+        .unwrap_or_else(|| "unavailable".to_string())
+}
+
+fn tool_span(tool: &'static str, request_id: &str, principal: &Principal) -> tracing::Span {
+    let digest = Sha256::digest(principal.scope_id().as_bytes());
+    let scope_id_hash = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    tracing::info_span!(
+        "ram_a.tool",
+        request_id = request_id,
+        tool,
+        scope_id_hash = scope_id_hash
+    )
 }
 
 fn service_error(error: ServiceError) -> CallToolResult {

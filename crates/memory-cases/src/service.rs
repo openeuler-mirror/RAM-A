@@ -367,17 +367,45 @@ impl RagService {
         let Some(task) = self.repo.lease_next_pending_task()? else {
             return Ok(false);
         };
+        let started = std::time::Instant::now();
+        tracing::info!(
+            event = "ram_a.case.ingestion.task.started",
+            task_id = task.id,
+            dataset_id = task.dataset_id,
+            document_id = task.document_id
+        );
 
         match self.ingest_task(&task).await {
             Ok(chunk_count) => {
                 self.repo
                     .complete_task(&task.id, &task.document_id, chunk_count)?;
+                tracing::info!(
+                    event = "ram_a.case.ingestion.task.completed",
+                    task_id = task.id,
+                    dataset_id = task.dataset_id,
+                    document_id = task.document_id,
+                    chunk_count,
+                    latency_ms = started.elapsed().as_millis() as u64
+                );
             }
             Err(error) => {
                 let message = error.to_string();
+                let error_kind = observable_error_kind(&error);
+                let error_summary = observable_error_summary(&error);
+                let retriable = ingestion_error_retriable(&error);
                 self.repo
                     .fail_task(&task.id, &task.document_id, &message)
                     .with_context(|| format!("failed to mark task {} failed", task.id))?;
+                tracing::error!(
+                    event = "ram_a.case.ingestion.task.failed",
+                    task_id = task.id,
+                    dataset_id = task.dataset_id,
+                    document_id = task.document_id,
+                    error_kind,
+                    error = %error_summary,
+                    retriable,
+                    latency_ms = started.elapsed().as_millis() as u64
+                );
                 return Err(error);
             }
         }
@@ -467,15 +495,20 @@ impl RagService {
                             "llm",
                         );
                     }
-                    eprintln!(
-                        "summary LLM returned no usable summary for {}; using offline document summary",
-                        document.name
+                    tracing::warn!(
+                        event = "ram_a.case.ingestion.degraded",
+                        stage = "summary",
+                        fallback = "offline",
+                        error_kind = "empty_summary"
                     );
                 }
                 Err(error) => {
-                    eprintln!(
-                        "summary LLM failed for {}: {error}; using offline document summary",
-                        document.name
+                    tracing::warn!(
+                        event = "ram_a.case.ingestion.degraded",
+                        stage = "summary",
+                        fallback = "offline",
+                        error_kind = observable_error_kind(&error),
+                        error = %observable_error_summary(&error)
                     );
                 }
             }
@@ -579,6 +612,69 @@ impl RagService {
         );
         Ok(())
     }
+}
+
+pub fn observable_error_kind(error: &anyhow::Error) -> &'static str {
+    let message = error_chain_text(error).to_ascii_lowercase();
+    if message.contains("429") || message.contains("too many requests") {
+        "http_429"
+    } else if message.contains("401") || message.contains("unauthorized") {
+        "http_401"
+    } else if message.contains("403") || message.contains("forbidden") {
+        "http_403"
+    } else if (500..=599).any(|status| message.contains(&status.to_string())) {
+        "http_5xx"
+    } else if message.contains("timed out") || message.contains("timeout") {
+        "timeout"
+    } else if message.contains("connect") || message.contains("dns") {
+        "connection"
+    } else if message.contains("decode")
+        || message.contains("invalid json")
+        || message.contains("invalid response")
+    {
+        "decode"
+    } else if message.contains("sqlite") || message.contains("database") {
+        "storage"
+    } else if message.contains("not found")
+        || message.contains("does not exist")
+        || message.contains("not a directory")
+        || message.contains("invalid input")
+        || message.contains("dimension mismatch")
+    {
+        "invalid_input"
+    } else {
+        "unknown"
+    }
+}
+
+pub fn observable_error_summary(error: &anyhow::Error) -> &'static str {
+    match observable_error_kind(error) {
+        "http_429" => "provider returned HTTP 429",
+        "http_401" => "provider returned HTTP 401",
+        "http_403" => "provider returned HTTP 403",
+        "http_5xx" => "provider returned an HTTP 5xx response",
+        "timeout" => "provider request timed out",
+        "connection" => "provider connection failed",
+        "decode" => "provider response could not be decoded",
+        "storage" => "case storage operation failed",
+        "invalid_input" => "case ingestion input is invalid",
+        _ => "case ingestion failed with an unclassified error",
+    }
+}
+
+pub fn ingestion_error_retriable(error: &anyhow::Error) -> bool {
+    matches!(
+        observable_error_kind(error),
+        "http_429" | "http_5xx" | "timeout" | "connection" | "storage"
+    )
+}
+
+fn error_chain_text(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
 }
 
 fn build_chunks_from_file(document: &StoredDocument, config: &RagConfig) -> Result<Vec<Chunk>> {
@@ -1919,6 +2015,28 @@ mod tests {
     };
 
     use crate::token_counter::TestTokenCounter;
+
+    #[test]
+    fn provider_error_observability_redacts_response_bodies() {
+        let error = anyhow::anyhow!(
+            "embedding API returned HTTP 429 Too Many Requests: secret provider body"
+        );
+
+        assert_eq!(observable_error_kind(&error), "http_429");
+        assert_eq!(
+            observable_error_summary(&error),
+            "provider returned HTTP 429"
+        );
+        assert!(ingestion_error_retriable(&error));
+        assert!(!observable_error_summary(&error).contains("secret"));
+    }
+
+    #[test]
+    fn invalid_ingestion_errors_are_not_retriable() {
+        let error = anyhow::anyhow!("source_dir does not exist or is not a directory");
+        assert_eq!(observable_error_kind(&error), "invalid_input");
+        assert!(!ingestion_error_retriable(&error));
+    }
 
     fn chunk(id: &str, index: usize, content: &str) -> Chunk {
         Chunk {

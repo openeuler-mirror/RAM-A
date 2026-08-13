@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::time::Instant;
 
 use chrono::{DateTime, NaiveDate, Utc};
 use memory_core::{
@@ -16,6 +17,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinSet;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::idempotency::{IdempotencyEntry, IdempotencyError, IdempotencyRepository, Reservation};
@@ -183,9 +185,26 @@ where
         principal: &Principal,
         request: IngestRequest,
     ) -> Result<IngestResponse, ServiceError> {
-        request
-            .validate()
-            .map_err(|_| ServiceError::InvalidRequest)?;
+        let mut stage_started = Instant::now();
+        tracing::info!(
+            event = "ram_a.memory.ingest.stage.started",
+            stage = "validate"
+        );
+        request.validate().map_err(|_| {
+            tracing::error!(
+                event = "ram_a.memory.ingest.stage.failed",
+                stage = "validate",
+                error_code = ServiceError::InvalidRequest.code(),
+                retriable = false,
+                elapsed_ms = stage_started.elapsed().as_millis() as u64
+            );
+            ServiceError::InvalidRequest
+        })?;
+        tracing::info!(
+            event = "ram_a.memory.ingest.stage.completed",
+            stage = "validate",
+            elapsed_ms = stage_started.elapsed().as_millis() as u64
+        );
         let scope_id = principal.scope_id();
         let entries = request
             .messages
@@ -201,6 +220,12 @@ where
         let lock = self.ingest_lock(&scope_id, &request, &entries)?;
         let _guard = lock.lock().await;
         let proposed_run_id = format!("run-{}", Uuid::new_v4());
+        stage_started = Instant::now();
+        tracing::info!(
+            event = "ram_a.memory.ingest.stage.started",
+            stage = "idempotency_reserve",
+            candidate_count = entries.len()
+        );
         let (pipeline_run_id, candidate_message_ids) = if entries.is_empty() {
             (proposed_run_id, HashSet::new())
         } else {
@@ -208,17 +233,42 @@ where
                 .idempotency
                 .reserve(&entries, &proposed_run_id)
                 .await
-                .map_err(map_idempotency_error)?
-            {
-                Reservation::Cached { results } => return cached_response(results),
+                .map_err(|error| {
+                    let mapped = map_idempotency_error(error);
+                    tracing::error!(
+                        event = "ram_a.memory.ingest.stage.failed",
+                        stage = "idempotency_reserve",
+                        error_code = mapped.code(),
+                        retriable = mapped.retriable(),
+                        elapsed_ms = stage_started.elapsed().as_millis() as u64
+                    );
+                    mapped
+                })? {
+                Reservation::Cached { results } => {
+                    tracing::info!(
+                        event = "ram_a.memory.ingest.stage.completed",
+                        stage = "idempotency_reserve",
+                        idempotency_hit = true,
+                        elapsed_ms = stage_started.elapsed().as_millis() as u64
+                    );
+                    return cached_response(results);
+                }
                 Reservation::Proceed {
                     pipeline_run_id,
                     candidate_message_ids,
                 } => (pipeline_run_id, candidate_message_ids.into_iter().collect()),
             }
         };
+        tracing::info!(
+            event = "ram_a.memory.ingest.stage.completed",
+            stage = "idempotency_reserve",
+            idempotency_hit = false,
+            elapsed_ms = stage_started.elapsed().as_millis() as u64
+        );
 
         let prepared = build_prepared_input(principal, &request, &candidate_message_ids);
+        stage_started = Instant::now();
+        tracing::info!(event = "ram_a.memory.ingest.stage.started", stage = "memory_pipeline", pipeline_run_id = %pipeline_run_id);
         let run = run_memory_pipeline(
             &prepared,
             &self.pipeline_config,
@@ -227,23 +277,82 @@ where
             None,
         )
         .await
-        .map_err(|_| ServiceError::Pipeline)?;
+        .map_err(|_| {
+            tracing::error!(
+                event = "ram_a.memory.ingest.stage.failed",
+                stage = "memory_pipeline",
+                error_code = ServiceError::Pipeline.code(),
+                retriable = true,
+                elapsed_ms = stage_started.elapsed().as_millis() as u64
+            );
+            ServiceError::Pipeline
+        })?;
+        tracing::info!(
+            event = "ram_a.memory.ingest.stage.completed",
+            stage = "memory_pipeline",
+            accepted_count = run.accepted_memories.len(),
+            rejected_count = run.rejected.len(),
+            quarantined_count = run.quarantined.len(),
+            elapsed_ms = stage_started.elapsed().as_millis() as u64
+        );
         let requests = stored_memory_requests(&run.prepared, principal, &pipeline_run_id)?;
         let graph_requests = if self.graph_memory.is_some() {
             build_graph_add_requests(principal, &requests)?
         } else {
             Vec::new()
         };
+        stage_started = Instant::now();
+        tracing::info!(
+            event = "ram_a.memory.ingest.stage.started",
+            stage = "vector_persist",
+            record_count = requests.len()
+        );
         let memory_ids = self
             .manager
             .add_many(requests)
             .await
-            .map_err(|_| ServiceError::Storage)?
+            .map_err(|_| {
+                tracing::error!(
+                    event = "ram_a.memory.ingest.stage.failed",
+                    stage = "vector_persist",
+                    error_code = ServiceError::Storage.code(),
+                    retriable = true,
+                    elapsed_ms = stage_started.elapsed().as_millis() as u64
+                );
+                ServiceError::Storage
+            })?
             .into_iter()
             .map(|response| response.id)
             .collect::<Vec<_>>();
+        tracing::info!(
+            event = "ram_a.memory.ingest.stage.completed",
+            stage = "vector_persist",
+            record_count = memory_ids.len(),
+            elapsed_ms = stage_started.elapsed().as_millis() as u64
+        );
         if let Some(graph_memory) = &self.graph_memory {
-            build_graph_memories(graph_memory, graph_requests).await?;
+            stage_started = Instant::now();
+            tracing::info!(
+                event = "ram_a.memory.ingest.stage.started",
+                stage = "graph_build",
+                record_count = graph_requests.len()
+            );
+            build_graph_memories(graph_memory, graph_requests)
+                .await
+                .inspect_err(|error| {
+                    tracing::error!(
+                        event = "ram_a.memory.ingest.stage.failed",
+                        stage = "graph_build",
+                        error_code = error.code(),
+                        retriable = error.retriable(),
+                        elapsed_ms = stage_started.elapsed().as_millis() as u64
+                    );
+                })?;
+            tracing::info!(
+                event = "ram_a.memory.ingest.stage.completed",
+                stage = "graph_build",
+                elapsed_ms = stage_started.elapsed().as_millis() as u64
+            );
         }
         let response = IngestResponse {
             pipeline_run_id: pipeline_run_id.clone(),
@@ -255,6 +364,11 @@ where
             retriable: false,
         };
         if !entries.is_empty() {
+            stage_started = Instant::now();
+            tracing::info!(
+                event = "ram_a.memory.ingest.stage.started",
+                stage = "idempotency_complete"
+            );
             let pending_entries = entries
                 .iter()
                 .filter(|entry| candidate_message_ids.contains(&entry.message_id))
@@ -264,7 +378,22 @@ where
             self.idempotency
                 .complete(&pending_entries, &pipeline_run_id, &result)
                 .await
-                .map_err(map_idempotency_error)?;
+                .map_err(|error| {
+                    let mapped = map_idempotency_error(error);
+                    tracing::error!(
+                        event = "ram_a.memory.ingest.stage.failed",
+                        stage = "idempotency_complete",
+                        error_code = mapped.code(),
+                        retriable = mapped.retriable(),
+                        elapsed_ms = stage_started.elapsed().as_millis() as u64
+                    );
+                    mapped
+                })?;
+            tracing::info!(
+                event = "ram_a.memory.ingest.stage.completed",
+                stage = "idempotency_complete",
+                elapsed_ms = stage_started.elapsed().as_millis() as u64
+            );
         }
         Ok(response)
     }
@@ -274,9 +403,26 @@ where
         principal: &Principal,
         request: SearchRequest,
     ) -> Result<SearchResponse, ServiceError> {
-        request
-            .validate()
-            .map_err(|_| ServiceError::InvalidRequest)?;
+        let mut stage_started = Instant::now();
+        tracing::info!(
+            event = "ram_a.memory.search.stage.started",
+            stage = "validate"
+        );
+        request.validate().map_err(|_| {
+            tracing::error!(
+                event = "ram_a.memory.search.stage.failed",
+                stage = "validate",
+                error_code = ServiceError::InvalidRequest.code(),
+                retriable = false,
+                elapsed_ms = stage_started.elapsed().as_millis() as u64
+            );
+            ServiceError::InvalidRequest
+        })?;
+        tracing::info!(
+            event = "ram_a.memory.search.stage.completed",
+            stage = "validate",
+            elapsed_ms = stage_started.elapsed().as_millis() as u64
+        );
         let top_k = request.top_k;
         let memory_types = request.memory_types.iter().cloned().collect::<HashSet<_>>();
         let event_time_from = request
@@ -285,6 +431,12 @@ where
             .and_then(parse_event_time);
         let event_time_to = request.event_time_to.as_deref().and_then(parse_event_time);
         let candidate_limit = bounded_candidate_limit(top_k);
+        stage_started = Instant::now();
+        tracing::info!(
+            event = "ram_a.memory.search.stage.started",
+            stage = "retrieve",
+            candidate_limit
+        );
         let candidates = self
             .manager
             .search(CoreSearchRequest {
@@ -296,7 +448,29 @@ where
                 graph_target_evidence_speaker: None,
             })
             .await
-            .map_err(|_| ServiceError::Storage)?;
+            .map_err(|_| {
+                tracing::error!(
+                    event = "ram_a.memory.search.stage.failed",
+                    stage = "retrieve",
+                    error_code = ServiceError::Storage.code(),
+                    retriable = true,
+                    elapsed_ms = stage_started.elapsed().as_millis() as u64
+                );
+                ServiceError::Storage
+            })?;
+        let candidate_count = candidates.len();
+        tracing::info!(
+            event = "ram_a.memory.search.stage.completed",
+            stage = "retrieve",
+            candidate_count,
+            elapsed_ms = stage_started.elapsed().as_millis() as u64
+        );
+        stage_started = Instant::now();
+        tracing::info!(
+            event = "ram_a.memory.search.stage.started",
+            stage = "predicate_filter",
+            candidate_count
+        );
         let mut memories = candidates
             .into_iter()
             .map(|candidate| search_result(candidate.record, candidate.score))
@@ -310,6 +484,13 @@ where
             })
             .collect::<Vec<_>>();
         memories.truncate(top_k);
+        tracing::info!(
+            event = "ram_a.memory.search.stage.completed",
+            stage = "predicate_filter",
+            candidate_count,
+            result_count = memories.len(),
+            elapsed_ms = stage_started.elapsed().as_millis() as u64
+        );
         Ok(SearchResponse { memories })
     }
 
@@ -556,7 +737,8 @@ fn spawn_graph_build(
     pipeline: Arc<GraphBuildPipeline>,
     request: GraphAddMemoryRequest,
 ) {
-    tasks.spawn(async move { pipeline.resume_memory(request).await });
+    let span = tracing::Span::current();
+    tasks.spawn(async move { pipeline.resume_memory(request).await }.instrument(span));
 }
 
 fn search_result(record: MemoryRecord, score: f32) -> SearchResult {

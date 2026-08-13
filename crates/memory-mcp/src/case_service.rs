@@ -411,6 +411,7 @@ impl EmbeddedCaseSearchProvider {
             .ok_or(CaseServiceError::DocumentNotFound)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn stage_mutation(
         &self,
         principal: &Principal,

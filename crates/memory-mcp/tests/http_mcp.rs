@@ -1689,6 +1689,7 @@ fn production_runtime_config_requires_live_components_and_nonzero_limits() {
         limits: LimitsConfig::default(),
         storage: None,
         providers: None,
+        retrieval: Default::default(),
         case_library: None,
         graph_memory: None,
     };
@@ -1715,6 +1716,7 @@ fn production_runtime_config_requires_live_components_and_nonzero_limits() {
             timeout_seconds: 30,
             max_retries: 2,
         }),
+        retrieval: Default::default(),
         case_library: None,
         graph_memory: None,
     };

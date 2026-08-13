@@ -84,6 +84,22 @@ Create `config/ram-a-mem.json`:
     "timeout_seconds": 120,
     "max_retries": 3
   },
+  "retrieval": {
+    "mode": "hybrid",
+    "candidate_k": 100,
+    "embedding_weight": 0.7,
+    "bm25_weight": 0.3,
+    "rerank": {
+      "enabled": false,
+      "provider": "openrouter",
+      "model": "cohere/rerank-v3.5",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "base_url": "https://openrouter.ai/api/v1",
+      "input_k": 40,
+      "timeout_ms": 30000,
+      "fail_open": false
+    }
+  },
   "case_library": {
     "rag_store": "data/memory-cases.sqlite",
     "index_store": "data/memory-cases-index.sqlite",
@@ -257,6 +273,76 @@ Example self-hosted embedding settings:
   "embedding_dimensions": 1024
 }
 ```
+
+## Retrieval and rerank
+
+`retrieval.mode` supports `dense`, `bm25`, and `hybrid` in the MCP service. `hybrid` is the
+default. `graph` is intentionally configured through `features.graph_memory` and
+`graph_memory.retrieval`, so there is only one graph-memory switch and configuration source.
+
+For hybrid retrieval, `embedding_weight` and `bm25_weight` must each be between `0` and `1`
+and must sum to `1`. `candidate_k`, when set, must be between `1` and `500`. Learned rerank is
+optional and is applied after hybrid fusion. It therefore requires `mode=hybrid`.
+
+The first rerank adapter uses the OpenRouter-compatible wire protocol. `provider=openrouter`
+describes that HTTP protocol and does not require the service itself to be hosted by OpenRouter.
+RAM-A sends `POST {base_url}/rerank` (or uses `base_url` directly when it already ends in
+`/rerank`) with this shape:
+
+```json
+{
+  "model": "local-rerank-model",
+  "query": "the search query",
+  "documents": ["candidate one", "candidate two"],
+  "top_n": 2
+}
+```
+
+The endpoint must return indexes into the original `documents` array:
+
+```json
+{
+  "results": [
+    {"index": 1, "relevance_score": 0.93},
+    {"index": 0, "relevance_score": 0.71}
+  ]
+}
+```
+
+For OpenRouter or another authenticated endpoint, set `api_key_env` to the environment
+variable holding the Bearer credential. Authenticated public endpoints must use HTTPS; plain HTTP
+is accepted only for loopback, RFC1918/unique-local, or link-local hosts. An unauthenticated local service may set
+`api_key_env` to `null`; RAM-A then omits the `Authorization` header. Setting it to `null` is an
+explicit operator acknowledgement: expose that endpoint only on a trusted loopback, container,
+or private network. A local inference server using another request or response schema needs a
+protocol adapter or gateway.
+
+`fail_open=false` makes rerank errors fail the search. With `fail_open=true`, RAM-A returns the
+pre-rerank hybrid order and emits a `ram_a.memory.search.degraded` event.
+
+## Structured progress logs
+
+`ram-a-mem` writes one-line JSON logs. Use `RUST_LOG` to select the level; the default is `info`.
+Every MCP tool call carries the HTTP `request_id` in its tracing span. Memory ingest emits stage
+events for validation, idempotency, normalization, episode/window construction, extraction,
+verification, vector persistence, optional graph build, and completion. Hybrid search emits
+stage events for query embedding, dense retrieval, BM25 retrieval, fusion, optional graph
+augmentation, rerank, filtering, and response completion.
+
+Each stage uses one of these stable event names:
+
+- `ram_a.memory.ingest.stage.started|completed|failed|window_skipped`
+- `ram_a.memory.search.stage.started|completed|failed`
+- `ram_a.provider.retry|failed`
+- `ram_a.case.ingestion.started|completed|failed`
+- `ram_a.case.ingestion.task.started|completed|failed`
+
+The latest event for a `request_id` shows the currently running or last failed stage. Events
+include elapsed time and counts where available. Logs never include API credentials, query text,
+memory text, or provider response bodies. Successful ingest events include generated record IDs;
+case task events include `task_id`, `dataset_id`, and `document_id` for operational correlation.
+`window_skipped` is emitted only for fail-open extraction or verification errors where the
+pipeline continues; `failed` means the current ingest operation stops.
 
 ## Storage boundary
 

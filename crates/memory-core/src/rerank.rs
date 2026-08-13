@@ -41,7 +41,7 @@ pub trait Reranker: Send + Sync {
 
 pub struct OpenRouterReranker {
     client: reqwest::Client,
-    api_key: String,
+    api_key: Option<String>,
     base_url: String,
     model: String,
     timeout: Option<Duration>,
@@ -59,7 +59,7 @@ impl OpenRouterReranker {
     ) -> Self {
         Self {
             client: reqwest::Client::new(),
-            api_key: api_key.into(),
+            api_key: Some(api_key.into()),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             model: model.into(),
             timeout: None,
@@ -69,6 +69,21 @@ impl OpenRouterReranker {
     pub fn from_config(api_key: impl Into<String>, config: &RerankConfig) -> Self {
         Self::with_base_url(api_key, config.base_url.clone(), config.model.clone())
             .with_timeout_ms(config.timeout_ms)
+    }
+
+    /// Construct an OpenRouter-wire-compatible reranker. `None` is intended for
+    /// trusted local endpoints that do not require Bearer authentication.
+    pub fn from_config_with_optional_api_key(
+        api_key: Option<String>,
+        config: &RerankConfig,
+    ) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            api_key,
+            base_url: config.base_url.trim_end_matches('/').to_string(),
+            model: config.model.clone(),
+            timeout: config.timeout_ms.map(Duration::from_millis),
+        }
     }
 
     pub fn with_timeout_ms(mut self, timeout_ms: Option<u64>) -> Self {
@@ -102,11 +117,10 @@ impl Reranker for OpenRouterReranker {
 
         let mut last_error = None;
         for attempt in 1..=RERANK_MAX_ATTEMPTS {
-            let mut request = self
-                .client
-                .post(self.rerank_url())
-                .bearer_auth(&self.api_key)
-                .json(&body);
+            let mut request = self.client.post(self.rerank_url()).json(&body);
+            if let Some(api_key) = self.api_key.as_deref() {
+                request = request.bearer_auth(api_key);
+            }
             if let Some(timeout) = self.timeout {
                 request = request.timeout(timeout);
             }
@@ -144,15 +158,31 @@ impl Reranker for OpenRouterReranker {
                 let retryable = is_retryable_rerank_failure(&message);
                 last_error = Some(message.clone());
                 if retryable && attempt < RERANK_MAX_ATTEMPTS {
-                    eprintln!(
-                        "OpenRouter rerank attempt {attempt}/{RERANK_MAX_ATTEMPTS} failed: {}; retrying in {}s",
-                        message,
-                        retry_backoff(attempt).as_secs()
+                    let backoff = retry_backoff(attempt);
+                    tracing::warn!(
+                        event = "ram_a.provider.retry",
+                        provider_kind = "rerank",
+                        provider = "openrouter_compatible",
+                        model = self.model,
+                        operation = "rerank",
+                        attempt,
+                        max_attempts = RERANK_MAX_ATTEMPTS,
+                        backoff_ms = backoff.as_millis() as u64,
+                        error_kind = retry_error_kind(&message)
                     );
-                    tokio::time::sleep(retry_backoff(attempt)).await;
+                    tokio::time::sleep(backoff).await;
                     continue;
                 }
 
+                tracing::error!(
+                    event = "ram_a.provider.failed",
+                    provider_kind = "rerank",
+                    provider = "openrouter_compatible",
+                    model = self.model,
+                    operation = "rerank",
+                    attempts = attempt,
+                    error_kind = retry_error_kind(&message)
+                );
                 return Err(MemoryError::Rerank { message });
             }
         }
@@ -162,6 +192,24 @@ impl Reranker for OpenRouterReranker {
                 .unwrap_or_else(|| "OpenRouter rerank request failed without an error".to_string()),
         })
     }
+}
+
+fn retry_error_kind(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    for (needle, kind) in [
+        ("http 429", "http_429"),
+        ("http 503", "http_503"),
+        ("http 502", "http_502"),
+        ("http 504", "http_504"),
+        ("timed out", "timeout"),
+        ("decode failed", "decode"),
+        ("failed to read", "read"),
+    ] {
+        if lower.contains(needle) {
+            return kind;
+        }
+    }
+    "request"
 }
 
 #[derive(Serialize)]
@@ -258,6 +306,11 @@ fn preview_body(body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+
     use super::*;
     use crate::MemoryRecord;
 
@@ -296,6 +349,70 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].record.id, "second");
         assert!((results[0].score - 0.91).abs() < 0.0001);
+    }
+
+    #[test]
+    fn local_openrouter_compatible_reranker_can_omit_bearer_auth() {
+        let config = RerankConfig {
+            enabled: true,
+            base_url: "http://127.0.0.1:8081/v1".to_string(),
+            model: "local-reranker".to_string(),
+            ..RerankConfig::default()
+        };
+        let reranker = OpenRouterReranker::from_config_with_optional_api_key(None, &config);
+
+        assert!(reranker.api_key.is_none());
+        assert_eq!(reranker.rerank_url(), "http://127.0.0.1:8081/v1/rerank");
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_local_request_omits_authorization_header() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test reranker");
+        let address = listener.local_addr().expect("test reranker address");
+        let (request_tx, request_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept rerank request");
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).expect("read rerank request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            request_tx.send(request).expect("capture rerank request");
+            let response_body = r#"{"results":[{"index":0,"relevance_score":0.9}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            )
+            .expect("write rerank response");
+        });
+        let config = RerankConfig {
+            enabled: true,
+            base_url: format!("http://{address}"),
+            model: "local-reranker".to_string(),
+            ..RerankConfig::default()
+        };
+        let reranker = OpenRouterReranker::from_config_with_optional_api_key(None, &config);
+
+        let results = reranker
+            .rerank("query", vec![candidate("first")], 1)
+            .await
+            .expect("local rerank succeeds");
+        server.join().expect("join test reranker");
+        let request = String::from_utf8(request_rx.recv().expect("captured request"))
+            .expect("request is UTF-8");
+
+        assert_eq!(results.len(), 1);
+        assert!(!request.to_ascii_lowercase().contains("authorization:"));
+        assert!(request.starts_with("POST /rerank HTTP/1.1"));
     }
 
     #[test]

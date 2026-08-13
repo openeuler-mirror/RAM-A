@@ -29,6 +29,8 @@ sha2.workspace = true
 subtle.workspace = true
 tokio = { workspace = true, features = ["net", "signal", "sync"] }
 tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 tower = { version = "0.5", features = ["limit", "util"] }
 url.workspace = true
 uuid.workspace = true

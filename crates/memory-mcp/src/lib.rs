@@ -20,7 +20,8 @@ pub use config::{
     AuthConfig, CaseLibraryConfig, CaseLibraryFeatureConfig, CaseLibraryServiceConfig,
     CaseServiceConfig, EmbeddingProviderKind, FeatureFlags, FeaturesConfig,
     GraphMemoryFeatureConfig, GraphMemoryRetrievalConfig, GraphMemoryServiceConfig, HttpConfig,
-    LimitsConfig, MemoryFeatureConfig, ProvidersConfig, ServerConfig, StorageConfig, TokenConfig,
+    LimitsConfig, MemoryFeatureConfig, ProvidersConfig, RerankServiceConfig,
+    RetrievalServiceConfig, ServerConfig, StorageConfig, TokenConfig,
 };
 pub use http::{create_http_router, HttpRuntime, RequestId, AGENT_ID_HEADER, REQUEST_ID_HEADER};
 pub use idempotency::IdempotencyRepository;

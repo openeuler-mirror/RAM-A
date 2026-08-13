@@ -20,6 +20,8 @@ pub struct ServerConfig {
     #[serde(default)]
     pub providers: Option<ProvidersConfig>,
     #[serde(default)]
+    pub retrieval: RetrievalServiceConfig,
+    #[serde(default)]
     pub case_library: Option<CaseLibraryServiceConfig>,
     #[serde(default)]
     pub graph_memory: Option<GraphMemoryServiceConfig>,
@@ -149,7 +151,11 @@ impl GraphMemoryServiceConfig {
         if self.llm_api_key_env.trim().is_empty() || self.llm_model.trim().is_empty() {
             anyhow::bail!("graph memory LLM configuration is incomplete");
         }
-        validate_provider_base_url(&self.llm_base_url, "graph memory LLM base URL")?;
+        validate_authenticated_provider_base_url(
+            &self.llm_base_url,
+            "graph memory LLM base URL",
+            Some(&self.llm_api_key_env),
+        )?;
         if self.llm_timeout_ms == 0 || self.build_concurrency == 0 {
             anyhow::bail!("graph memory timeout and build concurrency must be non-zero");
         }
@@ -343,6 +349,147 @@ pub struct ProvidersConfig {
     pub timeout_seconds: u64,
     #[serde(default = "default_provider_max_retries")]
     pub max_retries: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RetrievalServiceConfig {
+    pub mode: memory_core::SearchMode,
+    pub embedding_weight: f32,
+    pub bm25_weight: f32,
+    pub candidate_k: Option<usize>,
+    pub rerank: RerankServiceConfig,
+}
+
+impl Default for RetrievalServiceConfig {
+    fn default() -> Self {
+        let defaults = memory_core::RetrievalConfig::default();
+        Self {
+            mode: defaults.mode,
+            embedding_weight: defaults.embedding_weight,
+            bm25_weight: defaults.bm25_weight,
+            candidate_k: defaults.candidate_k,
+            rerank: RerankServiceConfig::default(),
+        }
+    }
+}
+
+impl RetrievalServiceConfig {
+    pub fn core_config(
+        &self,
+        graph: memory_core::GraphRetrievalConfig,
+    ) -> memory_core::RetrievalConfig {
+        memory_core::RetrievalConfig {
+            mode: self.mode,
+            embedding_weight: self.embedding_weight,
+            bm25_weight: self.bm25_weight,
+            candidate_k: self.candidate_k,
+            graph,
+            rerank: self.rerank.core_config(),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.mode == memory_core::SearchMode::Graph {
+            anyhow::bail!(
+                "retrieval mode graph is not supported by the MCP service; enable graph_memory augmentation instead"
+            );
+        }
+        if self
+            .candidate_k
+            .is_some_and(|value| !(1..=500).contains(&value))
+        {
+            anyhow::bail!("retrieval candidate_k must be between 1 and 500");
+        }
+        if self.mode == memory_core::SearchMode::Hybrid {
+            let weights = [self.embedding_weight, self.bm25_weight];
+            if weights
+                .iter()
+                .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
+                || (weights.iter().sum::<f32>() - 1.0).abs() > 1e-6
+            {
+                anyhow::bail!(
+                    "hybrid retrieval weights must be finite, between 0 and 1, and sum to 1"
+                );
+            }
+        }
+        self.rerank.validate(self.mode)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RerankServiceConfig {
+    pub enabled: bool,
+    pub provider: memory_core::RerankProvider,
+    pub model: String,
+    pub api_key_env: Option<String>,
+    pub base_url: String,
+    pub input_k: usize,
+    pub timeout_ms: Option<u64>,
+    pub fail_open: bool,
+}
+
+impl Default for RerankServiceConfig {
+    fn default() -> Self {
+        let defaults = memory_core::RerankConfig::default();
+        Self {
+            enabled: defaults.enabled,
+            provider: defaults.provider,
+            model: defaults.model,
+            api_key_env: Some(defaults.api_key_env),
+            base_url: defaults.base_url,
+            input_k: defaults.input_k,
+            timeout_ms: defaults.timeout_ms,
+            fail_open: defaults.fail_open,
+        }
+    }
+}
+
+impl RerankServiceConfig {
+    pub fn core_config(&self) -> memory_core::RerankConfig {
+        memory_core::RerankConfig {
+            enabled: self.enabled,
+            provider: self.provider,
+            model: self.model.clone(),
+            api_key_env: self.api_key_env.clone().unwrap_or_default(),
+            base_url: self.base_url.clone(),
+            input_k: self.input_k,
+            timeout_ms: self.timeout_ms,
+            fail_open: self.fail_open,
+        }
+    }
+
+    fn validate(&self, mode: memory_core::SearchMode) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if mode != memory_core::SearchMode::Hybrid {
+            anyhow::bail!("rerank requires retrieval mode hybrid");
+        }
+        if self.model.trim().is_empty() || self.base_url.trim().is_empty() {
+            anyhow::bail!("rerank model and base_url must not be empty");
+        }
+        if self
+            .api_key_env
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            anyhow::bail!("rerank API key environment name must not be empty");
+        }
+        validate_authenticated_provider_base_url(
+            &self.base_url,
+            "rerank base URL",
+            self.api_key_env.as_deref(),
+        )?;
+        if !(1..=500).contains(&self.input_k) {
+            anyhow::bail!("rerank input_k must be between 1 and 500");
+        }
+        if self.timeout_ms == Some(0) {
+            anyhow::bail!("rerank timeout_ms must be non-zero when configured");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -615,6 +762,7 @@ impl ServerConfig {
 
     pub fn validate_runtime(&self) -> Result<()> {
         self.http.validate_bind()?;
+        self.retrieval.validate()?;
         if self.features.case_library.enabled == Some(true) && self.case_library.is_none() {
             anyhow::bail!("case_library feature requires case_library configuration");
         }
@@ -673,7 +821,11 @@ impl ServerConfig {
         {
             anyhow::bail!("provider configuration is incomplete");
         }
-        validate_provider_base_url(&providers.base_url, "provider base URL")?;
+        validate_authenticated_provider_base_url(
+            &providers.base_url,
+            "provider base URL",
+            Some(&providers.api_key_env),
+        )?;
         if let Some(embedding_api_key_env) = providers.embedding_api_key_env.as_deref() {
             if embedding_api_key_env.trim().is_empty() {
                 anyhow::bail!("embedding API key environment name must not be empty");
@@ -681,6 +833,53 @@ impl ServerConfig {
         }
         if let Some(embedding_base_url) = providers.embedding_base_url.as_deref() {
             validate_provider_base_url(embedding_base_url, "embedding base URL")?;
+        }
+        if providers.embedding_provider == EmbeddingProviderKind::OpenAiCompatible {
+            validate_authenticated_provider_base_url(
+                providers
+                    .embedding_base_url
+                    .as_deref()
+                    .unwrap_or(&providers.base_url),
+                "embedding base URL",
+                Some(
+                    providers
+                        .embedding_api_key_env
+                        .as_deref()
+                        .unwrap_or(&providers.api_key_env),
+                ),
+            )?;
+        }
+        if let Some(case_library) = &self.case_library {
+            if case_library.embedding_provider == EmbeddingProviderKind::OpenAiCompatible {
+                validate_authenticated_provider_base_url(
+                    case_library
+                        .embedding_base_url
+                        .as_deref()
+                        .unwrap_or(&providers.base_url),
+                    "case library embedding base URL",
+                    Some(
+                        case_library
+                            .embedding_api_key_env
+                            .as_deref()
+                            .unwrap_or(&providers.api_key_env),
+                    ),
+                )?;
+            }
+            if case_library.summary_llm_model.is_some() {
+                validate_authenticated_provider_base_url(
+                    case_library
+                        .summary_llm_base_url
+                        .as_deref()
+                        .unwrap_or(&providers.base_url),
+                    "case library summary LLM base URL",
+                    Some(
+                        case_library
+                            .summary_llm_api_key_env
+                            .as_deref()
+                            .unwrap_or(&providers.api_key_env),
+                    ),
+                )?;
+            }
         }
         Ok(())
     }
@@ -718,7 +917,7 @@ fn validate_case_library_mappings(
     Ok(())
 }
 
-fn validate_provider_base_url(value: &str, label: &str) -> Result<()> {
+fn validate_provider_base_url(value: &str, label: &str) -> Result<url::Url> {
     let (url_scheme, url_remainder) = value
         .split_once("://")
         .with_context(|| format!("{label} must include an HTTP or HTTPS scheme"))?;
@@ -740,12 +939,52 @@ fn validate_provider_base_url(value: &str, label: &str) -> Result<()> {
             "{label} must be an absolute HTTP or HTTPS URL without credentials, query, or fragment"
         );
     }
-    Ok(())
+    Ok(parsed_base_url)
+}
+
+fn validate_authenticated_provider_base_url(
+    value: &str,
+    label: &str,
+    api_key_env: Option<&str>,
+) -> Result<url::Url> {
+    let parsed_base_url = validate_provider_base_url(value, label)?;
+    if api_key_env.is_some()
+        && parsed_base_url.scheme() != "https"
+        && !is_loopback_or_private(&parsed_base_url)
+    {
+        anyhow::bail!(
+            "{label} must use HTTPS when an API key is configured unless the host is loopback, private, or link-local"
+        );
+    }
+    Ok(parsed_base_url)
+}
+
+fn is_loopback_or_private(value: &url::Url) -> bool {
+    match value.host() {
+        Some(url::Host::Ipv4(address)) => {
+            address.is_loopback() || address.is_private() || address.is_link_local()
+        }
+        Some(url::Host::Ipv6(address)) => {
+            if let Some(ipv4) = address.to_ipv4_mapped() {
+                return ipv4.is_loopback() || ipv4.is_private() || ipv4.is_link_local();
+            }
+            address.is_loopback() || address.is_unique_local() || address.is_unicast_link_local()
+        }
+        Some(url::Host::Domain(domain)) => {
+            domain.eq_ignore_ascii_case("localhost")
+                || domain.to_ascii_lowercase().ends_with(".localhost")
+        }
+        None => false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::validate_provider_base_url;
+    use super::{
+        validate_provider_base_url, EmbeddingProviderKind, RerankServiceConfig,
+        RetrievalServiceConfig, ServerConfig,
+    };
+    use memory_core::SearchMode;
 
     #[test]
     fn provider_base_url_rejects_credentials_query_and_fragment() {
@@ -765,6 +1004,178 @@ mod tests {
     fn provider_base_url_allows_trusted_http_endpoints() {
         assert!(validate_provider_base_url("http://127.0.0.1:8080/v1", "provider").is_ok());
         assert!(validate_provider_base_url("https://example.com/v1", "provider").is_ok());
+    }
+
+    #[test]
+    fn retrieval_defaults_preserve_current_hybrid_behavior() {
+        let config = RetrievalServiceConfig::default();
+        assert_eq!(config.mode, SearchMode::Hybrid);
+        assert_eq!(config.embedding_weight, 0.7);
+        assert_eq!(config.bm25_weight, 0.3);
+        assert_eq!(config.candidate_k, None);
+        assert!(!config.rerank.enabled);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn retrieval_parses_openrouter_compatible_local_rerank_without_auth() {
+        let config: RetrievalServiceConfig = serde_json::from_value(serde_json::json!({
+            "mode": "hybrid",
+            "embedding_weight": 0.6,
+            "bm25_weight": 0.4,
+            "candidate_k": 120,
+            "rerank": {
+                "enabled": true,
+                "provider": "openrouter",
+                "model": "local-reranker",
+                "api_key_env": null,
+                "base_url": "http://127.0.0.1:8081/v1",
+                "input_k": 40,
+                "timeout_ms": 5000,
+                "fail_open": true
+            }
+        }))
+        .expect("parse retrieval config");
+
+        assert!(config.validate().is_ok());
+        assert_eq!(config.rerank.api_key_env, None);
+        let core = config.core_config(memory_core::GraphRetrievalConfig::default());
+        assert!(core.rerank.enabled);
+        assert_eq!(core.rerank.model, "local-reranker");
+    }
+
+    #[test]
+    fn authenticated_rerank_rejects_plain_http_public_host() {
+        for base_url in [
+            "http://public.example.com/v1",
+            "http://[::ffff:8.8.8.8]:8080/v1",
+        ] {
+            let config = RetrievalServiceConfig {
+                rerank: RerankServiceConfig {
+                    enabled: true,
+                    api_key_env: Some("OPENROUTER_API_KEY".to_string()),
+                    base_url: base_url.to_string(),
+                    ..RerankServiceConfig::default()
+                },
+                ..RetrievalServiceConfig::default()
+            };
+
+            let error = config.validate().expect_err("public HTTP must be rejected");
+            assert!(error.to_string().contains("must use HTTPS"), "{base_url}");
+        }
+    }
+
+    #[test]
+    fn authenticated_rerank_allows_https_and_trusted_http_hosts() {
+        for base_url in [
+            "https://public.example.com/v1",
+            "http://localhost:8080/v1",
+            "http://127.0.0.1:8080/v1",
+            "http://10.0.0.1:8080/v1",
+            "http://169.254.1.1:8080/v1",
+            "http://[::1]:8080/v1",
+            "http://[::ffff:127.0.0.1]:8080/v1",
+            "http://[fd00::1]:8080/v1",
+            "http://[fe80::1]:8080/v1",
+        ] {
+            let config = RetrievalServiceConfig {
+                rerank: RerankServiceConfig {
+                    enabled: true,
+                    api_key_env: Some("OPENROUTER_API_KEY".to_string()),
+                    base_url: base_url.to_string(),
+                    ..RerankServiceConfig::default()
+                },
+                ..RetrievalServiceConfig::default()
+            };
+
+            assert!(config.validate().is_ok(), "{base_url}");
+        }
+    }
+
+    #[test]
+    fn authenticated_runtime_providers_reject_plain_http_public_hosts() {
+        let mut config = packaged_config();
+        config.providers.as_mut().expect("providers").base_url =
+            "http://public.example.com/v1".to_string();
+        assert!(config
+            .validate_runtime()
+            .expect_err("primary provider public HTTP must be rejected")
+            .to_string()
+            .contains("provider base URL must use HTTPS"));
+
+        let mut config = packaged_config();
+        let providers = config.providers.as_mut().expect("providers");
+        providers.embedding_provider = EmbeddingProviderKind::OpenAiCompatible;
+        providers.embedding_base_url = Some("http://public.example.com/v1".to_string());
+        assert!(config
+            .validate_runtime()
+            .expect_err("embedding provider public HTTP must be rejected")
+            .to_string()
+            .contains("embedding base URL must use HTTPS"));
+
+        let mut config = packaged_config();
+        let graph = config.graph_memory.as_mut().expect("graph memory");
+        graph.llm_base_url = "http://public.example.com/v1".to_string();
+        assert!(config
+            .validate_runtime()
+            .expect_err("graph provider public HTTP must be rejected")
+            .to_string()
+            .contains("graph memory LLM base URL must use HTTPS"));
+
+        let mut config = packaged_config();
+        let case_library = config.case_library.as_mut().expect("case library");
+        case_library.embedding_provider = EmbeddingProviderKind::OpenAiCompatible;
+        case_library.embedding_base_url = Some("http://public.example.com/v1".to_string());
+        assert!(config
+            .validate_runtime()
+            .expect_err("case embedding public HTTP must be rejected")
+            .to_string()
+            .contains("case library embedding base URL must use HTTPS"));
+
+        let mut config = packaged_config();
+        let case_library = config.case_library.as_mut().expect("case library");
+        case_library.summary_llm_model = Some("summary-model".to_string());
+        case_library.summary_llm_base_url = Some("http://public.example.com/v1".to_string());
+        assert!(config
+            .validate_runtime()
+            .expect_err("case summary public HTTP must be rejected")
+            .to_string()
+            .contains("case library summary LLM base URL must use HTTPS"));
+    }
+
+    #[test]
+    fn retrieval_rejects_invalid_weights_and_non_hybrid_rerank() {
+        let invalid_weights = RetrievalServiceConfig {
+            embedding_weight: 0.8,
+            bm25_weight: 0.3,
+            ..RetrievalServiceConfig::default()
+        };
+        assert!(invalid_weights.validate().is_err());
+
+        let dense_rerank = RetrievalServiceConfig {
+            mode: SearchMode::Dense,
+            rerank: RerankServiceConfig {
+                enabled: true,
+                ..RerankServiceConfig::default()
+            },
+            ..RetrievalServiceConfig::default()
+        };
+        assert!(dense_rerank.validate().is_err());
+    }
+
+    #[test]
+    fn packaged_rpm_example_matches_server_schema() {
+        let config = packaged_config();
+
+        assert!(config.validate_runtime().is_ok());
+        assert_eq!(config.retrieval.mode, SearchMode::Hybrid);
+        assert_eq!(config.retrieval.embedding_weight, 0.7);
+        assert_eq!(config.retrieval.bm25_weight, 0.3);
+    }
+
+    fn packaged_config() -> ServerConfig {
+        serde_json::from_str(include_str!("../../../plugins/mcp/ram-a-mem.json"))
+            .expect("packaged config parses")
     }
 }
 
