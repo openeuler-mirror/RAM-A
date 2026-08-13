@@ -128,3 +128,22 @@ def test_stage_requires_inputs_to_exist(tmp_path):
             inputs=(missing,),
             runner=_writer([], output),
         )
+
+
+def test_stage_completion_records_utc_timestamps_and_duration(tmp_path):
+    output = tmp_path / "output.json"
+
+    run_stage(
+        "search",
+        ["fake"],
+        (output,),
+        {"configuration_hash": "c"},
+        runner=_writer([], output),
+    )
+
+    complete = json.loads(
+        (tmp_path / "stages" / "search.complete.json").read_text(encoding="utf-8")
+    )
+    assert complete["started_at"].endswith("+00:00")
+    assert complete["finished_at"].endswith("+00:00")
+    assert complete["duration_seconds"] >= 0
