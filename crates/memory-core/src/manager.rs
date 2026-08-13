@@ -510,7 +510,16 @@ impl MemoryManager {
             );
             let candidates = self
                 .fuse_optional_graph_channel(&request, candidates, result_limit)
-                .await?;
+                .await
+                .inspect_err(|_error| {
+                    tracing::error!(
+                        event = "ram_a.memory.search.stage.failed",
+                        stage = "graph_augment",
+                        error_code = "GRAPH_RETRIEVE_FAILED",
+                        retriable = true,
+                        elapsed_ms = stage_started.elapsed().as_millis() as u64
+                    );
+                })?;
             tracing::info!(
                 event = "ram_a.memory.search.stage.completed",
                 stage = "graph_augment",
@@ -563,6 +572,13 @@ impl MemoryManager {
     ) -> MemoryResult<Vec<ScoredMemory>> {
         let Some(reranker) = self.reranker.as_ref() else {
             if self.retrieval_config.rerank.fail_open {
+                tracing::warn!(
+                    event = "ram_a.memory.search.degraded",
+                    stage = "rerank",
+                    error_code = "RERANKER_UNCONFIGURED",
+                    fallback = "hybrid",
+                    candidate_count = candidates.len()
+                );
                 candidates.truncate(top_k);
                 return Ok(candidates);
             }

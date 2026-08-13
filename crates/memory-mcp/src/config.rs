@@ -467,7 +467,15 @@ impl RerankServiceConfig {
         {
             anyhow::bail!("rerank API key environment name must not be empty");
         }
-        validate_provider_base_url(&self.base_url, "rerank base URL")?;
+        let parsed_base_url = validate_provider_base_url(&self.base_url, "rerank base URL")?;
+        if self.api_key_env.is_some()
+            && parsed_base_url.scheme() != "https"
+            && !is_loopback_or_private(&parsed_base_url)
+        {
+            anyhow::bail!(
+                "rerank base URL must use HTTPS when api_key_env is set unless the host is loopback, private, or link-local"
+            );
+        }
         if !(1..=500).contains(&self.input_k) {
             anyhow::bail!("rerank input_k must be between 1 and 500");
         }
@@ -838,7 +846,7 @@ fn validate_case_library_mappings(
     Ok(())
 }
 
-fn validate_provider_base_url(value: &str, label: &str) -> Result<()> {
+fn validate_provider_base_url(value: &str, label: &str) -> Result<url::Url> {
     let (url_scheme, url_remainder) = value
         .split_once("://")
         .with_context(|| format!("{label} must include an HTTP or HTTPS scheme"))?;
@@ -860,7 +868,23 @@ fn validate_provider_base_url(value: &str, label: &str) -> Result<()> {
             "{label} must be an absolute HTTP or HTTPS URL without credentials, query, or fragment"
         );
     }
-    Ok(())
+    Ok(parsed_base_url)
+}
+
+fn is_loopback_or_private(value: &url::Url) -> bool {
+    match value.host() {
+        Some(url::Host::Ipv4(address)) => {
+            address.is_loopback() || address.is_private() || address.is_link_local()
+        }
+        Some(url::Host::Ipv6(address)) => {
+            address.is_loopback() || address.is_unique_local() || address.is_unicast_link_local()
+        }
+        Some(url::Host::Domain(domain)) => {
+            domain.eq_ignore_ascii_case("localhost")
+                || domain.to_ascii_lowercase().ends_with(".localhost")
+        }
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -926,6 +950,48 @@ mod tests {
         let core = config.core_config(memory_core::GraphRetrievalConfig::default());
         assert!(core.rerank.enabled);
         assert_eq!(core.rerank.model, "local-reranker");
+    }
+
+    #[test]
+    fn authenticated_rerank_rejects_plain_http_public_host() {
+        let config = RetrievalServiceConfig {
+            rerank: RerankServiceConfig {
+                enabled: true,
+                api_key_env: Some("OPENROUTER_API_KEY".to_string()),
+                base_url: "http://public.example.com/v1".to_string(),
+                ..RerankServiceConfig::default()
+            },
+            ..RetrievalServiceConfig::default()
+        };
+
+        let error = config.validate().expect_err("public HTTP must be rejected");
+        assert!(error.to_string().contains("must use HTTPS"));
+    }
+
+    #[test]
+    fn authenticated_rerank_allows_https_and_trusted_http_hosts() {
+        for base_url in [
+            "https://public.example.com/v1",
+            "http://localhost:8080/v1",
+            "http://127.0.0.1:8080/v1",
+            "http://10.0.0.1:8080/v1",
+            "http://169.254.1.1:8080/v1",
+            "http://[::1]:8080/v1",
+            "http://[fd00::1]:8080/v1",
+            "http://[fe80::1]:8080/v1",
+        ] {
+            let config = RetrievalServiceConfig {
+                rerank: RerankServiceConfig {
+                    enabled: true,
+                    api_key_env: Some("OPENROUTER_API_KEY".to_string()),
+                    base_url: base_url.to_string(),
+                    ..RerankServiceConfig::default()
+                },
+                ..RetrievalServiceConfig::default()
+            };
+
+            assert!(config.validate().is_ok(), "{base_url}");
+        }
     }
 
     #[test]

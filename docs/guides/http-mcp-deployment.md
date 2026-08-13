@@ -296,7 +296,8 @@ The endpoint must return indexes into the original `documents` array:
 ```
 
 For OpenRouter or another authenticated endpoint, set `api_key_env` to the environment
-variable holding the Bearer credential. An unauthenticated local service may set
+variable holding the Bearer credential. Authenticated public endpoints must use HTTPS; plain HTTP
+is accepted only for loopback, RFC1918/unique-local, or link-local hosts. An unauthenticated local service may set
 `api_key_env` to `null`; RAM-A then omits the `Authorization` header. Setting it to `null` is an
 explicit operator acknowledgement: expose that endpoint only on a trusted loopback, container,
 or private network. A local inference server using another request or response schema needs a
