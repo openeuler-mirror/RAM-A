@@ -12,6 +12,7 @@ from common.memory_ab import file_sha256, validate_pair_contract
 from common.memory_ab_compare import (
     PromotionPolicy,
     build_history_records,
+    history_configuration,
     evaluate_checks,
     remove_stale_history_artifact,
     resolve_history_artifact_path,
@@ -127,23 +128,9 @@ def _arm(config: dict[str, Any], metrics: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("arm config requires run_id or run_dir")
     if not artifact_path:
         raise ValueError("arm config requires artifact_path or run_dir")
-    compact_keys = (
-        "backend",
-        "top_k",
-        "candidate_k",
-        "search_mode",
-        "embedding_model",
-        "embedding_dimensions",
-        "answer_model",
-        "context_token_budget",
-    )
     return {
         "run_id": str(run_id),
-        "configuration": {
-            key: config[key]
-            for key in compact_keys
-            if key in config and config[key] is not None
-        },
+        "configuration": history_configuration(config),
         "metrics": metrics,
         "artifact_path": str(artifact_path),
     }

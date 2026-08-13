@@ -39,6 +39,10 @@ class RamaBackend(MemoryBackend):
             graph_llm_model=self.config.graph_llm_model,
             graph_llm_base_url=self.config.graph_llm_base_url,
             graph_llm_timeout_ms=self.config.graph_llm_timeout_ms,
+            search_mode=self.config.search_mode,
+            embedding_weight=self.config.embedding_weight,
+            bm25_weight=self.config.bm25_weight,
+            candidate_k=self.config.candidate_k,
         )
 
     def search(self, prepared_path: Path, output_path: Path) -> None:
@@ -73,4 +77,8 @@ class RamaBackend(MemoryBackend):
             rerank_input_k=self.config.rerank_input_k,
             rerank_timeout_ms=self.config.rerank_timeout_ms,
             rerank_fail_open=self.config.rerank_fail_open,
+            search_mode=self.config.search_mode,
+            embedding_weight=self.config.embedding_weight,
+            bm25_weight=self.config.bm25_weight,
+            candidate_k=self.config.candidate_k,
         )

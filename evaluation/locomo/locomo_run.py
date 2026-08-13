@@ -55,12 +55,23 @@ class RunConfig:
     pair_id: str = "standalone"
     promotion_policy_hash: str | None = None
     chat_model: str = "openai/gpt-4o-mini"
+    extraction_model: str = "openai/gpt-4o-mini"
+    verifier_model: str = "openai/gpt-4o-mini"
+    extraction_api_key_env: str = "OPENROUTER_API_KEY"
+    extraction_base_url: str = OPENROUTER_BASE_URL
+    answer_model: str = "openai/gpt-4o-mini"
+    answer_api_key_env: str = "OPENROUTER_API_KEY"
+    answer_base_url: str = OPENROUTER_BASE_URL
+    judge_model: str = "openai/gpt-4o-mini"
+    judge_api_key_env: str = "OPENROUTER_API_KEY"
+    judge_base_url: str = OPENROUTER_BASE_URL
     embedding_provider: str = "openrouter"
     embedding_model: str = "baai/bge-m3"
     embedding_dimensions: int = 1024
     embedding_weight: float = 0.7
     bm25_weight: float = 0.3
     candidate_k: int = 150
+    search_mode: str = "hybrid"
     rerank_model: str = "cohere/rerank-v3.5"
     rerank_input_k: int = 40
     rerank_enabled: bool = True
@@ -79,6 +90,7 @@ class RunConfig:
     base_url: str = OPENROUTER_BASE_URL
     credential_env: str = "OPENROUTER_API_KEY"
     graph_enabled: bool = False
+    graph_build_enabled: bool = False
     graph_weight: float = 0.2
     graph_rerank: bool = False
     graph_allow_graph_only: bool = False
@@ -100,6 +112,10 @@ class RunConfig:
             raise ValueError(f"unsupported PHASE: {self.phase}; only full is supported")
         if self.mode not in {"normal", "strict"}:
             raise ValueError(f"unsupported RUN_MODE: {self.mode}")
+        if self.mode == "normal" and self.promotion_policy_hash is not None:
+            raise ValueError("PROMOTION_POLICY is only valid in strict mode")
+        if self.mode == "strict" and self.promotion_policy_hash is None:
+            raise ValueError("PROMOTION_POLICY is required in strict mode")
         if self.max_graph_context_facts < 0:
             raise ValueError("MAX_GRAPH_CONTEXT_FACTS must be at least 0")
         if self.graph_max_graph_only_results is not None and self.graph_max_graph_only_results < 0:
@@ -114,6 +130,12 @@ class RunConfig:
             raise ValueError(
                 "GRAPH_MAX_GRAPH_ONLY_RESULTS requires GRAPH_ALLOW_GRAPH_ONLY"
             )
+        if self.search_mode not in {"dense", "bm25", "hybrid", "graph"}:
+            raise ValueError("MEMORY_BENCH_SEARCH_MODE is invalid")
+        if self.rerank_enabled and self.search_mode != "hybrid":
+            raise ValueError("RERANK requires MEMORY_BENCH_SEARCH_MODE=hybrid")
+        if self.search_mode == "graph" and not self.graph_enabled:
+            raise ValueError("graph search mode requires MEMORY_BENCH_GRAPH")
 
     @classmethod
     def from_env(cls, overrides: Mapping[str, str] | None = None) -> "RunConfig":
@@ -145,16 +167,61 @@ class RunConfig:
                 file_sha256(Path(policy_path).resolve()) if policy_path else None
             ),
             chat_model=values.get("MODEL", "openai/gpt-4o-mini"),
+            extraction_model=values.get(
+                "MEMORY_EXTRACTION_MODEL",
+                values.get("MODEL", "openai/gpt-4o-mini"),
+            ),
+            verifier_model=values.get(
+                "MEMORY_VERIFIER_MODEL",
+                values.get("MODEL", "openai/gpt-4o-mini"),
+            ),
+            extraction_api_key_env=values.get(
+                "MEMORY_API_KEY_ENV",
+                values.get("EMBEDDING_API_KEY_ENV", "OPENROUTER_API_KEY"),
+            ),
+            extraction_base_url=values.get(
+                "MEMORY_BASE_URL",
+                values.get("OPENAI_BASE_URL", OPENROUTER_BASE_URL),
+            ),
+            answer_model=values.get(
+                "ANSWER_MODEL", values.get("MODEL", "openai/gpt-4o-mini")
+            ),
+            answer_api_key_env=values.get(
+                "ANSWER_API_KEY_ENV",
+                values.get("EMBEDDING_API_KEY_ENV", "OPENROUTER_API_KEY"),
+            ),
+            answer_base_url=values.get(
+                "ANSWER_BASE_URL",
+                values.get("OPENAI_BASE_URL", OPENROUTER_BASE_URL),
+            ),
+            judge_model=values.get(
+                "JUDGE_MODEL", values.get("MODEL", "openai/gpt-4o-mini")
+            ),
+            judge_api_key_env=values.get(
+                "JUDGE_API_KEY_ENV",
+                values.get("EMBEDDING_API_KEY_ENV", "OPENROUTER_API_KEY"),
+            ),
+            judge_base_url=values.get(
+                "JUDGE_BASE_URL",
+                values.get("OPENAI_BASE_URL", OPENROUTER_BASE_URL),
+            ),
             embedding_provider=values.get("EMBEDDING_PROVIDER", "openrouter"),
             embedding_model=values.get("EMBEDDING_MODEL", "baai/bge-m3"),
             embedding_dimensions=int(values.get("EMBEDDING_DIMENSIONS", "1024")),
             embedding_weight=float(values.get("EMBEDDING_WEIGHT", "0.7")),
             bm25_weight=float(values.get("BM25_WEIGHT", "0.3")),
             candidate_k=int(values.get("CANDIDATE_K", "150")),
+            search_mode=values.get("MEMORY_BENCH_SEARCH_MODE", "hybrid"),
             top_k=int(values.get("TOP_K", "30")),
             rerank_enabled=_truthy(values.get("RERANK", "1")),
             max_graph_context_facts=int(values.get("MAX_GRAPH_CONTEXT_FACTS", "3")),
             graph_enabled=_truthy(values.get("MEMORY_BENCH_GRAPH", "0")),
+            graph_build_enabled=_truthy(
+                values.get(
+                    "MEMORY_BENCH_GRAPH_BUILD",
+                    values.get("MEMORY_BENCH_GRAPH", "0"),
+                )
+            ),
             graph_weight=float(values.get("GRAPH_WEIGHT", "0.2")),
             graph_rerank=_truthy(values.get("GRAPH_RERANK", "0")),
             graph_allow_graph_only=_truthy(values.get("GRAPH_ALLOW_GRAPH_ONLY", "0")),
@@ -178,6 +245,10 @@ class RunConfig:
             rerank_timeout_ms=(int(rerank_timeout) if rerank_timeout.strip() else None),
             rerank_fail_open=_truthy(values.get("RERANK_FAIL_OPEN", "0")),
             answer_max_tokens=int(values.get("ANSWER_MAX_TOKENS", "512")),
+            max_candidate_tokens=int(values.get("MAX_CANDIDATE_TOKENS", "320")),
+            max_window_tokens=int(values.get("MAX_WINDOW_TOKENS", "640")),
+            context_before_messages=int(values.get("CONTEXT_BEFORE_MESSAGES", "2")),
+            context_after_messages=int(values.get("CONTEXT_AFTER_MESSAGES", "0")),
             base_url=values.get(
                 "LLM_BASE_URL",
                 values.get("OPENAI_BASE_URL", OPENROUTER_BASE_URL),
@@ -270,7 +341,7 @@ def memory_bench_base_command(config: RunConfig, store: Path) -> list[str]:
         "--dimensions",
         str(config.embedding_dimensions),
         "--search-mode",
-        "hybrid",
+        config.search_mode,
         "--embedding-weight",
         str(config.embedding_weight),
         "--bm25-weight",
@@ -297,10 +368,10 @@ def build_extraction_command(
         project_root=PROJECT_ROOT,
         cache_dir=config.run_dir / "cache" / "memory-pipeline",
         cache_version=configuration_digest,
-        model=config.chat_model,
-        verifier_model=config.chat_model,
-        api_key_env=config.credential_env,
-        base_url=config.base_url,
+        model=config.extraction_model,
+        verifier_model=config.verifier_model,
+        api_key_env=config.extraction_api_key_env,
+        base_url=config.extraction_base_url,
         max_candidate_tokens=config.max_candidate_tokens,
         max_window_tokens=config.max_window_tokens,
         context_before_messages=config.context_before_messages,
@@ -368,7 +439,7 @@ def build_add_command(
     indexed_prepared: Path,
 ) -> list[str]:
     command = [*memory_bench_base_command(config, store)]
-    if config.graph_enabled:
+    if config.graph_build_enabled:
         command.extend([
             "--graph-build",
             "--graph-build-concurrency",
@@ -420,9 +491,21 @@ def run_arm(config: RunConfig) -> None:
 
     if not config.dataset.is_file():
         raise ValueError(f"LoCoMo dataset does not exist: {config.dataset}")
-    api_key = os.getenv(config.credential_env)
-    if not api_key:
-        raise RuntimeError(f"missing API key env {config.credential_env}")
+    required_key_envs = [config.credential_env]
+    if config.memory_mode == "extracted":
+        required_key_envs.append(config.extraction_api_key_env)
+    if config.graph_build_enabled:
+        required_key_envs.append(config.graph_llm_api_key_env)
+    if config.rerank_enabled:
+        required_key_envs.append(config.rerank_api_key_env)
+    required_key_envs.extend(
+        [config.answer_api_key_env, config.judge_api_key_env]
+    )
+    for key_env in dict.fromkeys(required_key_envs):
+        if not os.getenv(key_env):
+            raise RuntimeError(f"missing API key env {key_env}")
+
+    answer_api_key = os.environ[config.answer_api_key_env]
 
     ensure_run_mode(config.run_dir, config.memory_mode)
     source_digest = file_sha256(config.dataset)
@@ -533,9 +616,9 @@ def run_arm(config: RunConfig) -> None:
     responses = config.run_dir / "responses.json"
     answer_stats = config.run_dir / "responses_answer_stats.json"
     answer_env = {
-        "OPENAI_API_KEY": api_key,
-        "OPENAI_BASE_URL": config.base_url,
-        "MODEL": config.chat_model,
+        "OPENAI_API_KEY": answer_api_key,
+        "OPENAI_BASE_URL": config.answer_base_url,
+        "MODEL": config.answer_model,
         "ANSWER_MAX_TOKENS": str(config.answer_max_tokens),
     }
     run_stage(
@@ -579,11 +662,11 @@ def run_arm(config: RunConfig) -> None:
             "--output",
             str(judged),
             "--judge-model",
-            config.chat_model,
+            config.judge_model,
             "--llm-api-key-env",
-            config.credential_env,
+            config.judge_api_key_env,
             "--llm-base-url",
-            config.base_url,
+            config.judge_base_url,
             "--cache-dir",
             str(config.run_dir / "cache" / "judge"),
             "--cache-version",

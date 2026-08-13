@@ -116,23 +116,20 @@ def build_dataset_commands(args: argparse.Namespace) -> DatasetCommands:
         raw = persona_arm("raw", raw_dir)
         extracted = persona_arm("extracted", extracted_dir)
         compare_argv = [
-                python,
-                "-m",
-                "personalmem.compare",
-                "--raw-dir",
-                str(raw_dir),
-                "--treatment-dir",
-                str(extracted_dir),
-                "--output-json",
-                str(comparison_path),
-                "--history-record",
-                str(history_artifact),
-            ]
+            python,
+            "-m",
+            "personalmem.compare",
+            "--raw-dir",
+            str(raw_dir),
+            "--treatment-dir",
+            str(extracted_dir),
+            "--output-json",
+            str(comparison_path),
+            "--history-record",
+            str(history_artifact),
+        ]
         if args.promotion_policy is not None:
-            compare_argv[compare_argv.index("--output-json"):compare_argv.index("--output-json")] = [
-                "--policy",
-                str(args.promotion_policy),
-            ]
+            compare_argv.extend(["--policy", str(args.promotion_policy)])
         compare = CommandSpec("compare", compare_argv)
     elif args.dataset == "longmemeval":
         def lme_arm(mode: str, run_dir: Path) -> CommandSpec:
@@ -159,23 +156,20 @@ def build_dataset_commands(args: argparse.Namespace) -> DatasetCommands:
         raw = lme_arm("raw", raw_dir)
         extracted = lme_arm("extracted", extracted_dir)
         compare_argv = [
-                python,
-                "-m",
-                "longmemeval.compare",
-                "--raw-dir",
-                str(raw_dir),
-                "--treatment-dir",
-                str(extracted_dir),
-                "--output-json",
-                str(comparison_path),
-                "--history-record",
-                str(history_artifact),
-            ]
+            python,
+            "-m",
+            "longmemeval.compare",
+            "--raw-dir",
+            str(raw_dir),
+            "--treatment-dir",
+            str(extracted_dir),
+            "--output-json",
+            str(comparison_path),
+            "--history-record",
+            str(history_artifact),
+        ]
         if args.promotion_policy is not None:
-            compare_argv[compare_argv.index("--output-json"):compare_argv.index("--output-json")] = [
-                "--policy",
-                str(args.promotion_policy),
-            ]
+            compare_argv.extend(["--policy", str(args.promotion_policy)])
         compare = CommandSpec("compare", compare_argv)
     elif args.dataset == "locomo":
         base_env = {
@@ -207,19 +201,19 @@ def build_dataset_commands(args: argparse.Namespace) -> DatasetCommands:
         raw = locomo_arm("raw", raw_dir)
         extracted = locomo_arm("extracted", extracted_dir)
         compare_argv = [
-                python,
-                "locomo/locomo_compare.py",
-                "--phase",
-                str(args.phase),
-                "--raw-dir",
-                str(raw_dir),
-                "--treatment-dir",
-                str(extracted_dir),
-                "--output-json",
-                str(comparison_path),
-                "--html-report",
-                str(comparison_html),
-            ]
+            python,
+            "locomo/locomo_compare.py",
+            "--phase",
+            str(args.phase),
+            "--raw-dir",
+            str(raw_dir),
+            "--treatment-dir",
+            str(extracted_dir),
+            "--output-json",
+            str(comparison_path),
+            "--html-report",
+            str(comparison_html),
+        ]
         if args.promotion_policy is not None:
             compare_argv.extend(["--policy", str(args.promotion_policy)])
         compare = CommandSpec("compare", compare_argv)
@@ -259,8 +253,6 @@ def run_pair(
     comparison = _read_object(commands.comparison_path)
     if args.dataset != "locomo":
         _write_comparison_html(commands.comparison_html_path, comparison)
-    if comparison.get("complete") is True:
-        _append_completed_full_history(args, commands)
     return comparison
 
 
@@ -271,6 +263,7 @@ def run_single(
     _validate_selectors(args)
     if args.mode != "normal":
         raise ValueError("single execution only supports normal mode")
+    _validate_policy(args)
     commands = build_dataset_commands(args)
     _validate_runtime_inputs(args)
     commands.pair_dir.mkdir(parents=True, exist_ok=True)
@@ -292,6 +285,8 @@ def _validate_selectors(args: argparse.Namespace) -> None:
         "extracted",
     }:
         raise ValueError("single execution requires memory_mode raw or extracted")
+    if execution == "ab" and getattr(args, "memory_mode", None) is not None:
+        raise ValueError("ab execution does not accept memory_mode")
     from common.run_artifacts import safe_slug
 
     safe_slug(str(args.pair_id))
@@ -337,14 +332,18 @@ def _validate_forwarded_arm_args(values: Sequence[str]) -> None:
     protected = {
         "--dataset",
         "--dataset-file",
+        "--extractor-responses",
+        "--grounding-responses",
         "--indexed-dataset",
         "--memory-mode",
+        "--mode",
         "--pair-id",
         "--phase",
         "--pipeline-phase",
         "--preflight",
         "--promotion-policy",
         "--run-dir",
+        "--resume",
     }
     for value in values:
         if value == "--":
@@ -357,44 +356,6 @@ def _validate_forwarded_arm_args(values: Sequence[str]) -> None:
             raise ValueError(
                 f"unified A/B runner owns {option}; do not forward it to an arm"
             )
-
-
-def _arm_immutable_manifest(dataset: str, spec: CommandSpec) -> dict:
-    if dataset == "personalmem":
-        import personalmem.run as runner
-
-        parsed = runner.build_parser().parse_args(spec.argv[3:])
-        implementation_digest = runner.implementation_hash()
-        policy_digest = runner.file_sha256(parsed.promotion_policy)
-        return runner.immutable_experiment_manifest(
-            parsed,
-            implementation_digest,
-            policy_digest,
-        )
-    if dataset == "longmemeval":
-        import longmemeval.run as runner
-
-        parsed = runner.parse_args(spec.argv[3:])
-        implementation_digest = runner.implementation_hash()
-        policy_digest = runner.file_sha256(parsed.promotion_policy)
-        return runner.immutable_experiment_manifest(
-            parsed,
-            implementation_digest,
-            policy_digest,
-        )
-    if dataset == "locomo":
-        import locomo.locomo_run as runner
-
-        parsed = runner.build_parser().parse_args(spec.argv[2:])
-        overrides = {
-            **spec.env_overrides,
-            "PHASE": parsed.phase,
-            "RUN_DIR": str(parsed.run_dir),
-        }
-        if parsed.dataset is not None:
-            overrides["DATASET"] = str(parsed.dataset)
-        return runner.RunConfig.from_env(overrides).immutable_manifest()
-    raise ValueError(f"unsupported memory A/B dataset: {dataset}")
 
 
 def _run_preflight(
@@ -484,50 +445,6 @@ def _read_object(path: Path) -> dict:
     return value
 
 
-def _append_completed_full_history(
-    args: argparse.Namespace,
-    commands: DatasetCommands,
-) -> None:
-    if not commands.history_artifact_path.is_file():
-        raise ValueError("complete full comparison did not write history_record.json")
-    pair_records = json.loads(
-        commands.history_artifact_path.read_text(encoding="utf-8")
-    )
-    if not isinstance(pair_records, list):
-        raise ValueError("history_record.json must contain a raw/extracted list")
-    record_path = Path(args.history_root) / "records" / f"{args.dataset}.jsonl"
-    existing = _load_records(record_path) if record_path.is_file() else []
-    matching = [
-        record
-        for record in existing
-        if record.get("pair_id") == str(args.pair_id)
-    ]
-    if matching:
-        if matching != pair_records:
-            raise ValueError(f"history already contains conflicting pair_id {args.pair_id}")
-    else:
-        _append_full_pair(record_path, pair_records)
-    build_workbooks(Path(args.history_root))
-
-
-def _load_records(path: Path) -> list[dict]:
-    from history.build_xlsx import load_records
-
-    return load_records(path)
-
-
-def _append_full_pair(path: Path, records: list[dict]) -> None:
-    from history.build_xlsx import append_full_pair
-
-    append_full_pair(path, records)
-
-
-def build_workbooks(history_root: Path) -> None:
-    from history.build_xlsx import build_workbooks as generate
-
-    generate(history_root)
-
-
 def _write_json_atomic(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -586,9 +503,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-root", type=Path, default=EVALUATION_ROOT / "outputs" / "memory-ab"
     )
     parser.add_argument("--promotion-policy", type=Path)
-    parser.add_argument("--history-root", type=Path, default=PROJECT_ROOT / "history")
     parser.add_argument("--python-executable", default=sys.executable)
-    parser.add_argument("--embedding", choices=("openrouter", "hash"), default="openrouter")
     parser.add_argument("--extractor-responses", type=Path)
     parser.add_argument("--grounding-responses", type=Path)
     parser.add_argument("--resume", action="store_true")

@@ -260,28 +260,30 @@ export MEMORY_PIPELINE_BIN="$PWD/target/debug/memory-pipeline"
 
 PYTHONPATH=evaluation evaluation/.venv/bin/python evaluation/scripts/run_memory_ab.py \
   --dataset personalmem --phase full --mode normal --pair-id personalmem-32k-v1 \
-  --dataset-file data/personalmem/prepared/personalmem_32k.json \
-  --promotion-policy /absolute/path/personalmem-policy.json
+  --dataset-file data/personalmem/prepared/personalmem_32k_v1.json
 
 PYTHONPATH=evaluation evaluation/.venv/bin/python evaluation/scripts/run_memory_ab.py \
   --dataset personalmem --phase full --mode strict --pair-id personalmem-32k-v1 \
-  --dataset-file data/personalmem/prepared/personalmem_32k.json \
+  --dataset-file data/personalmem/prepared/personalmem_32k_v1.json \
   --promotion-policy /absolute/path/personalmem-policy.json
 ```
 
 Replace `personalmem` and the dataset path with `longmemeval` or `locomo` for
 the other registries. Options after `--` are forwarded unchanged to both arm
-runners. Before either arm, the entrypoint runs and records the Python suite,
-Rust workspace tests, Clippy, and `git diff --check`; each arm validates the
-dataset-bound preflight artifact and records its SHA-256 in `config.json`.
+runners. In strict mode, before either arm the entrypoint runs and records the
+Python suite, Rust workspace tests, Clippy, and `git diff --check`, and validates
+the dataset-bound preflight artifact. Normal mode skips that heavy gate. Each arm
+records its reproducibility hashes in `config.json`.
 
 Artifacts live under
 `evaluation/outputs/memory-ab/<dataset>/<phase>/<pair-id>/`, with independent
 `raw/` and `extracted/` stores plus `comparison.json` and `comparison.html`.
-A complete full pair appends raw then extracted to `history/records/<dataset>.jsonl`
-and regenerates XLSX; a failed promotion is still recorded as failed and is not a
-baseline. Live full scores or promotion are not claimed until that controlled
-command is run manually with real providers.
+A complete pair also writes `history_record.json` in that artifact directory with
+the raw/extracted configurations, hashes, metrics, and promotion status. It is
+kept with the run artifacts and is not appended to the repository. A failed
+promotion is still recorded as failed and is not a baseline. Live full scores or
+promotion are not claimed until that controlled command is run manually with real
+providers.
 
 ## Tests
 

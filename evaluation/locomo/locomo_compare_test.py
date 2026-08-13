@@ -264,6 +264,9 @@ def test_complete_failed_full_pair_writes_common_history_without_mutating_report
     assert records[1]["promotion_reasons"] == ["historical_overall"]
     assert records[0]["schema_version"] == "memory-ab-history-v1"
     assert records[0]["split"] == "locomo10"
+    assert records[1]["configuration"]["graph_rerank"] is True
+    assert records[1]["configuration"]["graph_allow_graph_only"] is True
+    assert records[1]["configuration"]["graph_max_graph_only_results"] == 4
 
 
 def test_incomplete_pair_does_not_write_common_history(
@@ -308,6 +311,15 @@ def _common_history_report(*, phase: str, count: int, passed: bool) -> dict:
         "run_dir": "/artifacts/locomo-pair/raw",
         "chat_model": "answer-model",
         "top_k": 30,
+        "graph_enabled": True,
+        "graph_weight": 0.2,
+        "graph_rerank": True,
+        "graph_allow_graph_only": True,
+        "graph_max_graph_only_results": 4,
+        "max_graph_context_facts": 3,
+        "rerank_enabled": True,
+        "rerank_timeout_ms": 15000,
+        "rerank_fail_open": True,
         "source_hash": "source-sha",
         "configuration_hash": "config-sha",
         "implementation_hash": "code-sha",

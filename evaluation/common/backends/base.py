@@ -40,6 +40,10 @@ class BackendConfig:
     rerank_input_k: int = 40
     rerank_timeout_ms: int | None = None
     rerank_fail_open: bool = False
+    search_mode: str = "hybrid"
+    embedding_weight: float = 0.7
+    bm25_weight: float = 0.3
+    candidate_k: int | None = None
 
 
 class MemoryBackend:

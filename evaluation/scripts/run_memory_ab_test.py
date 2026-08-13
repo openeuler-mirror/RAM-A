@@ -31,11 +31,10 @@ class FakeRunner:
 
 
 class ArtifactRunner(FakeRunner):
-    def __init__(self, args, comparison: dict, history_records=None) -> None:
+    def __init__(self, args, comparison: dict) -> None:
         super().__init__()
         self.args = args
         self.comparison = comparison
-        self.history_records = history_records
 
     def __call__(self, command, **kwargs):
         completed = super().__call__(command, **kwargs)
@@ -53,10 +52,6 @@ class ArtifactRunner(FakeRunner):
             commands.comparison_path.write_text(
                 __import__("json").dumps(self.comparison), encoding="utf-8"
             )
-            if self.history_records is not None:
-                commands.history_artifact_path.write_text(
-                    __import__("json").dumps(self.history_records), encoding="utf-8"
-                )
         return completed
 
 
@@ -77,9 +72,7 @@ def _args(dataset: str, phase: str, tmp_path: Path) -> argparse.Namespace:
         dataset_file=source,
         output_root=tmp_path / "outputs",
         promotion_policy=policy,
-        history_root=tmp_path / "history",
         python_executable="python",
-        embedding="hash",
         extractor_responses=None,
         grounding_responses=None,
         resume=False,
@@ -128,6 +121,50 @@ def test_single_mode_runs_only_selected_arm(tmp_path: Path, memory_mode: str) ->
 
     assert runner.stage_names == [memory_mode]
 
+
+def test_single_mode_rejects_promotion_policy(tmp_path: Path) -> None:
+    args = _args("longmemeval", "full", tmp_path)
+    args.mode = "normal"
+    args.execution = "single"
+    args.memory_mode = "raw"
+    runner = FakeRunner()
+
+    with pytest.raises(ValueError, match="only valid in strict mode"):
+        run_single(args, runner=runner)
+
+    assert runner.calls == []
+
+
+def test_ab_mode_rejects_memory_mode(tmp_path: Path) -> None:
+    args = _args("longmemeval", "full", tmp_path)
+    args.memory_mode = "raw"
+
+    with pytest.raises(ValueError, match="ab execution does not accept memory_mode"):
+        memory_ab_runner._validate_selectors(args)
+
+
+@pytest.mark.parametrize("dataset", ("personalmem", "longmemeval"))
+def test_resume_is_forwarded_to_both_dataset_arms(
+    dataset: str,
+    tmp_path: Path,
+) -> None:
+    args = _args(dataset, "full", tmp_path)
+    args.resume = True
+
+    commands = build_dataset_commands(args)
+
+    assert "--resume" in commands.raw.argv
+    assert "--resume" in commands.extracted.argv
+
+
+def test_locomo_resume_is_managed_inside_the_dataset_runner(tmp_path: Path) -> None:
+    args = _args("locomo", "full", tmp_path)
+    args.resume = True
+
+    commands = build_dataset_commands(args)
+
+    assert "--resume" not in commands.raw.argv
+    assert "--resume" not in commands.extracted.argv
 
 
 def _write_personalmem_prepared_fixture(path: Path) -> int:
@@ -244,6 +281,8 @@ def test_unified_pair_runs_offline_fixture_arms_and_comparison(
     if dataset == "personalmem":
         question_count = _write_personalmem_prepared_fixture(args.dataset_file)
         args.arm_args = [
+            "--embedding",
+            "hash",
             "--model",
             "hash",
             "--dimensions",
@@ -255,6 +294,8 @@ def test_unified_pair_runs_offline_fixture_arms_and_comparison(
         args.dataset_file = fixtures / "longmemeval_sample.json"
         question_count = 1
         args.arm_args = [
+            "--embedding",
+            "hash",
             "--embedding-model",
             "hash",
             "--dimensions",
@@ -326,13 +367,17 @@ def test_unified_pair_commands_explicitly_bind_pipeline_phase_all(
     "override",
     (
         "--dataset-f=other.json",
+        "--extractor-r=extractor.json",
+        "--grounding-r=grounding.json",
         "--memory-m=extracted",
+        "--mode=strict",
         "--pair-i=other-pair",
         "--ph=full",
         "--pipeline-p=retrieval",
         "--prefl=other.json",
         "--promotion-p=other.json",
         "--run-d=other-run",
+        "--res",
     ),
 )
 def test_unified_pair_rejects_governance_option_abbreviations(
@@ -347,15 +392,6 @@ def test_unified_pair_rejects_governance_option_abbreviations(
         build_dataset_commands(args)
 
 
-def test_longmemeval_immutable_manifest_binds_pipeline_phase(tmp_path: Path) -> None:
-    args = _args("longmemeval", "full", tmp_path)
-    commands = build_dataset_commands(args)
-
-    manifest = memory_ab_runner._arm_immutable_manifest("longmemeval", commands.raw)
-
-    assert manifest["pipeline_phase"] == "all"
-
-
 def test_full_pair_runs_without_config_snapshot(
     tmp_path: Path,
 ) -> None:
@@ -365,48 +401,6 @@ def test_full_pair_runs_without_config_snapshot(
     runner = ArtifactRunner(
         args,
         {"complete": True},
-        history_records=[
-            {
-                "schema_version": "memory-ab-history-v1",
-                "pair_id": args.pair_id,
-                "run_id": "raw-run",
-                "dataset": args.dataset,
-                "split": "test",
-                "memory_mode": "raw",
-                "phase": "full",
-                "source_hash": "source",
-                "code_hash": "code",
-                "configuration_hash": "config",
-                "preflight_hash": None,
-                "policy_hash": None,
-                "governance_mode": "normal",
-                "configuration": {},
-                "metrics": {},
-                "promotion_status": "not_evaluated",
-                "promotion_reasons": [],
-                "artifact_path": "/artifacts/raw",
-            },
-            {
-                "schema_version": "memory-ab-history-v1",
-                "pair_id": args.pair_id,
-                "run_id": "extracted-run",
-                "dataset": args.dataset,
-                "split": "test",
-                "memory_mode": "extracted",
-                "phase": "full",
-                "source_hash": "source",
-                "code_hash": "code",
-                "configuration_hash": "config",
-                "preflight_hash": None,
-                "policy_hash": None,
-                "governance_mode": "normal",
-                "configuration": {},
-                "metrics": {},
-                "promotion_status": "not_evaluated",
-                "promotion_reasons": [],
-                "artifact_path": "/artifacts/extracted",
-            },
-        ],
     )
 
     comparison = run_pair(args, runner=runner)
@@ -525,66 +519,3 @@ def test_dataset_implementation_hash_covers_unified_orchestrator(
     orchestrator.write_text("VERSION = 2\n", encoding="utf-8")
 
     assert module.implementation_hash() != before
-
-
-def _history_records(pair_id: str, *, passed: bool) -> list[dict]:
-    shared = {
-        "schema_version": "memory-ab-history-v1",
-        "pair_id": pair_id,
-        "dataset": "personalmem",
-        "split": "32k",
-        "phase": "full",
-        "source_hash": "source",
-        "code_hash": "code",
-        "configuration_hash": "config",
-        "preflight_hash": "preflight",
-        "policy_hash": "policy",
-        "governance_mode": "strict",
-        "configuration": {},
-        "metrics": {},
-    }
-    return [
-        {
-            **shared,
-            "run_id": "raw-run",
-            "memory_mode": "raw",
-            "promotion_status": "reference",
-            "promotion_reasons": [],
-            "artifact_path": "/artifacts/raw",
-        },
-        {
-            **shared,
-            "run_id": "extracted-run",
-            "memory_mode": "extracted",
-            "promotion_status": "passed" if passed else "failed",
-            "promotion_reasons": [] if passed else ["fresh_raw_primary"],
-            "artifact_path": "/artifacts/extracted",
-        },
-    ]
-
-
-def test_complete_failed_full_pair_is_appended_after_comparison(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
-    args = _args("personalmem", "full", tmp_path)
-    commands = build_dataset_commands(args)
-    records = _history_records(args.pair_id, passed=False)
-    runner = ArtifactRunner(
-        args,
-        {"complete": True, "promotion": {"passed": False, "reasons": ["floor"]}},
-        records,
-    )
-    workbook_calls = []
-    monkeypatch.setattr(
-        memory_ab_runner,
-        "build_workbooks",
-        lambda root: workbook_calls.append(Path(root)),
-        raising=False,
-    )
-
-    run_pair(args, runner=runner)
-
-    record_path = args.history_root / "records" / "personalmem.jsonl"
-    assert len(record_path.read_text(encoding="utf-8").splitlines()) == 2
-    assert workbook_calls == [args.history_root]

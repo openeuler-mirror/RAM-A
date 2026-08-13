@@ -39,6 +39,10 @@ def run_add(
     graph_llm_model: str = "openai/gpt-4o-mini",
     graph_llm_base_url: str = "https://openrouter.ai/api/v1",
     graph_llm_timeout_ms: int | None = None,
+    search_mode: str | None = None,
+    embedding_weight: float | None = None,
+    bm25_weight: float | None = None,
+    candidate_k: int | None = None,
 ) -> None:
     """Run ``memory-bench add`` to ingest memories from a prepared dataset."""
     cmd = CARGO_BIN + [
@@ -49,6 +53,7 @@ def run_add(
         "--api-key-env", api_key_env,
         "--batch-size", str(batch_size),
     ]
+    cmd.extend(_retrieval_args(search_mode, embedding_weight, bm25_weight, candidate_k))
     if graph_build:
         cmd.append("--graph-build")
         cmd.extend(["--graph-build-concurrency", str(graph_build_concurrency)])
@@ -99,6 +104,10 @@ def run_search(
     rerank_input_k: int = 40,
     rerank_timeout_ms: int | None = None,
     rerank_fail_open: bool = False,
+    search_mode: str | None = None,
+    embedding_weight: float | None = None,
+    bm25_weight: float | None = None,
+    candidate_k: int | None = None,
 ) -> None:
     """Run ``memory-bench search`` to execute queries and save results."""
     cmd = CARGO_BIN + [
@@ -109,6 +118,7 @@ def run_search(
         "--api-key-env", api_key_env,
         "--batch-size", str(batch_size),
     ]
+    cmd.extend(_retrieval_args(search_mode, embedding_weight, bm25_weight, candidate_k))
     if graph:
         cmd.append("--graph")
         if graph_rerank:
@@ -149,6 +159,24 @@ def run_search(
         "--top-k", str(top_k),
     ])
     _run(cmd, f"search ({dataset_path.name})")
+
+
+def _retrieval_args(
+    search_mode: str | None,
+    embedding_weight: float | None,
+    bm25_weight: float | None,
+    candidate_k: int | None,
+) -> list[str]:
+    args: list[str] = []
+    if search_mode is not None:
+        args.extend(["--search-mode", search_mode])
+    if embedding_weight is not None:
+        args.extend(["--embedding-weight", str(embedding_weight)])
+    if bm25_weight is not None:
+        args.extend(["--bm25-weight", str(bm25_weight)])
+    if candidate_k is not None:
+        args.extend(["--candidate-k", str(candidate_k)])
+    return args
 
 
 def _graph_common_args(

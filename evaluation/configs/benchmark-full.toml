@@ -6,6 +6,7 @@
 phase = "full"                    # benchmark phase; current value is the only supported full run
 mode = "normal"                   # normal: record results; strict: enforce promotion policy
 execution = "ab"                  # ab: raw vs extracted; single: run one memory mode
+resume = false                     # true: continue partial batch outputs after interruption
 pair_id = "graph-full-v1"         # label for this run; use a new value for a new experiment
 output_root = "../../outputs/memory-ab" # output directory, relative to this config file
 # Only strict A/B runs need a promotion policy.
@@ -23,6 +24,8 @@ file = "${LONGMEMEVAL_DATASET}"   # prepared/oracle file supported by the runner
 [memory]
 extraction_model = "openai/gpt-4o-mini" # atomic-memory extraction model
 verifier_model = "openai/gpt-4o-mini"    # extraction grounding/verifier model
+api_key_env = "OPENROUTER_API_KEY"       # environment variable containing the extraction key
+base_url = "https://openrouter.ai/api/v1" # extraction and verifier endpoint
 max_candidate_tokens = 320               # extraction candidate budget
 max_window_tokens = 640                   # extraction window budget
 context_before_messages = 2               # preceding messages supplied as context
@@ -42,11 +45,11 @@ candidate_k = 150                         # candidate pool; unset default is max
 top_k = 30                                # final retrieval results; system default is 10
 
 [graph]
-enabled = true                            # include graph candidates during search; default false
+enabled = true                            # enable graph lookup during search; default false
 build_enabled = true                      # build graph data during add; default false
 build_concurrency = 1                     # concurrent graph builds; default 1
 weight = 0.2                              # graph fusion weight; default 0.2
-rerank = false                            # include graph candidates in rerank; default false
+rerank = false                            # include graph ranks in fusion; default false
 allow_graph_only = false                  # allow graph-only results; default false
 max_context_facts = 3                     # maximum graph facts added to answer context
 memory_space_mode = "auto"                # derive graph memory space from prepared data
@@ -69,9 +72,9 @@ input_k = 40                              # rerank input candidates; default 40
 model = "openai/gpt-4o-mini"              # answer-generation model
 api_key_env = "OPENROUTER_API_KEY"       # environment variable containing the key
 base_url = "https://openrouter.ai/api/v1" # answer endpoint
-qa_top_k = 10                             # retrieved memories supplied to answer model
+qa_top_k = 10                             # LongMemEval memories supplied to answer model
 
 [judge]
-model = "openai/gpt-4o-mini"              # answer judge model
+model = "openai/gpt-4o-mini"              # LoCoMo/LongMemEval answer judge model
 api_key_env = "OPENROUTER_API_KEY"       # environment variable containing the key
 base_url = "https://openrouter.ai/api/v1" # judge endpoint

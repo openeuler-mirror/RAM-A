@@ -12,6 +12,7 @@ from typing import Any
 
 from common.benchmark_config import load_benchmark_config
 from common.memory_ab import canonical_sha256, file_sha256
+from common.run_artifacts import safe_slug
 
 
 def load_runtime_config(path: Path, dataset: str) -> dict[str, Any]:
@@ -28,14 +29,13 @@ def load_runtime_config(path: Path, dataset: str) -> dict[str, Any]:
         raise ValueError("run.promotion_policy is only valid in strict mode")
     config["output_root"] = output_root
     config["promotion_policy_path"] = policy_path
-    pair_dir = output_root / dataset / str(run.get("phase", "full")) / str(
-        run.get("pair_id", "benchmark")
-    )
+    pair_id = safe_slug(str(run.get("pair_id", "benchmark")))
+    pair_dir = output_root / dataset / str(run.get("phase", "full")) / pair_id
     manifest = {
         "dataset": dataset,
         "phase": run.get("phase", "full"),
         "mode": run.get("mode", "normal"),
-        "pair_id": run.get("pair_id", "benchmark"),
+        "pair_id": pair_id,
         "config_path": str(config["config_path"]),
         "config_hash": canonical_sha256(_manifest_value(config)),
         "dataset_path": str(config["dataset_file"]),
@@ -76,14 +76,11 @@ def build_memory_ab_command(config: dict[str, Any]) -> tuple[list[str], dict[str
     ]
     if run.get("execution", "ab") == "single":
         command.extend(["--memory-mode", str(run["memory_mode"])])
+    if run.get("resume", False):
+        command.append("--resume")
     if config["promotion_policy_path"] is not None:
         command.extend(["--promotion-policy", str(config["promotion_policy_path"])])
     env = dict(os.environ)
-    embedding = config.get("embedding", {})
-    env.setdefault(
-        str(embedding.get("api_key_env", "OPENROUTER_API_KEY")),
-        "",
-    )
     forwarded = _build_forwarded_args(config)
     if dataset == "locomo":
         env.update(_locomo_environment(config))
@@ -119,6 +116,14 @@ def _build_forwarded_args(config: dict[str, Any]) -> list[str]:
         str(embedding.get("model", "baai/bge-m3")),
         "--dimensions",
         str(embedding.get("dimensions", 1024)),
+        "--search-mode",
+        str(retrieval.get("mode", "hybrid")),
+        "--embedding-weight",
+        str(retrieval.get("embedding_weight", 0.7)),
+        "--bm25-weight",
+        str(retrieval.get("bm25_weight", 0.3)),
+        "--candidate-k",
+        str(retrieval.get("candidate_k", 150)),
         top_k_flag,
         str(retrieval.get("top_k", 30)),
         "--max-graph-context-facts",
@@ -140,23 +145,16 @@ def _build_forwarded_args(config: dict[str, Any]) -> list[str]:
         "--context-after-messages",
         str(memory.get("context_after_messages", 0)),
     ]
-    if dataset != "longmemeval":
-        retrieval_args = [
-            "--search-mode",
-            str(retrieval.get("mode", "hybrid")),
-            "--embedding-weight",
-            str(retrieval.get("embedding_weight", 0.7)),
-            "--bm25-weight",
-            str(retrieval.get("bm25_weight", 0.3)),
-            "--candidate-k",
-            str(retrieval.get("candidate_k", 150)),
-        ]
-        args[args.index(top_k_flag):args.index(top_k_flag)] = retrieval_args
     if graph.get("build_enabled", False):
-        args.extend(["--graph-build", "--graph-build-concurrency", str(graph.get("build_concurrency", 1))])
-    if graph.get("enabled", False):
+        args.extend(
+            [
+                "--graph-build",
+                "--graph-build-concurrency",
+                str(graph.get("build_concurrency", 1)),
+            ]
+        )
+    if graph.get("build_enabled", False) or graph.get("enabled", False):
         args.extend([
-            "--graph",
             "--graph-weight",
             str(graph.get("weight", 0.2)),
             "--graph-memory-space-mode",
@@ -174,10 +172,19 @@ def _build_forwarded_args(config: dict[str, Any]) -> list[str]:
             "--graph-llm-timeout-ms",
             str(graph.get("llm_timeout_ms", 60000)),
         ])
+    if graph.get("enabled", False):
+        args.append("--graph")
         if graph.get("rerank", False):
             args.append("--graph-rerank")
         if graph.get("allow_graph_only", False):
             args.append("--graph-allow-graph-only")
+        if graph.get("max_graph_only_results") is not None:
+            args.extend([
+                "--graph-max-graph-only-results",
+                str(graph["max_graph_only_results"]),
+            ])
+        if graph.get("fail_open", False):
+            args.append("--graph-fail-open")
     if rerank.get("enabled", False):
         args.extend([
             "--rerank",
@@ -192,11 +199,29 @@ def _build_forwarded_args(config: dict[str, Any]) -> list[str]:
             "--rerank-input-k",
             str(rerank.get("input_k", 40)),
         ])
+        if rerank.get("timeout_ms") is not None:
+            args.extend(["--rerank-timeout-ms", str(rerank["timeout_ms"])])
+        if rerank.get("fail_open", False):
+            args.append("--rerank-fail-open")
     if answer.get("model"):
         answer_flag = "--answerer-model" if dataset == "longmemeval" else "--answer-model"
         args.extend([answer_flag, str(answer["model"])])
+    if dataset == "personalmem":
+        args.extend([
+            "--answer-api-key-env",
+            str(answer.get("api_key_env", "OPENROUTER_API_KEY")),
+            "--answer-base-url",
+            str(answer.get("base_url", "https://openrouter.ai/api/v1")),
+        ])
     if dataset == "longmemeval" and config.get("judge", {}).get("model"):
         args.extend(["--judge-model", str(config["judge"]["model"])])
+    if dataset == "longmemeval":
+        args.extend([
+            "--llm-api-key-env",
+            str(answer.get("api_key_env", "OPENROUTER_API_KEY")),
+            "--llm-base-url",
+            str(answer.get("base_url", "https://openrouter.ai/api/v1")),
+        ])
     if dataset == "longmemeval" and answer.get("qa_top_k") is not None:
         args.extend(["--qa-top-k", str(answer["qa_top_k"])])
     return args
@@ -207,14 +232,32 @@ def _locomo_environment(config: dict[str, Any]) -> dict[str, str]:
     retrieval = config.get("retrieval", {})
     graph = config.get("graph", {})
     rerank = config.get("rerank", {})
+    memory = config.get("memory", {})
+    answer = config.get("answer", {})
+    judge = config.get("judge", {})
     return {
-        "MODEL": str(config.get("answer", {}).get("model", "openai/gpt-4o-mini")),
+        "MODEL": str(answer.get("model", "openai/gpt-4o-mini")),
+        "MEMORY_EXTRACTION_MODEL": str(memory.get("extraction_model", "openai/gpt-4o-mini")),
+        "MEMORY_VERIFIER_MODEL": str(memory.get("verifier_model", "openai/gpt-4o-mini")),
+        "MEMORY_API_KEY_ENV": str(memory.get("api_key_env", "OPENROUTER_API_KEY")),
+        "MEMORY_BASE_URL": str(memory.get("base_url", "https://openrouter.ai/api/v1")),
+        "MAX_CANDIDATE_TOKENS": str(memory.get("max_candidate_tokens", 320)),
+        "MAX_WINDOW_TOKENS": str(memory.get("max_window_tokens", 640)),
+        "CONTEXT_BEFORE_MESSAGES": str(memory.get("context_before_messages", 2)),
+        "CONTEXT_AFTER_MESSAGES": str(memory.get("context_after_messages", 0)),
+        "ANSWER_MODEL": str(answer.get("model", "openai/gpt-4o-mini")),
+        "ANSWER_API_KEY_ENV": str(answer.get("api_key_env", "OPENROUTER_API_KEY")),
+        "ANSWER_BASE_URL": str(answer.get("base_url", "https://openrouter.ai/api/v1")),
+        "JUDGE_MODEL": str(judge.get("model", "openai/gpt-4o-mini")),
+        "JUDGE_API_KEY_ENV": str(judge.get("api_key_env", "OPENROUTER_API_KEY")),
+        "JUDGE_BASE_URL": str(judge.get("base_url", "https://openrouter.ai/api/v1")),
         "EMBEDDING_PROVIDER": str(embedding.get("provider", "openrouter")),
         "EMBEDDING_DIMENSIONS": str(embedding.get("dimensions", 1024)),
         "EMBEDDING_API_KEY_ENV": str(embedding.get("api_key_env", "OPENROUTER_API_KEY")),
-        "OPENAI_BASE_URL": str(config.get("answer", {}).get("base_url", "https://openrouter.ai/api/v1")),
-        "ANSWER_MAX_TOKENS": str(config.get("answer", {}).get("max_tokens", 512)),
+        "OPENAI_BASE_URL": str(answer.get("base_url", "https://openrouter.ai/api/v1")),
+        "ANSWER_MAX_TOKENS": str(answer.get("max_tokens", 512)),
         "MEMORY_BENCH_GRAPH": "1" if graph.get("enabled", False) else "0",
+        "MEMORY_BENCH_GRAPH_BUILD": "1" if graph.get("build_enabled", False) else "0",
         "GRAPH_RERANK": "1" if graph.get("rerank", False) else "0",
         "GRAPH_ALLOW_GRAPH_ONLY": "1" if graph.get("allow_graph_only", False) else "0",
         "MAX_GRAPH_CONTEXT_FACTS": str(graph.get("max_context_facts", 3)),
@@ -247,11 +290,27 @@ def _locomo_environment(config: dict[str, Any]) -> dict[str, str]:
 
 
 def _manifest_value(config: dict[str, Any]) -> dict[str, Any]:
-    return _json_safe({
+    logical = {
         key: value
         for key, value in config.items()
-        if key not in {"config_path", "dataset_file", "manifest_path"}
-    })
+        if key
+        not in {
+            "config_path",
+            "dataset",
+            "dataset_file",
+            "manifest_path",
+            "output_root",
+            "promotion_policy_path",
+        }
+    }
+    run = logical.get("run")
+    if isinstance(run, dict):
+        logical["run"] = {
+            key: value
+            for key, value in run.items()
+            if key not in {"output_root", "promotion_policy"}
+        }
+    return _json_safe(logical)
 
 
 def _json_safe(value: Any) -> Any:

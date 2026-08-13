@@ -20,7 +20,7 @@ adapter -> raw prepared -> 可选原子记忆抽取/grounding -> add
 | `execution = "single"` | 只运行一个版本；必须另外设置 `memory_mode = "raw"` 或 `"extracted"`。适合验证某一套固定配置。 |
 | `mode = "normal"` | 普通评测：生成结果和指标，不判断是否达到晋级门槛。日常 full/smoke 使用此模式。 |
 | `mode = "strict"` | 严格评测：在 A/B 结果上执行 promotion policy；只有已有评审过的 policy 时使用。 |
-| `phase = "full"` | 全量评测模式；当前统一入口不需要先运行 pilot。 |
+| `phase = "full"` | 当前唯一支持的阶段标签；实际样本规模由配置的数据集文件决定。 |
 
 `ab` 只比较 `raw` 和 `extracted`，不能在同一次运行中配置成“无图 vs 有图”或“无 rerank vs 有 rerank”。这类增量实验需要复制配置文件，分别将 `graph.enabled` 或 `rerank.enabled` 设置为不同值，然后用 `single` 各运行一次。
 
@@ -104,13 +104,17 @@ file = "${LONGMEMEVAL_DATASET}"
 | `run.execution` | `ab` 比较 raw/extracted；`single` 只运行一个版本。默认 `ab`。 |
 | `run.memory_mode` | 仅 `single` 使用，值为 `raw` 或 `extracted`；无默认值。 |
 | `run.mode` | `normal` 记录指标；`strict` 执行晋级策略。默认 `normal`。 |
-| `run.pair_id` | 运行标识；模板默认 `graph-full-v1`，新实验建议改成新名称。 |
-| `graph.enabled` | search 是否加入图候选；系统默认关闭，模板开启。 |
+| `run.resume` | 是否继续同一运行目录中的部分批次输出。默认 `false`；PersonaMem/LongMemEval 中断后保持其他配置不变，改为 `true` 再执行。LoCoMo 始终自动复用已完成步骤，该值不改变其行为。 |
+| `run.pair_id` | 运行标识；模板默认 `graph-full-v1`，复制模板做新实验时应改成新名称。 |
+| `graph.enabled` | search 是否开启图检索通道；系统默认关闭，模板开启。图独占候选还受下方两个字段控制。 |
 | `graph.build_enabled` | add 时是否构建图；系统默认关闭，模板开启。 |
+| `graph.rerank` | 是否用加权 RRF 融合基础与图排名；系统默认和模板均关闭。 |
+| `graph.allow_graph_only` | 是否允许基础检索未命中的图证据进入候选池；系统默认和模板均关闭。 |
+| `graph.max_graph_only_results` | 图独占候选上限；未设置时为最终 `top_k` 的 20%（向上取整），仅在 `allow_graph_only=true` 时有效。 |
 | `rerank.enabled` | 是否调用外部 rerank；系统默认关闭，模板开启。 |
 | `retrieval.top_k` | 最终返回数量；系统默认 `10`，模板为 `30`。 |
 | `retrieval.candidate_k` | 候选池大小；未设置时为 `max(top_k × 5, 100)`，模板为 `150`。 |
-| `answer.qa_top_k` | 传给答案模型的检索结果数量；模板为 `10`。 |
+| `answer.qa_top_k` | LongMemEval 传给答案模型的检索结果数量；模板为 `10`。 |
 | `graph.max_context_facts` | 答案阶段最多补充的图事实数量；模板为 `3`。 |
 
 公平比较时，A/B 两次运行必须保持 embedding 模型、维度、Hybrid 权重、`candidate_k`、`top_k`、answer/judge 模型一致，只改变要研究的一个开关。API key 只放环境变量，不写入配置文件。
@@ -136,7 +140,7 @@ python evaluation/run_benchmark.py \
 
 运行其他数据集时，将最后的 `locomo` 替换为 `personalmem` 或 `longmemeval`。
 
-默认配置实际启用：`phase=full`、`mode=normal`、`execution=ab`、Hybrid（0.7/0.3）、`candidate_k=150`、`top_k=30`、图构建、图检索、图权重 0.2、外部 rerank（`cohere/rerank-v3.5`，`input_k=40`），以及最多 3 条图事实进入答案上下文。
+默认配置实际启用：`phase=full`、`mode=normal`、`execution=ab`、Hybrid（0.7/0.3）、`candidate_k=150`、`top_k=30`、图构建、图检索、外部 rerank（`cohere/rerank-v3.5`，`input_k=40`），以及最多 3 条图事实进入答案上下文。默认不改变基础候选集合；图命中只为同一基础记录补充图事实。需要验证图独占候选时，应复制模板并同时开启 `graph.rerank` 与 `graph.allow_graph_only`。
 
 默认输出目录：
 
@@ -166,11 +170,17 @@ smoke 只验证代码链路、图构建、参数组合和输出格式，不用�
 
 ```bash
 export OPENROUTER_API_KEY="替换为真实密钥"
+export EMBEDDING_PROVIDER=hash
+export EMBEDDING_MODEL=hash
+export EMBEDDING_DIMENSIONS=32
 export MEMORY_BENCH_GRAPH=1
-export GRAPH_RERANK=0
-export GRAPH_ALLOW_GRAPH_ONLY=0
+export MEMORY_BENCH_GRAPH_BUILD=1
+export GRAPH_RERANK=1
+export GRAPH_ALLOW_GRAPH_ONLY=1
+export GRAPH_MAX_GRAPH_ONLY_RESULTS=2
 export MAX_GRAPH_CONTEXT_FACTS=3
 export GRAPH_BUILD_CONCURRENCY=1
+export RERANK=0
 export PHASE=full
 export DATASET="$PWD/evaluation/fixtures/locomo_sample.json"
 export RUN_DIR="$PWD/outputs/_smoke/locomo"
@@ -197,7 +207,7 @@ promotion_policy = "${PROMOTION_POLICY}"
 export PROMOTION_POLICY="/absolute/path/to/promotion-policy.json"
 ```
 
-strict 必须有 policy；normal 不应提供 policy。strict 不是日常 smoke/full 的前置步骤。
+strict 必须有 policy；normal 不应提供 policy。
 
 ## 10. 查看结果
 
@@ -216,15 +226,15 @@ for key in ("llm_score", "f1_score", "bleu_score"):
 PY
 ```
 
-常见文件：`retrieval_metrics.json`（召回）、`qa_metrics.json`（BLEU/F1/LLM score/token/延迟）、`metrics.json`（数据集专用汇总）、`run_manifest.json`（配置和数据 hash）以及 HTML 详细报告。
+常见文件：`retrieval_metrics.json`（召回）；LoCoMo/LongMemEval 的 `qa_metrics.json`；PersonaMem 的 `grade_metrics.json`；`run_manifest.json`（配置和数据 hash）；以及 HTML 详细报告。
 
 ## 11. 常见问题
 
 - `missing API key env ...`：重新在当前 shell 执行 `export`；激活 venv 不会恢复环境变量。
 - 数据集不存在：确认 `${LOCOMO_DATASET}` 等变量指向真实文件。
 - graph memory space 无法推导：prepared 数据需要对应的 `scope_id` 元数据，不能关闭校验掩盖空间隔离缺失。
-- 远程服务 429：客户端会重试；最终失败时使用 runner 支持的 resume 机制，不要把未完成结果当作正式分数。
 - 429 或网络超时：这是远程 provider 限流或网络问题，不代表图逻辑失败；等待重试结束。最终失败时，保留运行目录并使用 runner 支持的 resume 机制。
+- 中断后恢复：保持数据集、`pair_id` 和其他实验参数不变。PersonaMem/LongMemEval 将 `[run]` 中的 `resume` 改为 `true` 后重跑；LoCoMo 直接重跑同一命令并自动复用已完成步骤。LoCoMo 如需全新执行，应使用新的 `pair_id` 或空运行目录。
 - 不要把未完成运行目录中的指标当作正式结果；确认存在最终 metrics JSON 后再记录分数。
 
 完整数据集、store/SQLite、search results、responses、cache 和大型 HTML 只保存在本地，不作为评测命令的必需输入，也不应提交到 Git。

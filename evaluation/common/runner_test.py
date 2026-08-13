@@ -190,3 +190,38 @@ def test_run_search_enabled_omits_unset_optional_rerank_flags(monkeypatch, tmp_p
     assert cmd[cmd.index("--rerank-model") + 1] == "cohere/rerank-v3.5"
     assert "--rerank-timeout-ms" not in cmd
     assert "--rerank-fail-open" not in cmd
+
+
+def test_runner_passes_explicit_hybrid_settings_to_add_and_search(
+    monkeypatch, tmp_path
+):
+    captured = []
+
+    def fake_run(cmd, capture_output, cwd):
+        captured.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    common = {
+        "search_mode": "hybrid",
+        "embedding_weight": 0.6,
+        "bm25_weight": 0.4,
+        "candidate_k": 90,
+    }
+    runner.run_add(
+        tmp_path / "store.sqlite",
+        tmp_path / "prepared.json",
+        **common,
+    )
+    runner.run_search(
+        tmp_path / "store.sqlite",
+        tmp_path / "prepared.json",
+        tmp_path / "search.json",
+        **common,
+    )
+
+    for command in captured:
+        assert command[command.index("--search-mode") + 1] == "hybrid"
+        assert command[command.index("--embedding-weight") + 1] == "0.6"
+        assert command[command.index("--bm25-weight") + 1] == "0.4"
+        assert command[command.index("--candidate-k") + 1] == "90"

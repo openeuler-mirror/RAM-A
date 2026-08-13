@@ -429,6 +429,8 @@ def validate_experiment_args(args: argparse.Namespace) -> None:
         raise ValueError("--mode must be normal or strict")
     if mode == "strict" and args.phase == "full" and args.promotion_policy is None:
         raise ValueError("--promotion-policy is required for full runs")
+    if mode == "normal" and args.promotion_policy is not None:
+        raise ValueError("--promotion-policy is only valid in strict mode")
     validate_rerank_config(
         enabled=args.rerank,
         provider=args.rerank_provider,
@@ -462,6 +464,7 @@ def immutable_experiment_manifest(
         "backend": args.backend,
         "store_backend": args.store_backend,
         "embedding": args.embedding,
+        "api_key_env": args.api_key_env,
         "embedding_model": args.model,
         "embedding_dimensions": args.dimensions,
         "search_mode": args.search_mode,
@@ -493,6 +496,7 @@ def immutable_experiment_manifest(
         "rerank_timeout_ms": args.rerank_timeout_ms,
         "rerank_fail_open": args.rerank_fail_open,
         "answer_model": args.answer_model,
+        "answer_api_key_env": args.answer_api_key_env,
         "answer_base_url": args.answer_base_url,
         "context_token_budget": args.context_token_budget,
         "max_retries": args.max_retries,
@@ -502,6 +506,7 @@ def immutable_experiment_manifest(
         "gold_fields": args.gold_fields,
         "extraction_model": args.extraction_model,
         "verifier_model": args.verifier_model,
+        "extraction_api_key_env": args.extraction_api_key_env,
         "extraction_base_url": args.extraction_base_url,
         "max_candidate_tokens": args.max_candidate_tokens,
         "max_window_tokens": args.max_window_tokens,
@@ -587,6 +592,7 @@ def write_personalmem_arm_contract(
         "promotion_policy_hash": args.promotion_policy_hash,
         "preflight_path": str(args.preflight) if args.preflight is not None else None,
         "preflight_hash": args.preflight_hash,
+        "max_graph_context_facts": args.max_graph_context_facts,
         **immutable,
     }
     _write_json_atomic(Path(args.run_dir) / "config.json", config)

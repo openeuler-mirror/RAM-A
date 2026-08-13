@@ -15,6 +15,7 @@ sys.path.insert(0, str(EVALUATION_ROOT))
 from common.memory_ab import canonical_sha256, file_sha256
 from common.memory_ab_compare import (
     build_history_records,
+    history_configuration,
     remove_stale_history_artifact,
     resolve_history_artifact_path,
 )
@@ -440,17 +441,6 @@ def _common_arm(
     run_id = config.get("run_id") or (
         f"locomo-{memory_mode}-" + canonical_sha256({"run_dir": run_dir})[:16]
     )
-    compact_keys = (
-        "chat_model",
-        "embedding_model",
-        "embedding_dimensions",
-        "candidate_k",
-        "rerank_model",
-        "rerank_input_k",
-        "top_k",
-        "max_candidate_tokens",
-        "max_window_tokens",
-    )
     metrics = {
         "qa": {
             "overall": dict(qa["overall"]),
@@ -465,11 +455,7 @@ def _common_arm(
     }
     return {
         "run_id": str(run_id),
-        "configuration": {
-            key: config[key]
-            for key in compact_keys
-            if key in config and config[key] is not None
-        },
+        "configuration": history_configuration(config),
         "metrics": metrics,
         "artifact_path": run_dir,
     }

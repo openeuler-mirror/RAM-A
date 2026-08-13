@@ -7,13 +7,7 @@
 /dataset/longmemeval/
 /outputs/
 /evaluation/outputs/
-/history/*.xlsx
-/history/*.xlsx.tmp
-/history/.~lock.*#
-/history/outputs/
-/history/locks/
-/history/tmp/
-/history/records/*.tmp
+/history/
 /artifacts/
 /evaluation/results/
 /evaluation/scripts/locomo/src/

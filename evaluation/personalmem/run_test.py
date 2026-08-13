@@ -125,12 +125,16 @@ def test_personalmem_arm_contract_contains_real_preflight_hash_before_stages(
         str(source),
         "--run-dir",
         str(run_dir),
+        "--mode",
+        "strict",
         "--promotion-policy",
         str(policy),
         "--preflight",
         str(preflight),
         "--embedding",
         "hash",
+        "--max-graph-context-facts",
+        "7",
     )
     calls = []
     monkeypatch.setattr(personalmem_run, "build_parser", lambda: argparse.Namespace(parse_args=lambda: args))
@@ -151,6 +155,7 @@ def test_personalmem_arm_contract_contains_real_preflight_hash_before_stages(
 
     config = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
     assert config["preflight_hash"] == personalmem_run.file_sha256(preflight)
+    assert config["max_graph_context_facts"] == 7
     assert json.loads((run_dir / "raw_prepared.json").read_text(encoding="utf-8")) == prepared
     assert calls == ["resolve", "add", "search", "eval", "answer", "grade"]
 
@@ -317,6 +322,21 @@ def test_fixture_mode_requires_paired_response_maps(tmp_path):
     )
 
     with pytest.raises(ValueError, match="both --extractor-responses and"):
+        personalmem_run.validate_experiment_args(args)
+
+
+def test_normal_mode_rejects_promotion_policy(tmp_path):
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}\n", encoding="utf-8")
+    args = _parse(
+        "pipeline",
+        "--mode",
+        "normal",
+        "--promotion-policy",
+        str(policy),
+    )
+
+    with pytest.raises(ValueError, match="only valid in strict mode"):
         personalmem_run.validate_experiment_args(args)
 
 
@@ -989,6 +1009,24 @@ def test_rerank_settings_are_recorded_in_run_meta(tmp_path):
         assert settings["rerank_fail_open"] is False
     assert manifest["rerank_timeout_ms"] is None
     assert "rerank_timeout_ms" not in meta
+
+
+def test_memory_ab_manifest_records_provider_key_environment_names() -> None:
+    args = _parse(
+        "memory-ab-pipeline",
+        "--api-key-env",
+        "EMBEDDING_KEY",
+        "--answer-api-key-env",
+        "ANSWER_KEY",
+        "--extraction-api-key-env",
+        "EXTRACTION_KEY",
+    )
+
+    manifest = personalmem_run.immutable_experiment_manifest(args, "impl", None)
+
+    assert manifest["api_key_env"] == "EMBEDDING_KEY"
+    assert manifest["answer_api_key_env"] == "ANSWER_KEY"
+    assert manifest["extraction_api_key_env"] == "EXTRACTION_KEY"
 
 
 def test_bench_search_command_includes_graph_search_flags(tmp_path, monkeypatch):

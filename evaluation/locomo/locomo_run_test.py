@@ -84,6 +84,7 @@ def test_run_config_records_pair_and_explicit_policy_hash(monkeypatch, tmp_path)
     config = RunConfig.from_env(
         {
             "PAIR_ID": "locomo-pair-7",
+            "RUN_MODE": "strict",
             "PROMOTION_POLICY": str(policy),
             "DATASET": str(tmp_path / "locomo.json"),
             "RUN_DIR": str(tmp_path / "run"),
@@ -94,6 +95,32 @@ def test_run_config_records_pair_and_explicit_policy_hash(monkeypatch, tmp_path)
     assert config.public_manifest()["promotion_policy_hash"] == locomo_run.file_sha256(policy)
     assert "pair_id" not in config.immutable_manifest()
     assert config.immutable_manifest()["promotion_policy_hash"] == locomo_run.file_sha256(policy)
+
+
+def test_normal_run_config_rejects_promotion_policy(tmp_path):
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="only valid in strict mode"):
+        RunConfig.from_env(
+            {
+                "RUN_MODE": "normal",
+                "PROMOTION_POLICY": str(policy),
+                "DATASET": str(tmp_path / "locomo.json"),
+                "RUN_DIR": str(tmp_path / "run"),
+            }
+        )
+
+
+def test_strict_run_config_requires_promotion_policy(tmp_path):
+    with pytest.raises(ValueError, match="required in strict mode"):
+        RunConfig.from_env(
+            {
+                "RUN_MODE": "strict",
+                "DATASET": str(tmp_path / "locomo.json"),
+                "RUN_DIR": str(tmp_path / "run"),
+            }
+        )
 
 
 def test_run_config_and_search_command_follow_runtime_config(monkeypatch, tmp_path):
@@ -217,6 +244,113 @@ def test_memory_bench_command_contains_configured_retrieval_settings(tmp_path) -
         "0.3",
     ]
     assert command[-2:] == ["--candidate-k", "150"]
+
+
+def test_run_config_uses_independent_unified_provider_and_graph_build_settings(
+    tmp_path,
+) -> None:
+    config = RunConfig.from_env(
+        {
+            "DATASET": str(tmp_path / "locomo.json"),
+            "RUN_DIR": str(tmp_path / "run"),
+            "MEMORY_BENCH_SEARCH_MODE": "bm25",
+            "RERANK": "0",
+            "MEMORY_BENCH_GRAPH": "0",
+            "MEMORY_BENCH_GRAPH_BUILD": "1",
+            "MEMORY_EXTRACTION_MODEL": "extract/model",
+            "MEMORY_VERIFIER_MODEL": "verify/model",
+            "MEMORY_API_KEY_ENV": "MEMORY_KEY",
+            "MEMORY_BASE_URL": "https://memory.example/v1",
+            "ANSWER_MODEL": "answer/model",
+            "ANSWER_API_KEY_ENV": "ANSWER_KEY",
+            "ANSWER_BASE_URL": "https://answer.example/v1",
+            "JUDGE_MODEL": "judge/model",
+            "JUDGE_API_KEY_ENV": "JUDGE_KEY",
+            "JUDGE_BASE_URL": "https://judge.example/v1",
+        }
+    )
+
+    base = memory_bench_base_command(config, tmp_path / "store.sqlite")
+    add = build_add_command(config, tmp_path / "store.sqlite", tmp_path / "p.json")
+    search = build_search_command(
+        config,
+        tmp_path / "store.sqlite",
+        tmp_path / "p.json",
+        tmp_path / "r.json",
+    )
+    extraction = build_extraction_command(
+        config,
+        tmp_path / "raw.json",
+        tmp_path / "extracted.json",
+        tmp_path / "artifacts",
+        "digest",
+    )
+
+    assert base[base.index("--search-mode") + 1] == "bm25"
+    assert "--graph-build" in add
+    assert "--graph" not in search
+    assert extraction[extraction.index("--model") + 1] == "extract/model"
+    assert extraction[extraction.index("--verifier-model") + 1] == "verify/model"
+    assert extraction[extraction.index("--api-key-env") + 1] == "MEMORY_KEY"
+    assert extraction[extraction.index("--base-url") + 1] == "https://memory.example/v1"
+    assert config.answer_model == "answer/model"
+    assert config.answer_api_key_env == "ANSWER_KEY"
+    assert config.answer_base_url == "https://answer.example/v1"
+    assert config.judge_model == "judge/model"
+    assert config.judge_api_key_env == "JUDGE_KEY"
+    assert config.judge_base_url == "https://judge.example/v1"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "missing_key"),
+    [
+        (
+            {
+                "memory_mode": "extracted",
+                "extraction_api_key_env": "MISSING_EXTRACTION_KEY",
+                "rerank_enabled": False,
+            },
+            "MISSING_EXTRACTION_KEY",
+        ),
+        (
+            {
+                "graph_build_enabled": True,
+                "graph_llm_api_key_env": "MISSING_GRAPH_KEY",
+                "rerank_enabled": False,
+            },
+            "MISSING_GRAPH_KEY",
+        ),
+        (
+            {
+                "rerank_enabled": True,
+                "rerank_api_key_env": "MISSING_RERANK_KEY",
+            },
+            "MISSING_RERANK_KEY",
+        ),
+    ],
+)
+def test_run_arm_requires_credentials_for_enabled_remote_stages(
+    monkeypatch,
+    tmp_path,
+    overrides,
+    missing_key,
+) -> None:
+    monkeypatch.setenv("SHARED_TEST_KEY", "test-key")
+    monkeypatch.delenv(missing_key, raising=False)
+    settings = {
+        "memory_mode": "raw",
+        "phase": "full",
+        "dataset": FIXTURE,
+        "run_dir": tmp_path / "run",
+        "credential_env": "SHARED_TEST_KEY",
+        "answer_api_key_env": "SHARED_TEST_KEY",
+        "judge_api_key_env": "SHARED_TEST_KEY",
+    }
+    settings.update(overrides)
+    config = RunConfig(**settings)
+
+    with pytest.raises(RuntimeError, match=f"missing API key env {missing_key}"):
+        run_arm(config)
 
 
 def test_extraction_command_disables_fail_fast(tmp_path) -> None:

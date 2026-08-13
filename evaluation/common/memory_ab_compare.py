@@ -11,6 +11,84 @@ from typing import Any
 
 POLICY_SCHEMA_VERSION = "memory-ab-promotion-v1"
 HISTORY_SCHEMA_VERSION = "memory-ab-history-v1"
+HISTORY_CONFIGURATION_KEYS = (
+    "backend",
+    "store_backend",
+    "embedding",
+    "embedding_provider",
+    "embedding_model",
+    "embedding_dimensions",
+    "embedding_batch_size",
+    "api_key_env",
+    "credential_env",
+    "search_mode",
+    "embedding_weight",
+    "bm25_weight",
+    "candidate_k",
+    "top_k",
+    "retrieval_top_k",
+    "qa_top_k",
+    "graph",
+    "graph_enabled",
+    "graph_build",
+    "graph_build_enabled",
+    "graph_build_concurrency",
+    "graph_weight",
+    "graph_rerank",
+    "graph_allow_graph_only",
+    "graph_max_graph_only_results",
+    "graph_fail_open",
+    "graph_memory_space_mode",
+    "graph_memory_space_field",
+    "graph_owner_id",
+    "graph_llm_api_key_env",
+    "graph_llm_model",
+    "graph_llm_base_url",
+    "graph_llm_timeout_ms",
+    "max_graph_context_facts",
+    "rerank",
+    "rerank_enabled",
+    "rerank_provider",
+    "rerank_api_key_env",
+    "rerank_model",
+    "rerank_base_url",
+    "rerank_input_k",
+    "rerank_timeout_ms",
+    "rerank_fail_open",
+    "answer_model",
+    "answerer_model",
+    "chat_model",
+    "answer_api_key_env",
+    "answer_base_url",
+    "judge_model",
+    "judge_api_key_env",
+    "judge_base_url",
+    "llm_api_key_env",
+    "llm_base_url",
+    "llm_thinking",
+    "show_scores",
+    "answer_prompt_version",
+    "memory_format",
+    "answer_max_tokens",
+    "context_token_budget",
+    "max_retries",
+    "retry_backoff_seconds",
+    "text_fields",
+    "query_fields",
+    "gold_fields",
+    "max_candidate_tokens",
+    "max_window_tokens",
+    "context_before_messages",
+    "context_after_messages",
+    "extraction_model",
+    "verifier_model",
+    "extraction_api_key_env",
+    "extraction_base_url",
+    "pipeline_phase",
+    "prompt_versions",
+    "extraction_schema_version",
+    "llm_temperature",
+)
 
 
 @dataclass(frozen=True)
@@ -219,6 +297,15 @@ def build_history_record(
     return record
 
 
+def history_configuration(config: dict[str, Any]) -> dict[str, Any]:
+    """Select behavior-affecting, non-secret settings for history records."""
+    return {
+        key: config[key]
+        for key in HISTORY_CONFIGURATION_KEYS
+        if key in config and config[key] is not None
+    }
+
+
 def _portable_history_path(value: Any) -> str:
     """Keep repository-local artifacts portable across machines."""
     value = str(value)
@@ -226,15 +313,15 @@ def _portable_history_path(value: Any) -> str:
         return value
     path = Path(value)
     if not path.is_absolute():
-        return str(path)
+        return path.as_posix()
     parts = path.parts
     try:
         outputs_index = max(
             index for index, component in enumerate(parts) if component == "outputs"
         )
     except ValueError:
-        return str(path)
-    return str(Path(*parts[outputs_index:]))
+        return path.as_posix()
+    return Path(*parts[outputs_index:]).as_posix()
 
 
 def _portable_history_value(

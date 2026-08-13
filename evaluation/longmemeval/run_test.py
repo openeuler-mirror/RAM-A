@@ -75,6 +75,21 @@ def test_cli_accepts_memory_ab_preflight(monkeypatch, tmp_path):
     assert args.preflight == tmp_path / "preflight.json"
 
 
+def test_normal_mode_rejects_promotion_policy(monkeypatch, tmp_path):
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}\n", encoding="utf-8")
+    args = _parse(
+        monkeypatch,
+        "--mode",
+        "normal",
+        "--promotion-policy",
+        str(policy),
+    )
+
+    with pytest.raises(ValueError, match="only valid in strict mode"):
+        validate_experiment_args(args)
+
+
 def test_extracted_mode_uses_rust_output_as_indexed_prepared(monkeypatch, tmp_path):
     args = _parse(
         monkeypatch,
@@ -302,6 +317,8 @@ def test_extracted_arm_routes_raw_and_indexed_prepared_to_correct_consumers(
         "--rerank-timeout-ms",
         "30000",
         "--rerank-fail-open",
+        "--max-graph-context-facts",
+        "7",
     )
     run_dir.mkdir()
     (run_dir / "store.jsonl").write_text("partial\n", encoding="utf-8")
@@ -408,6 +425,7 @@ def test_extracted_arm_routes_raw_and_indexed_prepared_to_correct_consumers(
     assert config["rerank_input_k"] == 80
     assert config["rerank_timeout_ms"] == 30000
     assert config["rerank_fail_open"] is True
+    assert config["max_graph_context_facts"] == 7
     assert backend_configs[0].rerank is True
     assert backend_configs[0].rerank_model == "cohere/rerank-v3.5"
     assert backend_configs[0].rerank_api_key_env == "RERANK_KEY"
@@ -668,6 +686,24 @@ def test_parser_and_immutable_manifest_accept_rerank_overrides(monkeypatch):
     assert manifest["rerank_input_k"] == 80
     assert manifest["rerank_timeout_ms"] == 30000
     assert manifest["rerank_fail_open"] is True
+
+
+def test_manifest_records_provider_key_environment_names(monkeypatch) -> None:
+    args = _parse(
+        monkeypatch,
+        "--api-key-env",
+        "EMBEDDING_KEY",
+        "--llm-api-key-env",
+        "ANSWER_JUDGE_KEY",
+        "--extraction-api-key-env",
+        "EXTRACTION_KEY",
+    )
+
+    manifest = longmemeval_run.immutable_experiment_manifest(args, "impl", None)
+
+    assert manifest["api_key_env"] == "EMBEDDING_KEY"
+    assert manifest["llm_api_key_env"] == "ANSWER_JUDGE_KEY"
+    assert manifest["extraction_api_key_env"] == "EXTRACTION_KEY"
 
 
 def test_graph_context_limit_is_not_part_of_retrieval_manifest(monkeypatch):

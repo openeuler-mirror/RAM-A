@@ -133,6 +133,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Number of texts per embedding batch for add/search (default: 64)",
     )
     parser.add_argument(
+        "--search-mode",
+        choices=("dense", "bm25", "hybrid", "graph"),
+        default="hybrid",
+    )
+    parser.add_argument("--embedding-weight", type=float, default=0.7)
+    parser.add_argument("--bm25-weight", type=float, default=0.3)
+    parser.add_argument("--candidate-k", type=int)
+    parser.add_argument(
         "--graph",
         action="store_true",
         help="Enable graph retrieval channel for memory-bench search",
@@ -398,11 +406,14 @@ def validate_experiment_args(args: argparse.Namespace) -> None:
         raise ValueError("--mode must be normal or strict")
     if mode == "strict" and args.phase == "full" and args.promotion_policy is None:
         raise ValueError("--promotion-policy is required for full runs")
+    if mode == "normal" and args.promotion_policy is not None:
+        raise ValueError("--promotion-policy is only valid in strict mode")
     validate_rerank_config(
         enabled=args.rerank,
         provider=args.rerank_provider,
         input_k=args.rerank_input_k,
         timeout_ms=args.rerank_timeout_ms,
+        search_mode=args.search_mode,
     )
     validate_graph_search_config(
         graph=args.graph,
@@ -472,9 +483,14 @@ def immutable_experiment_manifest(
     return {
         "backend": args.backend,
         "embedding": args.embedding,
+        "api_key_env": args.api_key_env,
         "embedding_model": args.embedding_model,
         "embedding_dimensions": args.dimensions,
         "embedding_batch_size": args.embedding_batch_size,
+        "search_mode": args.search_mode,
+        "embedding_weight": args.embedding_weight,
+        "bm25_weight": args.bm25_weight,
+        "candidate_k": args.candidate_k,
         "retrieval_top_k": max(args.retrieval_top_k, args.qa_top_k),
         "graph": args.graph,
         "graph_build": args.graph_build,
@@ -501,6 +517,7 @@ def immutable_experiment_manifest(
         "rerank_fail_open": args.rerank_fail_open,
         "answerer_model": args.answerer_model,
         "judge_model": args.judge_model,
+        "llm_api_key_env": args.llm_api_key_env,
         "llm_base_url": args.llm_base_url,
         "llm_thinking": None if args.llm_thinking == "default" else args.llm_thinking,
         "qa_top_k": args.qa_top_k,
@@ -509,6 +526,7 @@ def immutable_experiment_manifest(
         "show_scores": args.show_scores,
         "extraction_model": args.extraction_model,
         "verifier_model": args.verifier_model,
+        "extraction_api_key_env": args.extraction_api_key_env,
         "extraction_base_url": args.extraction_base_url,
         "max_candidate_tokens": args.max_candidate_tokens,
         "max_window_tokens": args.max_window_tokens,
@@ -711,6 +729,7 @@ def main() -> None:
         "extraction_cache_version": (
             args.extraction_cache_version or configuration_digest
         ),
+        "max_graph_context_facts": args.max_graph_context_facts,
         **immutable,
     }
     _write_json_atomic(run_dir / "config.json", public_config)
@@ -792,6 +811,10 @@ def main() -> None:
             api_key_env=args.api_key_env,
             batch_size=args.embedding_batch_size,
             top_k=retrieval_top_k,
+            search_mode=args.search_mode,
+            embedding_weight=args.embedding_weight,
+            bm25_weight=args.bm25_weight,
+            candidate_k=args.candidate_k,
             graph=args.graph,
             graph_build=args.graph_build,
             graph_build_concurrency=args.graph_build_concurrency,

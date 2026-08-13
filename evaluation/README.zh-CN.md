@@ -238,25 +238,24 @@ export MEMORY_PIPELINE_BIN="$PWD/target/debug/memory-pipeline"
 
 PYTHONPATH=evaluation evaluation/.venv/bin/python evaluation/scripts/run_memory_ab.py \
   --dataset personalmem --phase full --mode normal --pair-id personalmem-32k-v1 \
-  --dataset-file data/personalmem/prepared/personalmem_32k.json \
-  --promotion-policy /absolute/path/personalmem-policy.json
+  --dataset-file data/personalmem/prepared/personalmem_32k_v1.json
 
 PYTHONPATH=evaluation evaluation/.venv/bin/python evaluation/scripts/run_memory_ab.py \
   --dataset personalmem --phase full --mode strict --pair-id personalmem-32k-v1 \
-  --dataset-file data/personalmem/prepared/personalmem_32k.json \
+  --dataset-file data/personalmem/prepared/personalmem_32k_v1.json \
   --promotion-policy /absolute/path/personalmem-policy.json
 ```
 
 运行其他 registry 时替换 `--dataset` 和数据文件即可；`--` 后面的参数会原样传给两臂。
-任何 arm 启动前，入口会运行并记录 Python suite、Rust workspace test、Clippy 和
-`git diff --check`。每个 arm 会在 `config.json` 中写入真实 SHA-256；strict 模式还会
-验证并记录 dataset-bound preflight。
+strict 模式在任何 arm 启动前运行并记录 Python suite、Rust workspace test、Clippy 和
+`git diff --check`，并验证 dataset-bound preflight；normal 模式不运行该重型门禁。
+每个 arm 都会在 `config.json` 中写入真实 SHA-256。
 
 制品位于 `evaluation/outputs/memory-ab/<dataset>/<phase>/<pair-id>/`，`raw/` 与
 `extracted/` 使用独立 store，目录还包含 `comparison.json` 和
-`comparison.html`。不完整 pair 永不写 history；完整 full pair 才按 raw、
-extracted 顺序追加到 `history/records/<dataset>.jsonl` 并重新生成 XLSX。晋级失败的完整
-full pair 仍以 failed 状态记录，但不能成为 baseline。在人工用真实 provider 完成受控
+`comparison.html`。完整 pair 还会在该目录生成 `history_record.json`，记录 raw/extracted
+两臂的配置、哈希、指标和晋级状态；该文件随运行制品保存，不自动写入仓库。晋级失败的
+完整 full pair 仍记录为 failed，但不能成为 baseline。在人工用真实 provider 完成受控
 full command 之前，不宣称 live 分数或晋级结果。
 
 ## 测试
