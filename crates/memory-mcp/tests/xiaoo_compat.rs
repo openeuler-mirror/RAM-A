@@ -36,6 +36,10 @@ async fn xiaoo_streamable_http_client_shares_memories_by_tenant_user_scope() {
         initialized["result"]["protocolVersion"],
         json!("2025-11-25")
     );
+    let instructions = initialized["result"]["instructions"].as_str().unwrap();
+    assert!(instructions.contains("finish diagnosis first"));
+    assert!(instructions.contains("ask the user to confirm"));
+    assert!(instructions.contains("after a later user message explicitly confirms"));
 
     let listed = call_session(
         &app,
@@ -57,7 +61,17 @@ async fn xiaoo_streamable_http_client_shares_memories_by_tenant_user_scope() {
     tool_names.sort();
     assert_eq!(
         tool_names,
-        vec!["memory_case_search", "memory_ingest", "memory_search"]
+        vec![
+            "memory_case_delete",
+            "memory_case_prepare_delete",
+            "memory_case_prepare_update",
+            "memory_case_prepare_upload",
+            "memory_case_search",
+            "memory_case_update",
+            "memory_case_upload",
+            "memory_ingest",
+            "memory_search"
+        ]
     );
     let case_description = listed["result"]["tools"]
         .as_array()

@@ -20,15 +20,14 @@ MEMORY_STORE="${MEMORY_CASES_QA_MEMORY_STORE:-${MEMORY_RAG_QA_MEMORY_STORE:-${TM
 PORT="${MEMORY_CASES_PORT:-${MEMORY_RAG_PORT:-$((20000 + RANDOM % 40000))}}"
 BASE_URL="http://127.0.0.1:${PORT}"
 API_LOG="${TMP_DIR}/api.log"
-INGESTOR_LOG="${TMP_DIR}/ingestor.log"
 API_PID=""
-INGESTOR_PID=""
+CONFIG_FILE="${TMP_DIR}/ram-a-mem.json"
 DATASET_ID="${MEMORY_CASES_QA_DATASET_ID:-${MEMORY_RAG_QA_DATASET_ID:-qa-eval-dataset}}"
 
 # 默认 chunk size 刻意设小一些，让“现象/根因/解决方案”更可能分散到不同 chunk。
 # 这样能测试文档级召回是否真的能把解决方案 chunk 一起带回来。
 CHUNK_SIZE="${MEMORY_CASES_QA_CHUNK_SIZE:-${MEMORY_RAG_QA_CHUNK_SIZE:-160}}"
-SERVER_ARGS=(--rag-store "$RAG_STORE" --memory-store "$MEMORY_STORE" --chunk-size "$CHUNK_SIZE")
+CASE_API_TOKEN="${MEMORY_CASES_API_TOKEN:-memory-cases-qa-eval-token}"
 DOC_FILES=()
 DOCUMENT_IDS=()
 TASK_IDS=()
@@ -37,11 +36,9 @@ solution_term_case_count=0
 
 cleanup() {
   set +e
-  # 脚本无论成功或失败都要停掉后台进程，避免端口和 ingestor 残留。
-  for pid in "$INGESTOR_PID" "$API_PID"; do
-    [[ -n "$pid" ]] && kill "$pid" 2>/dev/null
-    [[ -n "$pid" ]] && wait "$pid" 2>/dev/null
-  done
+  # API 和 ingestion 位于同一个 ram-a-mem 进程。
+  [[ -n "$API_PID" ]] && kill "$API_PID" 2>/dev/null
+  [[ -n "$API_PID" ]] && wait "$API_PID" 2>/dev/null
 
   # 默认清理临时 store 和日志；排查失败时可设置 MEMORY_CASES_QA_KEEP_TMP=1 保留现场。
   if [[ "${MEMORY_CASES_QA_KEEP_TMP:-${MEMORY_RAG_QA_KEEP_TMP:-0}}" == "1" ]]; then
@@ -54,19 +51,21 @@ trap cleanup EXIT
 
 fail() {
   echo "ERROR: $*" >&2
-  # 失败时打印 API 和 ingestor 最近日志，方便直接定位是启动、入库还是检索问题。
+  # 失败时打印统一服务日志，方便定位启动、入库或检索问题。
   echo "---- api log ----" >&2
   tail -n 80 "$API_LOG" >&2 2>/dev/null || true
-  echo "---- ingestor log ----" >&2
-  tail -n 80 "$INGESTOR_LOG" >&2 2>/dev/null || true
   exit 1
 }
 
-get() { curl --noproxy '*' -fsS "$BASE_URL$1"; }
+get() {
+  curl --noproxy '*' -fsS "$BASE_URL$1" \
+    -H "Authorization: Bearer ${CASE_API_TOKEN}"
+}
 
 # REST 调用的小封装，让下面的流程更像“测试步骤清单”。
 post_json() {
   curl --noproxy '*' -fsS "$BASE_URL$1" \
+    -H "Authorization: Bearer ${CASE_API_TOKEN}" \
     --json "$2"
 }
 
@@ -81,6 +80,7 @@ post_file() {
   mime_type="$(mime_type_for_file "$doc_file")"
 
   curl --noproxy '*' -fsS "$BASE_URL$path" \
+    -H "Authorization: Bearer ${CASE_API_TOKEN}" \
     --form-string "id=${document_id}" \
     --form-string "task_id=${task_id}" \
     --form-string "name=${doc_name}" \
@@ -96,13 +96,15 @@ put_file() {
   mime_type="$(mime_type_for_file "$doc_file")"
 
   curl --noproxy '*' -fsS -X PUT "$BASE_URL$path" \
+    -H "Authorization: Bearer ${CASE_API_TOKEN}" \
     --form-string "task_id=${task_id}" \
     --form-string "name=${doc_name}" \
     -F "file=@${doc_file};type=${mime_type}"
 }
 
 delete_path() {
-  curl --noproxy '*' -fsS -X DELETE "$BASE_URL$1"
+  curl --noproxy '*' -fsS -X DELETE "$BASE_URL$1" \
+    -H "Authorization: Bearer ${CASE_API_TOKEN}"
 }
 
 mime_type_for_file() {
@@ -208,31 +210,81 @@ print_config() {
   echo "solution_term_case_count=$solution_term_case_count"
 }
 
-build_memory_cases() {
+write_ram_a_config() {
+  cat >"$CONFIG_FILE" <<EOF
+{
+  "auth": {"tokens": [{
+    "token_env": "RAM_A_QA_EVAL_MCP_TOKEN",
+    "tenant_id": "tenant-local",
+    "user_id": "qa-eval",
+    "agent_id": "qa-eval",
+    "permissions": ["cases:read"]
+  }]},
+  "features": {"memory": {"enabled": false}, "case_library": {"enabled": true}},
+  "http": {
+    "bind_address": "127.0.0.1",
+    "port": ${PORT},
+    "allowed_origins": [],
+    "allowed_hosts": ["127.0.0.1:${PORT}"]
+  },
+  "storage": {"database_path": "${TMP_DIR}/ram-a-memory.sqlite"},
+  "providers": {
+    "api_key_env": "RAM_A_QA_EVAL_PROVIDER_KEY",
+    "base_url": "http://127.0.0.1:1/v1",
+    "embedding_provider": "hash",
+    "embedding_model": "hash",
+    "embedding_dimensions": 32,
+    "extractor_model": "unused",
+    "verifier_model": "unused"
+  },
+  "case_library": {
+    "rag_store": "${RAG_STORE}",
+    "index_store": "${MEMORY_STORE}",
+    "api_token_env": "MEMORY_CASES_API_TOKEN",
+    "ingestion_poll_ms": 100,
+    "embedding_provider": "hash",
+    "embedding_model": "hash",
+    "embedding_dimensions": 256,
+    "chunk_size": ${CHUNK_SIZE},
+    "default_library": "ops",
+    "libraries": [{
+      "name": "ops",
+      "dataset_id": "${DATASET_ID}",
+      "tenant_ids": ["tenant-local"]
+    }]
+  }
+}
+EOF
+}
+
+build_ram_a_mem() {
   # 先在前台完成编译，不把首次下载依赖或增量编译耗时计入 API 健康检查超时。
   # cargo run 会复用这里的构建产物，只需负责启动服务。
-  echo "building memory-cases"
+  echo "building ram-a-mem"
   (
     cd "$ROOT_DIR"
-    cargo build -p memory-cases --bin memory-cases
-  ) || fail "build memory-cases failed"
+    cargo build -p memory-mcp --bin ram-a-mem
+  ) || fail "build ram-a-mem failed"
 }
 
 start_api() {
-  # API 负责接收 dataset、document、search、chat 请求；日志写入临时目录。
+  # ram-a-mem 同时提供案例 API 和后台 ingestion；日志写入临时目录。
+  export MEMORY_CASES_API_TOKEN="$CASE_API_TOKEN"
+  export RAM_A_QA_EVAL_MCP_TOKEN="ram-a-qa-eval-mcp-token"
+  export RAM_A_QA_EVAL_PROVIDER_KEY="unused-provider-key"
   (
     cd "$ROOT_DIR"
-    cargo run -p memory-cases -- --api --bind "127.0.0.1:${PORT}" "${SERVER_ARGS[@]}"
+    cargo run -p memory-mcp --bin ram-a-mem -- --config "$CONFIG_FILE"
   ) >"$API_LOG" 2>&1 &
   API_PID="$!"
 
-  # 后台启动需要一点时间，这里轮询 /health，确认服务真的开始监听后再继续。
+  # 后台启动需要一点时间，这里轮询统一健康端点。
   for _ in $(seq 1 120); do
-    get /health >/dev/null 2>&1 && return
+    get /healthy >/dev/null 2>&1 && return
     kill -0 "$API_PID" 2>/dev/null || fail "api exited"
     sleep 0.25
   done
-  get /health >/dev/null || fail "api not healthy"
+  get /healthy >/dev/null || fail "api not healthy"
 }
 
 create_dataset() {
@@ -244,10 +296,8 @@ create_dataset() {
 }
 
 upload_documents() {
-  # 批量上传文档只创建入库任务；真正的解析和写入 memory-core 由 ingestor 完成。
-  # 这里先上传完再启动 ingestor，是为了让 QA 测试更稳定：
-  # 避免 API 写入上传任务时，ingestor 同时更新 task/chunk 导致业务 SQLite 写竞争。
-  # 真实部署中 ingestor 通常是常驻进程，可以早于文档上传启动。
+  # 批量上传文档只创建入库任务；真正的解析和写入 memory-core 由进程内 worker 完成。
+  # API 和 worker 会并发访问业务 SQLite，存储层负责写锁等待与重试。
   echo "uploading documents"
   local index=1
   local doc_file
@@ -269,22 +319,6 @@ upload_documents() {
   done
 }
 
-start_ingestor() {
-  # ingestor 消费 pending task：读取原文、切 chunk、写 rag_chunks 和 memory-core 索引库。
-  (
-    cd "$ROOT_DIR"
-    cargo run -p memory-cases -- --ingestor "${SERVER_ARGS[@]}" --poll-ms 100
-  ) >"$INGESTOR_LOG" 2>&1 &
-  INGESTOR_PID="$!"
-}
-
-stop_ingestor() {
-  [[ -n "$INGESTOR_PID" ]] || return 0
-  kill "$INGESTOR_PID" 2>/dev/null || true
-  wait "$INGESTOR_PID" 2>/dev/null || true
-  INGESTOR_PID=""
-}
-
 wait_for_task_completed() {
   local task_id="$1"
 
@@ -293,7 +327,7 @@ wait_for_task_completed() {
     task="$(get "/api/v1/tasks/${task_id}")"
     [[ "$task" == *'"status":"completed"'* ]] && return
     [[ "$task" == *'"status":"failed"'* ]] && fail "ingestion failed: $task"
-    kill -0 "$INGESTOR_PID" 2>/dev/null || fail "ingestor exited"
+    kill -0 "$API_PID" 2>/dev/null || fail "ram-a-mem exited"
     sleep 0.5
   done
 
@@ -323,7 +357,7 @@ wait_for_ingestion() {
       echo "pending ingestion tasks: ${#pending_tasks[@]}"
       last_pending_count="${#pending_tasks[@]}"
     fi
-    kill -0 "$INGESTOR_PID" 2>/dev/null || fail "ingestor exited"
+    kill -0 "$API_PID" 2>/dev/null || fail "ram-a-mem exited"
     sleep 0.5
   done
 
@@ -398,16 +432,9 @@ check_document_update_delete() {
   wait_for_task_completed "$create_task_id"
   assert_search_has_token "updatetestoldneedle"
 
-  # 暂停 ingestor 后更新，才能稳定验证“PUT 后、重入库前旧内容已清空，新内容尚未出现”。
-  stop_ingestor
+  # PUT 创建新的 ingestion task；内嵌 worker 会持续消费并替换旧索引。
   put_file "$update_task_id" "$new_file" "/api/v1/datasets/${DATASET_ID}/documents/${document_id}" \
     >/dev/null || fail "update document fixture failed"
-  chunks="$(get "/api/v1/datasets/${DATASET_ID}/documents/${document_id}/chunks")"
-  [[ "$chunks" == *'"total":0'* ]] || fail "expected chunks to be cleared after update: $chunks"
-  assert_search_missing_token "updatetestoldneedle"
-  assert_search_missing_token "updatetestnewneedle"
-
-  start_ingestor
   wait_for_task_completed "$update_task_id"
   assert_search_missing_token "updatetestoldneedle"
   assert_search_has_token "updatetestnewneedle"
@@ -426,11 +453,11 @@ main() {
   validate_inputs
   collect_doc_files
   print_config
-  build_memory_cases
+  write_ram_a_config
+  build_ram_a_mem
   start_api
   create_dataset
   upload_documents
-  start_ingestor
   wait_for_ingestion
   check_chunks
   run_cases

@@ -6,7 +6,7 @@
         "tenant_id": "tenant-local",
         "user_id": "alice",
         "agent_id": "xiaoo",
-        "permissions": ["memory:read", "memory:write", "cases:read"]
+        "permissions": ["memory:read", "memory:write", "cases:read", "cases:write"]
       }
     ]
   },
@@ -72,6 +72,8 @@
     "rag_store": "data/memory-cases.sqlite",
     "index_store": "data/memory-cases-index.sqlite",
     "source_dir": "crates/memory-cases/test/accuracy_docs",
+    "api_token_env": "RAM_A_CASES_ADMIN_TOKEN",
+    "ingestion_poll_ms": 1000,
     "embedding_provider": "hash",
     "embedding_model": "hash",
     "embedding_dimensions": 1024,

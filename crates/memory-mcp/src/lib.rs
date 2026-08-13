@@ -11,8 +11,10 @@ pub mod types;
 
 pub use auth::{Principal, TokenAuthenticator};
 pub use case_service::{
-    CaseReference, CaseSearchProvider, CaseSearchResponse, CaseServiceClient, CaseServiceError,
-    DisabledCaseSearchProvider, DynCaseSearchProvider, EmbeddedCaseSearchProvider,
+    CaseDeleteProposalResponse, CaseDocumentDeleteResponse, CaseDocumentMutationResponse,
+    CaseMutationProposalResponse, CaseReference, CaseSearchProvider, CaseSearchResponse,
+    CaseServiceClient, CaseServiceError, DisabledCaseSearchProvider, DynCaseSearchProvider,
+    EmbeddedCaseSearchProvider,
 };
 pub use config::{
     AuthConfig, CaseLibraryConfig, CaseLibraryFeatureConfig, CaseLibraryServiceConfig,
@@ -25,6 +27,10 @@ pub use idempotency::IdempotencyRepository;
 pub use mcp_server::{DynMemoryService, MemoryMcpServer};
 pub use service::{IngestResponse, MemoryService, SearchResponse, SearchResult, ServiceError};
 pub use types::{
-    CaseSearchRequest, IngestMessage, IngestRequest, SearchRequest, MAX_CASE_TOP_K,
-    MAX_INGEST_MESSAGES, MAX_MESSAGE_TEXT_CHARS, MAX_QUERY_CHARS, MAX_TOP_K,
+    CaseDocumentDeleteRequest, CaseDocumentUpdateRequest, CaseDocumentUploadRequest,
+    CaseMutationConfirmationRequest, CaseSearchRequest, IngestMessage, IngestRequest,
+    SearchRequest, MAX_CASE_DELETION_REASON_CHARS, MAX_CASE_DIAGNOSIS_CHARS,
+    MAX_CASE_DOCUMENT_CHARS, MAX_CASE_DOCUMENT_ID_CHARS, MAX_CASE_DOCUMENT_NAME_CHARS,
+    MAX_CASE_FILE_NAME_CHARS, MAX_CASE_TOP_K, MAX_INGEST_MESSAGES, MAX_MESSAGE_TEXT_CHARS,
+    MAX_QUERY_CHARS, MAX_TOP_K,
 };

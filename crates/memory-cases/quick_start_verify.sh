@@ -17,9 +17,8 @@ MEMORY_STORE="${MEMORY_CASES_MEMORY_STORE:-${TMP_DIR}/memory-cases-index.sqlite}
 PORT="${MEMORY_CASES_PORT:-$((20000 + RANDOM % 40000))}"
 BASE_URL="http://127.0.0.1:${PORT}"
 API_LOG="${TMP_DIR}/api.log"
-INGESTOR_LOG="${TMP_DIR}/ingestor.log"
 API_PID=""
-INGESTOR_PID=""
+CONFIG_FILE="${TMP_DIR}/ram-a-mem.json"
 CLEANED_UP=0
 
 DATASET_ID="${MEMORY_CASES_DATASET_ID:-quick-verify-dataset-${RUN_ID}}"
@@ -30,16 +29,7 @@ EMBEDDING_PROVIDER="${MEMORY_CASES_EMBEDDING_PROVIDER:-hash}"
 EMBEDDING_API_KEY_ENV="${MEMORY_CASES_EMBEDDING_API_KEY_ENV:-OPENAI_API_KEY}"
 EMBEDDING_BASE_URL="${MEMORY_CASES_EMBEDDING_BASE_URL:-https://api.openai.com/v1}"
 EMBEDDING_MODEL="${MEMORY_CASES_EMBEDDING_MODEL:-text-embedding-3-small}"
-SERVER_ARGS=(
-  --rag-store "$RAG_STORE"
-  --memory-store "$MEMORY_STORE"
-  --embedding-dimensions "$EMBEDDING_DIMENSIONS"
-  --embedding-provider "$EMBEDDING_PROVIDER"
-  --embedding-api-key-env "$EMBEDDING_API_KEY_ENV"
-  --embedding-base-url "$EMBEDDING_BASE_URL"
-  --embedding-model "$EMBEDDING_MODEL"
-  --chunk-size "$CHUNK_SIZE"
-)
+CASE_API_TOKEN="${MEMORY_CASES_API_TOKEN:-memory-cases-quick-verify-token}"
 
 DOC_FILES=()
 DOCUMENT_IDS=()
@@ -51,7 +41,7 @@ Usage:
   crates/memory-cases/quick_start_verify.sh [doc_dir]
 
 Purpose:
-  一键启动 memory-cases API 和 ingestor，导入指定目录中的文档，完成基础链路验证后进入交互问答循环。
+  一键启动集成案例 API 和后台 ingestion 的 ram-a-mem，导入文档并验证后进入交互问答循环。
 
 Environment:
   MEMORY_CASES_DOC_DIR       未传位置参数时使用的文档目录
@@ -80,15 +70,12 @@ cleanup() {
   [[ "$CLEANED_UP" == "1" ]] && return
   CLEANED_UP=1
 
-  # 清理过程中忽略二次中断，尽量保证后台 API/ingestor 都能被回收。
+  # 清理过程中忽略二次中断，尽量保证统一服务被回收。
   trap - EXIT
   trap '' INT TERM
 
-  # 退出时关闭两个后台进程，避免端口、SQLite 连接和轮询进程残留。
-  for pid in "$INGESTOR_PID" "$API_PID"; do
-    [[ -n "$pid" ]] && kill "$pid" 2>/dev/null
-    [[ -n "$pid" ]] && wait "$pid" 2>/dev/null
-  done
+  [[ -n "$API_PID" ]] && kill "$API_PID" 2>/dev/null
+  [[ -n "$API_PID" ]] && wait "$API_PID" 2>/dev/null
 
   # 默认清理临时目录；调试启动或入库问题时可设置 MEMORY_CASES_KEEP_TMP=1。
   if [[ "${MEMORY_CASES_KEEP_TMP:-0}" == "1" ]]; then
@@ -118,15 +105,17 @@ fail() {
   echo "ERROR: $*" >&2
   echo "---- api log ----" >&2
   tail -n 80 "$API_LOG" >&2 2>/dev/null || true
-  echo "---- ingestor log ----" >&2
-  tail -n 80 "$INGESTOR_LOG" >&2 2>/dev/null || true
   exit 1
 }
 
-get() { curl --noproxy '*' -fsS "$BASE_URL$1"; }
+get() {
+  curl --noproxy '*' -fsS "$BASE_URL$1" \
+    -H "Authorization: Bearer ${CASE_API_TOKEN}"
+}
 
 post_json() {
   curl --noproxy '*' -fsS "$BASE_URL$1" \
+    -H "Authorization: Bearer ${CASE_API_TOKEN}" \
     --json "$2"
 }
 
@@ -140,6 +129,7 @@ post_file() {
   mime_type="$(mime_type_for_file "$doc_file")"
 
   curl --noproxy '*' -fsS "$BASE_URL$path" \
+    -H "Authorization: Bearer ${CASE_API_TOKEN}" \
     --form-string "id=${document_id}" \
     --form-string "task_id=${task_id}" \
     --form-string "name=${doc_name}" \
@@ -209,40 +199,83 @@ print_config() {
   echo "chat_top_k=$CHAT_TOP_K"
 }
 
-build_memory_cases() {
+write_ram_a_config() {
+  cat >"$CONFIG_FILE" <<EOF
+{
+  "auth": {"tokens": [{
+    "token_env": "RAM_A_QUICK_VERIFY_MCP_TOKEN",
+    "tenant_id": "tenant-local",
+    "user_id": "quick-verify",
+    "agent_id": "quick-verify",
+    "permissions": ["cases:read"]
+  }]},
+  "features": {"memory": {"enabled": false}, "case_library": {"enabled": true}},
+  "http": {
+    "bind_address": "127.0.0.1",
+    "port": ${PORT},
+    "allowed_origins": [],
+    "allowed_hosts": ["127.0.0.1:${PORT}"]
+  },
+  "storage": {"database_path": "${TMP_DIR}/ram-a-memory.sqlite"},
+  "providers": {
+    "api_key_env": "RAM_A_QUICK_VERIFY_PROVIDER_KEY",
+    "base_url": "http://127.0.0.1:1/v1",
+    "embedding_provider": "hash",
+    "embedding_model": "hash",
+    "embedding_dimensions": 32,
+    "extractor_model": "unused",
+    "verifier_model": "unused"
+  },
+  "case_library": {
+    "rag_store": "${RAG_STORE}",
+    "index_store": "${MEMORY_STORE}",
+    "api_token_env": "MEMORY_CASES_API_TOKEN",
+    "ingestion_poll_ms": 100,
+    "embedding_provider": "${EMBEDDING_PROVIDER}",
+    "embedding_api_key_env": "${EMBEDDING_API_KEY_ENV}",
+    "embedding_base_url": "${EMBEDDING_BASE_URL}",
+    "embedding_model": "${EMBEDDING_MODEL}",
+    "embedding_dimensions": ${EMBEDDING_DIMENSIONS},
+    "chunk_size": ${CHUNK_SIZE},
+    "default_library": "ops",
+    "libraries": [{
+      "name": "ops",
+      "dataset_id": "${DATASET_ID}",
+      "tenant_ids": ["tenant-local"]
+    }]
+  }
+}
+EOF
+}
+
+build_ram_a_mem() {
   # 先在前台完成编译，不把首次下载依赖或增量编译耗时计入 API 健康检查超时。
   # cargo run 会复用这里的构建产物，只需负责启动服务。
-  echo "building memory-cases"
+  echo "building ram-a-mem"
   (
     cd "$ROOT_DIR"
-    cargo build -p memory-cases --bin memory-cases
-  ) || fail "build memory-cases failed"
+    cargo build -p memory-mcp --bin ram-a-mem
+  ) || fail "build ram-a-mem failed"
 }
 
 start_api() {
-  # API 负责接收 dataset、document、search、chat 请求。
+  # ram-a-mem 同时提供案例 API，并在进程内持续消费 ingestion task。
+  export MEMORY_CASES_API_TOKEN="$CASE_API_TOKEN"
+  export RAM_A_QUICK_VERIFY_MCP_TOKEN="ram-a-quick-verify-mcp-token"
+  export RAM_A_QUICK_VERIFY_PROVIDER_KEY="unused-provider-key"
   (
     cd "$ROOT_DIR"
-    cargo run -p memory-cases -- --api --bind "127.0.0.1:${PORT}" "${SERVER_ARGS[@]}"
+    cargo run -p memory-mcp --bin ram-a-mem -- --config "$CONFIG_FILE"
   ) >"$API_LOG" 2>&1 &
   API_PID="$!"
 
-  # 后台启动需要一点时间；轮询 /health，确认服务真的开始监听。
+  # 后台启动需要一点时间；轮询统一健康端点。
   for _ in $(seq 1 120); do
-    get /health >/dev/null 2>&1 && return
+    get /healthy >/dev/null 2>&1 && return
     kill -0 "$API_PID" 2>/dev/null || fail "api exited"
     sleep 0.25
   done
-  get /health >/dev/null || fail "api not healthy"
-}
-
-start_ingestor() {
-  # ingestor 常驻轮询 pending task，负责解析原文、切 chunk、写业务 SQLite 和 memory-core 索引库。
-  (
-    cd "$ROOT_DIR"
-    cargo run -p memory-cases -- --ingestor "${SERVER_ARGS[@]}" --poll-ms 100
-  ) >"$INGESTOR_LOG" 2>&1 &
-  INGESTOR_PID="$!"
+  get /healthy >/dev/null || fail "api not healthy"
 }
 
 create_dataset() {
@@ -264,7 +297,7 @@ PY
 }
 
 upload_documents() {
-  # 上传文档会创建入库任务；ingestor 可并发消费这些任务，存储层负责等待和重试 SQLite 写锁。
+  # 上传文档会创建入库任务；进程内 worker 会并发消费，存储层负责等待和重试 SQLite 写锁。
   echo "uploading documents"
   local index=1
   local doc_file
@@ -308,7 +341,7 @@ wait_for_ingestion() {
       echo "pending ingestion tasks: ${#pending_tasks[@]}"
       last_pending_count="${#pending_tasks[@]}"
     fi
-    kill -0 "$INGESTOR_PID" 2>/dev/null || fail "ingestor exited"
+    kill -0 "$API_PID" 2>/dev/null || fail "ram-a-mem exited"
     sleep 0.5
   done
 
@@ -411,9 +444,9 @@ main() {
   validate_inputs "$@"
   collect_doc_files
   print_config
-  build_memory_cases
+  write_ram_a_config
+  build_ram_a_mem
   start_api
-  start_ingestor
   create_dataset
   upload_documents
   wait_for_ingestion

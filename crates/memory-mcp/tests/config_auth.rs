@@ -2,8 +2,10 @@ use std::fs;
 use std::path::PathBuf;
 
 use memory_mcp::{
-    AuthConfig, CaseLibraryConfig, CaseSearchRequest, CaseServiceConfig, IngestMessage,
-    IngestRequest, Principal, SearchRequest, ServerConfig, TokenAuthenticator, TokenConfig,
+    AuthConfig, CaseDocumentDeleteRequest, CaseDocumentUpdateRequest, CaseDocumentUploadRequest,
+    CaseLibraryConfig, CaseMutationConfirmationRequest, CaseSearchRequest, CaseServiceConfig,
+    IngestMessage, IngestRequest, Principal, SearchRequest, ServerConfig, TokenAuthenticator,
+    TokenConfig,
 };
 use schemars::schema_for;
 use serde_json::json;
@@ -67,8 +69,24 @@ fn tool_inputs_exclude_caller_supplied_identity_fields() {
     let ingest_schema = serde_json::to_string(&schema_for!(IngestRequest)).unwrap();
     let search_schema = serde_json::to_string(&schema_for!(SearchRequest)).unwrap();
     let case_search_schema = serde_json::to_string(&schema_for!(CaseSearchRequest)).unwrap();
+    let case_upload_schema =
+        serde_json::to_string(&schema_for!(CaseDocumentUploadRequest)).unwrap();
+    let case_update_schema =
+        serde_json::to_string(&schema_for!(CaseDocumentUpdateRequest)).unwrap();
+    let case_confirmation_schema =
+        serde_json::to_string(&schema_for!(CaseMutationConfirmationRequest)).unwrap();
+    let case_delete_schema =
+        serde_json::to_string(&schema_for!(CaseDocumentDeleteRequest)).unwrap();
 
-    for schema in [&ingest_schema, &search_schema, &case_search_schema] {
+    for schema in [
+        &ingest_schema,
+        &search_schema,
+        &case_search_schema,
+        &case_upload_schema,
+        &case_update_schema,
+        &case_confirmation_schema,
+        &case_delete_schema,
+    ] {
         assert!(!schema.contains("tenant_id"));
         assert!(!schema.contains("user_id"));
         assert!(!schema.contains("scope_id"));
@@ -266,6 +284,64 @@ fn case_search_rejects_blank_or_oversized_queries_and_unbounded_results() {
     assert!(oversized.validate().is_err());
     assert!(zero.validate().is_err());
     assert!(too_many.validate().is_err());
+}
+
+#[test]
+fn case_document_mutations_accept_safe_text_files_and_reject_unsafe_content() {
+    let upload = CaseDocumentUploadRequest {
+        library: Some("ops".to_owned()),
+        document_id: Some("case-1".to_owned()),
+        file_name: "dns-failure.md".to_owned(),
+        name: Some("DNS failure".to_owned()),
+        diagnosis_summary: "The resolver was using a stale cached record.".to_owned(),
+        content: "# DNS failure\n\nFlush the resolver cache.".to_owned(),
+    };
+    assert!(upload.validate().is_ok());
+
+    let mut path_traversal = upload.clone();
+    path_traversal.file_name = "../dns-failure.md".to_owned();
+    assert!(path_traversal.validate().is_err());
+    let mut unsafe_document_id = upload.clone();
+    unsafe_document_id.document_id = Some("../dns-case".to_owned());
+    assert!(unsafe_document_id.validate().is_err());
+    let mut unsupported = upload.clone();
+    unsupported.file_name = "dns-failure.pdf".to_owned();
+    assert!(unsupported.validate().is_err());
+    let mut empty = upload.clone();
+    empty.content = " \n".to_owned();
+    assert!(empty.validate().is_err());
+    let mut missing_diagnosis = upload.clone();
+    missing_diagnosis.diagnosis_summary = " \n".to_owned();
+    assert!(missing_diagnosis.validate().is_err());
+
+    let update = CaseDocumentUpdateRequest {
+        library: None,
+        document_id: "case-1".to_owned(),
+        file_name: "dns-failure.txt".to_owned(),
+        name: None,
+        diagnosis_summary: "The old recovery procedure was incomplete.".to_owned(),
+        content: "Updated resolver procedure".to_owned(),
+    };
+    assert!(update.validate().is_ok());
+
+    let delete = CaseDocumentDeleteRequest {
+        library: Some("ops".to_owned()),
+        document_id: "case-1".to_owned(),
+        deletion_reason: "The case is obsolete and its remediation is unsafe.".to_owned(),
+    };
+    assert!(delete.validate().is_ok());
+    let mut missing_reason = delete.clone();
+    missing_reason.deletion_reason = " \n".to_owned();
+    assert!(missing_reason.validate().is_err());
+
+    let confirmed = CaseMutationConfirmationRequest {
+        confirmation_token: "ad0db7f0-a00f-4d74-aaf5-b2fbda36df20".to_owned(),
+        user_confirmed: true,
+    };
+    assert!(confirmed.validate().is_ok());
+    let mut unconfirmed = confirmed;
+    unconfirmed.user_confirmed = false;
+    assert!(unconfirmed.validate().is_err());
 }
 
 #[test]

@@ -484,6 +484,40 @@ impl RagRepository {
         })
     }
 
+    pub fn recover_running_tasks(&self) -> Result<usize> {
+        retry_sqlite_locked(|| {
+            let mut connection = open_connection(&self.path)?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let now = current_time_ms();
+
+            transaction.execute(
+                r#"
+                UPDATE rag_documents
+                SET status = 'uploaded', error = NULL, updated_at_ms = ?1
+                WHERE id IN (
+                    SELECT document_id
+                    FROM rag_tasks
+                    WHERE status IN ('running', 'failed')
+                )
+                "#,
+                params![now as i64],
+            )?;
+            let recovered = transaction.execute(
+                r#"
+                UPDATE rag_tasks
+                SET status = 'pending', error = NULL, updated_at_ms = ?1,
+                    started_at_ms = NULL, completed_at_ms = NULL
+                WHERE status IN ('running', 'failed')
+                "#,
+                params![now as i64],
+            )?;
+            transaction.commit()?;
+
+            Ok(recovered)
+        })
+    }
+
     pub fn get_stored_document(&self, document_id: &str) -> Result<Option<StoredDocument>> {
         retry_sqlite_locked(|| {
             let connection = open_connection(&self.path)?;
@@ -1050,6 +1084,66 @@ mod tests {
             .list_chunks("dataset-1", "doc-1")
             .expect("list chunks")
             .is_empty());
+
+        remove_repo_files(&path);
+    }
+
+    #[test]
+    fn recover_running_and_failed_tasks_returns_incomplete_work_to_pending() {
+        let (repo, path) = test_repo();
+        repo.create_dataset(Some("dataset-1"), "Dataset", None)
+            .expect("create dataset");
+        repo.create_document_with_task(
+            "dataset-1",
+            DocumentMutation {
+                document_id: Some("doc-1"),
+                task_id: Some("task-1"),
+                name: "doc.md",
+                file_path: "/tmp/doc.md",
+                mime_type: Some("text/markdown"),
+                size_bytes: 12,
+            },
+        )
+        .expect("create document");
+
+        let leased = repo
+            .lease_next_pending_task()
+            .expect("lease task")
+            .expect("pending task");
+        assert_eq!(leased.status, "running");
+
+        assert_eq!(repo.recover_running_tasks().expect("recover task"), 1);
+        let recovered = repo
+            .get_task("task-1")
+            .expect("get recovered task")
+            .expect("recovered task");
+        assert_eq!(recovered.status, "pending");
+        assert_eq!(recovered.started_at_ms, None);
+
+        let document = repo
+            .list_documents("dataset-1")
+            .expect("list documents")
+            .into_iter()
+            .next()
+            .expect("document");
+        assert_eq!(document.status, "uploaded");
+        assert_eq!(
+            repo.lease_next_pending_task()
+                .expect("lease recovered task")
+                .expect("recovered pending task")
+                .id,
+            "task-1"
+        );
+
+        repo.fail_task("task-1", "doc-1", "embedding provider returned HTTP 429")
+            .expect("mark task failed");
+        assert_eq!(repo.recover_running_tasks().expect("recover failed task"), 1);
+        let retried = repo
+            .lease_next_pending_task()
+            .expect("lease retried task")
+            .expect("failed task returned to pending");
+        assert_eq!(retried.id, "task-1");
+        assert_eq!(retried.status, "running");
 
         remove_repo_files(&path);
     }

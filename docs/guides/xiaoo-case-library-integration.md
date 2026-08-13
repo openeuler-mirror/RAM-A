@@ -8,7 +8,7 @@
 ```text
 xiaoO
   -> MCP tools/list / tools/call
-  -> ram-a-mem: memory_case_search(query, library?, top_k?)
+  -> ram-a-mem: memory_case_search / memory_case_prepare_* / memory_case_*
   -> tenant + library allowlist 映射为私有 dataset_id
   -> ram-a-mem 内置案例库检索
   -> 独立的案例业务库、检索索引和原文目录
@@ -52,6 +52,13 @@ RAM-A 服务端不会主动判断用户意图或自动触发工具。xiaoO 建�
 
 回答时以工具返回的案例引用为主要依据，并列出工具返回的来源名称。如果工具没有
 返回相关案例或调用失败，需要先说明这一点，再补充通用排障建议。
+
+诊断没有完成时禁止上传、更新或删除。诊断完成后，先向用户说明诊断结论；如果需要沉淀
+案例，调用 `memory_case_prepare_upload` 或 `memory_case_prepare_update`。向用户展示
+返回的提案并询问是否确认。如果案例已经过时、不安全或用户明确要求移除，调用
+`memory_case_prepare_delete` 并展示目标案例和删除原因。询问后结束本轮。只有用户在
+后续消息中明确确认该提案后，才能把一次性 `confirmation_token` 和
+`user_confirmed=true` 传给对应的最终工具。
 ```
 
 仓库中也提供了可复制片段：
@@ -96,13 +103,73 @@ RAM-A 会移除内部 `dataset_id` 和原始 `source_path`，并将单个引用�
 4000 字符。案例库不可用时返回 `CASE_UNAVAILABLE`（可重试）；未配置、越权或
 检索结果无效会返回对应的结构化工具错误。
 
+## 案例上传、更新和删除确认流程
+
+写操作使用两阶段工具，准备阶段不会写 SQLite，也不会创建 dataset 或文档：
+
+```text
+诊断完成
+  -> memory_case_prepare_upload / memory_case_prepare_update / memory_case_prepare_delete
+  -> xiaoO 展示提案并询问用户，然后结束本轮
+  -> 用户在后续消息中明确确认
+  -> memory_case_upload / memory_case_update / memory_case_delete
+  -> 上传/更新由 worker 完成索引；删除立即清理案例及索引
+```
+
+准备上传的参数示例：
+
+```json
+{
+  "library": "ops",
+  "document_id": "dns-cache-stale",
+  "file_name": "dns-cache-stale.md",
+  "name": "DNS 缓存过期导致解析异常",
+  "diagnosis_summary": "确认本地解析器持有过期记录，刷新缓存后恢复。",
+  "content": "# 现象\n...\n# 根因\n...\n# 处理步骤\n..."
+}
+```
+
+更新使用相同字段，但 `document_id` 必填。准备工具返回提案摘要、正文预览、正文
+SHA-256、十分钟有效的 `confirmation_token`。
+
+准备删除只需要确定的文档 ID 和删除原因：
+
+```json
+{
+  "library": "ops",
+  "document_id": "dns-cache-stale",
+  "deletion_reason": "该案例已经过时，继续推荐会产生错误操作。"
+}
+```
+
+准备删除不会移除任何内容；确认删除会同步清理原文、ingestion tasks、chunks 和
+检索记录。
+
+三种操作都只有在用户后续明确确认后，才调用对应的最终工具：
+
+```json
+{
+  "confirmation_token": "准备工具返回的一次性 token",
+  "user_confirmed": true
+}
+```
+
+token 与 tenant、user、agent 和操作类型绑定，只能使用一次；`false`、跨身份使用、
+工具类型不匹配、重复使用或过期都会被拒绝。待确认提案只保存在 `ram-a-mem` 进程
+内存中，服务重启后需要重新准备并再次询问。MCP 本身无法证明一句确认是否真的来自
+人类，因此服务端强制两阶段和一次性 token，xiaoO 提示词负责只在收到后续明确确认
+时提交 `user_confirmed=true`。
+
 ## RAM-A 服务配置
 
 给 xiaoO 的 RAM-A token 增加权限：
 
 ```json
-"permissions": ["memory:read", "memory:write", "cases:read"]
+"permissions": ["memory:read", "memory:write", "cases:read", "cases:write"]
 ```
+
+如果只允许 xiaoO 查询，不允许变更案例，请去掉 `cases:write`；准备工具和最终变更
+工具都会在 HTTP 权限层被拒绝。
 
 在 `ram-a-mem` JSON 中打开 RAM-A 长期记忆和案例库 MCP 工具：
 
@@ -124,6 +191,8 @@ RAM-A 会移除内部 `dataset_id` 和原始 `source_path`，并将单个引用�
   "rag_store": "data/memory-cases.sqlite",
   "index_store": "data/memory-cases-index.sqlite",
   "source_dir": "crates/memory-cases/test/accuracy_docs",
+  "api_token_env": "RAM_A_CASES_ADMIN_TOKEN",
+  "ingestion_poll_ms": 1000,
   "embedding_provider": "hash",
   "embedding_model": "hash",
   "embedding_dimensions": 1024,
@@ -157,6 +226,7 @@ RAM-A 会移除内部 `dataset_id` 和原始 `source_path`，并将单个引用�
 
 ```bash
 export RAM_A_XIAOO_TOKEN='replace-with-token'
+export RAM_A_CASES_ADMIN_TOKEN='replace-with-a-separate-admin-token'
 export LLM_API_KEY='replace-with-model-key'
 cargo run -p memory-mcp --bin ram-a-mem
 ```

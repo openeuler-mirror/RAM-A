@@ -19,6 +19,6 @@ retry_backoff_ms = 250
 allowed_agent_roles = ["main", "defaultagent"]
 
 # If your xiaoO deployment supports a global system prompt, role prompt, or demo prompt,
-# add the instruction from ./case-tool-instruction.md so troubleshooting and case-lookup
-# questions prefer the RAM-A `memory_case_search` MCP tool before answering from general
-# model knowledge.
+# add the instruction from ./case-tool-instruction.md. It makes troubleshooting and
+# case-lookup questions prefer `memory_case_search`, and requires xiaoO to show a prepared
+# case proposal and wait for an explicit user confirmation before upload, update, or delete.
