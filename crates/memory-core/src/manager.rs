@@ -511,12 +511,12 @@ impl MemoryManager {
             let candidates = self
                 .fuse_optional_graph_channel(&request, candidates, result_limit)
                 .await
-                .inspect_err(|_error| {
+                .inspect_err(|error| {
                     tracing::error!(
                         event = "ram_a.memory.search.stage.failed",
                         stage = "graph_augment",
                         error_code = "GRAPH_RETRIEVE_FAILED",
-                        retriable = true,
+                        retriable = graph_retrieval_error_retriable(error),
                         elapsed_ms = stage_started.elapsed().as_millis() as u64
                     );
                 })?;
@@ -1442,6 +1442,13 @@ fn current_time_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn graph_retrieval_error_retriable(error: &MemoryError) -> bool {
+    !matches!(
+        error,
+        MemoryError::InvalidInput { .. } | MemoryError::StoreBackend { .. } | MemoryError::Json(_)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1452,6 +1459,23 @@ mod tests {
     use async_trait::async_trait;
     use std::any::Any;
     use std::sync::Mutex;
+
+    #[test]
+    fn graph_retrieval_configuration_errors_are_not_retriable() {
+        assert!(!graph_retrieval_error_retriable(
+            &MemoryError::InvalidInput {
+                message: "missing graph memory space".to_string(),
+            }
+        ));
+        assert!(!graph_retrieval_error_retriable(
+            &MemoryError::StoreBackend {
+                message: "sqlite required".to_string(),
+            }
+        ));
+        assert!(graph_retrieval_error_retriable(&MemoryError::Embedding {
+            message: "provider timed out".to_string(),
+        }));
+    }
 
     struct StaticEmbedding {
         vector: Vec<f32>,

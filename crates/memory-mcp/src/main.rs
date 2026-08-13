@@ -249,8 +249,8 @@ async fn main() -> Result<()> {
             let imported = import_documents_from_dir(&case_service, default_dataset_id, source_dir)
                 .instrument(ingestion_span)
                 .await
-                .inspect_err(|_error| {
-                    tracing::error!(event = "ram_a.case.ingestion.failed", startup_run_id = %startup_run_id, dataset_id = default_dataset_id, error_kind = "import", retriable = true, latency_ms = ingestion_started.elapsed().as_millis() as u64);
+                .inspect_err(|error| {
+                    tracing::error!(event = "ram_a.case.ingestion.failed", startup_run_id = %startup_run_id, dataset_id = default_dataset_id, error_kind = memory_cases::service::observable_error_kind(error), error = memory_cases::service::observable_error_summary(error), retriable = memory_cases::service::ingestion_error_retriable(error), latency_ms = ingestion_started.elapsed().as_millis() as u64);
                 })
                 .context("failed to import configured case library documents")?;
             tracing::info!(event = "ram_a.case.ingestion.completed", startup_run_id = %startup_run_id, dataset_id = default_dataset_id, document_count = imported, latency_ms = ingestion_started.elapsed().as_millis() as u64);

@@ -232,7 +232,7 @@ impl MemoryMcpServer {
             let result = tokio::select! {
                 biased;
                 _ = self.cancellation_token.cancelled() => {
-                    tracing::warn!(event = "ram_a.case.search.failed", error_code = "CANCELLED", retriable = true, latency_ms = started.elapsed().as_millis() as u64);
+                    tracing::warn!(event = "ram_a.case.search.failed", stage = "cancelled", error_code = "CANCELLED", retriable = true, latency_ms = started.elapsed().as_millis() as u64);
                     return tool_error("CANCELLED", true);
                 }
                 result = self.case_search.search(principal, request) => result,
@@ -245,7 +245,7 @@ impl MemoryMcpServer {
                     )
                 }
                 Err(error) => {
-                    tracing::error!(event = "ram_a.case.search.failed", error_code = error.code(), retriable = error.retriable(), latency_ms = started.elapsed().as_millis() as u64);
+                    tracing::error!(event = "ram_a.case.search.failed", stage = "service", error_code = error.code(), retriable = error.retriable(), latency_ms = started.elapsed().as_millis() as u64);
                     case_service_error(error)
                 }
             }

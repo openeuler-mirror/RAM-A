@@ -317,7 +317,7 @@ augmentation, rerank, filtering, and response completion.
 
 Each stage uses one of these stable event names:
 
-- `ram_a.memory.ingest.stage.started|completed|failed`
+- `ram_a.memory.ingest.stage.started|completed|failed|window_skipped`
 - `ram_a.memory.search.stage.started|completed|failed`
 - `ram_a.provider.retry|failed`
 - `ram_a.case.ingestion.started|completed|failed`
@@ -327,6 +327,8 @@ The latest event for a `request_id` shows the currently running or last failed s
 include elapsed time and counts where available. Logs never include API credentials, query text,
 memory text, or provider response bodies. Successful ingest events include generated record IDs;
 case task events include `task_id`, `dataset_id`, and `document_id` for operational correlation.
+`window_skipped` is emitted only for fail-open extraction or verification errors where the
+pipeline continues; `failed` means the current ingest operation stops.
 
 ## Storage boundary
 
