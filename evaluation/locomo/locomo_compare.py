@@ -15,6 +15,7 @@ sys.path.insert(0, str(EVALUATION_ROOT))
 from common.memory_ab import canonical_sha256, file_sha256
 from common.memory_ab_compare import (
     build_history_records,
+    history_configuration,
     remove_stale_history_artifact,
     resolve_history_artifact_path,
 )
@@ -39,6 +40,21 @@ FULL_THRESHOLDS = {
     "3": 0.2717,
     "4": 0.4509,
 }
+
+
+def _matching_mode(raw: dict[str, Any], treatment: dict[str, Any]) -> str:
+    raw_mode = raw.get("mode", "strict")
+    treatment_mode = treatment.get("mode", "strict")
+    if raw_mode != treatment_mode or raw_mode not in {"normal", "strict"}:
+        raise ValueError("raw/treatment mode mismatch")
+    return str(raw_mode)
+
+
+def _validate_governance_mode(mode: str, policy: dict[str, Any] | None) -> None:
+    if mode == "strict" and policy is None:
+        raise ValueError("strict comparison requires a promotion policy")
+    if mode == "normal" and policy is not None:
+        raise ValueError("normal comparison must not receive a promotion policy")
 
 
 def promotion_policy_manifest() -> dict[str, Any]:
@@ -77,12 +93,23 @@ def validate_arm_contract(
         raise ValueError("fresh raw config does not declare memory_mode raw")
     if treatment_config.get("memory_mode") != "extracted":
         raise ValueError("treatment config does not declare memory_mode extracted")
+    normal_mode = (
+        raw_config.get("mode") == "normal"
+        and treatment_config.get("mode") == "normal"
+    )
     for key, label in (
         ("source_hash", "source hash"),
         ("configuration_hash", "configuration hash"),
         ("implementation_hash", "implementation hash"),
         ("preflight_hash", "preflight hash"),
     ):
+        if (
+            key == "preflight_hash"
+            and normal_mode
+            and not raw_config.get(key)
+            and not treatment_config.get(key)
+        ):
+            continue
         if not raw_config.get(key) or raw_config.get(key) != treatment_config.get(key):
             raise ValueError(f"raw/treatment {label} mismatch")
     raw_queries = raw_prepared.get("queries")
@@ -121,7 +148,7 @@ def build_comparison(
     pipeline_stats: dict,
     config: dict,
 ) -> dict[str, Any]:
-    if phase not in {"pilot", "full"}:
+    if phase != "full":
         raise ValueError(f"unsupported comparison phase: {phase}")
     validate_paired_query_ids(raw_judged, treatment_judged)
 
@@ -146,7 +173,7 @@ def build_comparison(
         },
         "cost": _cost_summary(raw_judged, treatment_judged, pipeline_stats, config),
     }
-    checks = pilot_checks(report) if phase == "pilot" else promotion_checks(report)
+    checks = promotion_checks(report)
     report["promotion"] = {
         "passed": all(item["passed"] for item in checks),
         "checks": checks,
@@ -201,54 +228,6 @@ def promotion_checks(report: dict[str, Any]) -> list[dict[str, Any]]:
             True,
         )
     )
-    return checks
-
-
-def pilot_checks(report: dict[str, Any]) -> list[dict[str, Any]]:
-    raw = report["fresh_raw"]
-    treatment = report["treatment"]
-    pipeline = report.get("pipeline", {})
-    retrieval = report.get("retrieval", {}).get("treatment", {}).get("overall", {})
-    raw_score = raw["overall"]["llm_score"]
-    treatment_score = treatment["overall"]["llm_score"]
-    checks = [
-        _check(
-            "treatment_beats_raw",
-            treatment_score > raw_score,
-            treatment_score,
-            ">",
-            raw_score,
-        )
-    ]
-    shared_categories = sorted(
-        set(raw.get("by_category", {})) & set(treatment.get("by_category", {})),
-        key=int,
-    )
-    for category in shared_categories:
-        delta = (
-            treatment["by_category"][category]["llm_score"]
-            - raw["by_category"][category]["llm_score"]
-        )
-        checks.append(
-            _check(f"category_{category}_delta", delta >= -0.05, delta, ">=", -0.05)
-        )
-    window_count = int(pipeline.get("window_count") or 0)
-    empty_windows = int(pipeline.get("empty_extraction_windows") or 0)
-    raw_candidates = int(pipeline.get("raw_candidate_count") or 0)
-    quarantined = int(pipeline.get("quarantined_count") or 0)
-    supported = int(
-        (pipeline.get("grounding_status_counts") or {}).get("SUPPORTED") or 0
-    )
-    health = [
-        ("candidate_source_coverage", float(pipeline.get("candidate_source_coverage") or 0.0) == 1.0, pipeline.get("candidate_source_coverage"), "==", 1.0),
-        ("window_count", window_count > 0, window_count, ">", 0),
-        ("nonempty_windows", window_count > 0 and empty_windows < window_count, empty_windows, "<", window_count),
-        ("accepted_memory_count", int(pipeline.get("accepted_memory_count") or 0) > 0, pipeline.get("accepted_memory_count"), ">", 0),
-        ("quarantine_not_total", raw_candidates > 0 and quarantined < raw_candidates, quarantined, "<", raw_candidates),
-        ("supported_grounding", supported > 0, supported, ">", 0),
-        ("evidence_expansion", float(retrieval.get("avg_expanded_source_turns") or 0.0) > 0.0, retrieval.get("avg_expanded_source_turns"), ">", 0.0),
-    ]
-    checks.extend(_check(name, passed, actual, operator, threshold) for name, passed, actual, operator, threshold in health)
     return checks
 
 
@@ -421,6 +400,7 @@ def _common_history_records(report: dict[str, Any]) -> list[dict[str, Any]]:
         for check in report.get("promotion", {}).get("checks", [])
         if check.get("passed") is not True
     ]
+    governance_mode = report.get("governance_mode", "strict")
     policy = promotion_policy_manifest()
     common = {
         "dataset": "locomo",
@@ -429,15 +409,24 @@ def _common_history_records(report: dict[str, Any]) -> list[dict[str, Any]]:
         "pair_id": str(pair_id),
         "complete": True,
         "arm_contract": report["arm_contract"],
-        "policy_hash": report.get("policy_hash") or canonical_sha256(policy),
+        "policy_hash": (
+            report.get("policy_hash") or canonical_sha256(policy)
+            if governance_mode == "strict"
+            else None
+        ),
+        "governance_mode": governance_mode,
         "fresh_raw": _common_arm(raw_config, report["fresh_raw"], report, "raw"),
         "treatment": _common_arm(
             extracted_config, report["treatment"], report, "extracted"
         ),
-        "promotion": {
-            "passed": report["promotion"]["passed"],
-            "reasons": failed_checks,
-        },
+        "promotion": (
+            {"passed": None, "reasons": []}
+            if governance_mode == "normal"
+            else {
+                "passed": report["promotion"]["passed"],
+                "reasons": failed_checks,
+            }
+        ),
     }
     return build_history_records(common)
 
@@ -451,17 +440,6 @@ def _common_arm(
     run_dir = _required_text(config, "run_dir")
     run_id = config.get("run_id") or (
         f"locomo-{memory_mode}-" + canonical_sha256({"run_dir": run_dir})[:16]
-    )
-    compact_keys = (
-        "chat_model",
-        "embedding_model",
-        "embedding_dimensions",
-        "candidate_k",
-        "rerank_model",
-        "rerank_input_k",
-        "top_k",
-        "max_candidate_tokens",
-        "max_window_tokens",
     )
     metrics = {
         "qa": {
@@ -477,11 +455,7 @@ def _common_arm(
     }
     return {
         "run_id": str(run_id),
-        "configuration": {
-            key: config[key]
-            for key in compact_keys
-            if key in config and config[key] is not None
-        },
+        "configuration": history_configuration(config),
         "metrics": metrics,
         "artifact_path": run_dir,
     }
@@ -656,7 +630,7 @@ def _write_json_atomic(path: Path, value: Any) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Compare paired LoCoMo memory arms.")
-    parser.add_argument("--phase", choices=("pilot", "full"))
+    parser.add_argument("--phase", choices=("full",), default="full")
     parser.add_argument("--raw-dir", type=Path)
     parser.add_argument("--treatment-dir", type=Path)
     parser.add_argument("--output-json", type=Path)
@@ -686,17 +660,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     pipeline_stats = _read_json(args.treatment_dir / "artifacts" / "extraction_stats.json")
     raw_config = _read_json(args.raw_dir / "config.json")
     config = _read_json(args.treatment_dir / "config.json")
+    governance_mode = _matching_mode(raw_config, config)
     policy_hash = None
     if args.policy is not None:
         policy = _read_json(args.policy)
+        _validate_governance_mode(governance_mode, policy)
         if policy != promotion_policy_manifest():
-            raise ValueError("LoCoMo promotion policy does not match the frozen policy")
+            raise ValueError("LoCoMo promotion policy does not match the fixed policy")
         policy_hash = file_sha256(args.policy)
         if any(
             arm.get("promotion_policy_hash") != policy_hash
             for arm in (raw_config, config)
         ):
             raise ValueError("promotion policy hash does not match paired configs")
+    else:
+        _validate_governance_mode(governance_mode, None)
     raw_prepared = _read_json(args.raw_dir / "raw_prepared.json")
     treatment_prepared = _read_json(args.treatment_dir / "raw_prepared.json")
     contract = validate_arm_contract(
@@ -716,6 +694,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         pipeline_stats,
         config,
     )
+    report["governance_mode"] = governance_mode
+    if governance_mode == "normal":
+        report["promotion"] = {
+            "passed": None,
+            "checks": [],
+            "reasons": [],
+        }
     report["arm_contract"] = contract
     report["configuration"] = {
         "fresh_raw": raw_config,
@@ -729,8 +714,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         history_path,
         report,
     )
-    if args.phase == "pilot" and report["promotion"]["passed"]:
-        _write_json_atomic(args.output_json.parent / "frozen_config.json", config)
     return 0
 
 

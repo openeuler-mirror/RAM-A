@@ -27,7 +27,6 @@ from common.config import DATASET_DIR, OUTPUTS_DIR  # noqa: E402
 from common.memory_ab import (  # noqa: E402
     canonical_sha256,
     ensure_run_mode,
-    validate_frozen_manifest,
     validate_memory_ab_preflight,
 )
 from common.memory_ab_stage import run_stage  # noqa: E402
@@ -133,6 +132,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=64,
         help="Number of texts per embedding batch for add/search (default: 64)",
     )
+    parser.add_argument(
+        "--search-mode",
+        choices=("dense", "bm25", "hybrid", "graph"),
+        default="hybrid",
+    )
+    parser.add_argument("--embedding-weight", type=float, default=0.7)
+    parser.add_argument("--bm25-weight", type=float, default=0.3)
+    parser.add_argument("--candidate-k", type=int)
     parser.add_argument(
         "--graph",
         action="store_true",
@@ -266,9 +273,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--phase",
-        choices=("pilot", "full"),
-        default="pilot",
-        help="Experiment governance phase (default: pilot)",
+        choices=("full",),
+        default="full",
+        help="Experiment run phase (full benchmark)",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("normal", "strict"),
+        default="normal",
+        help="normal records the run; strict enables governance checks",
     )
     parser.add_argument(
         "--pipeline-phase",
@@ -277,7 +290,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Pipeline stages to run (default: retrieval)",
     )
     parser.add_argument("--pair-id", default="standalone")
-    parser.add_argument("--frozen-config", type=Path)
     parser.add_argument("--promotion-policy", type=Path)
     parser.add_argument("--preflight", type=Path)
     parser.add_argument("--extraction-model", default="openai/gpt-4o-mini")
@@ -358,39 +370,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Override auto-generated QA output tag (default: auto from model/prompt/k)",
     )
-    raw_argv = list(sys.argv[1:] if argv is None else argv)
-    rewritten, legacy_phase = _rewrite_legacy_phase(raw_argv)
-    if legacy_phase and any(
-        item == "--pipeline-phase" or item.startswith("--pipeline-phase=")
-        for item in raw_argv
-    ):
-        parser.error(
-            "legacy --phase retrieval|qa|all cannot be combined with "
-            "--pipeline-phase"
-        )
-    if legacy_phase:
-        print(
-            "[run] Warning: --phase retrieval|qa|all is deprecated; "
-            "use --pipeline-phase instead.",
-            file=sys.stderr,
-        )
-    return parser.parse_args(rewritten)
-
-
-def _rewrite_legacy_phase(argv: list[str]) -> tuple[list[str], bool]:
-    rewritten = list(argv)
-    legacy = False
-    for index, item in enumerate(rewritten):
-        if item == "--phase" and index + 1 < len(rewritten):
-            if rewritten[index + 1] in {"retrieval", "qa", "all"}:
-                rewritten[index] = "--pipeline-phase"
-                legacy = True
-        elif item.startswith("--phase="):
-            value = item.partition("=")[2]
-            if value in {"retrieval", "qa", "all"}:
-                rewritten[index] = f"--pipeline-phase={value}"
-                legacy = True
-    return rewritten, legacy
+    return parser.parse_args(sys.argv[1:] if argv is None else argv)
 
 
 def build_run_paths(args: argparse.Namespace) -> RunPaths:
@@ -421,15 +401,19 @@ def validate_experiment_args(args: argparse.Namespace) -> None:
         raise ValueError("--graph-build-concurrency must be at least 1")
     if args.max_graph_context_facts < 0:
         raise ValueError("--max-graph-context-facts must be at least 0")
-    if args.phase == "full" and args.frozen_config is None:
-        raise ValueError("--frozen-config is required for full runs")
-    if args.phase == "full" and args.promotion_policy is None:
+    mode = getattr(args, "mode", "normal")
+    if mode not in {"normal", "strict"}:
+        raise ValueError("--mode must be normal or strict")
+    if mode == "strict" and args.phase == "full" and args.promotion_policy is None:
         raise ValueError("--promotion-policy is required for full runs")
+    if mode == "normal" and args.promotion_policy is not None:
+        raise ValueError("--promotion-policy is only valid in strict mode")
     validate_rerank_config(
         enabled=args.rerank,
         provider=args.rerank_provider,
         input_k=args.rerank_input_k,
         timeout_ms=args.rerank_timeout_ms,
+        search_mode=args.search_mode,
     )
     validate_graph_search_config(
         graph=args.graph,
@@ -499,9 +483,14 @@ def immutable_experiment_manifest(
     return {
         "backend": args.backend,
         "embedding": args.embedding,
+        "api_key_env": args.api_key_env,
         "embedding_model": args.embedding_model,
         "embedding_dimensions": args.dimensions,
         "embedding_batch_size": args.embedding_batch_size,
+        "search_mode": args.search_mode,
+        "embedding_weight": args.embedding_weight,
+        "bm25_weight": args.bm25_weight,
+        "candidate_k": args.candidate_k,
         "retrieval_top_k": max(args.retrieval_top_k, args.qa_top_k),
         "graph": args.graph,
         "graph_build": args.graph_build,
@@ -528,6 +517,7 @@ def immutable_experiment_manifest(
         "rerank_fail_open": args.rerank_fail_open,
         "answerer_model": args.answerer_model,
         "judge_model": args.judge_model,
+        "llm_api_key_env": args.llm_api_key_env,
         "llm_base_url": args.llm_base_url,
         "llm_thinking": None if args.llm_thinking == "default" else args.llm_thinking,
         "qa_top_k": args.qa_top_k,
@@ -536,6 +526,7 @@ def immutable_experiment_manifest(
         "show_scores": args.show_scores,
         "extraction_model": args.extraction_model,
         "verifier_model": args.verifier_model,
+        "extraction_api_key_env": args.extraction_api_key_env,
         "extraction_base_url": args.extraction_base_url,
         "max_candidate_tokens": args.max_candidate_tokens,
         "max_window_tokens": args.max_window_tokens,
@@ -690,8 +681,6 @@ def main() -> None:
         implementation_digest,
         promotion_policy_digest,
     )
-    if args.phase == "full":
-        validate_frozen_manifest(immutable, args.frozen_config)
     preflight_digest = (
         validate_memory_ab_preflight(
             args.preflight,
@@ -725,6 +714,7 @@ def main() -> None:
         "source_path": str(dataset_path),
         "run_dir": str(run_dir),
         "phase": args.phase,
+        "mode": args.mode,
         "pipeline_phase": args.pipeline_phase,
         "memory_mode": args.memory_mode,
         "pair_id": args.pair_id,
@@ -739,6 +729,7 @@ def main() -> None:
         "extraction_cache_version": (
             args.extraction_cache_version or configuration_digest
         ),
+        "max_graph_context_facts": args.max_graph_context_facts,
         **immutable,
     }
     _write_json_atomic(run_dir / "config.json", public_config)
@@ -820,6 +811,10 @@ def main() -> None:
             api_key_env=args.api_key_env,
             batch_size=args.embedding_batch_size,
             top_k=retrieval_top_k,
+            search_mode=args.search_mode,
+            embedding_weight=args.embedding_weight,
+            bm25_weight=args.bm25_weight,
+            candidate_k=args.candidate_k,
             graph=args.graph,
             graph_build=args.graph_build,
             graph_build_concurrency=args.graph_build_concurrency,

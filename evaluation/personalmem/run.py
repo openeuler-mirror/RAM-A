@@ -49,7 +49,6 @@ from common.memory_ab import (  # noqa: E402
     ensure_run_mode,
     ensure_store_mode,
     file_sha256,
-    validate_frozen_manifest,
     validate_memory_ab_preflight,
 )
 from common.memory_ab_stage import run_stage  # noqa: E402
@@ -151,8 +150,6 @@ def main() -> int:
             implementation_digest,
             promotion_policy_digest,
         )
-        if args.phase == "full":
-            validate_frozen_manifest(immutable, args.frozen_config)
         preflight_digest = (
             validate_memory_ab_preflight(
                 args.preflight,
@@ -288,6 +285,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--top-k", default=10, type=int)
     parser.add_argument("--embedding", default="openrouter", choices=("openrouter", "hash"))
+    parser.add_argument("--api-key-env", default="OPENROUTER_API_KEY")
     parser.add_argument("--search-mode", default="hybrid", choices=("dense", "bm25", "hybrid"))
     parser.add_argument("--embedding-weight", default=0.7, type=float)
     parser.add_argument("--bm25-weight", default=0.3, type=float)
@@ -379,9 +377,15 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--phase",
-        choices=("pilot", "full"),
-        default="pilot",
-        help="Experiment governance phase.",
+        choices=("full",),
+        default="full",
+        help="Experiment run phase (full benchmark).",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("normal", "strict"),
+        default="normal",
+        help="normal records the run; strict enables governance checks.",
     )
     parser.add_argument(
         "--pipeline-phase",
@@ -399,7 +403,6 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         type=Path,
         help="Prepared dataset produced and indexed by the extracted arm.",
     )
-    parser.add_argument("--frozen-config", type=Path)
     parser.add_argument("--promotion-policy", type=Path)
     parser.add_argument("--preflight", type=Path)
     parser.add_argument("--extraction-model", default=DEFAULT_EXTRACTION_MODEL)
@@ -421,10 +424,13 @@ def validate_experiment_args(args: argparse.Namespace) -> None:
         raise ValueError("--graph-build-concurrency must be at least 1")
     if args.max_graph_context_facts < 0:
         raise ValueError("--max-graph-context-facts must be at least 0")
-    if args.phase == "full" and args.frozen_config is None:
-        raise ValueError("--frozen-config is required for full runs")
-    if args.phase == "full" and args.promotion_policy is None:
+    mode = getattr(args, "mode", "normal")
+    if mode not in {"normal", "strict"}:
+        raise ValueError("--mode must be normal or strict")
+    if mode == "strict" and args.phase == "full" and args.promotion_policy is None:
         raise ValueError("--promotion-policy is required for full runs")
+    if mode == "normal" and args.promotion_policy is not None:
+        raise ValueError("--promotion-policy is only valid in strict mode")
     validate_rerank_config(
         enabled=args.rerank,
         provider=args.rerank_provider,
@@ -458,6 +464,7 @@ def immutable_experiment_manifest(
         "backend": args.backend,
         "store_backend": args.store_backend,
         "embedding": args.embedding,
+        "api_key_env": args.api_key_env,
         "embedding_model": args.model,
         "embedding_dimensions": args.dimensions,
         "search_mode": args.search_mode,
@@ -489,6 +496,7 @@ def immutable_experiment_manifest(
         "rerank_timeout_ms": args.rerank_timeout_ms,
         "rerank_fail_open": args.rerank_fail_open,
         "answer_model": args.answer_model,
+        "answer_api_key_env": args.answer_api_key_env,
         "answer_base_url": args.answer_base_url,
         "context_token_budget": args.context_token_budget,
         "max_retries": args.max_retries,
@@ -498,6 +506,7 @@ def immutable_experiment_manifest(
         "gold_fields": args.gold_fields,
         "extraction_model": args.extraction_model,
         "verifier_model": args.verifier_model,
+        "extraction_api_key_env": args.extraction_api_key_env,
         "extraction_base_url": args.extraction_base_url,
         "max_candidate_tokens": args.max_candidate_tokens,
         "max_window_tokens": args.max_window_tokens,
@@ -574,6 +583,7 @@ def write_personalmem_arm_contract(
         "run_id": Path(args.run_dir).name,
         "artifact_path": str(args.run_dir),
         "phase": args.phase,
+        "mode": args.mode,
         "memory_mode": args.memory_mode,
         "pair_id": args.pair_id,
         "source_hash": file_sha256(source_path),
@@ -582,6 +592,7 @@ def write_personalmem_arm_contract(
         "promotion_policy_hash": args.promotion_policy_hash,
         "preflight_path": str(args.preflight) if args.preflight is not None else None,
         "preflight_hash": args.preflight_hash,
+        "max_graph_context_facts": args.max_graph_context_facts,
         **immutable,
     }
     _write_json_atomic(Path(args.run_dir) / "config.json", config)
@@ -698,7 +709,7 @@ def resolve_indexed_dataset(args: argparse.Namespace) -> Path:
     indexed_dataset = Path(args.indexed_dataset)
     run_root = Path(args.run_dir) if getattr(args, "run_dir", None) else indexed_dataset.parent
     artifacts = run_root / "artifacts"
-    configuration_hash = getattr(args, "configuration_hash", "personalmem-pilot-v1")
+    configuration_hash = getattr(args, "configuration_hash", "personalmem-full-v1")
     config = MemoryPipelineCommandConfig(
         project_root=Path(getattr(args, "repo_root", find_repo_root())),
         cache_dir=(
@@ -1563,6 +1574,8 @@ def bench_base_command(args: argparse.Namespace) -> list[str]:
         args.store_backend,
         "--embedding",
         args.embedding,
+        "--api-key-env",
+        args.api_key_env,
         "--search-mode",
         args.search_mode,
         "--embedding-weight",

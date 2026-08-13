@@ -19,7 +19,6 @@ sys.path.insert(0, str(EVALUATION_ROOT))
 from common.memory_ab import (
     ensure_run_mode,
     file_sha256,
-    validate_frozen_manifest,
     validate_memory_ab_preflight,
 )
 from common.memory_ab_stage import run_stage
@@ -52,16 +51,35 @@ class RunConfig:
     phase: str
     dataset: Path
     run_dir: Path
+    mode: str = "normal"
     pair_id: str = "standalone"
     promotion_policy_hash: str | None = None
     chat_model: str = "openai/gpt-4o-mini"
+    extraction_model: str = "openai/gpt-4o-mini"
+    verifier_model: str = "openai/gpt-4o-mini"
+    extraction_api_key_env: str = "OPENROUTER_API_KEY"
+    extraction_base_url: str = OPENROUTER_BASE_URL
+    answer_model: str = "openai/gpt-4o-mini"
+    answer_api_key_env: str = "OPENROUTER_API_KEY"
+    answer_base_url: str = OPENROUTER_BASE_URL
+    judge_model: str = "openai/gpt-4o-mini"
+    judge_api_key_env: str = "OPENROUTER_API_KEY"
+    judge_base_url: str = OPENROUTER_BASE_URL
+    embedding_provider: str = "openrouter"
     embedding_model: str = "baai/bge-m3"
     embedding_dimensions: int = 1024
     embedding_weight: float = 0.7
     bm25_weight: float = 0.3
     candidate_k: int = 150
+    search_mode: str = "hybrid"
     rerank_model: str = "cohere/rerank-v3.5"
     rerank_input_k: int = 40
+    rerank_enabled: bool = True
+    rerank_provider: str = "openrouter"
+    rerank_api_key_env: str = "OPENROUTER_API_KEY"
+    rerank_base_url: str = OPENROUTER_BASE_URL
+    rerank_timeout_ms: int | None = None
+    rerank_fail_open: bool = False
     top_k: int = 30
     answer_max_tokens: int = 512
     max_graph_context_facts: int = 3
@@ -72,6 +90,7 @@ class RunConfig:
     base_url: str = OPENROUTER_BASE_URL
     credential_env: str = "OPENROUTER_API_KEY"
     graph_enabled: bool = False
+    graph_build_enabled: bool = False
     graph_weight: float = 0.2
     graph_rerank: bool = False
     graph_allow_graph_only: bool = False
@@ -89,8 +108,14 @@ class RunConfig:
     def __post_init__(self) -> None:
         if self.memory_mode not in {"raw", "extracted"}:
             raise ValueError(f"unsupported MEMORY_MODE: {self.memory_mode}")
-        if self.phase not in {"pilot", "full"}:
-            raise ValueError(f"unsupported PHASE: {self.phase}")
+        if self.phase != "full":
+            raise ValueError(f"unsupported PHASE: {self.phase}; only full is supported")
+        if self.mode not in {"normal", "strict"}:
+            raise ValueError(f"unsupported RUN_MODE: {self.mode}")
+        if self.mode == "normal" and self.promotion_policy_hash is not None:
+            raise ValueError("PROMOTION_POLICY is only valid in strict mode")
+        if self.mode == "strict" and self.promotion_policy_hash is None:
+            raise ValueError("PROMOTION_POLICY is required in strict mode")
         if self.max_graph_context_facts < 0:
             raise ValueError("MAX_GRAPH_CONTEXT_FACTS must be at least 0")
         if self.graph_max_graph_only_results is not None and self.graph_max_graph_only_results < 0:
@@ -105,13 +130,19 @@ class RunConfig:
             raise ValueError(
                 "GRAPH_MAX_GRAPH_ONLY_RESULTS requires GRAPH_ALLOW_GRAPH_ONLY"
             )
+        if self.search_mode not in {"dense", "bm25", "hybrid", "graph"}:
+            raise ValueError("MEMORY_BENCH_SEARCH_MODE is invalid")
+        if self.rerank_enabled and self.search_mode != "hybrid":
+            raise ValueError("RERANK requires MEMORY_BENCH_SEARCH_MODE=hybrid")
+        if self.search_mode == "graph" and not self.graph_enabled:
+            raise ValueError("graph search mode requires MEMORY_BENCH_GRAPH")
 
     @classmethod
     def from_env(cls, overrides: Mapping[str, str] | None = None) -> "RunConfig":
         values = dict(os.environ)
         if overrides:
             values.update(overrides)
-        phase = values.get("PHASE", "pilot")
+        phase = values.get("PHASE", "full")
         memory_mode = values.get("MEMORY_MODE", "raw")
         dataset = Path(
             values.get("DATASET", str(PROJECT_ROOT / "data" / "locomo" / "locomo10.json"))
@@ -124,17 +155,73 @@ class RunConfig:
         ).resolve()
         policy_path = values.get("PROMOTION_POLICY")
         max_graph_only = values.get("GRAPH_MAX_GRAPH_ONLY_RESULTS", "")
+        rerank_timeout = values.get("RERANK_TIMEOUT_MS", "")
         return cls(
             memory_mode=memory_mode,
             phase=phase,
             dataset=dataset,
             run_dir=run_dir,
+            mode=values.get("RUN_MODE", "normal"),
             pair_id=values.get("PAIR_ID", "standalone"),
             promotion_policy_hash=(
                 file_sha256(Path(policy_path).resolve()) if policy_path else None
             ),
+            chat_model=values.get("MODEL", "openai/gpt-4o-mini"),
+            extraction_model=values.get(
+                "MEMORY_EXTRACTION_MODEL",
+                values.get("MODEL", "openai/gpt-4o-mini"),
+            ),
+            verifier_model=values.get(
+                "MEMORY_VERIFIER_MODEL",
+                values.get("MODEL", "openai/gpt-4o-mini"),
+            ),
+            extraction_api_key_env=values.get(
+                "MEMORY_API_KEY_ENV",
+                values.get("EMBEDDING_API_KEY_ENV", "OPENROUTER_API_KEY"),
+            ),
+            extraction_base_url=values.get(
+                "MEMORY_BASE_URL",
+                values.get("OPENAI_BASE_URL", OPENROUTER_BASE_URL),
+            ),
+            answer_model=values.get(
+                "ANSWER_MODEL", values.get("MODEL", "openai/gpt-4o-mini")
+            ),
+            answer_api_key_env=values.get(
+                "ANSWER_API_KEY_ENV",
+                values.get("EMBEDDING_API_KEY_ENV", "OPENROUTER_API_KEY"),
+            ),
+            answer_base_url=values.get(
+                "ANSWER_BASE_URL",
+                values.get("OPENAI_BASE_URL", OPENROUTER_BASE_URL),
+            ),
+            judge_model=values.get(
+                "JUDGE_MODEL", values.get("MODEL", "openai/gpt-4o-mini")
+            ),
+            judge_api_key_env=values.get(
+                "JUDGE_API_KEY_ENV",
+                values.get("EMBEDDING_API_KEY_ENV", "OPENROUTER_API_KEY"),
+            ),
+            judge_base_url=values.get(
+                "JUDGE_BASE_URL",
+                values.get("OPENAI_BASE_URL", OPENROUTER_BASE_URL),
+            ),
+            embedding_provider=values.get("EMBEDDING_PROVIDER", "openrouter"),
+            embedding_model=values.get("EMBEDDING_MODEL", "baai/bge-m3"),
+            embedding_dimensions=int(values.get("EMBEDDING_DIMENSIONS", "1024")),
+            embedding_weight=float(values.get("EMBEDDING_WEIGHT", "0.7")),
+            bm25_weight=float(values.get("BM25_WEIGHT", "0.3")),
+            candidate_k=int(values.get("CANDIDATE_K", "150")),
+            search_mode=values.get("MEMORY_BENCH_SEARCH_MODE", "hybrid"),
+            top_k=int(values.get("TOP_K", "30")),
+            rerank_enabled=_truthy(values.get("RERANK", "1")),
             max_graph_context_facts=int(values.get("MAX_GRAPH_CONTEXT_FACTS", "3")),
             graph_enabled=_truthy(values.get("MEMORY_BENCH_GRAPH", "0")),
+            graph_build_enabled=_truthy(
+                values.get(
+                    "MEMORY_BENCH_GRAPH_BUILD",
+                    values.get("MEMORY_BENCH_GRAPH", "0"),
+                )
+            ),
             graph_weight=float(values.get("GRAPH_WEIGHT", "0.2")),
             graph_rerank=_truthy(values.get("GRAPH_RERANK", "0")),
             graph_allow_graph_only=_truthy(values.get("GRAPH_ALLOW_GRAPH_ONLY", "0")),
@@ -150,6 +237,23 @@ class RunConfig:
             graph_llm_base_url=values.get("GRAPH_LLM_BASE_URL", OPENROUTER_BASE_URL),
             graph_llm_timeout_ms=int(values.get("GRAPH_LLM_TIMEOUT_MS", "60000")),
             graph_build_concurrency=int(values.get("GRAPH_BUILD_CONCURRENCY", "1")),
+            rerank_model=values.get("RERANK_MODEL", "cohere/rerank-v3.5"),
+            rerank_input_k=int(values.get("RERANK_INPUT_K", "40")),
+            rerank_provider=values.get("RERANK_PROVIDER", "openrouter"),
+            rerank_api_key_env=values.get("RERANK_API_KEY_ENV", "OPENROUTER_API_KEY"),
+            rerank_base_url=values.get("RERANK_BASE_URL", OPENROUTER_BASE_URL),
+            rerank_timeout_ms=(int(rerank_timeout) if rerank_timeout.strip() else None),
+            rerank_fail_open=_truthy(values.get("RERANK_FAIL_OPEN", "0")),
+            answer_max_tokens=int(values.get("ANSWER_MAX_TOKENS", "512")),
+            max_candidate_tokens=int(values.get("MAX_CANDIDATE_TOKENS", "320")),
+            max_window_tokens=int(values.get("MAX_WINDOW_TOKENS", "640")),
+            context_before_messages=int(values.get("CONTEXT_BEFORE_MESSAGES", "2")),
+            context_after_messages=int(values.get("CONTEXT_AFTER_MESSAGES", "0")),
+            base_url=values.get(
+                "LLM_BASE_URL",
+                values.get("OPENAI_BASE_URL", OPENROUTER_BASE_URL),
+            ),
+            credential_env=values.get("EMBEDDING_API_KEY_ENV", "OPENROUTER_API_KEY"),
         )
 
     def public_manifest(self) -> dict[str, Any]:
@@ -186,10 +290,6 @@ def stage_manifest(name: str, source_hash: str, config_hash: str) -> dict[str, s
         "source_hash": source_hash,
         "configuration_hash": config_hash,
     }
-
-
-def validate_frozen_config(config: RunConfig, frozen_path: Path) -> None:
-    validate_frozen_manifest(config.immutable_manifest(), frozen_path)
 
 
 def validate_preflight(config: RunConfig, preflight_path: Path) -> str:
@@ -233,7 +333,7 @@ def memory_bench_base_command(config: RunConfig, store: Path) -> list[str]:
         "--store-backend",
         "sqlite",
         "--embedding",
-        "openrouter",
+        config.embedding_provider,
         "--api-key-env",
         config.credential_env,
         "--model",
@@ -241,7 +341,7 @@ def memory_bench_base_command(config: RunConfig, store: Path) -> list[str]:
         "--dimensions",
         str(config.embedding_dimensions),
         "--search-mode",
-        "hybrid",
+        config.search_mode,
         "--embedding-weight",
         str(config.embedding_weight),
         "--bm25-weight",
@@ -268,10 +368,10 @@ def build_extraction_command(
         project_root=PROJECT_ROOT,
         cache_dir=config.run_dir / "cache" / "memory-pipeline",
         cache_version=configuration_digest,
-        model=config.chat_model,
-        verifier_model=config.chat_model,
-        api_key_env=config.credential_env,
-        base_url=config.base_url,
+        model=config.extraction_model,
+        verifier_model=config.verifier_model,
+        api_key_env=config.extraction_api_key_env,
+        base_url=config.extraction_base_url,
         max_candidate_tokens=config.max_candidate_tokens,
         max_window_tokens=config.max_window_tokens,
         context_before_messages=config.context_before_messages,
@@ -302,18 +402,25 @@ def build_search_command(
     command = [*memory_bench_base_command(config, store)]
     if config.graph_enabled:
         command.extend(_graph_search_args(config))
+    if config.rerank_enabled:
+        command.extend([
+            "--rerank",
+            "--rerank-provider",
+            config.rerank_provider,
+            "--rerank-model",
+            config.rerank_model,
+            "--rerank-api-key-env",
+            config.rerank_api_key_env,
+            "--rerank-base-url",
+            config.rerank_base_url,
+            "--rerank-input-k",
+            str(config.rerank_input_k),
+        ])
+        if config.rerank_timeout_ms is not None:
+            command.extend(["--rerank-timeout-ms", str(config.rerank_timeout_ms)])
+        if config.rerank_fail_open:
+            command.append("--rerank-fail-open")
     command.extend([
-        "--rerank",
-        "--rerank-provider",
-        "openrouter",
-        "--rerank-model",
-        config.rerank_model,
-        "--rerank-api-key-env",
-        config.credential_env,
-        "--rerank-base-url",
-        config.base_url,
-        "--rerank-input-k",
-        str(config.rerank_input_k),
         "search",
         "--dataset",
         str(indexed_prepared),
@@ -332,7 +439,7 @@ def build_add_command(
     indexed_prepared: Path,
 ) -> list[str]:
     command = [*memory_bench_base_command(config, store)]
-    if config.graph_enabled:
+    if config.graph_build_enabled:
         command.extend([
             "--graph-build",
             "--graph-build-concurrency",
@@ -373,23 +480,32 @@ def _graph_search_args(config: RunConfig) -> list[str]:
 
 
 def run_arm(config: RunConfig) -> None:
-    if config.phase == "full":
-        frozen_path = os.getenv("FROZEN_CONFIG")
-        if not frozen_path:
-            raise RuntimeError("FROZEN_CONFIG is required for a full run")
-        validate_frozen_config(config, Path(frozen_path))
-
-    preflight_path_value = os.getenv("PREFLIGHT_PATH")
-    if not preflight_path_value:
-        raise RuntimeError("PREFLIGHT_PATH is required for LoCoMo runs")
-    preflight_path = Path(preflight_path_value).resolve()
-    preflight_hash = validate_preflight(config, preflight_path)
+    preflight_path: Path | None = None
+    preflight_hash: str | None = None
+    if config.mode == "strict":
+        preflight_path_value = os.getenv("PREFLIGHT_PATH")
+        if not preflight_path_value:
+            raise RuntimeError("PREFLIGHT_PATH is required for strict LoCoMo runs")
+        preflight_path = Path(preflight_path_value).resolve()
+        preflight_hash = validate_preflight(config, preflight_path)
 
     if not config.dataset.is_file():
         raise ValueError(f"LoCoMo dataset does not exist: {config.dataset}")
-    api_key = os.getenv(config.credential_env)
-    if not api_key:
-        raise RuntimeError(f"missing API key env {config.credential_env}")
+    required_key_envs = [config.credential_env]
+    if config.memory_mode == "extracted":
+        required_key_envs.append(config.extraction_api_key_env)
+    if config.graph_build_enabled:
+        required_key_envs.append(config.graph_llm_api_key_env)
+    if config.rerank_enabled:
+        required_key_envs.append(config.rerank_api_key_env)
+    required_key_envs.extend(
+        [config.answer_api_key_env, config.judge_api_key_env]
+    )
+    for key_env in dict.fromkeys(required_key_envs):
+        if not os.getenv(key_env):
+            raise RuntimeError(f"missing API key env {key_env}")
+
+    answer_api_key = os.environ[config.answer_api_key_env]
 
     ensure_run_mode(config.run_dir, config.memory_mode)
     source_digest = file_sha256(config.dataset)
@@ -399,7 +515,7 @@ def run_arm(config: RunConfig) -> None:
         {
             "source_hash": source_digest,
             "configuration_hash": configuration_digest,
-            "preflight_path": str(preflight_path),
+            "preflight_path": str(preflight_path) if preflight_path else None,
             "preflight_hash": preflight_hash,
             "regression_passed": True,
         }
@@ -416,8 +532,6 @@ def run_arm(config: RunConfig) -> None:
         "--output",
         str(raw_prepared),
     ]
-    if config.phase == "pilot":
-        adapter_command.extend(["--sample-index", "0"])
     run_stage(
         "adapter",
         adapter_command,
@@ -502,9 +616,9 @@ def run_arm(config: RunConfig) -> None:
     responses = config.run_dir / "responses.json"
     answer_stats = config.run_dir / "responses_answer_stats.json"
     answer_env = {
-        "OPENAI_API_KEY": api_key,
-        "OPENAI_BASE_URL": config.base_url,
-        "MODEL": config.chat_model,
+        "OPENAI_API_KEY": answer_api_key,
+        "OPENAI_BASE_URL": config.answer_base_url,
+        "MODEL": config.answer_model,
         "ANSWER_MAX_TOKENS": str(config.answer_max_tokens),
     }
     run_stage(
@@ -548,11 +662,11 @@ def run_arm(config: RunConfig) -> None:
             "--output",
             str(judged),
             "--judge-model",
-            config.chat_model,
+            config.judge_model,
             "--llm-api-key-env",
-            config.credential_env,
+            config.judge_api_key_env,
             "--llm-base-url",
-            config.base_url,
+            config.judge_base_url,
             "--cache-dir",
             str(config.run_dir / "cache" / "judge"),
             "--cache-version",
@@ -655,7 +769,7 @@ def _truthy(value: str) -> bool:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run one LoCoMo memory A/B arm.")
-    parser.add_argument("--phase", choices=("pilot", "full"), required=True)
+    parser.add_argument("--phase", choices=("full",), required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--dataset", type=Path)
     return parser

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 import shlex
 import subprocess
+import time
 from typing import Any, Callable
 
 from common.memory_ab import canonical_sha256, file_sha256
@@ -57,11 +59,21 @@ def run_stage(
     if env_overrides:
         child_env.update(env_overrides)
     print(f"[stage {name}] running: {shlex.join(command)}")
+    started_at = datetime.now(timezone.utc).isoformat()
+    started = time.monotonic()
     runner(command, cwd=EVALUATION_ROOT, env=child_env, check=True)
+    duration_seconds = round(time.monotonic() - started, 3)
     missing = [str(path) for path in outputs if not path.is_file()]
     if missing:
         raise RuntimeError(f"stage {name} did not produce outputs: {missing}")
     completed = dict(expected)
+    completed.update(
+        {
+            "started_at": started_at,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "duration_seconds": duration_seconds,
+        }
+    )
     completed["outputs"] = {
         str(path): file_sha256(path)
         for path in outputs

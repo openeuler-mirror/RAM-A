@@ -24,6 +24,20 @@ def _config(mode: str) -> dict:
         "promotion_policy_hash": "policy-sha",
         "retrieval_top_k": 10,
         "qa_top_k": 10,
+        "search_mode": "hybrid",
+        "embedding_weight": 0.7,
+        "bm25_weight": 0.3,
+        "candidate_k": 150,
+        "graph": True,
+        "graph_build": True,
+        "graph_weight": 0.2,
+        "graph_rerank": True,
+        "graph_allow_graph_only": True,
+        "graph_max_graph_only_results": 4,
+        "max_graph_context_facts": 3,
+        "rerank": True,
+        "rerank_timeout_ms": 15000,
+        "rerank_fail_open": True,
     }
 
 
@@ -136,6 +150,12 @@ def test_full_comparison_reads_qa_and_provenance_retrieval_metrics() -> None:
     assert "ndcg@10" not in metrics["retrieval"]["turn"]["overall"]
     assert report["promotion"]["passed"] is True
     assert len(report["history_records"]) == 2
+    configuration = report["history_records"][1]["configuration"]
+    assert configuration["search_mode"] == "hybrid"
+    assert configuration["candidate_k"] == 150
+    assert configuration["graph_rerank"] is True
+    assert configuration["graph_allow_graph_only"] is True
+    assert configuration["graph_max_graph_only_results"] == 4
 
 
 def test_missing_retrieval_result_makes_full_pair_incomplete() -> None:

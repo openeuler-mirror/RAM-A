@@ -108,8 +108,7 @@ LoCoMo 专门解析。
 
 ## 有证据约束的原子记忆 A/B
 
-新的配对实验应使用统一受治理入口。Pilot 前先把下面这份固定 LoCoMo policy 保存为
-JSON 文件：
+strict full 对比需要使用下面这份 LoCoMo policy：
 
 ```json
 {"schema_version":"locomo-promotion-v1","historical_overall":{"operator":">","threshold":0.4065},"fresh_raw_overall":{"operator":">"},"scored_count":1540,"category_floors":{"1":0.1999,"2":0.4161,"3":0.2717,"4":0.4509},"regression_suite_required":true}
@@ -117,20 +116,13 @@ JSON 文件：
 
 ```bash
 PYTHONPATH=evaluation evaluation/.venv/bin/python evaluation/scripts/run_memory_ab.py \
-  --dataset locomo --phase pilot --pair-id locomo-v4 \
-  --dataset-file data/locomo/locomo10.json \
-  --promotion-policy /absolute/path/locomo-policy.json
-
-PYTHONPATH=evaluation evaluation/.venv/bin/python evaluation/scripts/run_memory_ab.py \
   --dataset locomo --phase full --pair-id locomo-v4 \
   --dataset-file data/locomo/locomo10.json \
-  --promotion-policy /absolute/path/locomo-policy.json \
-  --frozen-config evaluation/outputs/memory-ab/locomo/pilot/locomo-v4/frozen_config.json
+  --promotion-policy /absolute/path/locomo-policy.json
 ```
 
-Policy 文件字节的 hash 会写入两臂 config 和 frozen manifest。Pilot 不写 history；完整
-full pair 即使晋级失败也会记录，但只有通过的 treatment 才能成为 baseline。以上命令
-定义 live 协议；人工实际运行前不宣称任何 live 分数或晋级结果。
+Policy 文件字节的 hash 会写入两臂 config。不完整 pair 不写入 history；完整 pair 即使
+晋级失败也会记录，但只有通过的 treatment 才能成为 baseline。
 
 `run_locomo_memory_ab.sh` 用于评估记忆特性 2 和 4，不改变 answer prompt。配对实验包含两个 arm：
 
@@ -151,19 +143,11 @@ cd evaluation
 export OPENROUTER_API_KEY="<new-rotated-key>"
 
 PYTHON_BIN=../.venv/bin/python \
-PHASE=pilot RUN_DIR=outputs/locomo-memory-ab/pilot \
-./run_locomo_memory_ab.sh
-
-PYTHON_BIN=../.venv/bin/python \
-PHASE=full \
-FROZEN_CONFIG=outputs/locomo-memory-ab/pilot/frozen_config.json \
-RUN_DIR=outputs/locomo-memory-ab/full \
+PHASE=full RUN_DIR=outputs/locomo-memory-ab/full \
 ./run_locomo_memory_ab.sh
 ```
 
-Pilot 固定使用 conversation index 0。Pilot 通过后会把 model、window、retrieval
-和 rerank 配置冻结到 `frozen_config.json`；full run 会在任何模型调用前拒绝配置
-不一致。固定模型为：extraction、grounding、answer、judge 均使用
+固定模型为：extraction、grounding、answer、judge 均使用
 `openai/gpt-4o-mini`；embedding 使用 1,024 维 `baai/bge-m3`；rerank 使用
 `cohere/rerank-v3.5`。Hybrid 权重为 0.7/0.3，candidate K 为 150，rerank input K
 为 40，最终 Top K 为 30。
@@ -205,8 +189,8 @@ shell 和离线 smoke 回归。如果任一检查失败，接入代码必须保�
 会映射为 `memory-bench` 的 `--graph-llm-model`。
 `MAX_GRAPH_CONTEXT_FACTS` 只控制答案上下文渲染，不改变构图、检索候选或排序。
 治理入口 `locomo_run.py` 读取同一组 `MEMORY_BENCH_GRAPH` 和 `GRAPH_*` 变量，并生成相同的
-add/search 参数。需要冻结配置、支持断点续跑的全量 A/B 实验应使用治理入口；shell wrapper
-继续作为已有评测任务的兼容启动方式。
+add/search 参数。需要记录数据集级 full-run 元数据时使用治理入口；shell wrapper
+作为便捷启动方式保留。
 默认 `auto` memory-space 模式下，prepared LoCoMo 记录会使用 `path:$[0]`
 这类 `scope_id`。恢复 graph build 时，已 completed 的 graph run 会跳过，缺失的
 graph run 会补构，failed/running 的 graph run 会明确报错，避免半构图 benchmark

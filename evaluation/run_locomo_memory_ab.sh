@@ -12,27 +12,14 @@ if [ -f .env ]; then
 fi
 
 : "${OPENROUTER_API_KEY:?OPENROUTER_API_KEY must be set}"
-PHASE="${PHASE:-pilot}"
+PHASE="${PHASE:-full}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 DATASET="${DATASET:-${PROJECT_ROOT}/data/locomo/locomo10.json}"
 RUN_DIR="${RUN_DIR:-outputs/locomo-memory-ab/${PHASE}}"
-PREFLIGHT_PATH="${RUN_DIR}/preflight.json"
-export PREFLIGHT_PATH
-
-case "$PHASE" in
-    pilot)
-        ;;
-    full)
-        : "${FROZEN_CONFIG:?FROZEN_CONFIG is required for a full run}"
-        export FROZEN_CONFIG
-        ;;
-    *)
-        echo "PHASE must be pilot or full" >&2
+if [ "$PHASE" != "full" ]; then
+        echo "PHASE must be full" >&2
         exit 2
-        ;;
-esac
-
-"$PYTHON_BIN" locomo/locomo_preflight.py --output "$PREFLIGHT_PATH"
+fi
 
 MEMORY_MODE=raw "$PYTHON_BIN" locomo/locomo_run.py \
     --phase "$PHASE" --dataset "$DATASET" --run-dir "$RUN_DIR/raw"
@@ -47,4 +34,4 @@ MEMORY_MODE=extracted "$PYTHON_BIN" locomo/locomo_run.py \
     --output-json "$RUN_DIR/comparison.json" \
     --html-report "$RUN_DIR/comparison.html"
 
-echo "[done] LoCoMo memory A/B ${PHASE} artifacts: ${RUN_DIR}"
+echo "[done] LoCoMo memory A/B full artifacts: ${RUN_DIR}"

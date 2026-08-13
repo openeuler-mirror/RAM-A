@@ -42,6 +42,14 @@ def _legacy_fixture():
     }
 
 
+def _redirect_default_run_dir(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        personalmem_run,
+        "default_run_dir",
+        lambda dataset, run_id=None: tmp_path / "default-run",
+    )
+
+
 def _args(**overrides):
     values = {
         "memory_mode": "raw",
@@ -117,12 +125,16 @@ def test_personalmem_arm_contract_contains_real_preflight_hash_before_stages(
         str(source),
         "--run-dir",
         str(run_dir),
+        "--mode",
+        "strict",
         "--promotion-policy",
         str(policy),
         "--preflight",
         str(preflight),
         "--embedding",
         "hash",
+        "--max-graph-context-facts",
+        "7",
     )
     calls = []
     monkeypatch.setattr(personalmem_run, "build_parser", lambda: argparse.Namespace(parse_args=lambda: args))
@@ -143,6 +155,7 @@ def test_personalmem_arm_contract_contains_real_preflight_hash_before_stages(
 
     config = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
     assert config["preflight_hash"] == personalmem_run.file_sha256(preflight)
+    assert config["max_graph_context_facts"] == 7
     assert json.loads((run_dir / "raw_prepared.json").read_text(encoding="utf-8")) == prepared
     assert calls == ["resolve", "add", "search", "eval", "answer", "grade"]
 
@@ -282,8 +295,6 @@ def test_pipeline_parses_memory_ab_and_extraction_flags(command, tmp_path):
         "3",
         "--context-after-messages",
         "1",
-        "--frozen-config",
-        str(tmp_path / "frozen.json"),
         "--promotion-policy",
         str(tmp_path / "policy.json"),
     )
@@ -298,7 +309,6 @@ def test_pipeline_parses_memory_ab_and_extraction_flags(command, tmp_path):
     assert args.max_window_tokens == 222
     assert args.context_before_messages == 3
     assert args.context_after_messages == 1
-    assert args.frozen_config == tmp_path / "frozen.json"
     assert args.promotion_policy == tmp_path / "policy.json"
 
 
@@ -315,6 +325,21 @@ def test_fixture_mode_requires_paired_response_maps(tmp_path):
         personalmem_run.validate_experiment_args(args)
 
 
+def test_normal_mode_rejects_promotion_policy(tmp_path):
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}\n", encoding="utf-8")
+    args = _parse(
+        "pipeline",
+        "--mode",
+        "normal",
+        "--promotion-policy",
+        str(policy),
+    )
+
+    with pytest.raises(ValueError, match="only valid in strict mode"):
+        personalmem_run.validate_experiment_args(args)
+
+
 def test_graph_build_concurrency_must_be_positive():
     args = _parse("pipeline", "--graph-build-concurrency", "0")
 
@@ -322,15 +347,9 @@ def test_graph_build_concurrency_must_be_positive():
         personalmem_run.validate_experiment_args(args)
 
 
-def test_full_mode_requires_frozen_config_and_promotion_policy():
+def test_full_mode_is_the_only_experiment_phase():
     args = _parse("pipeline", "--phase", "full")
-
-    with pytest.raises(ValueError, match="--frozen-config"):
-        personalmem_run.validate_experiment_args(args)
-
-    args.frozen_config = Path("frozen.json")
-    with pytest.raises(ValueError, match="--promotion-policy"):
-        personalmem_run.validate_experiment_args(args)
+    assert args.phase == "full"
 
 
 def test_raw_and_extracted_arms_share_immutable_settings():
@@ -422,98 +441,6 @@ def test_implementation_hash_tracks_memory_pipeline_binary(monkeypatch, tmp_path
     binary.write_bytes(b"second")
 
     assert personalmem_run.implementation_hash() != first
-
-
-def test_full_validation_happens_before_run_dir_or_runner_side_effects(monkeypatch):
-    args = _parse("pipeline", "--phase", "full")
-    calls = []
-    monkeypatch.setattr(personalmem_run, "build_parser", lambda: argparse.Namespace(parse_args=lambda: args))
-    monkeypatch.setattr(
-        personalmem_run,
-        "apply_default_paths",
-        lambda value: calls.append("run-dir"),
-    )
-    monkeypatch.setattr(
-        personalmem_run,
-        "run_add",
-        lambda value: calls.append("add") or 0,
-    )
-
-    with pytest.raises(ValueError, match="--frozen-config"):
-        personalmem_run.main()
-
-    assert calls == []
-
-
-def test_full_frozen_mismatch_precedes_dataset_and_pipeline_side_effects(
-    monkeypatch,
-    tmp_path,
-):
-    policy = tmp_path / "policy.json"
-    policy.write_text('{"minimum_accuracy_delta": 0.0}\n', encoding="utf-8")
-    frozen = tmp_path / "frozen.json"
-    args = _parse(
-        "pipeline",
-        "--phase",
-        "full",
-        "--frozen-config",
-        str(frozen),
-        "--promotion-policy",
-        str(policy),
-        "--dataset",
-        str(tmp_path / "raw.json"),
-    )
-    implementation_digest = "a" * 64
-    immutable = personalmem_run.immutable_experiment_manifest(
-        args,
-        implementation_digest,
-        personalmem_run.file_sha256(policy),
-    )
-    immutable["max_retries"] = args.max_retries + 1
-    frozen.write_text(json.dumps(immutable), encoding="utf-8")
-    calls = []
-    monkeypatch.setattr(personalmem_run, "build_parser", lambda: argparse.Namespace(parse_args=lambda: args))
-    monkeypatch.setattr(
-        personalmem_run,
-        "implementation_hash",
-        lambda: implementation_digest,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        personalmem_run,
-        "apply_default_paths",
-        lambda value: calls.append("run-dir"),
-    )
-    monkeypatch.setattr(
-        personalmem_run,
-        "ensure_store_mode",
-        lambda store, memory_mode: calls.append("store"),
-    )
-    monkeypatch.setattr(
-        personalmem_run,
-        "resolve_indexed_dataset",
-        lambda value: calls.append("extract") or value.dataset,
-    )
-    monkeypatch.setattr(
-        personalmem_run,
-        "run_add",
-        lambda value: calls.append("add") or 0,
-    )
-    monkeypatch.setattr(
-        personalmem_run,
-        "run_search",
-        lambda value: calls.append("search") or 0,
-    )
-    monkeypatch.setattr(
-        personalmem_run,
-        "run_eval",
-        lambda value: calls.append("eval") or 0,
-    )
-
-    with pytest.raises(ValueError, match="frozen configuration mismatch.*max_retries"):
-        personalmem_run.main()
-
-    assert calls == []
 
 
 def test_pipeline_reuses_existing_stages_with_resolved_indexed_dataset(
@@ -794,7 +721,7 @@ def test_run_meta_records_memory_ab_identity_and_hashes(tmp_path):
         context_token_budget=2000,
         backend="RAM-A",
         memory_mode="extracted",
-        phase="pilot",
+        phase="full",
         pair_id="pair-5",
         configuration_hash="a" * 64,
         implementation_hash="b" * 64,
@@ -805,7 +732,7 @@ def test_run_meta_records_memory_ab_identity_and_hashes(tmp_path):
     meta = write_personamem_run_meta(args, phase="retrieval")
 
     assert meta["memory_mode"] == "extracted"
-    assert meta["experiment_phase"] == "pilot"
+    assert meta["experiment_phase"] == "full"
     assert meta["pair_id"] == "pair-5"
     assert meta["source_path"] == str(tmp_path / "raw.json")
     assert meta["indexed_dataset"] == str(tmp_path / "extracted.json")
@@ -888,7 +815,8 @@ def test_parser_accepts_graph_flags():
     assert args.graph_llm_timeout_ms == 60000
 
 
-def test_parser_exposes_default_off_rerank_settings():
+def test_parser_exposes_default_off_rerank_settings(tmp_path, monkeypatch):
+    _redirect_default_run_dir(monkeypatch, tmp_path)
     args = _parse("search", "--dataset", "data.json")
 
     assert args.rerank is False
@@ -964,7 +892,8 @@ def test_validate_rejects_inert_graph_search_settings(extra_args, message):
         personalmem_run.validate_experiment_args(args)
 
 
-def test_bench_search_command_includes_enabled_rerank_before_search(tmp_path):
+def test_bench_search_command_includes_enabled_rerank_before_search(tmp_path, monkeypatch):
+    _redirect_default_run_dir(monkeypatch, tmp_path)
     args = _parse(
         "search",
         "--dataset",
@@ -1049,7 +978,7 @@ def test_scoped_search_passes_rerank_before_search_and_keeps_context_filter(
         assert json.loads(filter_value) == {"shared_context_id": shared_context_id}
 
 
-def test_rerank_settings_are_frozen_and_written_to_run_meta(tmp_path):
+def test_rerank_settings_are_recorded_in_run_meta(tmp_path):
     args = _parse(
         "search",
         "--dataset",
@@ -1082,7 +1011,26 @@ def test_rerank_settings_are_frozen_and_written_to_run_meta(tmp_path):
     assert "rerank_timeout_ms" not in meta
 
 
-def test_bench_search_command_includes_graph_search_flags(tmp_path):
+def test_memory_ab_manifest_records_provider_key_environment_names() -> None:
+    args = _parse(
+        "memory-ab-pipeline",
+        "--api-key-env",
+        "EMBEDDING_KEY",
+        "--answer-api-key-env",
+        "ANSWER_KEY",
+        "--extraction-api-key-env",
+        "EXTRACTION_KEY",
+    )
+
+    manifest = personalmem_run.immutable_experiment_manifest(args, "impl", None)
+
+    assert manifest["api_key_env"] == "EMBEDDING_KEY"
+    assert manifest["answer_api_key_env"] == "ANSWER_KEY"
+    assert manifest["extraction_api_key_env"] == "EXTRACTION_KEY"
+
+
+def test_bench_search_command_includes_graph_search_flags(tmp_path, monkeypatch):
+    _redirect_default_run_dir(monkeypatch, tmp_path)
     parser = personalmem_run.build_parser()
     args = parser.parse_args([
         "search",
@@ -1191,6 +1139,7 @@ def test_answer_resume_rejects_a_different_graph_fact_limit():
 
 
 def test_run_add_passes_graph_build_concurrency(monkeypatch, tmp_path):
+    _redirect_default_run_dir(monkeypatch, tmp_path)
     parser = personalmem_run.build_parser()
     args = parser.parse_args([
         "add",
@@ -1218,6 +1167,7 @@ def test_run_add_passes_graph_build_concurrency(monkeypatch, tmp_path):
 
 
 def test_run_add_omits_enabled_rerank(monkeypatch, tmp_path):
+    _redirect_default_run_dir(monkeypatch, tmp_path)
     args = _parse(
         "add",
         "--dataset",

@@ -39,7 +39,6 @@ class CommandSpec:
 class DatasetCommands:
     pair_dir: Path
     preflight_path: Path
-    frozen_path: Path
     comparison_path: Path
     comparison_html_path: Path
     history_artifact_path: Path
@@ -59,9 +58,6 @@ def build_dataset_commands(args: argparse.Namespace) -> DatasetCommands:
     raw_dir = pair_dir / "raw"
     extracted_dir = pair_dir / "extracted"
     preflight_path = pair_dir / "preflight.json"
-    if args.phase == "pilot" and args.frozen_config is not None:
-        raise ValueError("--frozen-config is only valid for full runs")
-    frozen_path = Path(args.frozen_config or pair_dir / "frozen_config.json")
     comparison_path = pair_dir / "comparison.json"
     comparison_html = pair_dir / "comparison.html"
     history_artifact = pair_dir / "history_record.json"
@@ -72,15 +68,13 @@ def build_dataset_commands(args: argparse.Namespace) -> DatasetCommands:
         str(args.phase),
         "--pair-id",
         str(args.pair_id),
-        "--promotion-policy",
-        str(args.promotion_policy),
-        "--preflight",
-        str(preflight_path),
+        "--mode",
+        str(args.mode),
     ]
-    if args.phase == "full":
-        common.extend(["--frozen-config", str(frozen_path)])
-    if getattr(args, "embedding", None):
-        common.extend(["--embedding", str(args.embedding)])
+    if args.mode == "strict":
+        common.extend(["--preflight", str(preflight_path)])
+    if args.promotion_policy is not None:
+        common.extend(["--promotion-policy", str(args.promotion_policy)])
     if getattr(args, "resume", False):
         common.append("--resume")
     fixtures: list[str] = []
@@ -121,24 +115,22 @@ def build_dataset_commands(args: argparse.Namespace) -> DatasetCommands:
 
         raw = persona_arm("raw", raw_dir)
         extracted = persona_arm("extracted", extracted_dir)
-        compare = CommandSpec(
-            "compare",
-            [
-                python,
-                "-m",
-                "personalmem.compare",
-                "--raw-dir",
-                str(raw_dir),
-                "--treatment-dir",
-                str(extracted_dir),
-                "--policy",
-                str(args.promotion_policy),
-                "--output-json",
-                str(comparison_path),
-                "--history-record",
-                str(history_artifact),
-            ],
-        )
+        compare_argv = [
+            python,
+            "-m",
+            "personalmem.compare",
+            "--raw-dir",
+            str(raw_dir),
+            "--treatment-dir",
+            str(extracted_dir),
+            "--output-json",
+            str(comparison_path),
+            "--history-record",
+            str(history_artifact),
+        ]
+        if args.promotion_policy is not None:
+            compare_argv.extend(["--policy", str(args.promotion_policy)])
+        compare = CommandSpec("compare", compare_argv)
     elif args.dataset == "longmemeval":
         def lme_arm(mode: str, run_dir: Path) -> CommandSpec:
             return CommandSpec(
@@ -163,32 +155,31 @@ def build_dataset_commands(args: argparse.Namespace) -> DatasetCommands:
 
         raw = lme_arm("raw", raw_dir)
         extracted = lme_arm("extracted", extracted_dir)
-        compare = CommandSpec(
-            "compare",
-            [
-                python,
-                "-m",
-                "longmemeval.compare",
-                "--raw-dir",
-                str(raw_dir),
-                "--treatment-dir",
-                str(extracted_dir),
-                "--policy",
-                str(args.promotion_policy),
-                "--output-json",
-                str(comparison_path),
-                "--history-record",
-                str(history_artifact),
-            ],
-        )
+        compare_argv = [
+            python,
+            "-m",
+            "longmemeval.compare",
+            "--raw-dir",
+            str(raw_dir),
+            "--treatment-dir",
+            str(extracted_dir),
+            "--output-json",
+            str(comparison_path),
+            "--history-record",
+            str(history_artifact),
+        ]
+        if args.promotion_policy is not None:
+            compare_argv.extend(["--policy", str(args.promotion_policy)])
+        compare = CommandSpec("compare", compare_argv)
     elif args.dataset == "locomo":
         base_env = {
             "PAIR_ID": str(args.pair_id),
-            "PROMOTION_POLICY": str(args.promotion_policy),
-            "PREFLIGHT_PATH": str(preflight_path),
+            "RUN_MODE": str(args.mode),
         }
-        if args.phase == "full":
-            base_env["FROZEN_CONFIG"] = str(frozen_path)
+        if args.mode == "strict":
+            base_env["PREFLIGHT_PATH"] = str(preflight_path)
+        if args.promotion_policy is not None:
+            base_env["PROMOTION_POLICY"] = str(args.promotion_policy)
 
         def locomo_arm(mode: str, run_dir: Path) -> CommandSpec:
             return CommandSpec(
@@ -209,32 +200,29 @@ def build_dataset_commands(args: argparse.Namespace) -> DatasetCommands:
 
         raw = locomo_arm("raw", raw_dir)
         extracted = locomo_arm("extracted", extracted_dir)
-        compare = CommandSpec(
-            "compare",
-            [
-                python,
-                "locomo/locomo_compare.py",
-                "--phase",
-                str(args.phase),
-                "--raw-dir",
-                str(raw_dir),
-                "--treatment-dir",
-                str(extracted_dir),
-                "--output-json",
-                str(comparison_path),
-                "--html-report",
-                str(comparison_html),
-                "--policy",
-                str(args.promotion_policy),
-            ],
-        )
+        compare_argv = [
+            python,
+            "locomo/locomo_compare.py",
+            "--phase",
+            str(args.phase),
+            "--raw-dir",
+            str(raw_dir),
+            "--treatment-dir",
+            str(extracted_dir),
+            "--output-json",
+            str(comparison_path),
+            "--html-report",
+            str(comparison_html),
+        ]
+        if args.promotion_policy is not None:
+            compare_argv.extend(["--policy", str(args.promotion_policy)])
+        compare = CommandSpec("compare", compare_argv)
     else:
         raise ValueError(f"unsupported memory A/B dataset: {args.dataset}")
 
     return DatasetCommands(
         pair_dir=pair_dir,
         preflight_path=preflight_path,
-        frozen_path=frozen_path,
         comparison_path=comparison_path,
         comparison_html_path=comparison_html,
         history_artifact_path=history_artifact,
@@ -250,15 +238,12 @@ def run_pair(
 ) -> dict:
     _validate_selectors(args)
     commands = build_dataset_commands(args)
-    if args.phase == "pilot":
-        commands.frozen_path.unlink(missing_ok=True)
     _validate_policy(args)
-    if args.phase == "full":
-        _validate_frozen_gate(args, commands)
     _validate_runtime_inputs(args)
 
     commands.pair_dir.mkdir(parents=True, exist_ok=True)
-    _run_preflight(args, commands.preflight_path, runner)
+    if args.mode == "strict":
+        _run_preflight(args, commands.preflight_path, runner)
     _invoke(commands.raw, runner)
     _invoke(commands.extracted, runner)
     _invoke(commands.compare, runner)
@@ -268,26 +253,52 @@ def run_pair(
     comparison = _read_object(commands.comparison_path)
     if args.dataset != "locomo":
         _write_comparison_html(commands.comparison_html_path, comparison)
-    if args.phase == "pilot":
-        if comparison.get("promotion", {}).get("passed") is True:
-            frozen = _read_object(commands.pair_dir / "extracted" / "config.json")
-            _write_json_atomic(commands.frozen_path, frozen)
-    elif comparison.get("complete") is True:
-        _append_completed_full_history(args, commands)
     return comparison
 
 
+def run_single(
+    args: argparse.Namespace,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> None:
+    _validate_selectors(args)
+    if args.mode != "normal":
+        raise ValueError("single execution only supports normal mode")
+    _validate_policy(args)
+    commands = build_dataset_commands(args)
+    _validate_runtime_inputs(args)
+    commands.pair_dir.mkdir(parents=True, exist_ok=True)
+    _invoke(commands.raw if args.memory_mode == "raw" else commands.extracted, runner)
+
+
 def _validate_selectors(args: argparse.Namespace) -> None:
-    if args.phase not in {"pilot", "full"}:
-        raise ValueError("phase must be pilot or full")
+    if args.phase != "full":
+        raise ValueError("phase must be full")
     if args.dataset not in {"personalmem", "longmemeval", "locomo"}:
         raise ValueError(f"unsupported memory A/B dataset: {args.dataset}")
+    if args.mode not in {"normal", "strict"}:
+        raise ValueError("mode must be normal or strict")
+    execution = getattr(args, "execution", "ab")
+    if execution not in {"single", "ab"}:
+        raise ValueError("execution must be single or ab")
+    if execution == "single" and getattr(args, "memory_mode", None) not in {
+        "raw",
+        "extracted",
+    }:
+        raise ValueError("single execution requires memory_mode raw or extracted")
+    if execution == "ab" and getattr(args, "memory_mode", None) is not None:
+        raise ValueError("ab execution does not accept memory_mode")
     from common.run_artifacts import safe_slug
 
     safe_slug(str(args.pair_id))
 
 
 def _validate_policy(args: argparse.Namespace) -> None:
+    if args.promotion_policy is None:
+        if args.mode == "normal":
+            return
+        raise ValueError("promotion policy file is required in strict mode")
+    if args.mode == "normal":
+        raise ValueError("promotion policy is only valid in strict mode")
     if not Path(args.promotion_policy).is_file():
         raise ValueError("promotion policy file is required")
 
@@ -300,7 +311,7 @@ def _validate_policy(args: argparse.Namespace) -> None:
         from locomo.locomo_compare import promotion_policy_manifest
 
         if policy != promotion_policy_manifest():
-            raise ValueError("LoCoMo promotion policy does not match the frozen policy")
+            raise ValueError("LoCoMo promotion policy does not match the current policy")
 
 
 def _validate_runtime_inputs(args: argparse.Namespace) -> None:
@@ -321,15 +332,18 @@ def _validate_forwarded_arm_args(values: Sequence[str]) -> None:
     protected = {
         "--dataset",
         "--dataset-file",
-        "--frozen-config",
+        "--extractor-responses",
+        "--grounding-responses",
         "--indexed-dataset",
         "--memory-mode",
+        "--mode",
         "--pair-id",
         "--phase",
         "--pipeline-phase",
         "--preflight",
         "--promotion-policy",
         "--run-dir",
+        "--resume",
     }
     for value in values:
         if value == "--":
@@ -342,70 +356,6 @@ def _validate_forwarded_arm_args(values: Sequence[str]) -> None:
             raise ValueError(
                 f"unified A/B runner owns {option}; do not forward it to an arm"
             )
-
-
-def _validate_frozen_gate(
-    args: argparse.Namespace,
-    commands: DatasetCommands,
-) -> None:
-    path = commands.frozen_path
-    if not Path(path).is_file():
-        raise ValueError(f"frozen configuration does not exist: {path}")
-    from common.memory_ab import validate_frozen_manifest
-
-    raw_immutable = _arm_immutable_manifest(str(args.dataset), commands.raw)
-    extracted_immutable = _arm_immutable_manifest(
-        str(args.dataset), commands.extracted
-    )
-    if raw_immutable != extracted_immutable:
-        differing = sorted(
-            key
-            for key in set(raw_immutable) | set(extracted_immutable)
-            if raw_immutable.get(key) != extracted_immutable.get(key)
-        )
-        raise ValueError(
-            "paired arm immutable configuration mismatch: " + ", ".join(differing)
-        )
-    validate_frozen_manifest(raw_immutable, path)
-    validate_frozen_manifest(extracted_immutable, path)
-
-
-def _arm_immutable_manifest(dataset: str, spec: CommandSpec) -> dict:
-    if dataset == "personalmem":
-        import personalmem.run as runner
-
-        parsed = runner.build_parser().parse_args(spec.argv[3:])
-        implementation_digest = runner.implementation_hash()
-        policy_digest = runner.file_sha256(parsed.promotion_policy)
-        return runner.immutable_experiment_manifest(
-            parsed,
-            implementation_digest,
-            policy_digest,
-        )
-    if dataset == "longmemeval":
-        import longmemeval.run as runner
-
-        parsed = runner.parse_args(spec.argv[3:])
-        implementation_digest = runner.implementation_hash()
-        policy_digest = runner.file_sha256(parsed.promotion_policy)
-        return runner.immutable_experiment_manifest(
-            parsed,
-            implementation_digest,
-            policy_digest,
-        )
-    if dataset == "locomo":
-        import locomo.locomo_run as runner
-
-        parsed = runner.build_parser().parse_args(spec.argv[2:])
-        overrides = {
-            **spec.env_overrides,
-            "PHASE": parsed.phase,
-            "RUN_DIR": str(parsed.run_dir),
-        }
-        if parsed.dataset is not None:
-            overrides["DATASET"] = str(parsed.dataset)
-        return runner.RunConfig.from_env(overrides).immutable_manifest()
-    raise ValueError(f"unsupported memory A/B dataset: {dataset}")
 
 
 def _run_preflight(
@@ -495,50 +445,6 @@ def _read_object(path: Path) -> dict:
     return value
 
 
-def _append_completed_full_history(
-    args: argparse.Namespace,
-    commands: DatasetCommands,
-) -> None:
-    if not commands.history_artifact_path.is_file():
-        raise ValueError("complete full comparison did not write history_record.json")
-    pair_records = json.loads(
-        commands.history_artifact_path.read_text(encoding="utf-8")
-    )
-    if not isinstance(pair_records, list):
-        raise ValueError("history_record.json must contain a raw/extracted list")
-    record_path = Path(args.history_root) / "records" / f"{args.dataset}.jsonl"
-    existing = _load_records(record_path) if record_path.is_file() else []
-    matching = [
-        record
-        for record in existing
-        if record.get("pair_id") == str(args.pair_id)
-    ]
-    if matching:
-        if matching != pair_records:
-            raise ValueError(f"history already contains conflicting pair_id {args.pair_id}")
-    else:
-        _append_full_pair(record_path, pair_records)
-    build_workbooks(Path(args.history_root))
-
-
-def _load_records(path: Path) -> list[dict]:
-    from history.build_xlsx import load_records
-
-    return load_records(path)
-
-
-def _append_full_pair(path: Path, records: list[dict]) -> None:
-    from history.build_xlsx import append_full_pair
-
-    append_full_pair(path, records)
-
-
-def build_workbooks(history_root: Path) -> None:
-    from history.build_xlsx import build_workbooks as generate
-
-    generate(history_root)
-
-
 def _write_json_atomic(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -573,17 +479,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dataset", choices=("personalmem", "longmemeval", "locomo"), required=True
     )
-    parser.add_argument("--phase", choices=("pilot", "full"), required=True)
+    parser.add_argument("--phase", choices=("full",), required=True)
+    parser.add_argument(
+        "--mode",
+        choices=("normal", "strict"),
+        default="normal",
+        help="normal records the run; strict enables governance checks",
+    )
+    parser.add_argument(
+        "--execution",
+        choices=("single", "ab"),
+        default="ab",
+        help="single runs one memory arm; ab runs raw and extracted arms",
+    )
+    parser.add_argument(
+        "--memory-mode",
+        choices=("raw", "extracted"),
+        help="memory representation for single execution",
+    )
     parser.add_argument("--pair-id", required=True)
     parser.add_argument("--dataset-file", type=Path, required=True)
     parser.add_argument(
         "--output-root", type=Path, default=EVALUATION_ROOT / "outputs" / "memory-ab"
     )
-    parser.add_argument("--promotion-policy", type=Path, required=True)
-    parser.add_argument("--frozen-config", type=Path)
-    parser.add_argument("--history-root", type=Path, default=PROJECT_ROOT / "history")
+    parser.add_argument("--promotion-policy", type=Path)
     parser.add_argument("--python-executable", default=sys.executable)
-    parser.add_argument("--embedding", choices=("openrouter", "hash"), default="openrouter")
     parser.add_argument("--extractor-responses", type=Path)
     parser.add_argument("--grounding-responses", type=Path)
     parser.add_argument("--resume", action="store_true")
@@ -593,7 +513,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    run_pair(args)
+    if args.execution == "single":
+        run_single(args)
+    else:
+        run_pair(args)
     return 0
 
 

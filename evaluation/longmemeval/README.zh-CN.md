@@ -71,10 +71,9 @@ python3 evaluation/longmemeval/run.py [选项]
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--memory-mode` | `raw` | 索引 `raw` turn 或 Rust 生成的 `extracted` memory |
-| `--phase` | `pilot` | 实验治理阶段：`pilot` 或 `full` |
+| `--phase` | `full` | benchmark 阶段 |
 | `--pipeline-phase` | `retrieval` | 执行 `retrieval`、`qa` 或 `all` 阶段 |
 | `--pair-id` | `standalone` | 配对 arms 共用的稳定标识 |
-| `--frozen-config` | *（无）* | 冻结的 immutable manifest；`full` 必需 |
 | `--promotion-policy` | *（无）* | 写入 manifest hash 的晋级策略；`full` 必需 |
 | `--backend` | `RAM-A` | RAM-A 后端 key |
 | `--embedding` | `openrouter` | `openrouter` 或 `hash` |
@@ -119,9 +118,6 @@ python3 evaluation/longmemeval/run.py [选项]
 
 完整参数列表：`python3 evaluation/longmemeval/run.py --help`
 
-为兼容旧调用，`--phase retrieval|qa|all`（含 `--phase=value`）会被改写为
-`--pipeline-phase` 并输出弃用警告。旧写法与显式 `--pipeline-phase` 同时出现时会报错。
-
 ## 快速冒烟测试
 
 ```bash
@@ -137,8 +133,8 @@ export OPENROUTER_API_KEY="your-key"
 # 仅检索
 python3 evaluation/longmemeval/run.py
 
-# 检索 + QA pilot arm
-python3 evaluation/longmemeval/run.py --phase pilot --pipeline-phase all \
+# 检索 + QA full run
+python3 evaluation/longmemeval/run.py --phase full --pipeline-phase all \
   --answerer-model openai/gpt-4o-mini \
   --judge-model openai/gpt-4o-mini \
   --llm-api-key-env OPENROUTER_API_KEY \
@@ -151,9 +147,8 @@ python3 evaluation/longmemeval/run.py \
   --graph-llm-model openai/gpt-4o-mini
 ```
 
-受治理的 `--phase full` 还必须提供 `--frozen-config` 和
-`--promotion-policy`。runner 会在预处理或构造 embedding/chat client 之前校验 immutable
-字段与策略 hash。
+受治理的 `--phase full` 还必须提供 `--promotion-policy`。runner 会在预处理或构造
+embedding/chat client 之前校验 immutable 字段与策略 hash。
 
 ## 完全离线的 extracted fixture
 
@@ -164,7 +159,7 @@ python3 evaluation/longmemeval/run.py \
 python3 evaluation/longmemeval/run.py \
   --dataset-file "$PWD/evaluation/fixtures/longmemeval_sample.json" \
   --run-dir /tmp/longmemeval-extracted-offline \
-  --memory-mode extracted --phase pilot --pipeline-phase retrieval \
+  --memory-mode extracted --phase full --pipeline-phase retrieval \
   --pair-id offline-longmemeval \
   --extractor-responses "$PWD/evaluation/fixtures/longmemeval_memory_extractor_responses.json" \
   --grounding-responses "$PWD/evaluation/fixtures/longmemeval_memory_grounding_responses.json" \

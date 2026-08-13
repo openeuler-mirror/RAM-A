@@ -75,6 +75,21 @@ def test_cli_accepts_memory_ab_preflight(monkeypatch, tmp_path):
     assert args.preflight == tmp_path / "preflight.json"
 
 
+def test_normal_mode_rejects_promotion_policy(monkeypatch, tmp_path):
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}\n", encoding="utf-8")
+    args = _parse(
+        monkeypatch,
+        "--mode",
+        "normal",
+        "--promotion-policy",
+        str(policy),
+    )
+
+    with pytest.raises(ValueError, match="only valid in strict mode"):
+        validate_experiment_args(args)
+
+
 def test_extracted_mode_uses_rust_output_as_indexed_prepared(monkeypatch, tmp_path):
     args = _parse(
         monkeypatch,
@@ -168,11 +183,9 @@ def test_automatic_resume_discovers_only_the_requested_memory_arm(
     assert paths.run_dir == expected
 
 
-def test_full_mode_requires_frozen_config_before_runner_calls(monkeypatch):
+def test_full_mode_is_the_only_experiment_phase(monkeypatch):
     args = _parse(monkeypatch, "--phase", "full")
-
-    with pytest.raises(ValueError, match="--frozen-config"):
-        validate_experiment_args(args)
+    assert args.phase == "full"
 
 
 def test_graph_build_concurrency_must_be_positive(monkeypatch):
@@ -193,24 +206,6 @@ def test_canonical_experiment_and_pipeline_phases_are_distinct(monkeypatch):
 
     assert args.phase == "full"
     assert args.pipeline_phase == "all"
-
-
-def test_legacy_phase_is_rewritten_with_warning(monkeypatch, capsys):
-    args = _parse(monkeypatch, "--phase", "qa")
-
-    assert args.phase == "pilot"
-    assert args.pipeline_phase == "qa"
-    assert "deprecated" in capsys.readouterr().err.lower()
-
-
-def test_legacy_phase_conflicts_with_explicit_pipeline_phase(monkeypatch):
-    with pytest.raises(SystemExit):
-        _parse(
-            monkeypatch,
-            "--phase=all",
-            "--pipeline-phase",
-            "retrieval",
-        )
 
 
 def test_fixture_mode_requires_paired_response_maps(monkeypatch, tmp_path):
@@ -276,159 +271,6 @@ def test_implementation_hash_tracks_memory_pipeline_binary(monkeypatch, tmp_path
     assert longmemeval_run.implementation_hash() != first
 
 
-def test_full_validation_happens_before_preprocess_or_backend(monkeypatch):
-    args = _parse(monkeypatch, "--phase", "full", "--resume")
-    calls = []
-    monkeypatch.setattr(longmemeval_run, "parse_args", lambda: args)
-    monkeypatch.setattr(
-        longmemeval_run,
-        "latest_run_dir",
-        lambda *args: calls.append("latest_run_dir"),
-    )
-    monkeypatch.setattr(Path, "is_file", lambda self: calls.append("is_file") or True)
-
-    with pytest.raises(ValueError, match="--frozen-config"):
-        longmemeval_run.main()
-
-    assert calls == []
-
-
-def test_full_mode_rejects_frozen_mismatch_before_dataset_access(
-    monkeypatch,
-    tmp_path,
-):
-    policy = tmp_path / "promotion-policy.json"
-    policy.write_text('{"minimum_accuracy_delta": 0.0}\n', encoding="utf-8")
-    frozen = tmp_path / "frozen-config.json"
-    args = _parse(
-        monkeypatch,
-        "--phase",
-        "full",
-        "--resume",
-        "--frozen-config",
-        str(frozen),
-        "--promotion-policy",
-        str(policy),
-    )
-    implementation_digest = "a" * 64
-    policy_digest = longmemeval_run.file_sha256(policy)
-    immutable = longmemeval_run.immutable_experiment_manifest(
-        args,
-        implementation_digest,
-        policy_digest,
-    )
-    immutable["qa_top_k"] = args.qa_top_k + 1
-    frozen.write_text(json.dumps(immutable), encoding="utf-8")
-    dataset_accesses = []
-    monkeypatch.setattr(longmemeval_run, "parse_args", lambda: args)
-    monkeypatch.setattr(
-        longmemeval_run,
-        "implementation_hash",
-        lambda: implementation_digest,
-    )
-    original_is_file = Path.is_file
-    run_discoveries = []
-
-    monkeypatch.setattr(
-        longmemeval_run,
-        "latest_run_dir",
-        lambda *args: run_discoveries.append(args) or None,
-    )
-
-    def record_dataset_access(path):
-        dataset_accesses.append(path)
-        return original_is_file(path)
-
-    monkeypatch.setattr(Path, "is_file", record_dataset_access)
-
-    with pytest.raises(ValueError, match="frozen configuration mismatch.*qa_top_k"):
-        longmemeval_run.main()
-
-    assert run_discoveries == []
-    assert dataset_accesses == []
-
-
-def test_full_mode_rejects_changed_policy_before_run_or_provider_access(
-    monkeypatch,
-    tmp_path,
-):
-    import common.backends
-    import longmemeval.preprocess
-
-    dataset = tmp_path / "longmemeval.json"
-    policy = tmp_path / "promotion-policy.json"
-    policy.write_text('{"minimum_accuracy_delta": 0.0}\n', encoding="utf-8")
-    frozen = tmp_path / "frozen-config.json"
-    args = _parse(
-        monkeypatch,
-        "--dataset-file",
-        str(dataset),
-        "--phase",
-        "full",
-        "--resume",
-        "--frozen-config",
-        str(frozen),
-        "--promotion-policy",
-        str(policy),
-    )
-    implementation_digest = "a" * 64
-    immutable = longmemeval_run.immutable_experiment_manifest(
-        args,
-        implementation_digest,
-        longmemeval_run.file_sha256(policy),
-    )
-    frozen.write_text(json.dumps(immutable), encoding="utf-8")
-    policy.write_text('{"minimum_accuracy_delta": 0.1}\n', encoding="utf-8")
-    calls = []
-    monkeypatch.setattr(longmemeval_run, "parse_args", lambda: args)
-    monkeypatch.setattr(
-        longmemeval_run,
-        "implementation_hash",
-        lambda: implementation_digest,
-    )
-    monkeypatch.setattr(
-        longmemeval_run,
-        "latest_run_dir",
-        lambda *args: calls.append("run discovery"),
-    )
-    monkeypatch.setattr(
-        longmemeval_run,
-        "_write_json_atomic",
-        lambda *args: calls.append("run write"),
-    )
-    monkeypatch.setattr(
-        longmemeval_run,
-        "ensure_run_mode",
-        lambda *args: calls.append("run write"),
-    )
-    monkeypatch.setattr(
-        longmemeval.preprocess,
-        "preprocess",
-        lambda *args, **kwargs: calls.append("dataset preprocess"),
-    )
-    monkeypatch.setattr(
-        common.backends,
-        "create_backend",
-        lambda *args, **kwargs: calls.append("provider construction"),
-    )
-    original_is_file = Path.is_file
-
-    def record_dataset_access(path):
-        if path == dataset:
-            calls.append("dataset access")
-        return original_is_file(path)
-
-    monkeypatch.setattr(Path, "is_file", record_dataset_access)
-
-    with pytest.raises(
-        ValueError,
-        match="frozen configuration mismatch.*promotion_policy_hash",
-    ):
-        longmemeval_run.main()
-
-    assert calls == []
-
-
 def test_extracted_arm_routes_raw_and_indexed_prepared_to_correct_consumers(
     monkeypatch,
     tmp_path,
@@ -475,6 +317,8 @@ def test_extracted_arm_routes_raw_and_indexed_prepared_to_correct_consumers(
         "--rerank-timeout-ms",
         "30000",
         "--rerank-fail-open",
+        "--max-graph-context-facts",
+        "7",
     )
     run_dir.mkdir()
     (run_dir / "store.jsonl").write_text("partial\n", encoding="utf-8")
@@ -581,6 +425,7 @@ def test_extracted_arm_routes_raw_and_indexed_prepared_to_correct_consumers(
     assert config["rerank_input_k"] == 80
     assert config["rerank_timeout_ms"] == 30000
     assert config["rerank_fail_open"] is True
+    assert config["max_graph_context_facts"] == 7
     assert backend_configs[0].rerank is True
     assert backend_configs[0].rerank_model == "cohere/rerank-v3.5"
     assert backend_configs[0].rerank_api_key_env == "RERANK_KEY"
@@ -589,7 +434,7 @@ def test_extracted_arm_routes_raw_and_indexed_prepared_to_correct_consumers(
     assert backend_configs[0].rerank_timeout_ms == 30000
     assert backend_configs[0].rerank_fail_open is True
     run_meta = json.loads((run_dir / "run_meta.json").read_text(encoding="utf-8"))
-    assert run_meta["phase"] == "pilot"
+    assert run_meta["phase"] == "full"
     assert run_meta["pipeline_phase"] == "all"
     assert run_meta["rerank"] is True
     assert run_meta["rerank_provider"] == "openrouter"
@@ -841,6 +686,24 @@ def test_parser_and_immutable_manifest_accept_rerank_overrides(monkeypatch):
     assert manifest["rerank_input_k"] == 80
     assert manifest["rerank_timeout_ms"] == 30000
     assert manifest["rerank_fail_open"] is True
+
+
+def test_manifest_records_provider_key_environment_names(monkeypatch) -> None:
+    args = _parse(
+        monkeypatch,
+        "--api-key-env",
+        "EMBEDDING_KEY",
+        "--llm-api-key-env",
+        "ANSWER_JUDGE_KEY",
+        "--extraction-api-key-env",
+        "EXTRACTION_KEY",
+    )
+
+    manifest = longmemeval_run.immutable_experiment_manifest(args, "impl", None)
+
+    assert manifest["api_key_env"] == "EMBEDDING_KEY"
+    assert manifest["llm_api_key_env"] == "ANSWER_JUDGE_KEY"
+    assert manifest["extraction_api_key_env"] == "EXTRACTION_KEY"
 
 
 def test_graph_context_limit_is_not_part_of_retrieval_manifest(monkeypatch):

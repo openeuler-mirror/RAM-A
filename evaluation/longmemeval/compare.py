@@ -12,6 +12,7 @@ from common.memory_ab import file_sha256, validate_pair_contract
 from common.memory_ab_compare import (
     PromotionPolicy,
     build_history_records,
+    history_configuration,
     evaluate_checks,
     remove_stale_history_artifact,
     resolve_history_artifact_path,
@@ -27,7 +28,7 @@ def build_comparison(
     extracted_qa: dict[str, Any],
     raw_retrieval: dict[str, Any],
     extracted_retrieval: dict[str, Any],
-    policy: PromotionPolicy,
+    policy: PromotionPolicy | None,
 ) -> dict[str, Any]:
     contract = validate_pair_contract(
         raw_config,
@@ -37,16 +38,20 @@ def build_comparison(
     )
     phase = _matching_required(raw_config, extracted_config, "phase")
     pair_id = _matching_required(raw_config, extracted_config, "pair_id")
-    policy_hash = _matching_required(
-        raw_config, extracted_config, "promotion_policy_hash"
-    )
+    mode = _matching_mode(raw_config, extracted_config)
+    policy_hash = _matching_optional(raw_config, extracted_config, "promotion_policy_hash")
+    _validate_governance_mode(mode, policy)
     _require_dataset(raw_config)
     _require_dataset(extracted_config)
     split = _prepared_split(raw_prepared)
 
     raw_metrics = _metrics(raw_qa, raw_retrieval)
     extracted_metrics = _metrics(extracted_qa, extracted_retrieval)
-    promotion = evaluate_checks(policy, raw_metrics, extracted_metrics)
+    promotion = (
+        evaluate_checks(policy, raw_metrics, extracted_metrics)
+        if policy is not None
+        else {"passed": None, "checks": [], "reasons": []}
+    )
     query_count = contract["query_count"]
     retrieval_count = sum(
         1
@@ -59,7 +64,7 @@ def build_comparison(
         and metrics["retrieval"]["overall"]["missing"] == 0
         for metrics in (raw_metrics, extracted_metrics)
     )
-    if phase == "full":
+    if phase == "full" and policy is not None:
         complete = complete and _completeness_checks_passed(policy, promotion)
     if not complete:
         promotion = _fail_incomplete(promotion, query_count, retrieval_count)
@@ -78,7 +83,8 @@ def build_comparison(
             "preflight_hash": raw_config["preflight_hash"],
         },
         "policy_hash": policy_hash,
-        "policy": policy.to_dict(),
+        "policy": policy.to_dict() if policy is not None else None,
+        "governance_mode": mode,
         "fresh_raw": _arm(raw_config, raw_metrics),
         "treatment": _arm(extracted_config, extracted_metrics),
         "promotion": promotion,
@@ -169,24 +175,9 @@ def _arm(config: dict[str, Any], metrics: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("arm config requires run_id or run_dir")
     if not artifact_path:
         raise ValueError("arm config requires artifact_path or run_dir")
-    compact_keys = (
-        "backend",
-        "embedding_model",
-        "embedding_dimensions",
-        "retrieval_top_k",
-        "qa_top_k",
-        "answerer_model",
-        "judge_model",
-        "answer_prompt_version",
-        "memory_format",
-    )
     return {
         "run_id": str(run_id),
-        "configuration": {
-            key: config[key]
-            for key in compact_keys
-            if key in config and config[key] is not None
-        },
+        "configuration": history_configuration(config),
         "metrics": metrics,
         "artifact_path": str(artifact_path),
     }
@@ -199,6 +190,31 @@ def _matching_required(
     if value is None or value == "" or value != extracted.get(key):
         raise ValueError(f"raw/extracted {key} mismatch")
     return value
+
+
+def _matching_optional(
+    raw: dict[str, Any], extracted: dict[str, Any], key: str
+) -> Any:
+    raw_value = raw.get(key)
+    extracted_value = extracted.get(key)
+    if raw_value != extracted_value:
+        raise ValueError(f"raw/extracted {key} mismatch")
+    return raw_value
+
+
+def _matching_mode(raw: dict[str, Any], extracted: dict[str, Any]) -> str:
+    raw_mode = raw.get("mode", "strict")
+    extracted_mode = extracted.get("mode", "strict")
+    if raw_mode != extracted_mode or raw_mode not in {"normal", "strict"}:
+        raise ValueError("raw/extracted mode mismatch")
+    return str(raw_mode)
+
+
+def _validate_governance_mode(mode: str, policy: PromotionPolicy | None) -> None:
+    if mode == "strict" and policy is None:
+        raise ValueError("strict comparison requires a promotion policy")
+    if mode == "normal" and policy is not None:
+        raise ValueError("normal comparison must not receive a promotion policy")
 
 
 def _require_dataset(config: dict[str, Any]) -> None:
@@ -270,7 +286,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--raw-dir", required=True, type=Path)
     parser.add_argument("--treatment-dir", required=True, type=Path)
-    parser.add_argument("--policy", required=True, type=Path)
+    parser.add_argument("--policy", type=Path)
     parser.add_argument("--output-json", required=True, type=Path)
     parser.add_argument("--history-record", type=Path)
     parser.add_argument("--raw-qa-metrics", type=Path)
@@ -285,9 +301,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     raw_config = _read_object(args.raw_dir / "config.json")
     extracted_config = _read_object(args.treatment_dir / "config.json")
-    policy_value = _read_object(args.policy)
-    policy_hash = file_sha256(args.policy)
-    if any(
+    policy_value = _read_object(args.policy) if args.policy is not None else None
+    policy_hash = file_sha256(args.policy) if args.policy is not None else None
+    if args.policy is not None and any(
         config.get("promotion_policy_hash") != policy_hash
         for config in (raw_config, extracted_config)
     ):
@@ -303,7 +319,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         _read_object(args.raw_dir / "metrics.json"),
         _read_object(args.treatment_dir / "metrics.json"),
-        PromotionPolicy.from_dict(policy_value),
+        PromotionPolicy.from_dict(policy_value) if policy_value is not None else None,
     )
     _write_json_atomic(args.output_json, report)
     if "history_records" in report:

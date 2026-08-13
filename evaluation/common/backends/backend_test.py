@@ -69,6 +69,10 @@ def test_backend_config_carries_default_off_rerank_options():
     assert config.rerank_input_k == 40
     assert config.rerank_timeout_ms is None
     assert config.rerank_fail_open is False
+    assert config.search_mode == "hybrid"
+    assert config.embedding_weight == 0.7
+    assert config.bm25_weight == 0.3
+    assert config.candidate_k is None
 
 
 def test_rama_backend_passes_graph_options(monkeypatch, tmp_path):
@@ -116,6 +120,10 @@ def test_rama_backend_passes_graph_options(monkeypatch, tmp_path):
         rerank_input_k=80,
         rerank_timeout_ms=30000,
         rerank_fail_open=True,
+        search_mode="hybrid",
+        embedding_weight=0.6,
+        bm25_weight=0.4,
+        candidate_k=90,
     )
 
     backend = RamaBackend(config)
@@ -143,6 +151,10 @@ def test_rama_backend_passes_graph_options(monkeypatch, tmp_path):
     assert captured["search"]["rerank_input_k"] == 80
     assert captured["search"]["rerank_timeout_ms"] == 30000
     assert captured["search"]["rerank_fail_open"] is True
+    assert captured["add"]["search_mode"] == "hybrid"
+    assert captured["add"]["candidate_k"] == 90
+    assert captured["search"]["embedding_weight"] == 0.6
+    assert captured["search"]["bm25_weight"] == 0.4
 
 
 if __name__ == "__main__":

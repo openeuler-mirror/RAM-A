@@ -11,6 +11,84 @@ from typing import Any
 
 POLICY_SCHEMA_VERSION = "memory-ab-promotion-v1"
 HISTORY_SCHEMA_VERSION = "memory-ab-history-v1"
+HISTORY_CONFIGURATION_KEYS = (
+    "backend",
+    "store_backend",
+    "embedding",
+    "embedding_provider",
+    "embedding_model",
+    "embedding_dimensions",
+    "embedding_batch_size",
+    "api_key_env",
+    "credential_env",
+    "search_mode",
+    "embedding_weight",
+    "bm25_weight",
+    "candidate_k",
+    "top_k",
+    "retrieval_top_k",
+    "qa_top_k",
+    "graph",
+    "graph_enabled",
+    "graph_build",
+    "graph_build_enabled",
+    "graph_build_concurrency",
+    "graph_weight",
+    "graph_rerank",
+    "graph_allow_graph_only",
+    "graph_max_graph_only_results",
+    "graph_fail_open",
+    "graph_memory_space_mode",
+    "graph_memory_space_field",
+    "graph_owner_id",
+    "graph_llm_api_key_env",
+    "graph_llm_model",
+    "graph_llm_base_url",
+    "graph_llm_timeout_ms",
+    "max_graph_context_facts",
+    "rerank",
+    "rerank_enabled",
+    "rerank_provider",
+    "rerank_api_key_env",
+    "rerank_model",
+    "rerank_base_url",
+    "rerank_input_k",
+    "rerank_timeout_ms",
+    "rerank_fail_open",
+    "answer_model",
+    "answerer_model",
+    "chat_model",
+    "answer_api_key_env",
+    "answer_base_url",
+    "judge_model",
+    "judge_api_key_env",
+    "judge_base_url",
+    "llm_api_key_env",
+    "llm_base_url",
+    "llm_thinking",
+    "show_scores",
+    "answer_prompt_version",
+    "memory_format",
+    "answer_max_tokens",
+    "context_token_budget",
+    "max_retries",
+    "retry_backoff_seconds",
+    "text_fields",
+    "query_fields",
+    "gold_fields",
+    "max_candidate_tokens",
+    "max_window_tokens",
+    "context_before_messages",
+    "context_after_messages",
+    "extraction_model",
+    "verifier_model",
+    "extraction_api_key_env",
+    "extraction_base_url",
+    "pipeline_phase",
+    "prompt_versions",
+    "extraction_schema_version",
+    "llm_temperature",
+)
 
 
 @dataclass(frozen=True)
@@ -155,16 +233,27 @@ def build_history_record(
 
     contract = comparison["arm_contract"]
     promotion = comparison["promotion"]
-    if not isinstance(promotion.get("passed"), bool):
+    governance_mode = comparison.get("governance_mode", "strict")
+    if governance_mode not in {"normal", "strict"}:
+        raise ValueError("history record governance_mode must be normal or strict")
+    if governance_mode == "strict" and not isinstance(promotion.get("passed"), bool):
         raise ValueError("history record promotion passed must be boolean")
     reasons = promotion.get("reasons")
     if (
         not isinstance(reasons, list)
         or any(not isinstance(reason, str) or not reason for reason in reasons)
-        or (promotion["passed"] is False and not reasons)
+        or (
+            governance_mode == "strict"
+            and promotion.get("passed") is False
+            and not reasons
+        )
     ):
         raise ValueError("history record promotion reasons are invalid")
     arm = comparison["fresh_raw" if memory_mode == "raw" else "treatment"]
+    artifact_path = arm.get("artifact_path")
+    if artifact_path is None or (isinstance(artifact_path, str) and not artifact_path):
+        raise ValueError("history record requires artifact_path")
+    metrics = _portable_history_value(arm["metrics"])
     record = {
         "schema_version": HISTORY_SCHEMA_VERSION,
         "pair_id": comparison["pair_id"],
@@ -176,28 +265,79 @@ def build_history_record(
         "source_hash": contract["source_hash"],
         "code_hash": contract["implementation_hash"],
         "configuration_hash": contract["configuration_hash"],
-        "preflight_hash": contract["preflight_hash"],
-        "policy_hash": comparison["policy_hash"],
+        "preflight_hash": contract.get("preflight_hash"),
+        "policy_hash": comparison.get("policy_hash"),
+        "governance_mode": governance_mode,
         "configuration": arm["configuration"],
-        "metrics": arm["metrics"],
+        "metrics": metrics,
         "promotion_status": (
-            "reference"
-            if memory_mode == "raw"
-            else ("passed" if promotion["passed"] else "failed")
+            "not_evaluated"
+            if governance_mode == "normal"
+            else (
+                "reference"
+                if memory_mode == "raw"
+                else ("passed" if promotion["passed"] else "failed")
+            )
         ),
         "promotion_reasons": (
-            [] if memory_mode == "raw" else list(reasons)
+            []
+            if governance_mode == "normal" or memory_mode == "raw"
+            else list(reasons)
         ),
-        "artifact_path": arm["artifact_path"],
+        "artifact_path": _portable_history_path(artifact_path),
     }
     for key, value in record.items():
-        if value is None or (isinstance(value, str) and not value):
+        nullable = governance_mode == "normal" and key in {"preflight_hash", "policy_hash"}
+        if not nullable and (value is None or (isinstance(value, str) and not value)):
             raise ValueError(f"history record requires {key}")
     if not isinstance(record["configuration"], dict):
         raise ValueError("history record configuration must be an object")
     if not isinstance(record["metrics"], dict):
         raise ValueError("history record metrics must be an object")
     return record
+
+
+def history_configuration(config: dict[str, Any]) -> dict[str, Any]:
+    """Select behavior-affecting, non-secret settings for history records."""
+    return {
+        key: config[key]
+        for key in HISTORY_CONFIGURATION_KEYS
+        if key in config and config[key] is not None
+    }
+
+
+def _portable_history_path(value: Any) -> str:
+    """Keep repository-local artifacts portable across machines."""
+    value = str(value)
+    if "://" in value:
+        return value
+    path = Path(value)
+    if not path.is_absolute():
+        return path.as_posix()
+    parts = path.parts
+    try:
+        outputs_index = max(
+            index for index, component in enumerate(parts) if component == "outputs"
+        )
+    except ValueError:
+        return path.as_posix()
+    return Path(*parts[outputs_index:]).as_posix()
+
+
+def _portable_history_value(
+    value: Any, path: tuple[str, ...] = ()
+) -> Any:
+    """Normalize repository-local paths embedded in history metrics."""
+    if isinstance(value, dict):
+        return {
+            child_key: _portable_history_value(child, (*path, child_key))
+            for child_key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [_portable_history_value(child, path) for child in value]
+    if path[-2:] == ("retrieval", "input") and isinstance(value, str):
+        return _portable_history_path(value)
+    return value
 
 
 def build_history_records(comparison: dict[str, Any]) -> list[dict[str, Any]]:

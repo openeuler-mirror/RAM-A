@@ -365,8 +365,8 @@ output 已迁移到 Rust `memory-pipeline` crate。Python 只保留数据集 ada
 ## 8. 统一 A/B 治理入口
 
 PersonaMem、LongMemEval 和 LoCoMo 现在由
-`evaluation/scripts/run_memory_ab.py` 按同一顺序运行：完整 frozen/policy 门禁、
-dataset-bound regression preflight、fresh raw、extracted、comparison，最后才执行 pilot
-freeze 或 full history append。Preflight hash 在 arm 启动前由各 runner 验证并写入
+`evaluation/scripts/run_memory_ab.py` 按同一顺序运行：normal 模式直接执行 full
+pair；strict 模式额外执行 policy 与 dataset-bound regression preflight，随后运行
+fresh raw、extracted、comparison。Preflight hash 在 arm 启动前由各 runner 验证并写入
 `config.json`；Python 不补写或伪造 Rust memory pipeline 的结果。只有完整 full pair
-进入版本化 JSONL history，晋级失败的完整 pair 保留为 failed，pilot/不完整 pair 不写。
+进入版本化 JSONL history，晋级失败的完整 pair 保留为 failed，不完整 pair 不写。
