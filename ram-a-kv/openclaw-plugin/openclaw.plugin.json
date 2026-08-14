@@ -1,0 +1,44 @@
+{
+  "id": "ram-a-kv-hook",
+  "name": "ram-a-kv KV Cache",
+  "description": "Provider plugin that intercepts LLM responses for KV cache lifecycle management with ram-a-kv daemon",
+  "providers": ["ram-a-kv"],
+  "activation": { "onStartup": true },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "daemonUrl": {
+        "type": "string",
+        "default": "http://127.0.0.1:6998",
+        "description": "ram-a-kv daemon URL"
+      },
+      "authToken": {
+        "type": "string",
+        "default": "",
+        "description": "Bearer token sent as `Authorization: Bearer <token>` when non-empty; required if the daemon is exposed on a non-loopback address"
+      },
+      "restoreOnSessionStart": {
+        "type": "boolean",
+        "default": true,
+        "description": "Automatically restore KV cache when a session resumes from a previous one"
+      },
+      "skipRestoreReasons": {
+        "type": "array",
+        "items": { "type": "string" },
+        "default": ["new", "reset", "deleted"],
+        "description": "Session end reasons that should NOT trigger KV cache restore"
+      },
+      "prefetchOnTurnStart": {
+        "type": "boolean",
+        "default": true,
+        "description": "Send turn_start to prefetch KV cache before inference"
+      },
+      "requestTimeoutMs": {
+        "type": "number",
+        "default": 6000,
+        "description": "HTTP request timeout for ram-a-kv daemon calls (ms)"
+      }
+    }
+  }
+}

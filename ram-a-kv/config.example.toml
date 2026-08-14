@@ -1,0 +1,6 @@
+# ram-a-kv daemon configuration example
+
+listen_addr = "127.0.0.1:6998"
+lmcache_url = "http://localhost:6999"
+debug_enabled = false
+debug_dir = "kvcache_debug"
