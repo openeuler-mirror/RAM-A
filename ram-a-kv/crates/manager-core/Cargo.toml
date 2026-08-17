@@ -1,0 +1,18 @@
+[package]
+name = "manager-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "sync"] }
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "sync"] }

@@ -1,0 +1,27 @@
+{
+  "name": "ram-a-kv-hook",
+  "version": "0.1.0",
+  "description": "OpenClaw hook plugin for ram-a-kv KV cache integration",
+  "type": "module",
+  "main": "dist/index.js",
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepack": "npm run build",
+    "test": "echo \"no tests yet\" && exit 0"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.7.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  },
+  "files": [
+    "dist/",
+    "openclaw.plugin.json"
+  ]
+}

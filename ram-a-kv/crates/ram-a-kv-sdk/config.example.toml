@@ -1,0 +1,2 @@
+daemon_url = "http://127.0.0.1:6998"
+# auth_token = "change-me"
