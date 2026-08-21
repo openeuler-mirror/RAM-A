@@ -104,10 +104,12 @@ impl GroundingVerifier for LlmGroundingVerifier {
             serde_json::json!({"role": "user", "content": prompt}),
         ], self.max_output_tokens).await?;
         let payload = parse_extraction_json(&result.content)
-            .map_err(|error| PipelineError::Protocol(format!("invalid grounding JSON: {error}")))?;
+            .map_err(|error| PipelineError::Protocol(format!("invalid grounding JSON: {error}")))
+            .map_err(|error| error.at_site("memory_pipeline.ground.parse_response"))?;
         Ok(GroundingBatch {
             window_id: window.id.clone(),
-            results: parse_grounding_results(&payload, memories)?,
+            results: parse_grounding_results(&payload, memories)
+                .map_err(|error| error.at_site("memory_pipeline.ground.validate_response"))?,
             usage: result.usage,
             raw_response: result.content,
         })

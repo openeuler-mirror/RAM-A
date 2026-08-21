@@ -958,6 +958,40 @@ async fn memory_search_returns_structured_content_and_json_text_fallback() {
 }
 
 #[tokio::test]
+async fn memory_search_failure_exposes_the_http_request_id() {
+    let fixture = fixture_router().await;
+    let (session_id, _) = initialize(&fixture.app).await;
+    std::fs::remove_file(&fixture.database_path).expect("remove SQLite database");
+    std::fs::create_dir(&fixture.database_path).expect("replace SQLite file with a directory");
+    let called = call_tool(
+        &fixture.app,
+        &session_id,
+        204,
+        "memory_search",
+        json!({"query": "window seat", "top_k": 5}),
+    )
+    .await;
+    assert_eq!(called.status(), StatusCode::OK);
+    let request_id = called
+        .headers()
+        .get("x-request-id")
+        .expect("response request id")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let called = response_json(called).await;
+    assert_eq!(called["result"]["isError"], json!(true));
+    assert_eq!(
+        called["result"]["structuredContent"]["code"],
+        json!("STORAGE_FAILED")
+    );
+    assert_eq!(
+        called["result"]["structuredContent"]["request_id"],
+        json!(request_id)
+    );
+}
+
+#[tokio::test]
 async fn invalid_tool_input_is_a_tool_execution_error_not_a_protocol_error() {
     let fixture = fixture_router().await;
     let (session_id, _) = initialize(&fixture.app).await;

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use memory_pipeline::cache::JsonCache;
 use memory_pipeline::episode::build_episodes;
+use memory_pipeline::error::PipelineStage;
 use memory_pipeline::extraction::StaticMemoryExtractor;
 use memory_pipeline::grounding::StaticGroundingVerifier;
 use memory_pipeline::normalize::normalize_prepared_memories;
@@ -205,11 +206,11 @@ async fn fail_fast_controls_extraction_and_grounding_failures() {
 
     let missing_extraction = StaticMemoryExtractor::new(HashMap::new());
     let empty_verifier = StaticGroundingVerifier::new(HashMap::new());
-    assert!(
-        run_memory_pipeline(&source, &config, &missing_extraction, &empty_verifier, None,)
+    let extraction_error =
+        run_memory_pipeline(&source, &config, &missing_extraction, &empty_verifier, None)
             .await
-            .is_err()
-    );
+            .unwrap_err();
+    assert_eq!(extraction_error.stage(), Some(PipelineStage::Extract));
 
     let best_effort = PipelineConfig {
         fail_fast: false,
@@ -230,11 +231,10 @@ async fn fail_fast_controls_extraction_and_grounding_failures() {
         window.id,
         json!({"schema_version": "atomic_memory_v1", "memories": [raw_memory()]}),
     )]));
-    assert!(
-        run_memory_pipeline(&source, &config, &extractor, &empty_verifier, None)
-            .await
-            .is_err()
-    );
+    let grounding_error = run_memory_pipeline(&source, &config, &extractor, &empty_verifier, None)
+        .await
+        .unwrap_err();
+    assert_eq!(grounding_error.stage(), Some(PipelineStage::Ground));
 
     let grounding_run =
         run_memory_pipeline(&source, &best_effort, &extractor, &empty_verifier, None)

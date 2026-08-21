@@ -322,7 +322,31 @@ pre-rerank hybrid order and emits a `ram_a.memory.search.degraded` event.
 
 ## Structured progress logs
 
-`ram-a-mem` writes one-line JSON logs. Use `RUST_LOG` to select the level; the default is `info`.
+`ram-a-mem` writes logs to stderr. Use `RUST_LOG` to select the level; the default is `info`.
+The rendering format and source location are configured before the service configuration is loaded:
+
+```bash
+# Production/log collector (defaults shown explicitly)
+export RAM_A_LOG_FORMAT=json
+export RAM_A_LOG_SOURCE=false
+
+# Terminal debugging
+export RAM_A_LOG_FORMAT=compact
+export RAM_A_LOG_SOURCE=true
+```
+
+`RAM_A_LOG_FORMAT` accepts only `json` or `compact`. `RAM_A_LOG_SOURCE` accepts only `true`
+or `false`. Invalid, differently cased, or whitespace-padded values make startup fail before the
+listener and storage are initialized. JSON is one object per line. Compact output has this shape:
+
+```text
+[2026-08-20T08:30:00.123Z] [ERROR] [crates/memory-pipeline/src/extraction.rs:91] [memory_ingest/extract] PIPELINE_FAILED: model returned invalid JSON | request_id=... pipeline_run_id=... error_site=memory_pipeline.extract.parse_response source_error_kind=invalid_json
+```
+
+RAM-A failure events include the error origin regardless of `RAM_A_LOG_SOURCE`. Enabling source
+adds the location of each tracing call as `filename`/`line_number` in JSON or `log_at` in compact
+output; it is useful for debug sessions but is not a stable alerting field.
+
 Every MCP tool call carries the HTTP `request_id` in its tracing span. Memory ingest emits stage
 events for validation, idempotency, normalization, episode/window construction, extraction,
 verification, vector persistence, optional graph build, and completion. Hybrid search emits
@@ -343,6 +367,8 @@ memory text, or provider response bodies. Successful ingest events include gener
 case task events include `task_id`, `dataset_id`, and `document_id` for operational correlation.
 `window_skipped` is emitted only for fail-open extraction or verification errors where the
 pipeline continues; `failed` means the current ingest operation stops.
+The process does not create or rotate log files; journald, the container runtime, or an external
+collector owns persistence and retention.
 
 ## Storage boundary
 

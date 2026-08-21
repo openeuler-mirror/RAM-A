@@ -12,6 +12,7 @@ use memory_core::{
     sqlite::GraphRepository, EmbeddingProvider, GraphBuildPipeline, HashEmbedding, MemoryManager,
     OpenRouterEmbedding, OpenRouterReranker, RerankProvider, SqliteMemoryStore,
 };
+use memory_mcp::observability::{LogSettings, RamLogFormatter};
 use memory_mcp::{
     create_http_router, EmbeddingProviderKind, HttpRuntime, IdempotencyRepository, MemoryService,
     ServerConfig, TokenAuthenticator,
@@ -21,6 +22,7 @@ use memory_pipeline::extraction::{LlmMemoryExtractor, MemoryExtractor};
 use memory_pipeline::grounding::{GroundingVerifier, LlmGroundingVerifier};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
+use tracing_subscriber::fmt::format::JsonFields;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use uuid::Uuid;
 
@@ -35,7 +37,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing()?;
+    let log_settings = init_tracing()?;
     let startup_run_id = Uuid::new_v4().to_string();
     let args = Args::parse();
     let config_path = resolve_config_path(args.config)?;
@@ -75,7 +77,9 @@ async fn main() -> Result<()> {
         embedding_dimensions = providers.embedding_dimensions,
         rerank_enabled = config.retrieval.rerank.enabled,
         rerank_provider = ?config.retrieval.rerank.provider,
-        rerank_model = config.retrieval.rerank.model
+        rerank_model = config.retrieval.rerank.model,
+        log_format = log_settings.format.as_str(),
+        log_source = log_settings.source
     );
     let provider_key = resolve_secret_env(&providers.api_key_env)?;
     let embedder: Arc<dyn EmbeddingProvider> = match providers.embedding_provider {
@@ -344,13 +348,20 @@ async fn main() -> Result<()> {
     server_result.context("HTTP server failed")
 }
 
-fn init_tracing() -> Result<()> {
+fn init_tracing() -> Result<LogSettings> {
+    let settings = LogSettings::from_env()?;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::registry()
         .with(filter)
-        .with(tracing_subscriber::fmt::layer().json())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .fmt_fields(JsonFields::new())
+                .event_format(RamLogFormatter::new(settings))
+                .with_writer(std::io::stderr),
+        )
         .try_init()
-        .context("failed to initialize structured logging")
+        .context("failed to initialize structured logging")?;
+    Ok(settings)
 }
 
 fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {

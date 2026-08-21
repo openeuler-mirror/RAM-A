@@ -435,7 +435,7 @@ async fn graph_ingest_retries_an_incomplete_build_without_duplicating_memory() {
             .ingest(&principal, preference_ingest())
             .await
             .unwrap_err(),
-        ServiceError::Pipeline
+        ServiceError::Pipeline { stage: None }
     );
     let retry = fixture
         .service
@@ -472,7 +472,7 @@ async fn graph_ingest_retry_is_stable_when_another_agent_resumes_the_request() {
             .ingest(&first_agent, preference_ingest())
             .await
             .unwrap_err(),
-        ServiceError::Pipeline
+        ServiceError::Pipeline { stage: None }
     );
     let retry = fixture
         .service

@@ -99,8 +99,10 @@ impl MemoryExtractor for LlmMemoryExtractor {
             json!({"role": "system", "content": "You are a source-faithful long-term-memory extractor. Output only the requested JSON object. Never invent evidence identifiers."}),
             json!({"role": "user", "content": prompt}),
         ], self.max_output_tokens).await?;
-        let payload = parse_extraction_json(&result.content)?;
-        let mut batch = batch_from_payload(&window.id, &payload, &result.content)?;
+        let payload = parse_extraction_json(&result.content)
+            .map_err(|error| error.at_site("memory_pipeline.extract.parse_response"))?;
+        let mut batch = batch_from_payload(&window.id, &payload, &result.content)
+            .map_err(|error| error.at_site("memory_pipeline.extract.validate_response"))?;
         batch.usage = result.usage;
         Ok(batch)
     }

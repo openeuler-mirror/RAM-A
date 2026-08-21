@@ -6,6 +6,7 @@ pub mod config;
 pub mod http;
 pub mod idempotency;
 pub mod mcp_server;
+pub mod observability;
 pub mod service;
 pub mod types;
 

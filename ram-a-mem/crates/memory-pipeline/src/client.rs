@@ -83,7 +83,13 @@ impl OpenAiCompatibleClient {
                             last_error = format!("chat completion body read failed: {error}");
                             if attempt + 1 < self.max_retries.max(1) {
                                 let backoff = Duration::from_secs((1u64 << attempt.min(6)).min(64));
-                                log_retry(model, attempt, self.max_retries, backoff, "read");
+                                log_retry(
+                                    model,
+                                    attempt,
+                                    self.max_retries,
+                                    backoff,
+                                    "response_read",
+                                );
                                 tokio::time::sleep(backoff).await;
                             }
                             continue;
@@ -95,7 +101,13 @@ impl OpenAiCompatibleClient {
                             last_error = format!("chat completion returned invalid JSON: {error}");
                             if attempt + 1 < self.max_retries.max(1) {
                                 let backoff = Duration::from_secs((1u64 << attempt.min(6)).min(64));
-                                log_retry(model, attempt, self.max_retries, backoff, "decode");
+                                log_retry(
+                                    model,
+                                    attempt,
+                                    self.max_retries,
+                                    backoff,
+                                    "invalid_json",
+                                );
                                 tokio::time::sleep(backoff).await;
                             }
                             continue;
@@ -167,7 +179,8 @@ impl OpenAiCompatibleClient {
         );
         Err(PipelineError::Protocol(format!(
             "chat completion failed after retries: {last_error}"
-        )))
+        ))
+        .at_site("memory_pipeline.provider.chat_completion"))
     }
 }
 
@@ -187,16 +200,22 @@ fn log_retry(model: &str, attempt: usize, max_retries: usize, backoff: Duration,
 
 fn llm_error_kind(message: &str) -> &'static str {
     let lower = message.to_ascii_lowercase();
-    if lower.contains("429") {
+    if lower.contains("empty content") {
+        "empty_content"
+    } else if lower.contains("429") {
         "http_429"
     } else if lower.contains("503") {
         "http_503"
     } else if lower.contains("invalid json") {
-        "decode"
+        "invalid_json"
     } else if lower.contains("body read") {
-        "read"
+        "response_read"
     } else if lower.contains("timed out") {
         "timeout"
+    } else if lower.contains("http ") {
+        "http_status"
+    } else if lower.contains("connect") {
+        "connect"
     } else {
         "request"
     }
@@ -224,6 +243,21 @@ mod tests {
     #[test]
     fn rejects_empty_api_key() {
         assert!(OpenAiCompatibleClient::new("  ", "http://localhost", 1, 1).is_err());
+    }
+
+    #[test]
+    fn model_failures_have_stable_safe_categories() {
+        for (message, expected) in [
+            ("chat completion returned empty content", "empty_content"),
+            ("chat completion returned invalid JSON", "invalid_json"),
+            ("chat completion body read failed", "response_read"),
+            ("request timed out", "timeout"),
+            ("HTTP 429 Too Many Requests", "http_429"),
+            ("HTTP 400 Bad Request", "http_status"),
+            ("connection refused", "connect"),
+        ] {
+            assert_eq!(llm_error_kind(message), expected);
+        }
     }
 
     #[tokio::test]
