@@ -242,6 +242,10 @@ guidance, see [`plugins/mcp/case-tool-instruction.md`](plugins/mcp/case-tool-ins
 xiaoO + RAM-A knowledge base configuration can start from those files and then apply the
 field changes listed below.
 
+The full server-field reference and the input/output contract of each memory pipeline stage are
+documented in
+[`docs/guides/ram-a-mem-configuration-and-pipeline.zh-CN.md`](docs/guides/ram-a-mem-configuration-and-pipeline.zh-CN.md).
+
 ```json
 {
   "auth": {
@@ -273,7 +277,7 @@ field changes listed below.
     "allowed_hosts": ["127.0.0.1:18081"]
   },
   "limits": {
-    "max_body_bytes": 1048576,
+    "max_body_bytes": 16777216,
     "requests_per_second": 20,
     "rate_burst": 40,
     "max_in_flight_per_principal_tool": 4,
@@ -282,6 +286,10 @@ field changes listed below.
     "max_active_sessions_per_principal": 8,
     "max_active_sessions_global": 256,
     "session_idle_timeout_seconds": 1800
+  },
+  "pipeline": {
+    "fail_fast": true,
+    "max_memory_chars": 500
   },
   "storage": {
     "database_path": "data/ram-a-memory.sqlite"

@@ -29,6 +29,10 @@ repository.
 - [guides/memory-cases-qa-evaluation.md](guides/memory-cases-qa-evaluation.md): QA eval
   test flow, case schema, coverage, strengths and limitations, and comparison with
   external retrieval tests.
+- [guides/ram-a-mem-configuration-and-pipeline.zh-CN.md](guides/ram-a-mem-configuration-and-pipeline.zh-CN.md):
+  RAM-A-MEM 完整配置、摄入七阶段、完整摄入链和检索链的数据契约。
+- [guides/ram-a-mem-rpm-agent-self-test.zh-CN.md](guides/ram-a-mem-rpm-agent-self-test.zh-CN.md):
+  在 openEuler 容器中安装 RAM-A RPM，并通过裸 MCP 和 xiaoO 验证摄入、检索与持久化。
 - [guides/xiaoo-case-library-integration.md](guides/xiaoo-case-library-integration.md):
   `memory_case_search` deployment, authorization, tool selection, and xiaoO
   integration boundary.

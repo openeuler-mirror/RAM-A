@@ -12,8 +12,9 @@ use memory_core::{HashEmbedding, MemoryManager, SqliteMemoryStore};
 use memory_mcp::{
     create_http_router, AuthConfig, CaseLibraryConfig, DynCaseSearchProvider,
     EmbeddedCaseSearchProvider, EmbeddingProviderKind, FeatureFlags, GraphMemoryRetrievalConfig,
-    HttpConfig, HttpRuntime, IdempotencyRepository, LimitsConfig, MemoryService, ProvidersConfig,
-    ServerConfig, StorageConfig, TokenAuthenticator, TokenConfig,
+    HttpConfig, HttpRuntime, IdempotencyRepository, LimitsConfig, MemoryService,
+    PipelineServiceConfig, ProvidersConfig, ServerConfig, StorageConfig, TokenAuthenticator,
+    TokenConfig,
 };
 use memory_pipeline::error::Result as PipelineResult;
 use memory_pipeline::extraction::{ExtractionBatch, MemoryExtractor, ModelUsage, SCHEMA_VERSION};
@@ -1091,8 +1092,7 @@ async fn missing_case_search_permission_is_rejected_with_http_forbidden() {
 
 #[tokio::test]
 async fn case_document_mutation_tools_require_cases_write_permission() {
-    let read_only =
-        fixture_router_with_permissions(&["cases:read"], LimitsConfig::default()).await;
+    let read_only = fixture_router_with_permissions(&["cases:read"], LimitsConfig::default()).await;
     let (read_only_session, _) = initialize(&read_only.app).await;
     let denied = call_tool(
         &read_only.app,
@@ -1298,10 +1298,12 @@ async fn mcp_upload_update_and_delete_flow_reaches_the_embedded_case_library() {
     )
     .await;
     let new_search = response_json(new_search).await;
-    assert!(new_search["result"]["structuredContent"]["references"][0]["content"]
-        .as_str()
-        .unwrap()
-        .contains("mcpnewdnsneedle"));
+    assert!(
+        new_search["result"]["structuredContent"]["references"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("mcpnewdnsneedle")
+    );
 
     let delete_proposal = call_tool(
         &fixture.app,
@@ -1721,6 +1723,7 @@ fn production_runtime_config_requires_live_components_and_nonzero_limits() {
         features: Default::default(),
         http: HttpConfig::default(),
         limits: LimitsConfig::default(),
+        pipeline: PipelineServiceConfig::default(),
         storage: None,
         providers: None,
         retrieval: Default::default(),
@@ -1734,6 +1737,7 @@ fn production_runtime_config_requires_live_components_and_nonzero_limits() {
         features: Default::default(),
         http: HttpConfig::default(),
         limits: LimitsConfig::default(),
+        pipeline: PipelineServiceConfig::default(),
         storage: Some(StorageConfig {
             database_path: "memory.sqlite".into(),
         }),

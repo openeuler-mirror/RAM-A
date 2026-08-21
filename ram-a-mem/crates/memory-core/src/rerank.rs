@@ -12,14 +12,13 @@ fn retry_backoff(attempt: usize) -> Duration {
     Duration::from_secs(1 << (attempt - 1))
 }
 
-/// Whether a rerank failure is worth retrying (network drop, retryable HTTP status,
-/// decode hiccup). Mirrors the embedding retry policy.
+/// Whether a rerank failure is worth retrying. Invalid provider responses are
+/// deterministic contract failures and are not retried.
 fn is_retryable_rerank_failure(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("error sending request")
         || lower.contains("failed to read")
         || lower.contains("operation timed out")
-        || lower.contains("decode failed")
         || lower.contains("http 408")
         || lower.contains("http 425")
         || lower.contains("http 429")
@@ -318,6 +317,34 @@ mod tests {
     fn retry_budget_covers_extended_network_outages() {
         assert_eq!(RERANK_MAX_ATTEMPTS, 8);
         assert_eq!(retry_backoff(7), Duration::from_secs(64));
+    }
+
+    #[test]
+    fn retry_classification_is_limited_to_transient_failures() {
+        for message in [
+            "error sending request",
+            "failed to read response",
+            "operation timed out",
+            "HTTP 408",
+            "HTTP 425",
+            "HTTP 429",
+            "HTTP 500",
+            "HTTP 502",
+            "HTTP 503",
+            "HTTP 504",
+        ] {
+            assert!(is_retryable_rerank_failure(message), "{message}");
+        }
+        for message in [
+            "HTTP 400",
+            "HTTP 401",
+            "HTTP 403",
+            "decode failed",
+            "duplicate index",
+            "non-finite score",
+        ] {
+            assert!(!is_retryable_rerank_failure(message), "{message}");
+        }
     }
 
     fn candidate(id: &str) -> ScoredMemory {

@@ -157,7 +157,13 @@ async fn main() -> Result<()> {
             retrieval_config,
         ))
     };
-    let mut service = MemoryService::new(manager, idempotency, extractor, verifier);
+    let mut service = MemoryService::with_pipeline_config(
+        manager,
+        idempotency,
+        extractor,
+        verifier,
+        config.pipeline.pipeline_config(),
+    );
     if features.memory && config.features.graph_memory.enabled {
         let graph = config
             .graph_memory

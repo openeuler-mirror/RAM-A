@@ -41,10 +41,11 @@
     "bind_address": "127.0.0.1",
     "port": 18081,
     "allowed_origins": ["http://127.0.0.1:18080"],
-    "allowed_hosts": ["127.0.0.1:18081"]
+    "allowed_hosts": ["127.0.0.1:18081"],
+    "tls_termination_acknowledged": false
   },
   "limits": {
-    "max_body_bytes": 1048576,
+    "max_body_bytes": 16777216,
     "requests_per_second": 20,
     "rate_burst": 40,
     "max_in_flight_per_principal_tool": 4,
@@ -54,6 +55,10 @@
     "max_active_sessions_global": 256,
     "session_idle_timeout_seconds": 1800
   },
+  "pipeline": {
+    "fail_fast": true,
+    "max_memory_chars": 500
+  },
   "storage": {
     "database_path": "data/ram-a-memory.sqlite"
   },
@@ -61,6 +66,8 @@
     "api_key_env": "LLM_API_KEY",
     "base_url": "http://127.0.0.1:8000/v1",
     "embedding_provider": "hash",
+    "embedding_api_key_env": null,
+    "embedding_base_url": null,
     "embedding_model": "hash",
     "embedding_dimensions": 1024,
     "extractor_model": "GLM-5.2",
@@ -91,9 +98,15 @@
     "api_token_env": "RAM_A_CASES_ADMIN_TOKEN",
     "ingestion_poll_ms": 1000,
     "embedding_provider": "hash",
+    "embedding_api_key_env": null,
+    "embedding_base_url": null,
     "embedding_model": "hash",
     "embedding_dimensions": 1024,
     "chunk_size": 160,
+    "summary_llm_model": null,
+    "summary_llm_api_key_env": null,
+    "summary_llm_base_url": null,
+    "summary_llm_timeout_ms": 30000,
     "default_library": "ops",
     "libraries": [
       {

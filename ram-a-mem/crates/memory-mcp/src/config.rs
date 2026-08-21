@@ -16,6 +16,8 @@ pub struct ServerConfig {
     #[serde(default)]
     pub limits: LimitsConfig,
     #[serde(default)]
+    pub pipeline: PipelineServiceConfig,
+    #[serde(default)]
     pub storage: Option<StorageConfig>,
     #[serde(default)]
     pub providers: Option<ProvidersConfig>,
@@ -26,6 +28,18 @@ pub struct ServerConfig {
     #[serde(default)]
     pub graph_memory: Option<GraphMemoryServiceConfig>,
 }
+
+pub const MAX_MCP_BODY_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_REQUESTS_PER_SECOND: u32 = 10_000;
+pub const MAX_RATE_BURST: u32 = 100_000;
+pub const MAX_IN_FLIGHT_PER_PRINCIPAL_TOOL: usize = 1_024;
+pub const MAX_INITIALIZE_REQUESTS_PER_SECOND: u32 = 1_000;
+pub const MAX_INITIALIZE_RATE_BURST: u32 = 10_000;
+pub const MAX_ACTIVE_SESSIONS_PER_PRINCIPAL: usize = 1_024;
+pub const MAX_ACTIVE_SESSIONS_GLOBAL: usize = 100_000;
+pub const MAX_SESSION_IDLE_TIMEOUT_SECONDS: u64 = 86_400;
+pub const DEFAULT_RERANK_TIMEOUT_MS: u64 = 30_000;
+pub const MAX_RERANK_TIMEOUT_MS: u64 = 120_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FeatureFlags {
@@ -284,6 +298,69 @@ impl Default for LimitsConfig {
     }
 }
 
+impl LimitsConfig {
+    fn validate(&self) -> Result<()> {
+        let within_bounds = self.max_body_bytes <= MAX_MCP_BODY_BYTES
+            && self.requests_per_second <= MAX_REQUESTS_PER_SECOND
+            && self.rate_burst <= MAX_RATE_BURST
+            && self.max_in_flight_per_principal_tool <= MAX_IN_FLIGHT_PER_PRINCIPAL_TOOL
+            && self.initialize_requests_per_second <= MAX_INITIALIZE_REQUESTS_PER_SECOND
+            && self.initialize_rate_burst <= MAX_INITIALIZE_RATE_BURST
+            && self.max_active_sessions_per_principal <= MAX_ACTIVE_SESSIONS_PER_PRINCIPAL
+            && self.max_active_sessions_global <= MAX_ACTIVE_SESSIONS_GLOBAL
+            && self.session_idle_timeout_seconds <= MAX_SESSION_IDLE_TIMEOUT_SECONDS;
+        let all_nonzero = self.max_body_bytes > 0
+            && self.requests_per_second > 0
+            && self.rate_burst > 0
+            && self.max_in_flight_per_principal_tool > 0
+            && self.initialize_requests_per_second > 0
+            && self.initialize_rate_burst > 0
+            && self.max_active_sessions_per_principal > 0
+            && self.max_active_sessions_global > 0
+            && self.session_idle_timeout_seconds > 0;
+        if !all_nonzero || !within_bounds {
+            anyhow::bail!("HTTP limits are outside the supported range");
+        }
+        if self.max_active_sessions_global < self.max_active_sessions_per_principal {
+            anyhow::bail!("global active session limit must be at least the per-principal limit");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PipelineServiceConfig {
+    pub fail_fast: bool,
+    pub max_memory_chars: usize,
+}
+
+impl Default for PipelineServiceConfig {
+    fn default() -> Self {
+        let defaults = memory_pipeline::pipeline::PipelineConfig::default();
+        Self {
+            fail_fast: defaults.fail_fast,
+            max_memory_chars: defaults.validation.max_memory_chars,
+        }
+    }
+}
+
+impl PipelineServiceConfig {
+    pub fn pipeline_config(&self) -> memory_pipeline::pipeline::PipelineConfig {
+        let mut config = memory_pipeline::pipeline::PipelineConfig::default();
+        config.fail_fast = self.fail_fast;
+        config.validation.max_memory_chars = self.max_memory_chars;
+        config
+    }
+
+    fn validate(&self) -> Result<()> {
+        if !(1..=crate::MAX_MESSAGE_TEXT_CHARS).contains(&self.max_memory_chars) {
+            anyhow::bail!("pipeline max_memory_chars must be between 1 and 32000");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageConfig {
@@ -440,7 +517,7 @@ impl Default for RerankServiceConfig {
             api_key_env: Some(defaults.api_key_env),
             base_url: defaults.base_url,
             input_k: defaults.input_k,
-            timeout_ms: defaults.timeout_ms,
+            timeout_ms: Some(DEFAULT_RERANK_TIMEOUT_MS),
             fail_open: defaults.fail_open,
         }
     }
@@ -485,8 +562,10 @@ impl RerankServiceConfig {
         if !(1..=500).contains(&self.input_k) {
             anyhow::bail!("rerank input_k must be between 1 and 500");
         }
-        if self.timeout_ms == Some(0) {
-            anyhow::bail!("rerank timeout_ms must be non-zero when configured");
+        if !matches!(self.timeout_ms, Some(1..=MAX_RERANK_TIMEOUT_MS)) {
+            anyhow::bail!(
+                "enabled rerank timeout_ms must be between 1 and {MAX_RERANK_TIMEOUT_MS}"
+            );
         }
         Ok(())
     }
@@ -660,7 +739,7 @@ fn is_loopback_host(value: &str) -> bool {
 }
 
 fn default_max_body_bytes() -> usize {
-    1_048_576
+    16 * 1024 * 1024
 }
 
 fn default_requests_per_second() -> u32 {
@@ -762,6 +841,8 @@ impl ServerConfig {
 
     pub fn validate_runtime(&self) -> Result<()> {
         self.http.validate_bind()?;
+        self.limits.validate()?;
+        self.pipeline.validate()?;
         self.retrieval.validate()?;
         if self.features.case_library.enabled == Some(true) && self.case_library.is_none() {
             anyhow::bail!("case_library feature requires case_library configuration");
@@ -774,18 +855,6 @@ impl ServerConfig {
         }
         if self.auth.tokens.is_empty() {
             anyhow::bail!("production runtime requires at least one authenticated principal");
-        }
-        if self.limits.max_body_bytes == 0
-            || self.limits.requests_per_second == 0
-            || self.limits.rate_burst == 0
-            || self.limits.max_in_flight_per_principal_tool == 0
-            || self.limits.initialize_requests_per_second == 0
-            || self.limits.initialize_rate_burst == 0
-            || self.limits.max_active_sessions_per_principal == 0
-            || self.limits.max_active_sessions_global == 0
-            || self.limits.session_idle_timeout_seconds == 0
-        {
-            anyhow::bail!("HTTP limits must all be non-zero");
         }
         let storage = self
             .storage
@@ -981,10 +1050,120 @@ fn is_loopback_or_private(value: &url::Url) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_provider_base_url, EmbeddingProviderKind, RerankServiceConfig,
-        RetrievalServiceConfig, ServerConfig,
+        validate_provider_base_url, EmbeddingProviderKind, LimitsConfig, PipelineServiceConfig,
+        RerankServiceConfig, RetrievalServiceConfig, ServerConfig, DEFAULT_RERANK_TIMEOUT_MS,
+        MAX_ACTIVE_SESSIONS_GLOBAL, MAX_ACTIVE_SESSIONS_PER_PRINCIPAL, MAX_INITIALIZE_RATE_BURST,
+        MAX_INITIALIZE_REQUESTS_PER_SECOND, MAX_IN_FLIGHT_PER_PRINCIPAL_TOOL, MAX_MCP_BODY_BYTES,
+        MAX_RATE_BURST, MAX_REQUESTS_PER_SECOND, MAX_RERANK_TIMEOUT_MS,
+        MAX_SESSION_IDLE_TIMEOUT_SECONDS,
     };
     use memory_core::SearchMode;
+
+    #[test]
+    fn pipeline_defaults_and_boundaries_are_stable() {
+        let defaults = PipelineServiceConfig::default();
+        assert!(defaults.fail_fast);
+        assert_eq!(defaults.max_memory_chars, 500);
+        assert!(defaults.validate().is_ok());
+
+        for max_memory_chars in [1, crate::MAX_MESSAGE_TEXT_CHARS] {
+            let config = PipelineServiceConfig {
+                fail_fast: false,
+                max_memory_chars,
+            };
+            assert!(config.validate().is_ok());
+            let pipeline = config.pipeline_config();
+            assert!(!pipeline.fail_fast);
+            assert_eq!(pipeline.validation.max_memory_chars, max_memory_chars);
+        }
+        for max_memory_chars in [0, crate::MAX_MESSAGE_TEXT_CHARS + 1] {
+            assert!(PipelineServiceConfig {
+                fail_fast: true,
+                max_memory_chars,
+            }
+            .validate()
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn http_limit_defaults_are_stable_and_supported() {
+        let limits = LimitsConfig::default();
+        assert_eq!(limits.max_body_bytes, 16 * 1024 * 1024);
+        assert_eq!(limits.requests_per_second, 20);
+        assert_eq!(limits.rate_burst, 40);
+        assert_eq!(limits.max_in_flight_per_principal_tool, 4);
+        assert_eq!(limits.initialize_requests_per_second, 4);
+        assert_eq!(limits.initialize_rate_burst, 8);
+        assert_eq!(limits.max_active_sessions_per_principal, 8);
+        assert_eq!(limits.max_active_sessions_global, 256);
+        assert_eq!(limits.session_idle_timeout_seconds, 1_800);
+        assert!(limits.validate().is_ok());
+    }
+
+    #[test]
+    fn http_limits_accept_documented_upper_boundaries() {
+        let limits = LimitsConfig {
+            max_body_bytes: MAX_MCP_BODY_BYTES,
+            requests_per_second: MAX_REQUESTS_PER_SECOND,
+            rate_burst: MAX_RATE_BURST,
+            max_in_flight_per_principal_tool: MAX_IN_FLIGHT_PER_PRINCIPAL_TOOL,
+            initialize_requests_per_second: MAX_INITIALIZE_REQUESTS_PER_SECOND,
+            initialize_rate_burst: MAX_INITIALIZE_RATE_BURST,
+            max_active_sessions_per_principal: MAX_ACTIVE_SESSIONS_PER_PRINCIPAL,
+            max_active_sessions_global: MAX_ACTIVE_SESSIONS_GLOBAL,
+            session_idle_timeout_seconds: MAX_SESSION_IDLE_TIMEOUT_SECONDS,
+        };
+        assert!(limits.validate().is_ok());
+    }
+
+    #[test]
+    fn http_limits_reject_zero_out_of_range_and_inconsistent_sessions() {
+        let mut invalid = Vec::new();
+        macro_rules! invalid_limit {
+            ($field:ident, $value:expr) => {{
+                let mut limits = LimitsConfig::default();
+                limits.$field = $value;
+                invalid.push(limits);
+            }};
+        }
+        invalid_limit!(max_body_bytes, 0);
+        invalid_limit!(max_body_bytes, MAX_MCP_BODY_BYTES + 1);
+        invalid_limit!(requests_per_second, 0);
+        invalid_limit!(requests_per_second, MAX_REQUESTS_PER_SECOND + 1);
+        invalid_limit!(rate_burst, 0);
+        invalid_limit!(rate_burst, MAX_RATE_BURST + 1);
+        invalid_limit!(max_in_flight_per_principal_tool, 0);
+        invalid_limit!(
+            max_in_flight_per_principal_tool,
+            MAX_IN_FLIGHT_PER_PRINCIPAL_TOOL + 1
+        );
+        invalid_limit!(initialize_requests_per_second, 0);
+        invalid_limit!(
+            initialize_requests_per_second,
+            MAX_INITIALIZE_REQUESTS_PER_SECOND + 1
+        );
+        invalid_limit!(initialize_rate_burst, 0);
+        invalid_limit!(initialize_rate_burst, MAX_INITIALIZE_RATE_BURST + 1);
+        invalid_limit!(max_active_sessions_per_principal, 0);
+        invalid_limit!(
+            max_active_sessions_per_principal,
+            MAX_ACTIVE_SESSIONS_PER_PRINCIPAL + 1
+        );
+        invalid_limit!(max_active_sessions_global, 0);
+        invalid_limit!(max_active_sessions_global, MAX_ACTIVE_SESSIONS_GLOBAL + 1);
+        invalid_limit!(session_idle_timeout_seconds, 0);
+        invalid_limit!(
+            session_idle_timeout_seconds,
+            MAX_SESSION_IDLE_TIMEOUT_SECONDS + 1
+        );
+        let mut inconsistent = LimitsConfig::default();
+        inconsistent.max_active_sessions_per_principal = 9;
+        inconsistent.max_active_sessions_global = 8;
+        invalid.push(inconsistent);
+
+        assert!(invalid.into_iter().all(|limits| limits.validate().is_err()));
+    }
 
     #[test]
     fn provider_base_url_rejects_credentials_query_and_fragment() {
@@ -1014,6 +1193,7 @@ mod tests {
         assert_eq!(config.bm25_weight, 0.3);
         assert_eq!(config.candidate_k, None);
         assert!(!config.rerank.enabled);
+        assert_eq!(config.rerank.timeout_ms, Some(DEFAULT_RERANK_TIMEOUT_MS));
         assert!(config.validate().is_ok());
     }
 
@@ -1185,6 +1365,18 @@ mod tests {
             };
             assert!(config.validate().is_ok(), "input_k={input_k}");
         }
+
+        for timeout_ms in [1, MAX_RERANK_TIMEOUT_MS] {
+            let config = RetrievalServiceConfig {
+                rerank: RerankServiceConfig {
+                    enabled: true,
+                    timeout_ms: Some(timeout_ms),
+                    ..RerankServiceConfig::default()
+                },
+                ..RetrievalServiceConfig::default()
+            };
+            assert!(config.validate().is_ok(), "timeout_ms={timeout_ms}");
+        }
     }
 
     #[test]
@@ -1218,13 +1410,37 @@ mod tests {
             ..RetrievalServiceConfig::default()
         };
         assert!(zero_timeout.validate().is_err());
+
+        for timeout_ms in [None, Some(MAX_RERANK_TIMEOUT_MS + 1)] {
+            let invalid_timeout = RetrievalServiceConfig {
+                rerank: RerankServiceConfig {
+                    enabled: true,
+                    timeout_ms,
+                    ..RerankServiceConfig::default()
+                },
+                ..RetrievalServiceConfig::default()
+            };
+            assert!(invalid_timeout.validate().is_err());
+        }
     }
 
     #[test]
     fn packaged_rpm_example_matches_server_schema() {
-        let config = packaged_config();
+        let source: serde_json::Value =
+            serde_json::from_str(include_str!("../../../plugins/mcp/ram-a-mem.json"))
+                .expect("packaged config is JSON");
+        let config: ServerConfig =
+            serde_json::from_value(source.clone()).expect("packaged config parses");
 
         assert!(config.validate_runtime().is_ok());
+        assert_eq!(
+            serde_json::to_value(&config).expect("config serializes"),
+            source,
+            "the full example must explicitly contain every serializable config field"
+        );
+        assert_eq!(config.limits.max_body_bytes, 16 * 1024 * 1024);
+        assert!(config.pipeline.fail_fast);
+        assert_eq!(config.pipeline.max_memory_chars, 500);
         assert_eq!(config.retrieval.mode, SearchMode::Hybrid);
         assert_eq!(config.retrieval.embedding_weight, 0.7);
         assert_eq!(config.retrieval.bm25_weight, 0.3);

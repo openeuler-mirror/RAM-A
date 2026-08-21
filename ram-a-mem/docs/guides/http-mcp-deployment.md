@@ -29,6 +29,11 @@ delete confirmation tools, `memory_search`, and `memory_ingest` are MCP tools on
 
 Create `config/ram-a-mem.json`:
 
+The checked-in [`plugins/mcp/ram-a-mem.json`](../../plugins/mcp/ram-a-mem.json) explicitly
+lists every current server configuration field. For a field-by-field explanation and the
+seven-stage ingest data contract, see the
+[Chinese configuration and pipeline reference](ram-a-mem-configuration-and-pipeline.zh-CN.md).
+
 ```json
 {
   "auth": {
@@ -60,7 +65,7 @@ Create `config/ram-a-mem.json`:
     "allowed_hosts": ["127.0.0.1:18081"]
   },
   "limits": {
-    "max_body_bytes": 1048576,
+    "max_body_bytes": 16777216,
     "requests_per_second": 20,
     "rate_burst": 40,
     "max_in_flight_per_principal_tool": 4,
@@ -69,6 +74,10 @@ Create `config/ram-a-mem.json`:
     "max_active_sessions_per_principal": 8,
     "max_active_sessions_global": 256,
     "session_idle_timeout_seconds": 1800
+  },
+  "pipeline": {
+    "fail_fast": true,
+    "max_memory_chars": 500
   },
   "storage": {
     "database_path": "data/ram-a-memory.sqlite"
@@ -121,6 +130,35 @@ Create `config/ram-a-mem.json`:
   }
 }
 ```
+
+The `limits` values are service-level controls and are not MCP tool arguments:
+
+| Field | Default | Accepted range |
+| --- | ---: | ---: |
+| `max_body_bytes` | 16777216 | 1..=67108864 |
+| `requests_per_second` | 20 | 1..=10000 |
+| `rate_burst` | 40 | 1..=100000 |
+| `max_in_flight_per_principal_tool` | 4 | 1..=1024 |
+| `initialize_requests_per_second` | 4 | 1..=1000 |
+| `initialize_rate_burst` | 8 | 1..=10000 |
+| `max_active_sessions_per_principal` | 8 | 1..=1024 |
+| `max_active_sessions_global` | 256 | 1..=100000 |
+| `session_idle_timeout_seconds` | 1800 | 1..=86400 |
+
+`max_active_sessions_global` must be greater than or equal to
+`max_active_sessions_per_principal`. Tool rate and concurrency limits are keyed by authenticated
+`scope_id + agent_id + tool name`; initialize and per-principal session limits are keyed by
+`scope_id + agent_id`. Concurrency excess is rejected without queueing. A rejected request returns
+HTTP 429, `Retry-After: 1`, and an `x-ram-a-limit-reason` value of `tool_rate_limit`,
+`tool_concurrency`, `initialize_rate_limit`, or `session_admission`.
+
+The `pipeline` object controls ingest processing for the whole service. `fail_fast` defaults to
+`true`; an Extract or Ground provider failure terminates the request. The MCP tool error uses
+`code=PIPELINE_FAILED`, `retriable=true`, and `stage=extract` or `stage=ground`. With
+`fail_fast=false`, a failed Extract window is counted as rejected and a failed Ground window is
+counted as quarantined; remaining windows continue. `max_memory_chars` defaults to 500 and accepts
+1..=32000 Unicode characters. A longer extracted memory is quarantined rather than truncating or
+failing the request.
 
 Set secrets in the environment, not in config files:
 

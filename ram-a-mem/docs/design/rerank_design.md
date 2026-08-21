@@ -123,6 +123,21 @@ pub trait Reranker: Send + Sync {
 OpenRouter client 对网络错误、HTTP 429/5xx 和可重试服务错误做有限重试；认证、
 额度和响应格式错误会直接返回错误。
 
+在 `ram-a-mem` 服务中，配置入口为顶层配置文件的 `retrieval.rerank`，不是
+`memory_search` 的请求参数。`enabled=false` 时 `fail_open` 不生效；开启 rerank
+还要求 `retrieval.mode=hybrid`。最终错误是指 reranker 返回的任意错误，包括重试耗尽
+的传输或超时错误、非成功 HTTP 状态以及响应格式或索引校验错误。
+
+传输错误、响应读取错误、超时及 HTTP 408/425/429/500/502/503/504 最多尝试 8 次，
+重试等待为 1/2/4/8/16/32/64 秒。其他 HTTP 状态和响应校验错误不重试。
+
+`fail_open=false` 的最终错误通过 MCP 工具错误返回：`code=RERANK_FAILED`、
+`message="memory rerank failed"`、`retriable=true`。`fail_open=true` 返回 rerank 前的
+hybrid 顺序并截断至 `top_k`，同时记录 `ram_a.memory.search.degraded` 日志。
+
+MCP 服务的 `timeout_ms` 默认值为 30000；启用 rerank 时必须位于 1..=120000。
+超时按单次 provider 请求计算，最终 fail-open/fail-closed 判定发生在重试结束后。
+
 ## 6. CLI 使用
 
 `memory-bench` 默认不启用 rerank。开启方式：
