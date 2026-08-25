@@ -40,6 +40,8 @@ pub const MAX_ACTIVE_SESSIONS_GLOBAL: usize = 100_000;
 pub const MAX_SESSION_IDLE_TIMEOUT_SECONDS: u64 = 86_400;
 pub const DEFAULT_RERANK_TIMEOUT_MS: u64 = 30_000;
 pub const MAX_RERANK_TIMEOUT_MS: u64 = 120_000;
+const SUPPORTED_PERMISSIONS: [&str; 4] =
+    ["memory:read", "memory:write", "cases:read", "cases:write"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FeatureFlags {
@@ -428,6 +430,18 @@ pub struct ProvidersConfig {
     pub max_retries: usize,
 }
 
+impl ProvidersConfig {
+    pub fn resolved_embedding_api_key_env(&self) -> &str {
+        self.embedding_api_key_env
+            .as_deref()
+            .unwrap_or(&self.api_key_env)
+    }
+
+    pub fn resolved_embedding_base_url(&self) -> &str {
+        self.embedding_base_url.as_deref().unwrap_or(&self.base_url)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RetrievalServiceConfig {
@@ -651,6 +665,30 @@ impl CaseServiceConfig {
 }
 
 impl CaseLibraryServiceConfig {
+    pub fn resolved_embedding_api_key_env<'a>(&'a self, providers: &'a ProvidersConfig) -> &'a str {
+        self.embedding_api_key_env
+            .as_deref()
+            .unwrap_or(&providers.api_key_env)
+    }
+
+    pub fn resolved_embedding_base_url<'a>(&'a self, providers: &'a ProvidersConfig) -> &'a str {
+        self.embedding_base_url
+            .as_deref()
+            .unwrap_or(&providers.base_url)
+    }
+
+    pub fn resolved_summary_api_key_env<'a>(&'a self, providers: &'a ProvidersConfig) -> &'a str {
+        self.summary_llm_api_key_env
+            .as_deref()
+            .unwrap_or(&providers.api_key_env)
+    }
+
+    pub fn resolved_summary_base_url<'a>(&'a self, providers: &'a ProvidersConfig) -> &'a str {
+        self.summary_llm_base_url
+            .as_deref()
+            .unwrap_or(&providers.base_url)
+    }
+
     pub fn validate(&self, memory_database_path: Option<&Path>) -> Result<()> {
         validate_case_library_mappings(self.default_library.as_str(), &self.libraries)?;
         if self.rag_store.as_os_str().is_empty()
@@ -705,6 +743,13 @@ impl CaseLibraryServiceConfig {
         }
         if let Some(summary_base_url) = self.summary_llm_base_url.as_deref() {
             validate_provider_base_url(summary_base_url, "case library summary LLM base URL")?;
+        }
+        if self
+            .summary_llm_model
+            .as_deref()
+            .is_some_and(|model| model.trim().is_empty())
+        {
+            anyhow::bail!("case library summary LLM model must not be empty when configured");
         }
         Ok(())
     }
@@ -844,6 +889,7 @@ impl ServerConfig {
         self.limits.validate()?;
         self.pipeline.validate()?;
         self.retrieval.validate()?;
+        self.auth.validate()?;
         if self.features.case_library.enabled == Some(true) && self.case_library.is_none() {
             anyhow::bail!("case_library feature requires case_library configuration");
         }
@@ -852,9 +898,6 @@ impl ServerConfig {
         }
         if self.features.graph_memory.enabled && !self.features.memory.enabled {
             anyhow::bail!("graph_memory feature requires the memory feature");
-        }
-        if self.auth.tokens.is_empty() {
-            anyhow::bail!("production runtime requires at least one authenticated principal");
         }
         let storage = self
             .storage
@@ -905,48 +948,24 @@ impl ServerConfig {
         }
         if providers.embedding_provider == EmbeddingProviderKind::OpenAiCompatible {
             validate_authenticated_provider_base_url(
-                providers
-                    .embedding_base_url
-                    .as_deref()
-                    .unwrap_or(&providers.base_url),
+                providers.resolved_embedding_base_url(),
                 "embedding base URL",
-                Some(
-                    providers
-                        .embedding_api_key_env
-                        .as_deref()
-                        .unwrap_or(&providers.api_key_env),
-                ),
+                Some(providers.resolved_embedding_api_key_env()),
             )?;
         }
         if let Some(case_library) = &self.case_library {
             if case_library.embedding_provider == EmbeddingProviderKind::OpenAiCompatible {
                 validate_authenticated_provider_base_url(
-                    case_library
-                        .embedding_base_url
-                        .as_deref()
-                        .unwrap_or(&providers.base_url),
+                    case_library.resolved_embedding_base_url(providers),
                     "case library embedding base URL",
-                    Some(
-                        case_library
-                            .embedding_api_key_env
-                            .as_deref()
-                            .unwrap_or(&providers.api_key_env),
-                    ),
+                    Some(case_library.resolved_embedding_api_key_env(providers)),
                 )?;
             }
             if case_library.summary_llm_model.is_some() {
                 validate_authenticated_provider_base_url(
-                    case_library
-                        .summary_llm_base_url
-                        .as_deref()
-                        .unwrap_or(&providers.base_url),
+                    case_library.resolved_summary_base_url(providers),
                     "case library summary LLM base URL",
-                    Some(
-                        case_library
-                            .summary_llm_api_key_env
-                            .as_deref()
-                            .unwrap_or(&providers.api_key_env),
-                    ),
+                    Some(case_library.resolved_summary_api_key_env(providers)),
                 )?;
             }
         }
@@ -1050,14 +1069,613 @@ fn is_loopback_or_private(value: &url::Url) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_provider_base_url, EmbeddingProviderKind, LimitsConfig, PipelineServiceConfig,
-        RerankServiceConfig, RetrievalServiceConfig, ServerConfig, DEFAULT_RERANK_TIMEOUT_MS,
+        validate_provider_base_url, AuthConfig, CaseLibraryServiceConfig, EmbeddingProviderKind,
+        FeaturesConfig, GraphMemoryRetrievalConfig, GraphMemoryServiceConfig, HttpConfig,
+        LimitsConfig, PipelineServiceConfig, ProvidersConfig, RerankServiceConfig,
+        RetrievalServiceConfig, ServerConfig, TokenConfig, DEFAULT_RERANK_TIMEOUT_MS,
         MAX_ACTIVE_SESSIONS_GLOBAL, MAX_ACTIVE_SESSIONS_PER_PRINCIPAL, MAX_INITIALIZE_RATE_BURST,
         MAX_INITIALIZE_REQUESTS_PER_SECOND, MAX_IN_FLIGHT_PER_PRINCIPAL_TOOL, MAX_MCP_BODY_BYTES,
         MAX_RATE_BURST, MAX_REQUESTS_PER_SECOND, MAX_RERANK_TIMEOUT_MS,
         MAX_SESSION_IDLE_TIMEOUT_SECONDS,
     };
     use memory_core::SearchMode;
+
+    #[test]
+    fn feature_http_and_provider_defaults_are_stable() {
+        let features = FeaturesConfig::default();
+        assert!(features.memory.enabled);
+        assert_eq!(features.case_library.enabled, None);
+        assert!(!features.graph_memory.enabled);
+
+        let http = HttpConfig::default();
+        assert_eq!(http.bind_address.to_string(), "127.0.0.1");
+        assert_eq!(http.port, 8080);
+        assert!(http.allowed_origins.is_empty());
+        assert_eq!(http.allowed_hosts, ["localhost", "127.0.0.1", "::1"]);
+        assert!(!http.tls_termination_acknowledged);
+        assert!(http.validate_bind().is_ok());
+
+        let providers: ProvidersConfig = serde_json::from_value(serde_json::json!({
+            "api_key_env": "RAM_A_PROVIDER_KEY",
+            "embedding_model": "embedding-model",
+            "embedding_dimensions": 1024,
+            "extractor_model": "extractor-model",
+            "verifier_model": "verifier-model"
+        }))
+        .expect("parse provider defaults");
+        assert_eq!(providers.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(
+            providers.embedding_provider,
+            EmbeddingProviderKind::OpenAiCompatible
+        );
+        assert_eq!(providers.embedding_api_key_env, None);
+        assert_eq!(providers.embedding_base_url, None);
+        assert_eq!(
+            providers.resolved_embedding_api_key_env(),
+            "RAM_A_PROVIDER_KEY"
+        );
+        assert_eq!(
+            providers.resolved_embedding_base_url(),
+            "https://openrouter.ai/api/v1"
+        );
+        assert_eq!(providers.timeout_seconds, 120);
+        assert_eq!(providers.max_retries, 3);
+
+        let minimal: ServerConfig = serde_json::from_value(serde_json::json!({
+            "auth": {"tokens": []}
+        }))
+        .expect("parse top-level defaults");
+        assert!(minimal.features.memory.enabled);
+        assert_eq!(minimal.http.port, 8080);
+        assert_eq!(minimal.limits.max_body_bytes, 16 * 1024 * 1024);
+        assert!(minimal.pipeline.fail_fast);
+        assert_eq!(minimal.pipeline.max_memory_chars, 500);
+        assert!(minimal.storage.is_none());
+        assert!(minimal.providers.is_none());
+        assert_eq!(minimal.retrieval.mode, SearchMode::Hybrid);
+        assert!(minimal.case_library.is_none());
+        assert!(minimal.graph_memory.is_none());
+    }
+
+    #[test]
+    fn graph_and_case_library_defaults_are_stable() {
+        let graph: GraphMemoryServiceConfig = serde_json::from_value(serde_json::json!({
+            "llm_api_key_env": "RAM_A_GRAPH_KEY",
+            "llm_model": "graph-model"
+        }))
+        .expect("parse graph defaults");
+        assert_eq!(graph.llm_base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(graph.llm_timeout_ms, 60_000);
+        assert_eq!(graph.build_concurrency, 1);
+        assert_eq!(
+            graph.retrieval,
+            GraphMemoryRetrievalConfig {
+                weight: 0.2,
+                rerank_with_graph: false,
+                allow_graph_only: false,
+                max_graph_only_results: None,
+                seed_limit: None,
+                max_evidence_records_per_fact: None,
+                fail_open: false,
+            }
+        );
+        assert!(graph.validate().is_ok());
+
+        let cases: CaseLibraryServiceConfig = serde_json::from_value(serde_json::json!({
+            "default_library": "ops",
+            "libraries": [{
+                "name": "ops",
+                "dataset_id": "ops-dataset",
+                "tenant_ids": ["tenant-a"]
+            }]
+        }))
+        .expect("parse case library defaults");
+        assert_eq!(
+            cases.rag_store.to_string_lossy(),
+            "data/memory-cases.sqlite"
+        );
+        assert_eq!(
+            cases.index_store.to_string_lossy(),
+            "data/memory-cases-index.sqlite"
+        );
+        assert_eq!(cases.source_dir, None);
+        assert_eq!(cases.api_token_env, None);
+        assert_eq!(cases.ingestion_poll_ms, 1_000);
+        assert_eq!(
+            cases.embedding_provider,
+            EmbeddingProviderKind::OpenAiCompatible
+        );
+        assert_eq!(cases.embedding_api_key_env, None);
+        assert_eq!(cases.embedding_base_url, None);
+        assert_eq!(cases.embedding_model, "hash");
+        assert_eq!(cases.embedding_dimensions, 1_024);
+        assert_eq!(cases.chunk_size, 160);
+        assert_eq!(cases.summary_llm_model, None);
+        assert_eq!(cases.summary_llm_api_key_env, None);
+        assert_eq!(cases.summary_llm_base_url, None);
+        assert_eq!(cases.summary_llm_timeout_ms, 30_000);
+        assert!(cases
+            .validate(Some(std::path::Path::new("memory.sqlite")))
+            .is_ok());
+    }
+
+    #[test]
+    fn graph_configuration_rejects_invalid_configurable_values() {
+        let valid: GraphMemoryServiceConfig = serde_json::from_value(serde_json::json!({
+            "llm_api_key_env": "RAM_A_GRAPH_KEY",
+            "llm_model": "graph-model"
+        }))
+        .expect("parse graph config");
+
+        let mut invalid = Vec::new();
+        let mut config = valid.clone();
+        config.llm_api_key_env.clear();
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.llm_model.clear();
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.llm_api_key_env = " ".to_string();
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.llm_model = " ".to_string();
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.llm_base_url = "not-a-url".to_string();
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.llm_timeout_ms = 0;
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.build_concurrency = 0;
+        invalid.push(config);
+        for weight in [-0.1, 1.1, f32::NAN] {
+            let mut config = valid.clone();
+            config.retrieval.weight = weight;
+            invalid.push(config);
+        }
+        let mut config = valid.clone();
+        config.retrieval.max_graph_only_results = Some(0);
+        invalid.push(config);
+        for seed_limit in [Some(0), Some(memory_core::MAX_GRAPH_SEED_LIMIT + 1)] {
+            let mut config = valid.clone();
+            config.retrieval.seed_limit = seed_limit;
+            invalid.push(config);
+        }
+        for evidence_limit in [
+            Some(0),
+            Some(memory_core::MAX_GRAPH_EVIDENCE_RECORDS_PER_FACT + 1),
+        ] {
+            let mut config = valid.clone();
+            config.retrieval.max_evidence_records_per_fact = evidence_limit;
+            invalid.push(config);
+        }
+
+        assert!(invalid.into_iter().all(|config| config.validate().is_err()));
+    }
+
+    #[test]
+    fn graph_configuration_accepts_all_documented_boundaries() {
+        let base: GraphMemoryServiceConfig = serde_json::from_value(serde_json::json!({
+            "llm_api_key_env": "RAM_A_GRAPH_KEY",
+            "llm_model": "graph-model"
+        }))
+        .expect("parse graph config");
+
+        for weight in [0.0, 1.0] {
+            let mut config = base.clone();
+            config.llm_timeout_ms = 1;
+            config.build_concurrency = 1;
+            config.retrieval.weight = weight;
+            config.retrieval.max_graph_only_results = Some(1);
+            config.retrieval.seed_limit = Some(memory_core::MAX_GRAPH_SEED_LIMIT);
+            config.retrieval.max_evidence_records_per_fact =
+                Some(memory_core::MAX_GRAPH_EVIDENCE_RECORDS_PER_FACT);
+            assert!(config.validate().is_ok(), "weight={weight}");
+        }
+
+        let mut lower = base;
+        lower.retrieval.seed_limit = Some(1);
+        lower.retrieval.max_evidence_records_per_fact = Some(1);
+        assert!(lower.validate().is_ok());
+    }
+
+    #[test]
+    fn case_library_configuration_rejects_invalid_configurable_values() {
+        let valid: CaseLibraryServiceConfig = serde_json::from_value(serde_json::json!({
+            "default_library": "ops",
+            "libraries": [{
+                "name": "ops",
+                "dataset_id": "ops-dataset",
+                "tenant_ids": ["tenant-a"]
+            }]
+        }))
+        .expect("parse case library config");
+
+        let validate = |config: &CaseLibraryServiceConfig| {
+            config.validate(Some(std::path::Path::new("memory.sqlite")))
+        };
+        let mut invalid = Vec::new();
+        let mut config = valid.clone();
+        config.rag_store = ":memory:".into();
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.index_store = config.rag_store.clone();
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.index_store = "memory.sqlite".into();
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.source_dir = Some("".into());
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.api_token_env = Some(" RAM_A_CASE_TOKEN".to_string());
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.ingestion_poll_ms = 0;
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.embedding_model.clear();
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.embedding_dimensions = 0;
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.chunk_size = 0;
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.summary_llm_timeout_ms = 0;
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.summary_llm_model = Some(" ".to_string());
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.embedding_api_key_env = Some(" ".to_string());
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.summary_llm_api_key_env = Some(" ".to_string());
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.default_library = "missing".to_string();
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.libraries.push(config.libraries[0].clone());
+        invalid.push(config);
+
+        assert!(invalid.into_iter().all(|config| validate(&config).is_err()));
+    }
+
+    #[test]
+    fn case_library_positive_only_fields_accept_one() {
+        let mut config: CaseLibraryServiceConfig = serde_json::from_value(serde_json::json!({
+            "default_library": "ops",
+            "libraries": [{
+                "name": "ops",
+                "dataset_id": "ops-dataset",
+                "tenant_ids": ["tenant-a"]
+            }]
+        }))
+        .expect("parse case library config");
+        config.ingestion_poll_ms = 1;
+        config.embedding_dimensions = 1;
+        config.chunk_size = 1;
+        config.summary_llm_timeout_ms = 1;
+        assert!(config
+            .validate(Some(std::path::Path::new("memory.sqlite")))
+            .is_ok());
+    }
+
+    #[test]
+    fn provider_configuration_rejects_incomplete_configurable_values() {
+        let valid = packaged_config();
+        let mut invalid = Vec::new();
+        for field in [
+            "api_key_env",
+            "base_url",
+            "embedding_model",
+            "extractor_model",
+            "verifier_model",
+        ] {
+            let mut config = valid.clone();
+            let providers = config.providers.as_mut().expect("providers");
+            match field {
+                "api_key_env" => providers.api_key_env.clear(),
+                "base_url" => providers.base_url.clear(),
+                "embedding_model" => providers.embedding_model.clear(),
+                "extractor_model" => providers.extractor_model.clear(),
+                "verifier_model" => providers.verifier_model.clear(),
+                _ => unreachable!(),
+            }
+            invalid.push(config);
+        }
+        let mut config = valid.clone();
+        config
+            .providers
+            .as_mut()
+            .expect("providers")
+            .embedding_dimensions = 0;
+        invalid.push(config);
+        let mut config = valid.clone();
+        config
+            .providers
+            .as_mut()
+            .expect("providers")
+            .timeout_seconds = 0;
+        invalid.push(config);
+        let mut config = valid;
+        config.providers.as_mut().expect("providers").max_retries = 0;
+        invalid.push(config);
+        let mut config = packaged_config();
+        config
+            .providers
+            .as_mut()
+            .expect("providers")
+            .embedding_api_key_env = Some(" ".to_string());
+        invalid.push(config);
+        let mut config = packaged_config();
+        config
+            .providers
+            .as_mut()
+            .expect("providers")
+            .embedding_base_url = Some("not-a-url".to_string());
+        invalid.push(config);
+
+        assert!(invalid
+            .into_iter()
+            .all(|config| config.validate_runtime().is_err()));
+    }
+
+    #[test]
+    fn provider_positive_only_fields_accept_one() {
+        let mut config = packaged_config();
+        let providers = config.providers.as_mut().expect("providers");
+        providers.embedding_dimensions = 1;
+        providers.timeout_seconds = 1;
+        providers.max_retries = 1;
+        assert!(config.validate_runtime().is_ok());
+    }
+
+    #[test]
+    fn provider_and_case_library_fallbacks_are_explicit_and_overridable() {
+        let mut config = packaged_config();
+        let providers = config.providers.as_mut().expect("providers");
+        providers.api_key_env = "PRIMARY_KEY".to_string();
+        providers.base_url = "https://primary.example/v1".to_string();
+        providers.embedding_api_key_env = None;
+        providers.embedding_base_url = None;
+        assert_eq!(providers.resolved_embedding_api_key_env(), "PRIMARY_KEY");
+        assert_eq!(
+            providers.resolved_embedding_base_url(),
+            "https://primary.example/v1"
+        );
+
+        let cases = config.case_library.as_ref().expect("case library");
+        assert_eq!(
+            cases.resolved_embedding_api_key_env(providers),
+            "PRIMARY_KEY"
+        );
+        assert_eq!(
+            cases.resolved_embedding_base_url(providers),
+            "https://primary.example/v1"
+        );
+        assert_eq!(cases.resolved_summary_api_key_env(providers), "PRIMARY_KEY");
+        assert_eq!(
+            cases.resolved_summary_base_url(providers),
+            "https://primary.example/v1"
+        );
+
+        let providers = config.providers.as_mut().expect("providers");
+        providers.embedding_api_key_env = Some("EMBEDDING_KEY".to_string());
+        providers.embedding_base_url = Some("https://embedding.example/v1".to_string());
+        let cases = config.case_library.as_mut().expect("case library");
+        cases.embedding_api_key_env = Some("CASE_EMBEDDING_KEY".to_string());
+        cases.embedding_base_url = Some("https://case-embedding.example/v1".to_string());
+        cases.summary_llm_model = Some("summary-model".to_string());
+        cases.summary_llm_api_key_env = Some("SUMMARY_KEY".to_string());
+        cases.summary_llm_base_url = Some("https://summary.example/v1".to_string());
+
+        assert_eq!(providers.resolved_embedding_api_key_env(), "EMBEDDING_KEY");
+        assert_eq!(
+            providers.resolved_embedding_base_url(),
+            "https://embedding.example/v1"
+        );
+        assert_eq!(
+            cases.resolved_embedding_api_key_env(providers),
+            "CASE_EMBEDDING_KEY"
+        );
+        assert_eq!(
+            cases.resolved_embedding_base_url(providers),
+            "https://case-embedding.example/v1"
+        );
+        assert_eq!(cases.resolved_summary_api_key_env(providers), "SUMMARY_KEY");
+        assert_eq!(
+            cases.resolved_summary_base_url(providers),
+            "https://summary.example/v1"
+        );
+        assert!(config.validate_runtime().is_ok());
+    }
+
+    #[test]
+    fn storage_configuration_rejects_nonpersistent_paths_and_accepts_file_paths() {
+        for database_path in ["", ":memory:"] {
+            let mut config = packaged_config();
+            config.storage.as_mut().expect("storage").database_path = database_path.into();
+            assert!(config.validate_runtime().is_err(), "path={database_path}");
+        }
+
+        for database_path in [
+            "data/ram-a-memory.sqlite",
+            "/var/lib/ram-a/ram-a-memory.sqlite",
+        ] {
+            let mut config = packaged_config();
+            config.storage.as_mut().expect("storage").database_path = database_path.into();
+            assert!(config.validate_runtime().is_ok(), "path={database_path}");
+        }
+    }
+
+    #[test]
+    fn case_library_paths_and_mappings_reject_every_invalid_shape() {
+        let valid = packaged_config();
+        let mut invalid = Vec::new();
+
+        for field in ["rag_empty", "index_empty", "index_memory"] {
+            let mut config = valid.clone();
+            let cases = config.case_library.as_mut().expect("case library");
+            match field {
+                "rag_empty" => cases.rag_store = "".into(),
+                "index_empty" => cases.index_store = "".into(),
+                "index_memory" => cases.index_store = ":memory:".into(),
+                _ => unreachable!(),
+            }
+            invalid.push(config);
+        }
+
+        for field in [
+            "default_empty",
+            "libraries_empty",
+            "name_empty",
+            "name_noncanonical",
+            "dataset_empty",
+            "dataset_noncanonical",
+            "tenants_empty",
+            "tenant_empty",
+            "tenant_noncanonical",
+        ] {
+            let mut config = valid.clone();
+            let cases = config.case_library.as_mut().expect("case library");
+            match field {
+                "default_empty" => cases.default_library.clear(),
+                "libraries_empty" => cases.libraries.clear(),
+                "name_empty" => cases.libraries[0].name.clear(),
+                "name_noncanonical" => cases.libraries[0].name = " ops".to_string(),
+                "dataset_empty" => cases.libraries[0].dataset_id.clear(),
+                "dataset_noncanonical" => {
+                    cases.libraries[0].dataset_id = "ops-dataset ".to_string()
+                }
+                "tenants_empty" => cases.libraries[0].tenant_ids.clear(),
+                "tenant_empty" => cases.libraries[0].tenant_ids[0].clear(),
+                "tenant_noncanonical" => {
+                    cases.libraries[0].tenant_ids[0] = " tenant-local".to_string()
+                }
+                _ => unreachable!(),
+            }
+            invalid.push(config);
+        }
+
+        for field in ["embedding_url", "summary_url"] {
+            let mut config = valid.clone();
+            let cases = config.case_library.as_mut().expect("case library");
+            match field {
+                "embedding_url" => cases.embedding_base_url = Some("not-a-url".to_string()),
+                "summary_url" => {
+                    cases.summary_llm_model = Some("summary-model".to_string());
+                    cases.summary_llm_base_url = Some("not-a-url".to_string());
+                }
+                _ => unreachable!(),
+            }
+            invalid.push(config);
+        }
+
+        assert!(invalid
+            .into_iter()
+            .all(|config| config.validate_runtime().is_err()));
+    }
+
+    #[test]
+    fn http_configuration_covers_host_and_port_boundaries() {
+        let default = HttpConfig::default();
+        for port in [0_u16, 1, u16::MAX] {
+            let config: HttpConfig = serde_json::from_value(serde_json::json!({"port": port}))
+                .expect("port must fit u16");
+            assert_eq!(config.port, port);
+            assert!(config.validate_bind().is_ok());
+        }
+        assert!(serde_json::from_value::<HttpConfig>(serde_json::json!({"port": 65_536})).is_err());
+        assert!(serde_json::from_value::<HttpConfig>(serde_json::json!({"port": -1})).is_err());
+
+        for allowed_hosts in [Vec::new(), vec![String::new()], vec![" ".to_string()]] {
+            let config = HttpConfig {
+                allowed_hosts,
+                ..default.clone()
+            };
+            assert!(config.validate_bind().is_err());
+        }
+
+        let external = HttpConfig {
+            bind_address: "0.0.0.0".parse().unwrap(),
+            allowed_hosts: vec!["memory.example.test".to_string()],
+            tls_termination_acknowledged: true,
+            ..default
+        };
+        assert!(external.validate_bind().is_ok());
+    }
+
+    #[test]
+    fn authentication_configuration_enforces_fixed_permissions_and_canonical_ids() {
+        let valid = AuthConfig {
+            tokens: vec![TokenConfig {
+                token_env: "RAM_A_TOKEN".to_string(),
+                tenant_id: "tenant-a".to_string(),
+                user_id: "alice".to_string(),
+                agent_id: "xiaoo".to_string(),
+                permissions: vec![
+                    "memory:read".to_string(),
+                    "memory:write".to_string(),
+                    "cases:read".to_string(),
+                    "cases:write".to_string(),
+                ],
+            }],
+        };
+        assert!(valid.validate().is_ok());
+
+        let mut unknown_permission = valid.clone();
+        unknown_permission.tokens[0].permissions = vec!["memory:admin".to_string()];
+        assert!(unknown_permission.validate().is_err());
+
+        let mut duplicate_permission = valid.clone();
+        duplicate_permission.tokens[0].permissions =
+            vec!["memory:read".to_string(), "memory:read".to_string()];
+        assert!(duplicate_permission.validate().is_err());
+
+        for field in ["token_env", "tenant_id", "user_id", "agent_id"] {
+            let mut noncanonical = valid.clone();
+            match field {
+                "token_env" => noncanonical.tokens[0].token_env = " RAM_A_TOKEN".to_string(),
+                "tenant_id" => noncanonical.tokens[0].tenant_id = "tenant-a ".to_string(),
+                "user_id" => noncanonical.tokens[0].user_id.clear(),
+                "agent_id" => noncanonical.tokens[0].agent_id = " ".to_string(),
+                _ => unreachable!(),
+            }
+            assert!(noncanonical.validate().is_err(), "field={field}");
+        }
+
+        let mut duplicate_environment = valid.clone();
+        duplicate_environment.tokens.push(valid.tokens[0].clone());
+        assert!(duplicate_environment.validate().is_err());
+    }
+
+    #[test]
+    fn configurable_enums_reject_unsupported_values() {
+        assert!(serde_json::from_str::<EmbeddingProviderKind>(r#""hash""#).is_ok());
+        assert!(serde_json::from_str::<EmbeddingProviderKind>(r#""openai_compatible""#).is_ok());
+        assert_eq!(
+            serde_json::from_str::<EmbeddingProviderKind>(r#""open_router""#).unwrap(),
+            EmbeddingProviderKind::OpenAiCompatible
+        );
+        assert!(serde_json::from_str::<EmbeddingProviderKind>(r#""unknown""#).is_err());
+        assert!(serde_json::from_str::<SearchMode>(r#""dense""#).is_ok());
+        assert!(serde_json::from_str::<SearchMode>(r#""bm25""#).is_ok());
+        assert!(serde_json::from_str::<SearchMode>(r#""hybrid""#).is_ok());
+        assert!(serde_json::from_str::<SearchMode>(r#""unknown""#).is_err());
+        assert!(serde_json::from_str::<memory_core::RerankProvider>(r#""openrouter""#).is_ok());
+        assert!(serde_json::from_str::<memory_core::RerankProvider>(r#""unknown""#).is_err());
+
+        let graph_mode = RetrievalServiceConfig {
+            mode: SearchMode::Graph,
+            ..RetrievalServiceConfig::default()
+        };
+        assert!(graph_mode.validate().is_err());
+    }
 
     #[test]
     fn pipeline_defaults_and_boundaries_are_stable() {
@@ -1113,6 +1731,22 @@ mod tests {
             max_active_sessions_per_principal: MAX_ACTIVE_SESSIONS_PER_PRINCIPAL,
             max_active_sessions_global: MAX_ACTIVE_SESSIONS_GLOBAL,
             session_idle_timeout_seconds: MAX_SESSION_IDLE_TIMEOUT_SECONDS,
+        };
+        assert!(limits.validate().is_ok());
+    }
+
+    #[test]
+    fn http_limits_accept_documented_lower_boundaries() {
+        let limits = LimitsConfig {
+            max_body_bytes: 1,
+            requests_per_second: 1,
+            rate_burst: 1,
+            max_in_flight_per_principal_tool: 1,
+            initialize_requests_per_second: 1,
+            initialize_rate_burst: 1,
+            max_active_sessions_per_principal: 1,
+            max_active_sessions_global: 1,
+            session_idle_timeout_seconds: 1,
         };
         assert!(limits.validate().is_ok());
     }
@@ -1193,7 +1827,19 @@ mod tests {
         assert_eq!(config.bm25_weight, 0.3);
         assert_eq!(config.candidate_k, None);
         assert!(!config.rerank.enabled);
+        assert_eq!(
+            config.rerank.provider,
+            memory_core::RerankProvider::OpenRouter
+        );
+        assert_eq!(config.rerank.model, "cohere/rerank-v3.5");
+        assert_eq!(
+            config.rerank.api_key_env.as_deref(),
+            Some("OPENROUTER_API_KEY")
+        );
+        assert_eq!(config.rerank.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(config.rerank.input_k, 40);
         assert_eq!(config.rerank.timeout_ms, Some(DEFAULT_RERANK_TIMEOUT_MS));
+        assert!(!config.rerank.fail_open);
         assert!(config.validate().is_ok());
     }
 
@@ -1325,12 +1971,23 @@ mod tests {
 
     #[test]
     fn retrieval_rejects_invalid_weights_and_non_hybrid_rerank() {
-        let invalid_weights = RetrievalServiceConfig {
-            embedding_weight: 0.8,
-            bm25_weight: 0.3,
-            ..RetrievalServiceConfig::default()
-        };
-        assert!(invalid_weights.validate().is_err());
+        for (embedding_weight, bm25_weight) in [
+            (0.8, 0.3),
+            (-0.1, 1.1),
+            (1.1, -0.1),
+            (f32::NAN, 0.0),
+            (f32::INFINITY, 0.0),
+        ] {
+            let invalid_weights = RetrievalServiceConfig {
+                embedding_weight,
+                bm25_weight,
+                ..RetrievalServiceConfig::default()
+            };
+            assert!(
+                invalid_weights.validate().is_err(),
+                "embedding_weight={embedding_weight}, bm25_weight={bm25_weight}"
+            );
+        }
 
         let dense_rerank = RetrievalServiceConfig {
             mode: SearchMode::Dense,
@@ -1341,6 +1998,62 @@ mod tests {
             ..RetrievalServiceConfig::default()
         };
         assert!(dense_rerank.validate().is_err());
+    }
+
+    #[test]
+    fn retrieval_accepts_hybrid_weight_boundaries() {
+        for (embedding_weight, bm25_weight) in [(0.0, 1.0), (1.0, 0.0), (0.7, 0.3)] {
+            let config = RetrievalServiceConfig {
+                embedding_weight,
+                bm25_weight,
+                ..RetrievalServiceConfig::default()
+            };
+            assert!(config.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn disabled_rerank_ignores_inactive_provider_fields() {
+        let config = RetrievalServiceConfig {
+            rerank: RerankServiceConfig {
+                enabled: false,
+                model: String::new(),
+                api_key_env: Some(String::new()),
+                base_url: String::new(),
+                input_k: 0,
+                timeout_ms: None,
+                fail_open: true,
+                ..RerankServiceConfig::default()
+            },
+            ..RetrievalServiceConfig::default()
+        };
+
+        assert!(config.validate().is_ok());
+        let core = config.core_config(memory_core::GraphRetrievalConfig::default());
+        assert!(!core.rerank.enabled);
+        assert!(core.rerank.fail_open);
+    }
+
+    #[test]
+    fn enabled_rerank_rejects_every_invalid_provider_field() {
+        let mut invalid = Vec::new();
+        for field in ["model", "base_url", "api_key_env"] {
+            let mut config = RetrievalServiceConfig::default();
+            config.rerank.enabled = true;
+            match field {
+                "model" => config.rerank.model = " ".to_string(),
+                "base_url" => config.rerank.base_url = " ".to_string(),
+                "api_key_env" => config.rerank.api_key_env = Some(" ".to_string()),
+                _ => unreachable!(),
+            }
+            invalid.push(config);
+        }
+        let mut invalid_url = RetrievalServiceConfig::default();
+        invalid_url.rerank.enabled = true;
+        invalid_url.rerank.base_url = "not-a-url".to_string();
+        invalid.push(invalid_url);
+
+        assert!(invalid.into_iter().all(|config| config.validate().is_err()));
     }
 
     #[test]
@@ -1466,4 +2179,40 @@ pub struct TokenConfig {
     pub user_id: String,
     pub agent_id: String,
     pub permissions: Vec<String>,
+}
+
+impl AuthConfig {
+    fn validate(&self) -> Result<()> {
+        if self.tokens.is_empty() {
+            anyhow::bail!("production runtime requires at least one authenticated principal");
+        }
+
+        let mut token_environments = HashSet::with_capacity(self.tokens.len());
+        for token in &self.tokens {
+            for (label, value) in [
+                ("token_env", token.token_env.as_str()),
+                ("tenant_id", token.tenant_id.as_str()),
+                ("user_id", token.user_id.as_str()),
+                ("agent_id", token.agent_id.as_str()),
+            ] {
+                if value.trim().is_empty() || value.trim() != value {
+                    anyhow::bail!("authentication {label} must be canonical and non-empty");
+                }
+            }
+            if !token_environments.insert(token.token_env.as_str()) {
+                anyhow::bail!("authentication token environment names must be unique");
+            }
+
+            let mut permissions = HashSet::with_capacity(token.permissions.len());
+            for permission in &token.permissions {
+                if !SUPPORTED_PERMISSIONS.contains(&permission.as_str()) {
+                    anyhow::bail!("authentication permission `{permission}` is not supported");
+                }
+                if !permissions.insert(permission.as_str()) {
+                    anyhow::bail!("authentication permissions must be unique per token");
+                }
+            }
+        }
+        Ok(())
+    }
 }

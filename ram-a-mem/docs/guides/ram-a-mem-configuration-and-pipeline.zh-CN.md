@@ -3,6 +3,8 @@
 本文以 `ram-a-mem` HTTP MCP 服务的当前实现为准。仓库中的完整配置文件是
 [`plugins/mcp/ram-a-mem.json`](../../plugins/mcp/ram-a-mem.json)。该文件显式列出了
 `ServerConfig` 的全部配置模块和字段；密钥只写环境变量名称，不写密钥值。
+逐字段的默认值、推荐值、约束、生效条件和测试要求见
+[`ram-a-mem-configuration-reference.zh-CN.md`](ram-a-mem-configuration-reference.zh-CN.md)。
 RPM 和 xiaoO 的可执行环境验收步骤见
 [`ram-a-mem-rpm-agent-self-test.zh-CN.md`](ram-a-mem-rpm-agent-self-test.zh-CN.md)。
 

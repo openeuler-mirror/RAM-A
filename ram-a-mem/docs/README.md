@@ -31,6 +31,8 @@ repository.
   external retrieval tests.
 - [guides/ram-a-mem-configuration-and-pipeline.zh-CN.md](guides/ram-a-mem-configuration-and-pipeline.zh-CN.md):
   RAM-A-MEM 完整配置、摄入七阶段、完整摄入链和检索链的数据契约。
+- [guides/ram-a-mem-configuration-reference.zh-CN.md](guides/ram-a-mem-configuration-reference.zh-CN.md):
+  RAM-A-MEM 全量配置字段、默认值、推荐值、条件依赖和测试要求。
 - [guides/ram-a-mem-rpm-agent-self-test.zh-CN.md](guides/ram-a-mem-rpm-agent-self-test.zh-CN.md):
   在 openEuler 容器中安装 RAM-A RPM，并通过裸 MCP 和 xiaoO 验证摄入、检索与持久化。
 - [guides/xiaoo-case-library-integration.md](guides/xiaoo-case-library-integration.md):

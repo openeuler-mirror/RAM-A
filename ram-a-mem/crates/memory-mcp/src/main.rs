@@ -84,15 +84,9 @@ async fn main() -> Result<()> {
     let provider_key = resolve_secret_env(&providers.api_key_env)?;
     let embedder: Arc<dyn EmbeddingProvider> = match providers.embedding_provider {
         EmbeddingProviderKind::OpenAiCompatible => {
-            let embedding_key_env = providers
-                .embedding_api_key_env
-                .as_deref()
-                .unwrap_or(&providers.api_key_env);
+            let embedding_key_env = providers.resolved_embedding_api_key_env();
             let embedding_key = resolve_secret_env(embedding_key_env)?;
-            let embedding_base_url = providers
-                .embedding_base_url
-                .as_deref()
-                .unwrap_or(&providers.base_url);
+            let embedding_base_url = providers.resolved_embedding_base_url();
             Arc::new(OpenRouterEmbedding::with_base_url(
                 embedding_key,
                 embedding_base_url,
@@ -219,25 +213,21 @@ async fn main() -> Result<()> {
                 }
             },
             embedding_api_key_env: case_library
-                .embedding_api_key_env
-                .clone()
-                .unwrap_or_else(|| providers.api_key_env.clone()),
+                .resolved_embedding_api_key_env(providers)
+                .to_string(),
             embedding_base_url: case_library
-                .embedding_base_url
-                .clone()
-                .unwrap_or_else(|| providers.base_url.clone()),
+                .resolved_embedding_base_url(providers)
+                .to_string(),
             embedding_model: case_library.embedding_model.clone(),
             embedding_dimensions: case_library.embedding_dimensions,
             chunk_size: case_library.chunk_size,
             summary_llm_model: case_library.summary_llm_model.clone(),
             summary_llm_api_key_env: case_library
-                .summary_llm_api_key_env
-                .clone()
-                .unwrap_or_else(|| providers.api_key_env.clone()),
+                .resolved_summary_api_key_env(providers)
+                .to_string(),
             summary_llm_base_url: case_library
-                .summary_llm_base_url
-                .clone()
-                .unwrap_or_else(|| providers.base_url.clone()),
+                .resolved_summary_base_url(providers)
+                .to_string(),
             summary_llm_timeout_ms: case_library.summary_llm_timeout_ms,
         };
         let case_service = memory_cases::build_service(&case_options)
