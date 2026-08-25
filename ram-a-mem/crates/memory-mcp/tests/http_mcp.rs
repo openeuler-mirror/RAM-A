@@ -672,16 +672,16 @@ async fn idle_session_expiry_closes_the_session_and_releases_its_slot() {
         initialize_rate_burst: 100,
         max_active_sessions_per_principal: 1,
         max_active_sessions_global: 1,
-        session_idle_timeout_seconds: 1,
+        session_idle_timeout_seconds: 2,
         ..LimitsConfig::default()
     };
     let fixture = fixture_router_with_permissions(&["memory:read"], limits).await;
     let (expired_session_id, _) = initialize(&fixture.app).await;
-    tokio::time::advance(Duration::from_secs(2)).await;
+    tokio::time::advance(Duration::from_secs(3)).await;
 
-    let _ = initialize(&fixture.app).await;
     let expired = fixture
         .app
+        .clone()
         .oneshot(session_request(
             &expired_session_id,
             json!({"jsonrpc": "2.0", "id": 102, "method": "tools/list", "params": {}}),
@@ -689,6 +689,35 @@ async fn idle_session_expiry_closes_the_session_and_releases_its_slot() {
         .await
         .unwrap();
     assert_eq!(expired.status(), StatusCode::NOT_FOUND);
+    let body = to_bytes(expired.into_body(), 1024).await.unwrap();
+    assert_eq!(body.as_ref(), b"session not found");
+
+    let _ = initialize(&fixture.app).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn session_remains_available_before_the_configured_idle_timeout() {
+    let limits = LimitsConfig {
+        initialize_requests_per_second: 100,
+        initialize_rate_burst: 100,
+        session_idle_timeout_seconds: 30,
+        ..LimitsConfig::default()
+    };
+    let fixture = fixture_router_with_permissions(&["memory:read"], limits).await;
+    let (session_id, _) = initialize(&fixture.app).await;
+
+    tokio::time::advance(Duration::from_secs(3)).await;
+
+    let response = fixture
+        .app
+        .oneshot(session_request(
+            &session_id,
+            json!({"jsonrpc": "2.0", "id": 106, "method": "tools/list", "params": {}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response_json(response).await;
 }
 
 #[tokio::test(start_paused = true)]
