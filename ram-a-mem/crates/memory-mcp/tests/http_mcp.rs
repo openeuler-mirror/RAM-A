@@ -692,6 +692,32 @@ async fn idle_session_expiry_closes_the_session_and_releases_its_slot() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn configured_idle_timeout_is_applied_to_the_rmcp_session_worker() {
+    let limits = LimitsConfig {
+        initialize_requests_per_second: 100,
+        initialize_rate_burst: 100,
+        session_idle_timeout_seconds: 600,
+        ..LimitsConfig::default()
+    };
+    let fixture = fixture_router_with_permissions(&["memory:read"], limits).await;
+    let (session_id, _) = initialize(&fixture.app).await;
+
+    tokio::time::advance(Duration::from_secs(301)).await;
+    tokio::task::yield_now().await;
+
+    let response = fixture
+        .app
+        .oneshot(session_request(
+            &session_id,
+            json!({"jsonrpc": "2.0", "id": 103, "method": "tools/list", "params": {}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response_json(response).await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn authenticated_session_activity_refreshes_the_idle_deadline() {
     let limits = LimitsConfig {
         initialize_requests_per_second: 100,
@@ -716,6 +742,18 @@ async fn authenticated_session_activity_refreshes_the_idle_deadline() {
     assert_eq!(active.status(), StatusCode::OK);
     let _ = response_json(active).await;
     tokio::time::advance(Duration::from_millis(1_500)).await;
+
+    let still_active = fixture
+        .app
+        .clone()
+        .oneshot(session_request(
+            &session_id,
+            json!({"jsonrpc": "2.0", "id": 105, "method": "tools/list", "params": {}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(still_active.status(), StatusCode::OK);
+    let _ = response_json(still_active).await;
 
     let still_at_cap = fixture
         .app

@@ -143,7 +143,7 @@ The `limits` values are service-level controls and are not MCP tool arguments:
 | `initialize_rate_burst` | 8 | 1..=10000 |
 | `max_active_sessions_per_principal` | 8 | 1..=1024 |
 | `max_active_sessions_global` | 256 | 1..=100000 |
-| `session_idle_timeout_seconds` | 1800 | 1..=86400 |
+| `session_idle_timeout_seconds` | 1800 | 1..=86400; shared by RAM-A session admission and the underlying rmcp session worker |
 
 `max_active_sessions_global` must be greater than or equal to
 `max_active_sessions_per_principal`. Tool rate and concurrency limits are keyed by authenticated

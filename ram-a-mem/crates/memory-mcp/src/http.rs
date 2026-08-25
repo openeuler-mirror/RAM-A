@@ -308,7 +308,13 @@ pub fn create_http_router(
     let features = runtime.features;
     let cancellation_token = runtime.cancellation_token.clone();
     let service_cancellation_token = cancellation_token.clone();
-    let session_manager = Arc::new(LocalSessionManager::default());
+    let session_idle_timeout = Duration::from_secs(limits.session_idle_timeout_seconds.max(1));
+    let mut local_session_manager = LocalSessionManager::default();
+    local_session_manager
+        .session_config
+        .keep_alive
+        .replace(session_idle_timeout);
+    let session_manager = Arc::new(local_session_manager);
     let mcp_service: StreamableHttpService<MemoryMcpServer, LocalSessionManager> =
         StreamableHttpService::new(
             move || {
@@ -353,7 +359,7 @@ pub fn create_http_router(
         session_admission: Arc::new(SessionAdmission::new(
             limits.max_active_sessions_per_principal.max(1),
             limits.max_active_sessions_global.max(1),
-            Duration::from_secs(limits.session_idle_timeout_seconds.max(1)),
+            session_idle_timeout,
         )),
         session_manager,
     };

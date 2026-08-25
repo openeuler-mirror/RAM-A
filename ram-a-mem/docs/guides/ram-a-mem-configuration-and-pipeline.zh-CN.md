@@ -57,7 +57,7 @@ RPM 和 xiaoO 的可执行环境验收步骤见
 | `initialize_rate_burst` | 8 | 1..=10000 | MCP initialize 突发容量 |
 | `max_active_sessions_per_principal` | 8 | 1..=1024 | 每主体的活动 Session 数 |
 | `max_active_sessions_global` | 256 | 1..=100000 | 进程内活动 Session 总数 |
-| `session_idle_timeout_seconds` | 1800 | 1..=86400 | Session 空闲回收时间 |
+| `session_idle_timeout_seconds` | 1800 | 1..=86400 | MCP Session 空闲回收时间，同时作用于 RAM-A Admission 和底层 `rmcp` Session Worker |
 
 全局 Session 上限必须不小于单主体上限。并发超限不会排队，直接返回 HTTP 429。
 

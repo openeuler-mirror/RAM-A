@@ -30,13 +30,15 @@ cd /path/to/RAM-A
 cargo test -p memory-core hybrid_search_fail_
 cargo test -p memory-core retry_classification_is_limited_to_transient_failures
 
-# HTTP 限流、并发上限和 SessionAdmission。
+# HTTP 限流、并发上限和 MCP Session 生命周期。
 cargo test -p memory-mcp --test http_mcp \
   concurrent_tool_limit_rejects_excess_work_without_queueing -- --exact
 cargo test -p memory-mcp --test http_mcp \
   tool_rate_limit_is_scoped_to_the_authenticated_principal_and_tool -- --exact
 cargo test -p memory-mcp --test http_mcp \
   active_session_cap_is_enforced_per_principal -- --exact
+cargo test -p memory-mcp --test http_mcp \
+  configured_idle_timeout_is_applied_to_the_rmcp_session_worker -- --exact
 
 # Pipeline fail_fast、阶段日志以及对外错误结构。
 cargo test -p memory-pipeline --test offline_pipeline \

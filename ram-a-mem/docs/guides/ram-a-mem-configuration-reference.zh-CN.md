@@ -102,11 +102,12 @@ Token 本身没有由 RAM-A 管理的过期时间。轮换方式是更新环境�
 | `initialize_rate_burst` | 8 | 1..=10000 | MCP initialize 突发容量 |
 | `max_active_sessions_per_principal` | 8 | 1..=1024 | 单 Principal 活动 MCP Session 上限 |
 | `max_active_sessions_global` | 256 | 1..=100000 | 单进程活动 MCP Session 总上限 |
-| `session_idle_timeout_seconds` | 1800 | 1..=86400 | RAM-A Admission 层的 Session 空闲回收时间 |
+| `session_idle_timeout_seconds` | 1800 | 1..=86400 | MCP Session 空闲回收时间；同一值同时配置 RAM-A Admission 和底层 `rmcp` Session Worker |
 
 `max_active_sessions_global` 固定不得小于 `max_active_sessions_per_principal`。每个字段都必须有
 默认值、下边界、上边界、0、上边界加一的配置测试；并发、速率、请求体和 Session 回收还应有
-HTTP 行为测试。该 Session 超时不承诺修改底层 `rmcp` 自身的内部超时。
+HTTP 行为测试。Session 超时测试必须覆盖配置值大于 `rmcp` 历史默认 300 秒的场景，证明底层
+Session Worker 不会先于 `session_idle_timeout_seconds` 终止；活动请求必须同时刷新两层的空闲期限。
 
 ## 7. `pipeline`
 
