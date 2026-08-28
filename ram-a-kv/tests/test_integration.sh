@@ -342,6 +342,15 @@ emit "turn_end chunk_hashes contains non-string (rejected)" "false" \
     '{"type":"turn_end","session_id":"edge-s1","kv_transfer_params":{"chunk_hashes":["ok",123]}}'
 emit "turn_end with explicit empty chunk_hashes (allowed, clears session)" "true" \
     '{"type":"turn_end","session_id":"edge-clear","kv_transfer_params":{"chunk_hashes":[]}}'
+# chunk_hash length and count limits (hard-coded: 100 bytes per hash, 1000 hashes per request)
+emit "turn_end chunk_hashes with 1001 entries (rejected by count limit)" "false" \
+    "$(jq -ncM '{type:"turn_end",session_id:"edge-count-overflow",kv_transfer_params:{chunk_hashes:[range(1001)|"h"+tostring]}}')"
+emit "turn_end chunk_hashes with exactly 1000 entries (allowed at boundary)" "true" \
+    "$(jq -ncM '{type:"turn_end",session_id:"edge-count-1000",kv_transfer_params:{chunk_hashes:[range(1000)|"h"+tostring]}}')"
+emit "turn_end chunk_hash of 101 bytes (rejected by length limit)" "false" \
+    "$(jq -ncM '{type:"turn_end",session_id:"edge-len-overflow",kv_transfer_params:{chunk_hashes:[("x"*101)]}}')"
+emit "turn_end chunk_hash of exactly 100 bytes (allowed at boundary)" "true" \
+    "$(jq -ncM '{type:"turn_end",session_id:"edge-len-100",kv_transfer_params:{chunk_hashes:[("x"*100)]}}')"
 emit "session_map nonexistent session" "false" \
     '{"type":"session_map","session_id":"nonexistent-xxx"}'
 # session_close is lenient on unknown sessions.
@@ -353,6 +362,10 @@ curl -s -X POST "$DAEMON_URL/event" -H "Content-Type: application/json" \
     -d '{"type":"session_close","session_id":"edge-s1"}' > /dev/null
 curl -s -X POST "$DAEMON_URL/event" -H "Content-Type: application/json" \
     -d '{"type":"session_close","session_id":"edge-clear"}' > /dev/null
+curl -s -X POST "$DAEMON_URL/event" -H "Content-Type: application/json" \
+    -d '{"type":"session_close","session_id":"edge-count-1000"}' > /dev/null
+curl -s -X POST "$DAEMON_URL/event" -H "Content-Type: application/json" \
+    -d '{"type":"session_close","session_id":"edge-len-100"}' > /dev/null
 
 # ─────────────────────────────────────────────────────────────
 # L1.7b regression: duplicate hashes inside one session must not inflate refcount

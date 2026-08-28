@@ -6,6 +6,13 @@ use serde_json::{json, Value};
 
 use crate::event_registry::{AppContext, EventHandler, EventResult, EventSpec};
 
+// Hard-coded input limits for turn_end chunk_hashes.
+// Each chunk hash is at most 100 bytes; a single request carries at most 1000
+// chunks. Oversized payloads are rejected before reaching the manager so a
+// hostile or buggy client cannot blow up memory or stall eviction.
+const MAX_CHUNK_HASH_LEN: usize = 100;
+const MAX_CHUNK_COUNT: usize = 1000;
+
 pub struct TurnEndHandler;
 
 // Strict typed payload so missing or invalid `chunk_hashes` is rejected
@@ -47,6 +54,27 @@ impl EventHandler for TurnEndHandler {
             return EventResult::Err("session_id must not be empty".into());
         }
 
+        let chunk_hashes = parsed.kv_transfer_params.chunk_hashes;
+        if chunk_hashes.len() > MAX_CHUNK_COUNT {
+            return EventResult::Err(format!(
+                "chunk_hashes count {} exceeds limit of {}",
+                chunk_hashes.len(),
+                MAX_CHUNK_COUNT
+            ));
+        }
+        if let Some((i, h)) = chunk_hashes
+            .iter()
+            .enumerate()
+            .find(|(_, h)| h.len() > MAX_CHUNK_HASH_LEN)
+        {
+            return EventResult::Err(format!(
+                "chunk_hashes[{i}] length {} exceeds limit of {} bytes",
+                h.len(),
+                MAX_CHUNK_HASH_LEN
+            ));
+        }
+        let chunk_count = chunk_hashes.len();
+
         let debug_context = parsed.debug_context.as_ref().and_then(|dc| {
             let messages = dc.get("messages").and_then(|m| m.as_array()).cloned();
             let timing = dc.get("timing").map(|t| TimingInfo {
@@ -68,8 +96,6 @@ impl EventHandler for TurnEndHandler {
             }
         });
 
-        let chunk_hashes = parsed.kv_transfer_params.chunk_hashes;
-        let chunk_count = chunk_hashes.len();
         let outcome: OperationOutcome = match ctx
             .manager
             .on_turn_end(&parsed.session_id, chunk_hashes, debug_context)
