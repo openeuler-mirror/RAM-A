@@ -12,7 +12,7 @@ use crate::event_registry::{AppContext, EventRegistry, EventResult};
 #[derive(Serialize)]
 pub struct EventResponse {
     ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     type_: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<Value>,
