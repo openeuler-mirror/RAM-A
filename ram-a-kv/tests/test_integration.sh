@@ -191,6 +191,11 @@ echo ""
 echo "=== L1.1 health check ==="
 emit "health returns ok=true" "true" '{"type":"health"}'
 
+health_resp=$(curl -s -X POST "$DAEMON_URL/event" \
+    -H "Content-Type: application/json" -d '{"type":"health"}')
+assert_field "response key is 'type' with value health" "$health_resp" '.type' 'health'
+assert_field "response must not carry 'type_' key" "$health_resp" '.type_' 'null'
+
 echo ""
 echo "=== L1.2 list_events meta-event ==="
 list_resp=$(curl -s -X POST "$DAEMON_URL/event" \
