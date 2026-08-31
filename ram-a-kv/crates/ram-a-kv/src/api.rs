@@ -64,7 +64,11 @@ pub async fn handle_event(
         return Json(EventResponse::error(None, "missing or empty 'type' field"));
     }
 
-    tracing::info!(type = type_str, session_id = session_id, "ram-a-kv event received");
+    if session_id.is_empty() {
+        tracing::info!(type = type_str, "ram-a-kv event received");
+    } else {
+        tracing::info!(type = type_str, session_id = session_id, "ram-a-kv event received");
+    }
 
     // list_events is a meta-event: bypass handlers and return every registered spec.
     if type_str == "list_events" {
@@ -113,7 +117,11 @@ pub async fn handle_event(
 
     match result {
         EventResult::Ok(data) => {
-            tracing::info!(type = type_str, status = 200, session_id = session_id, "ram-a-kv event completed");
+            if session_id.is_empty() {
+                tracing::info!(type = type_str, status = 200, "ram-a-kv event completed");
+            } else {
+                tracing::info!(type = type_str, status = 200, session_id = session_id, "ram-a-kv event completed");
+            }
             // Persist session state on turn_end so it survives daemon restarts.
             // Use the actual turn_count from the manager so the counter is not
             // reset to 0 on every save (the previous code hard-coded 0).
