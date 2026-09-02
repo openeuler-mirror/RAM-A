@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import re
 import unittest
 
 
@@ -52,6 +53,14 @@ class Arm64ImageAssetsTest(unittest.TestCase):
                 text = path.read_text(encoding="utf-8", errors="ignore")
                 for prefix in forbidden:
                     self.assertNotIn(prefix, text, str(path))
+
+    def test_powershell_variables_before_colons_are_delimited(self):
+        invalid_reference = re.compile(
+            r"\$(?!(?:env|global|script|local|private):)[A-Za-z_][A-Za-z0-9_]*:"
+        )
+        for path in ROOT.glob("*.ps1"):
+            text = path.read_text(encoding="utf-8")
+            self.assertIsNone(invalid_reference.search(text), str(path))
 
 
 if __name__ == "__main__":
