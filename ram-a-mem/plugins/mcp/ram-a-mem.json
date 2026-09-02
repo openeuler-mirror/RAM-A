@@ -65,6 +65,7 @@
   "providers": {
     "api_key_env": "LLM_API_KEY",
     "base_url": "http://127.0.0.1:8000/v1",
+    "reasoning_effort": null,
     "embedding_provider": "hash",
     "embedding_api_key_env": null,
     "embedding_base_url": null,

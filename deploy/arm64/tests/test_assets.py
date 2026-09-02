@@ -52,6 +52,7 @@ class Arm64ImageAssetsTest(unittest.TestCase):
         self.assertEqual("hash", config["providers"]["embedding_provider"])
         self.assertEqual(1024, config["providers"]["embedding_dimensions"])
         self.assertEqual("GLM-5.2", config["providers"]["extractor_model"])
+        self.assertEqual("none", config["providers"]["reasoning_effort"])
         self.assertFalse(config["features"]["graph_memory"]["enabled"])
         self.assertFalse(config["retrieval"]["rerank"]["enabled"])
 
@@ -74,7 +75,16 @@ class Arm64ImageAssetsTest(unittest.TestCase):
     def test_glm_smoke_allows_reasoning_responses(self):
         text = (ROOT / "scripts/verify-ingest.sh").read_text(encoding="utf-8")
         self.assertIn("max_tokens:64", text)
+        self.assertIn('reasoning_effort:"none"', text)
+        self.assertIn("--retry 5", text)
+        self.assertIn("--retry-all-errors", text)
         self.assertIn("reasoning_content", text)
+        self.assertIn('((.content // "") | length) > 0', text)
+
+    def test_xiaoo_uses_supported_glm_reasoning_effort(self):
+        text = (ROOT / "config/xiaoo.toml").read_text(encoding="utf-8")
+        self.assertIn('reasoning_effort = "none"', text)
+        self.assertNotIn('reasoning_effort = "off"', text)
 
     def test_powershell_variables_before_colons_are_delimited(self):
         invalid_reference = re.compile(

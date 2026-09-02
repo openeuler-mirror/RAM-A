@@ -43,6 +43,7 @@
   "providers": {
     "api_key_env": "GLM_CODING_TOKEN",
     "base_url": "https://open.bigmodel.cn/api/coding/paas/v4",
+    "reasoning_effort": "none",
     "embedding_provider": "hash",
     "embedding_api_key_env": null,
     "embedding_base_url": null,

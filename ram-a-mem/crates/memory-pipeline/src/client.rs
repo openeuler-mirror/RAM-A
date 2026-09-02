@@ -12,6 +12,7 @@ pub struct OpenAiCompatibleClient {
     api_key: String,
     base_url: String,
     max_retries: usize,
+    reasoning_effort: Option<String>,
 }
 
 pub struct ChatResult {
@@ -43,7 +44,15 @@ impl OpenAiCompatibleClient {
             api_key,
             base_url: base_url.trim_end_matches('/').into(),
             max_retries,
+            reasoning_effort: None,
         })
+    }
+
+    pub fn with_reasoning_effort(mut self, reasoning_effort: Option<String>) -> Self {
+        self.reasoning_effort = reasoning_effort
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        self
     }
 
     pub fn from_env(
@@ -64,7 +73,10 @@ impl OpenAiCompatibleClient {
         messages: Vec<Value>,
         max_tokens: usize,
     ) -> Result<ChatResult> {
-        let payload = json!({"model": model, "messages": messages, "temperature": 0.0, "max_tokens": max_tokens});
+        let mut payload = json!({"model": model, "messages": messages, "temperature": 0.0, "max_tokens": max_tokens});
+        if let Some(reasoning_effort) = &self.reasoning_effort {
+            payload["reasoning_effort"] = json!(reasoning_effort);
+        }
         let mut last_error = String::new();
         for attempt in 0..self.max_retries.max(1) {
             let started = Instant::now();
@@ -234,8 +246,10 @@ fn estimate_text_tokens(value: &str) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::io::BufRead;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::mpsc;
     use std::thread;
 
     use super::*;
@@ -258,6 +272,80 @@ mod tests {
         ] {
             assert_eq!(llm_error_kind(message), expected);
         }
+    }
+
+    async fn complete_captured_chat_request(client: OpenAiCompatibleClient) {
+        let result = client
+            .chat("model", vec![json!({"role": "user", "content": "hi"})], 10)
+            .await
+            .unwrap();
+        assert_eq!(result.content, "ok");
+        assert_eq!(result.usage.total_tokens, 2);
+    }
+
+    fn request_capturing_server() -> (String, mpsc::Receiver<Value>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line
+                    .to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(str::trim)
+                {
+                    content_length = value.parse().unwrap();
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            reader.read_exact(&mut body).unwrap();
+            sender.send(serde_json::from_slice(&body).unwrap()).unwrap();
+            let body = serde_json::json!({
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })
+            .to_string();
+            write!(
+                reader.get_mut(),
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        (format!("http://{address}"), receiver, server)
+    }
+
+    #[tokio::test]
+    async fn configured_reasoning_effort_is_sent() {
+        let (base_url, request, server) = request_capturing_server();
+        let client = OpenAiCompatibleClient::new("key", &base_url, 2, 1)
+            .unwrap()
+            .with_reasoning_effort(Some("none".to_string()));
+
+        complete_captured_chat_request(client).await;
+
+        assert_eq!(request.recv().unwrap()["reasoning_effort"], "none");
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn unconfigured_reasoning_effort_is_omitted() {
+        let (base_url, request, server) = request_capturing_server();
+        let client = OpenAiCompatibleClient::new("key", &base_url, 2, 1).unwrap();
+
+        complete_captured_chat_request(client).await;
+
+        assert!(request.recv().unwrap().get("reasoning_effort").is_none());
+        server.join().unwrap();
     }
 
     #[tokio::test]

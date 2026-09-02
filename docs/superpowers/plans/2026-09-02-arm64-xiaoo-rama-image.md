@@ -65,7 +65,7 @@ class Arm64ImageAssetsTest(unittest.TestCase):
         self.assertFalse(config["retrieval"]["rerank"]["enabled"])
 
     def test_repository_assets_do_not_contain_real_tokens(self):
-        forbidden = ("f12f159980484722", "sk-or-v1-87ad6b14")
+        forbidden = ("f12f" + "159980484722", "sk-or-v1-" + "87ad6b14")
         for path in ROOT.rglob("*"):
             if path.is_file() and path.suffix not in {".pyc", ".rpm"}:
                 text = path.read_text(encoding="utf-8", errors="ignore")
@@ -312,4 +312,3 @@ docker image inspect xiaoo-rama:arm64-pr18 --format '{{.Architecture}}'
 - 真实密钥只通过构建进程传入并固化到最终镜像，不提交到 Git，不写入计划或日志。
 - 构建、RPM、运行和验证均固定 `linux/arm64`。
 - 任一强制验收失败时保留旧镜像，不宣称完成。
-

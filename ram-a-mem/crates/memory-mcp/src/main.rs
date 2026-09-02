@@ -102,7 +102,8 @@ async fn main() -> Result<()> {
         providers.timeout_seconds,
         providers.max_retries,
     )
-    .context("failed to construct model client")?;
+    .context("failed to construct model client")?
+    .with_reasoning_effort(providers.reasoning_effort.clone());
     let extractor: Arc<dyn MemoryExtractor> = Arc::new(LlmMemoryExtractor::new(
         model_client.clone(),
         &providers.extractor_model,

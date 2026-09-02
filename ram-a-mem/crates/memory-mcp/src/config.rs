@@ -415,6 +415,8 @@ pub struct ProvidersConfig {
     #[serde(default = "default_provider_base_url")]
     pub base_url: String,
     #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
     pub embedding_provider: EmbeddingProviderKind,
     #[serde(default)]
     pub embedding_api_key_env: Option<String>,
@@ -943,6 +945,11 @@ impl ServerConfig {
                 anyhow::bail!("embedding API key environment name must not be empty");
             }
         }
+        if let Some(reasoning_effort) = providers.reasoning_effort.as_deref() {
+            if reasoning_effort.trim().is_empty() || reasoning_effort.trim() != reasoning_effort {
+                anyhow::bail!("provider reasoning effort must be canonical and non-empty");
+            }
+        }
         if let Some(embedding_base_url) = providers.embedding_base_url.as_deref() {
             validate_provider_base_url(embedding_base_url, "embedding base URL")?;
         }
@@ -1104,6 +1111,7 @@ mod tests {
         }))
         .expect("parse provider defaults");
         assert_eq!(providers.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(providers.reasoning_effort, None);
         assert_eq!(
             providers.embedding_provider,
             EmbeddingProviderKind::OpenAiCompatible
@@ -1135,6 +1143,28 @@ mod tests {
         assert_eq!(minimal.retrieval.mode, SearchMode::Hybrid);
         assert!(minimal.case_library.is_none());
         assert!(minimal.graph_memory.is_none());
+    }
+
+    #[test]
+    fn provider_reasoning_effort_is_configurable() {
+        let mut source: serde_json::Value =
+            serde_json::from_str(include_str!("../../../plugins/mcp/ram-a-mem.json"))
+                .expect("packaged config is JSON");
+        source["providers"]["reasoning_effort"] = serde_json::json!("none");
+
+        assert!(serde_json::from_value::<ServerConfig>(source).is_ok());
+    }
+
+    #[test]
+    fn provider_reasoning_effort_rejects_blank_value() {
+        let mut config = packaged_config();
+        config
+            .providers
+            .as_mut()
+            .expect("providers")
+            .reasoning_effort = Some(" ".to_string());
+
+        assert!(config.validate_runtime().is_err());
     }
 
     #[test]

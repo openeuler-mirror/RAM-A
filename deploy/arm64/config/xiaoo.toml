@@ -4,7 +4,7 @@ api_base = "https://open.bigmodel.cn/api/anthropic"
 model = "GLM-5.2"
 api_key_env = "ANTHROPIC_AUTH_TOKEN"
 max_tokens = 8192
-reasoning_effort = "off"
+reasoning_effort = "none"
 
 [memory_automation]
 enabled = true

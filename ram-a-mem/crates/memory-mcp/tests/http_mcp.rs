@@ -1811,6 +1811,7 @@ fn production_runtime_config_requires_live_components_and_nonzero_limits() {
         providers: Some(ProvidersConfig {
             api_key_env: "RAM_A_PROVIDER_KEY".to_string(),
             base_url: "https://provider.example/v1".to_string(),
+            reasoning_effort: None,
             embedding_provider: EmbeddingProviderKind::OpenAiCompatible,
             embedding_api_key_env: None,
             embedding_base_url: None,
