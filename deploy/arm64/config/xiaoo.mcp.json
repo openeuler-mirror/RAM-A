@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "ram-a": {
+      "transport": "streamable_http",
+      "url": "http://127.0.0.1:18081/mcp",
+      "bearer_token_env": "RAM_A_XIAOO_TOKEN",
+      "agent_id": "xiaoo",
+      "timeout_ms": 30000
+    }
+  }
+}

@@ -1,0 +1,74 @@
+{
+  "auth": {
+    "tokens": [
+      {
+        "token_env": "RAM_A_XIAOO_TOKEN",
+        "tenant_id": "tenant-local",
+        "user_id": "user-local",
+        "agent_id": "xiaoo",
+        "permissions": ["memory:read", "memory:write"]
+      }
+    ]
+  },
+  "features": {
+    "memory": {"enabled": true},
+    "case_library": {"enabled": false},
+    "graph_memory": {"enabled": false}
+  },
+  "http": {
+    "bind_address": "0.0.0.0",
+    "port": 18081,
+    "allowed_origins": [],
+    "allowed_hosts": ["127.0.0.1:18081", "localhost:18081"],
+    "tls_termination_acknowledged": true
+  },
+  "limits": {
+    "max_body_bytes": 16777216,
+    "requests_per_second": 20,
+    "rate_burst": 40,
+    "max_in_flight_per_principal_tool": 4,
+    "initialize_requests_per_second": 4,
+    "initialize_rate_burst": 8,
+    "max_active_sessions_per_principal": 8,
+    "max_active_sessions_global": 256,
+    "session_idle_timeout_seconds": 1800
+  },
+  "pipeline": {
+    "fail_fast": true,
+    "max_memory_chars": 500
+  },
+  "storage": {
+    "database_path": "/var/lib/ram-a/ram-a-memory.sqlite"
+  },
+  "providers": {
+    "api_key_env": "GLM_CODING_TOKEN",
+    "base_url": "https://open.bigmodel.cn/api/coding/paas/v4",
+    "embedding_provider": "hash",
+    "embedding_api_key_env": null,
+    "embedding_base_url": null,
+    "embedding_model": "hash",
+    "embedding_dimensions": 1024,
+    "extractor_model": "GLM-5.2",
+    "verifier_model": "GLM-5.2",
+    "timeout_seconds": 180,
+    "max_retries": 3
+  },
+  "retrieval": {
+    "mode": "hybrid",
+    "embedding_weight": 0.7,
+    "bm25_weight": 0.3,
+    "candidate_k": 100,
+    "rerank": {
+      "enabled": false,
+      "provider": "openrouter",
+      "model": "cohere/rerank-v3.5",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "base_url": "https://openrouter.ai/api/v1",
+      "input_k": 40,
+      "timeout_ms": 30000,
+      "fail_open": false
+    }
+  },
+  "case_library": null,
+  "graph_memory": null
+}
