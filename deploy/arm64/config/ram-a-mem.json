@@ -16,7 +16,7 @@
     "graph_memory": {"enabled": false}
   },
   "http": {
-    "bind_address": "0.0.0.0",
+    "bind_address": "127.0.0.1",
     "port": 18081,
     "allowed_origins": [],
     "allowed_hosts": ["127.0.0.1:18081", "localhost:18081"],

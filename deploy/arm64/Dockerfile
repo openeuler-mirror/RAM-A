@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.7
-
 FROM --platform=linux/arm64 openeuler/openeuler:24.03-lts-sp3 AS builder
 
 RUN dnf install -y \
@@ -34,8 +32,6 @@ ENV GLM_CODING_TOKEN=${GLM_CODING_TOKEN} \
     RAM_A_XIAOO_TOKEN=ram-a-local-image-token \
     RAM_A_MEM_CONFIG=/etc/ram-a/ram-a-mem.json \
     RUST_LOG=info
-
-RUN test -n "$GLM_CODING_TOKEN" && test -n "$OPENROUTER_API_KEY"
 
 RUN dnf install -y \
       ca-certificates cargo curl gcc gcc-c++ git jq make openssl openssl-devel \

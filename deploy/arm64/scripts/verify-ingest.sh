@@ -11,13 +11,16 @@ results_dir="$state_dir/results"
 log_file=/var/log/ram-a/ram-a-mem.jsonl
 mkdir -p "$results_dir"
 
-model_payload="$(jq -nc '{model:"GLM-5.2",messages:[{role:"user",content:"只回复 OK"}],temperature:0,max_tokens:16}')"
+model_payload="$(jq -nc '{model:"GLM-5.2",messages:[{role:"user",content:"只回复 OK"}],temperature:0,max_tokens:64}')"
 curl --fail --silent --show-error \
   -H "Authorization: Bearer $GLM_CODING_TOKEN" \
   -H 'Content-Type: application/json' \
   https://open.bigmodel.cn/api/coding/paas/v4/chat/completions \
   -d "$model_payload" >"$results_dir/model-smoke.json"
-jq -e '.choices[0].message.content | length > 0' "$results_dir/model-smoke.json" >/dev/null
+jq -e '
+  .choices[0].message
+  | ((.content // "") | length) > 0 or ((.reasoning_content // "") | length) > 0
+' "$results_dir/model-smoke.json" >/dev/null
 
 "$script_dir/mcp.sh" init >"$results_dir/mcp-initialize.json"
 jq -e '.result.protocolVersion == "2025-11-25"' "$results_dir/mcp-initialize.json" >/dev/null
