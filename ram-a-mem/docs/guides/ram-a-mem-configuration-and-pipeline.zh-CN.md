@@ -68,11 +68,15 @@ RPM 和 xiaoO 的可执行环境验收步骤见
   继续处理其他窗口。
 - `max_memory_chars`：默认 500，有效范围 1..=32000，按 Unicode 字符计数。超长抽取
   结果进入 quarantine，不截断，也不使请求失败。
+- `max_candidate_tokens`、`max_window_tokens`：Window 阶段的候选预算和候选加上下文预算。
+- `extractor_max_output_tokens`、`verifier_max_output_tokens`：Extract/Ground Chat 请求的
+  输出 token 上限。
+- `extractor_context_window_tokens`、`verifier_context_window_tokens`、`reasoning_reserve_tokens`：
+  可选的完整请求预算预检。Extract 超预算时先裁剪非候选上下文；候选内容仍超预算则失败。
 
-Episode 和 Window 的参数目前没有暴露为服务配置。服务固定使用代码默认值：Episode
-不按时间间隔和 metadata 字段主动切分；Window 的候选预算为 320 个估算 Token、总预算
-为 640、向前取 2 条上下文、向后取 0 条上下文。这里的 Token 是本地启发式估算，不是
-模型 Tokenizer 的精确计数。
+Episode 参数目前没有暴露为服务配置。服务固定使用代码默认值：Episode 不按时间间隔和
+metadata 字段主动切分；Window 向前取 2 条上下文、向后取 0 条上下文。这里的 Token 是本地
+启发式估算，不是模型 Tokenizer 的精确计数。
 
 ### `storage`
 
@@ -85,6 +89,13 @@ Episode 和 Window 的参数目前没有暴露为服务配置。服务固定使�
 - `extractor_model`：Extract 阶段模型名。
 - `verifier_model`：Ground 阶段模型名；可以与 Extract 相同，也可以独立配置。
 - `timeout_seconds`、`max_retries`：上述 Chat API 客户端的单次超时和最大尝试次数配置。
+- `reasoning_effort`、`enable_thinking`：可选的 thinking/reasoning 控制字段，最多启用一种；
+  Provider 不支持时应省略或在 smoke test 后再开启。
+- `send_temperature`、`temperature`：是否发送 temperature，以及发送时的数值。
+- `output_token_parameter`：选择发送 `max_tokens` 或 `max_completion_tokens`。
+- `structured_output`：选择 `prompt_only`、`json_object` 或 `json_schema`。
+- `reasoning_only_retry`：只有 `reasoning_content` 但没有最终 `content` 时，最多纠正重试一次。
+- `json_repair_attempts`：Extract/Ground 返回非合格 JSON 时，最多请求模型修复一次。
 - `embedding_provider`：`hash` 或 `openai_compatible`。`hash` 仅适合离线测试和演示。
 - `embedding_api_key_env`、`embedding_base_url`：可选；未配置时回退到 `api_key_env` 和
   `base_url`。
@@ -92,6 +103,8 @@ Episode 和 Window 的参数目前没有暴露为服务配置。服务固定使�
 
 即使选择 `embedding_provider=hash`，`api_key_env` 仍然必需，因为 Extract 和 Ground
 仍调用 Chat 模型。
+模型兼容性字段和 GLM Coding Plan 的已验证注意事项见
+[`model-compatibility.zh-CN.md`](model-compatibility.zh-CN.md)。
 
 ### `retrieval`
 
@@ -445,7 +458,12 @@ Episode 可以生成零个、一个或多个 Window；每个 Window 包含一组
 `<context>` 和 `<candidate>` 分区；上下文只能帮助消歧，不能单独产生记忆。
 
 **模型：** OpenAI-compatible Chat Completions，模型名为 `providers.extractor_model`，当前
-实现标识为 `LLMMemoryExtractor`，Prompt 版本 `extract_v2`，最大输出 1600 Token。
+实现标识为 `LLMMemoryExtractor`，Prompt 版本 `extract_v3`，最大输出由
+`pipeline.extractor_max_output_tokens` 控制，默认 1600 Token。
+
+Extract 请求会按 `providers` 中的模型兼容字段构造请求体。启用上下文窗口预算时，系统会估算
+system prompt、user prompt、推理预留和最大输出；如果超出预算，会先移除非候选上下文，再决定
+是否调用 Provider。
 
 **模型输出经协议解析后的 ExtractionBatch：**
 
@@ -528,7 +546,11 @@ ValidationBatch {
 NormalizedMessage。Prompt 只发送候选 claim 和已定位 Evidence，不重新发送任意历史数据。
 
 **模型：** OpenAI-compatible Chat Completions，模型名为 `providers.verifier_model`，当前
-实现标识为 `LLMGroundingVerifier`，Prompt 版本 `ground_v1`，最大输出 1000 Token。
+实现标识为 `LLMGroundingVerifier`，Prompt 版本 `ground_v2`，最大输出由
+`pipeline.verifier_max_output_tokens` 控制，默认 1000 Token。
+
+Ground 同样使用 `providers` 中的模型兼容字段。它只发送候选 claim 和已定位 Evidence，没有
+额外外围上下文可裁剪；配置上下文窗口预算后，超预算会作为 Ground 阶段错误返回。
 
 **输出：**
 

@@ -35,7 +35,14 @@
   },
   "pipeline": {
     "fail_fast": true,
-    "max_memory_chars": 500
+    "max_memory_chars": 500,
+    "max_candidate_tokens": 320,
+    "max_window_tokens": 640,
+    "extractor_max_output_tokens": 1600,
+    "verifier_max_output_tokens": 1000,
+    "extractor_context_window_tokens": null,
+    "verifier_context_window_tokens": null,
+    "reasoning_reserve_tokens": 0
   },
   "storage": {
     "database_path": "/var/lib/ram-a/ram-a-memory.sqlite"
@@ -44,6 +51,13 @@
     "api_key_env": "GLM_CODING_TOKEN",
     "base_url": "https://open.bigmodel.cn/api/coding/paas/v4",
     "reasoning_effort": "none",
+    "enable_thinking": null,
+    "send_temperature": true,
+    "temperature": 0.0,
+    "output_token_parameter": "max_tokens",
+    "structured_output": "prompt_only",
+    "reasoning_only_retry": true,
+    "json_repair_attempts": 1,
     "embedding_provider": "hash",
     "embedding_api_key_env": null,
     "embedding_base_url": null,

@@ -42,7 +42,7 @@
 | `features` | 推荐可配置 | 使用各功能默认值 | 对外能力开关 |
 | `http` | 推荐可配置 | 使用本地监听默认值 | HTTP 监听和来源限制 |
 | `limits` | 推荐可配置 | 使用服务保护默认值 | 请求、并发和 Session 限制 |
-| `pipeline` | 推荐可配置 | `fail_fast=true`、`max_memory_chars=500` | 记忆管线策略 |
+| `pipeline` | 推荐可配置 | 见第 7 节 | 记忆管线策略和模型 token 预算 |
 | `storage` | 部署必配 | 生产校验失败 | 个人记忆 SQLite 文件 |
 | `providers` | 部署必配 | 生产校验失败 | Extract、Ground 和 Embedding Provider |
 | `retrieval` | 推荐可配置 | Hybrid，不启用 Rerank | 个人记忆检索策略 |
@@ -115,9 +115,17 @@ Session Worker 不会先于 `session_idle_timeout_seconds` 终止；活动请求
 | --- | --- | --- | --- | --- |
 | `fail_fast` | 推荐可配置 | `true` | `true`/`false` | 只控制 Extract/Ground 窗口错误；`true` 终止本次摄入，`false` 跳过失败窗口并继续 |
 | `max_memory_chars` | 推荐可配置 | `500` | 1..=32000 Unicode 字符 | 抽取记忆超限进入 quarantine，不截断 |
+| `max_candidate_tokens` | 推荐可配置 | `320` | 大于 0 | Window 阶段单个候选窗口预算，使用本地启发式 token 估算 |
+| `max_window_tokens` | 推荐可配置 | `640` | 不小于 `max_candidate_tokens` | Window 阶段候选加上下文总预算，使用本地启发式 token 估算 |
+| `extractor_max_output_tokens` | 推荐可配置 | `1600` | 大于 0 | Extract Chat 请求的最大输出 token |
+| `verifier_max_output_tokens` | 推荐可配置 | `1000` | 大于 0 | Ground Chat 请求的最大输出 token |
+| `extractor_context_window_tokens` | 条件配置 | `null` | `null` 或大于 `extractor_max_output_tokens + reasoning_reserve_tokens` | 配置后在 Extract 请求前估算完整 messages 预算；超预算时先裁剪非候选上下文 |
+| `verifier_context_window_tokens` | 条件配置 | `null` | `null` 或大于 `verifier_max_output_tokens + reasoning_reserve_tokens` | 配置后在 Ground 请求前估算完整 messages 预算；Ground 无外围上下文可裁，超预算直接失败 |
+| `reasoning_reserve_tokens` | 推荐可配置 | `0` | 可为 0 | 给可能产生的推理 token 预留预算，只参与请求前估算 |
 
-Episode 和 Window 的内部参数当前不是服务配置字段，不能写入 JSON。测试必须覆盖两种
-`fail_fast` 行为，以及 `max_memory_chars` 的 1、500、32000、0、32001。
+Episode 的内部参数当前不是服务配置字段，不能写入 JSON。Window 的候选和总预算已通过
+`max_candidate_tokens` 与 `max_window_tokens` 暴露。测试必须覆盖两种 `fail_fast` 行为、
+`max_memory_chars` 的 1、500、32000、0、32001，以及 token 预算的默认值、合法边界和不一致组合。
 
 ## 8. `storage`
 
@@ -147,9 +155,19 @@ OpenAI-compatible API 或本地确定性 hash。
 | `verifier_model` | 部署必配 | 无 | 推荐与 `extractor_model` 使用相同模型 | 非空；用于 Ground，也支持独立配置 |
 | `timeout_seconds` | 推荐可配置 | 120 | 120 | 大于 0；Chat 请求超时 |
 | `max_retries` | 推荐可配置 | 3 | 3 | 大于 0；仅作用于 Extract/Ground 共用的 Chat 客户端 |
+| `reasoning_effort` | 条件配置 | `null` | GLM Coding Plan 已验证可用 `none` | 配置时非空；透传给 Chat 请求；与 `enable_thinking` 不能同时配置 |
+| `enable_thinking` | 条件配置 | `null` | 仅在 Provider 明确支持时使用 `false` | 布尔值；透传给 Chat 请求；与 `reasoning_effort` 不能同时配置 |
+| `send_temperature` | 推荐可配置 | `true` | 兼容服务不接受 temperature 时设 `false` | `true` 时发送 `temperature`，`false` 时省略 |
+| `temperature` | 推荐可配置 | 0.0 | 记忆抽取推荐低温 | 有限数，范围 -2.0..=2.0 |
+| `output_token_parameter` | 固定值枚举 | `max_tokens` | 按 Provider 协议选择 | 只接受 `max_tokens` 或 `max_completion_tokens`；单位是输出 token |
+| `structured_output` | 固定值枚举 | `prompt_only` | 未经 smoke test 时保持 `prompt_only` | 只接受 `prompt_only`、`json_object`、`json_schema` |
+| `reasoning_only_retry` | 推荐可配置 | `false` | GLM Coding Plan 容器配置为 `true` | 只有 `reasoning_content` 而最终 `content` 为空时，至多纠正重试一次 |
+| `json_repair_attempts` | 推荐可配置 | 0 | 需要兼容弱 JSON 模型时设 1 | 只允许 0 或 1；只修复 Extract/Ground 返回的非合格 JSON |
 
 配置测试验证枚举、默认值、非空、URL 安全规则和正数约束。模型存在性、API Key 权限、余额、
-限流、响应 JSON 质量必须由带真实 Provider 的集成测试验证。
+限流、响应 JSON 质量、Structured Output 支持情况必须由带真实 Provider 的集成测试验证。
+模型兼容性配置示例和 GLM 注意事项见
+[`model-compatibility.zh-CN.md`](model-compatibility.zh-CN.md)。
 
 ## 10. `retrieval`
 
@@ -266,8 +284,8 @@ Hybrid 推荐使用 0.7/0.3 权重组合。Dense 或 BM25 单通道模式不使�
 | --- | --- |
 | 完整示例与全字段 Schema | `packaged_rpm_example_matches_server_schema` |
 | 全部代码默认值 | `feature_http_and_provider_defaults_are_stable`、`graph_and_case_library_defaults_are_stable`、`http_limit_defaults_are_stable_and_supported`、`pipeline_defaults_and_boundaries_are_stable`、`retrieval_defaults_preserve_current_hybrid_behavior` |
-| 固定枚举 | `configurable_enums_reject_unsupported_values`、`authentication_configuration_enforces_fixed_permissions_and_canonical_ids` |
-| 数值范围和组合约束 | `http_limits_accept_documented_lower_boundaries`、`http_limits_accept_documented_upper_boundaries`、`http_limits_reject_zero_out_of_range_and_inconsistent_sessions`、`graph_configuration_accepts_all_documented_boundaries`、`graph_configuration_rejects_invalid_configurable_values`、`retrieval_accepts_hybrid_weight_boundaries`、`retrieval_candidate_and_rerank_limits_accept_boundaries`、`retrieval_rejects_candidate_and_rerank_values_outside_limits` |
+| 固定枚举 | `configurable_enums_reject_unsupported_values`、`authentication_configuration_enforces_fixed_permissions_and_canonical_ids`、`provider_compatibility_rejects_ambiguous_or_unbounded_values` |
+| 数值范围和组合约束 | `http_limits_accept_documented_lower_boundaries`、`http_limits_accept_documented_upper_boundaries`、`http_limits_reject_zero_out_of_range_and_inconsistent_sessions`、`graph_configuration_accepts_all_documented_boundaries`、`graph_configuration_rejects_invalid_configurable_values`、`retrieval_accepts_hybrid_weight_boundaries`、`retrieval_candidate_and_rerank_limits_accept_boundaries`、`retrieval_rejects_candidate_and_rerank_values_outside_limits`、`pipeline_rejects_invalid_model_token_budgets` |
 | 条件配置与回退 | `provider_and_case_library_fallbacks_are_explicit_and_overridable`、`disabled_rerank_ignores_inactive_provider_fields`、`enabled_rerank_rejects_every_invalid_provider_field`，以及 memory-core 的 Rerank/Graph `fail_open` 用例 |
 | 字符串、URL 和路径 | `provider_configuration_rejects_incomplete_configurable_values`、`provider_base_url_rejects_credentials_query_and_fragment`、`case_library_paths_and_mappings_reject_every_invalid_shape`、`storage_configuration_rejects_nonpersistent_paths_and_accepts_file_paths`、`http_configuration_covers_host_and_port_boundaries` |
 

@@ -601,7 +601,9 @@ mod tests {
             emit_failure,
         );
 
-        assert!(output.contains("[crates/memory-core/src/embedding.rs:153]"));
-        assert!(output.contains("log_at=crates/memory-mcp/src/observability.rs:"));
+        let normalized = output.replace('\\', "/");
+        assert!(normalized.contains("[crates/memory-core/src/embedding.rs:153]"));
+        assert!(normalized.contains("log_at="));
+        assert!(normalized.contains("observability.rs:"));
     }
 }

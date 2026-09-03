@@ -11,6 +11,20 @@ results_dir="$state_dir/results"
 log_file=/var/log/ram-a/ram-a-mem.jsonl
 mkdir -p "$results_dir"
 
+jq -e '
+  .pipeline.extractor_max_output_tokens == 1600 and
+  .pipeline.verifier_max_output_tokens == 1000 and
+  .pipeline.extractor_context_window_tokens == null and
+  .pipeline.verifier_context_window_tokens == null and
+  .pipeline.reasoning_reserve_tokens == 0 and
+  .providers.reasoning_effort == "none" and
+  .providers.enable_thinking == null and
+  .providers.output_token_parameter == "max_tokens" and
+  .providers.structured_output == "prompt_only" and
+  .providers.reasoning_only_retry == true and
+  .providers.json_repair_attempts == 1
+' /etc/ram-a/ram-a-mem.json >/dev/null
+
 model_payload="$(jq -nc '{model:"GLM-5.2",messages:[{role:"user",content:"只回复 OK"}],temperature:0,max_tokens:64,reasoning_effort:"none"}')"
 curl --fail --silent --show-error --retry 5 --retry-all-errors --retry-delay 2 \
   -H "Authorization: Bearer $GLM_CODING_TOKEN" \

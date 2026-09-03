@@ -17,3 +17,5 @@ The bundled xiaoO GLM configuration also uses `none`; its previous `off` value i
 ## Verification
 
 Unit tests capture a real local HTTP request and verify both compatibility paths: configured clients include `reasoning_effort`, while unconfigured clients omit it. Configuration tests verify deserialization and reject blank values. Asset tests verify the ARM64 image configuration. Finally, rebuild RAM-A in the ARM64 container and run the live GLM-backed memory ingestion check. The smoke request retries transient HTTP failures a bounded number of times; persistent Coding Plan usage-limit errors remain a reported external verification blocker.
+
+Follow-up design: `../plans/2026-09-03-memory-model-compatibility-phase-1.zh-CN.md` expands this pass-through field into typed provider compatibility controls, reasoning-only classification, bounded JSON repair, and per-stage token budgets.

@@ -114,6 +114,11 @@ impl PipelineError {
             Self::InvalidInput(_) => "invalid_input",
             Self::Json(_) => "invalid_json",
             Self::Io(_) => "io",
+            Self::Protocol(message)
+                if message.contains("reasoning content without final content") =>
+            {
+                "reasoning_only"
+            }
             Self::Protocol(message) if message.contains("empty content") => "empty_content",
             Self::Protocol(message)
                 if message.contains("valid JSON") || message.contains("invalid grounding JSON") =>
@@ -142,6 +147,7 @@ impl PipelineError {
     pub fn safe_summary(&self) -> &'static str {
         match self.source_error_kind() {
             "empty_content" => "model returned empty content",
+            "reasoning_only" => "model returned reasoning without final content",
             "invalid_json" => "model returned invalid JSON",
             "schema_invalid" => "model response did not match the required schema",
             "timeout" => "model request timed out",

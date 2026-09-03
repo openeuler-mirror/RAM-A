@@ -289,7 +289,14 @@ documented in
   },
   "pipeline": {
     "fail_fast": true,
-    "max_memory_chars": 500
+    "max_memory_chars": 500,
+    "max_candidate_tokens": 320,
+    "max_window_tokens": 640,
+    "extractor_max_output_tokens": 1600,
+    "verifier_max_output_tokens": 1000,
+    "extractor_context_window_tokens": null,
+    "verifier_context_window_tokens": null,
+    "reasoning_reserve_tokens": 0
   },
   "storage": {
     "database_path": "data/ram-a-memory.sqlite"
@@ -297,6 +304,14 @@ documented in
   "providers": {
     "api_key_env": "LLM_API_KEY",
     "base_url": "http://127.0.0.1:8000/v1",
+    "reasoning_effort": null,
+    "enable_thinking": null,
+    "send_temperature": true,
+    "temperature": 0.0,
+    "output_token_parameter": "max_tokens",
+    "structured_output": "prompt_only",
+    "reasoning_only_retry": false,
+    "json_repair_attempts": 0,
     "embedding_provider": "hash",
     "embedding_model": "hash",
     "embedding_dimensions": 1024,
@@ -361,6 +376,9 @@ Change these fields before deployment:
 - `storage.database_path`: RAM-A personal long-term memory SQLite path.
 - `providers.api_key_env`, `providers.base_url`, `extractor_model`, `verifier_model`:
   OpenAI-compatible chat/completions provider used by extraction and verification.
+- `providers.reasoning_effort`, `enable_thinking`, `output_token_parameter`,
+  `structured_output`: typed compatibility controls for provider request differences. See
+  [model compatibility](docs/guides/model-compatibility.zh-CN.md).
 - `providers.embedding_provider`: use `hash` for local demos; use `openai_compatible` for
   real semantic memory retrieval.
 - `case_library.rag_store`: case-library business SQLite path for datasets, documents,

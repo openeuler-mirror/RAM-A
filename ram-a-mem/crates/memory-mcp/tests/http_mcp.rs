@@ -1812,6 +1812,13 @@ fn production_runtime_config_requires_live_components_and_nonzero_limits() {
             api_key_env: "RAM_A_PROVIDER_KEY".to_string(),
             base_url: "https://provider.example/v1".to_string(),
             reasoning_effort: None,
+            enable_thinking: None,
+            send_temperature: true,
+            temperature: 0.0,
+            output_token_parameter: Default::default(),
+            structured_output: Default::default(),
+            reasoning_only_retry: false,
+            json_repair_attempts: 0,
             embedding_provider: EmbeddingProviderKind::OpenAiCompatible,
             embedding_api_key_env: None,
             embedding_base_url: None,
@@ -2315,6 +2322,10 @@ fn server_binary_supports_a_default_config_path() {
         .unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("Usage: ram-a-mem [OPTIONS]"), "{stdout}");
+    assert!(
+        stdout.contains("Usage: ram-a-mem [OPTIONS]")
+            || stdout.contains("Usage: ram-a-mem.exe [OPTIONS]"),
+        "{stdout}"
+    );
     assert!(stdout.contains("--config <CONFIG>"), "{stdout}");
 }

@@ -165,13 +165,23 @@ jq -n --arg base_url "$MODEL_BASE_URL" --arg model "$CHAT_MODEL" '{
     initialize_rate_burst:8,max_active_sessions_per_principal:8,
     max_active_sessions_global:256,session_idle_timeout_seconds:1800
   },
-  pipeline:{fail_fast:true,max_memory_chars:500},
+  pipeline:{
+    fail_fast:true,max_memory_chars:500,
+    max_candidate_tokens:320,max_window_tokens:640,
+    extractor_max_output_tokens:1600,verifier_max_output_tokens:1000,
+    extractor_context_window_tokens:null,verifier_context_window_tokens:null,
+    reasoning_reserve_tokens:0
+  },
   storage:{database_path:"/var/lib/ram-a/ram-a-memory.sqlite"},
   providers:{
     api_key_env:"LLM_API_KEY",base_url:$base_url,
     embedding_provider:"hash",embedding_api_key_env:null,embedding_base_url:null,
     embedding_model:"hash",embedding_dimensions:1024,
-    extractor_model:$model,verifier_model:$model,timeout_seconds:120,max_retries:3
+    extractor_model:$model,verifier_model:$model,timeout_seconds:120,max_retries:3,
+    reasoning_effort:null,enable_thinking:null,
+    send_temperature:true,temperature:0,
+    output_token_parameter:"max_tokens",structured_output:"prompt_only",
+    reasoning_only_retry:false,json_repair_attempts:0
   },
   retrieval:{
     mode:"hybrid",embedding_weight:0.7,bm25_weight:0.3,candidate_k:100,
@@ -187,6 +197,11 @@ jq -n --arg base_url "$MODEL_BASE_URL" --arg model "$CHAT_MODEL" '{
 chmod 0640 /etc/ram-a/ram-a-mem.json
 jq empty /etc/ram-a/ram-a-mem.json
 ```
+
+如果使用已验证的 GLM Coding Plan，可把 `providers.reasoning_effort` 设为 `"none"`，
+`reasoning_only_retry` 设为 `true`，`json_repair_attempts` 设为 `1`。如果目标服务支持
+`enable_thinking=false` 而不支持 `reasoning_effort`，只能配置 `enable_thinking`，两者不能同时设置。
+`max_tokens` 的单位是输出 token，不是字数或汉字个数。
 
 ## 5. 启动 RAM-A
 
@@ -563,7 +578,7 @@ api_base = "$MODEL_BASE_URL"
 model = "$CHAT_MODEL"
 api_key_env = "LLM_API_KEY"
 max_tokens = 8192
-reasoning_effort = "off"
+reasoning_effort = "none"
 
 [memory_automation]
 enabled = true

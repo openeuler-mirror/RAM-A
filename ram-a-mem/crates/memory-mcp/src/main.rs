@@ -103,15 +103,22 @@ async fn main() -> Result<()> {
         providers.max_retries,
     )
     .context("failed to construct model client")?
-    .with_reasoning_effort(providers.reasoning_effort.clone());
-    let extractor: Arc<dyn MemoryExtractor> = Arc::new(LlmMemoryExtractor::new(
-        model_client.clone(),
-        &providers.extractor_model,
-    ));
-    let verifier: Arc<dyn GroundingVerifier> = Arc::new(LlmGroundingVerifier::new(
-        model_client,
-        &providers.verifier_model,
-    ));
+    .with_compatibility(providers.chat_compatibility());
+    let extractor: Arc<dyn MemoryExtractor> = Arc::new(
+        LlmMemoryExtractor::new(model_client.clone(), &providers.extractor_model)
+            .with_token_budget(
+                config.pipeline.extractor_max_output_tokens,
+                config.pipeline.extractor_context_window_tokens,
+                config.pipeline.reasoning_reserve_tokens,
+            ),
+    );
+    let verifier: Arc<dyn GroundingVerifier> = Arc::new(
+        LlmGroundingVerifier::new(model_client, &providers.verifier_model).with_token_budget(
+            config.pipeline.verifier_max_output_tokens,
+            config.pipeline.verifier_context_window_tokens,
+            config.pipeline.reasoning_reserve_tokens,
+        ),
+    );
     let graph_retrieval = if features.memory && config.features.graph_memory.enabled {
         config
             .graph_memory

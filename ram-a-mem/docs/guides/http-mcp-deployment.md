@@ -77,7 +77,14 @@ seven-stage ingest data contract, see the
   },
   "pipeline": {
     "fail_fast": true,
-    "max_memory_chars": 500
+    "max_memory_chars": 500,
+    "max_candidate_tokens": 320,
+    "max_window_tokens": 640,
+    "extractor_max_output_tokens": 1600,
+    "verifier_max_output_tokens": 1000,
+    "extractor_context_window_tokens": null,
+    "verifier_context_window_tokens": null,
+    "reasoning_reserve_tokens": 0
   },
   "storage": {
     "database_path": "data/ram-a-memory.sqlite"
@@ -85,6 +92,14 @@ seven-stage ingest data contract, see the
   "providers": {
     "api_key_env": "LLM_API_KEY",
     "base_url": "http://127.0.0.1:8000/v1",
+    "reasoning_effort": null,
+    "enable_thinking": null,
+    "send_temperature": true,
+    "temperature": 0.0,
+    "output_token_parameter": "max_tokens",
+    "structured_output": "prompt_only",
+    "reasoning_only_retry": false,
+    "json_repair_attempts": 0,
     "embedding_provider": "hash",
     "embedding_model": "hash",
     "embedding_dimensions": 1024,
@@ -159,6 +174,13 @@ The `pipeline` object controls ingest processing for the whole service. `fail_fa
 counted as quarantined; remaining windows continue. `max_memory_chars` defaults to 500 and accepts
 1..=32000 Unicode characters. A longer extracted memory is quarantined rather than truncating or
 failing the request.
+
+Window and model token budgets are configurable under `pipeline`. Optional context-window values
+enable a deterministic preflight estimate; `null` preserves the previous behavior. Provider
+thinking controls, output-token parameter choice, Structured Output, reasoning-only correction,
+and JSON repair are documented in the
+[model compatibility guide](model-compatibility.zh-CN.md). These options do not change
+`fail_fast` semantics.
 
 Set secrets in the environment, not in config files:
 

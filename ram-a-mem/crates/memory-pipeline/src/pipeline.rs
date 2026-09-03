@@ -348,20 +348,17 @@ pub async fn run_memory_pipeline<E: MemoryExtractor + ?Sized, V: GroundingVerifi
     let (coverage, duplication) = candidate_span_metrics(&messages, &windows);
     let source_memory_counts = source_counts(&lookup, &accepted, true);
     let source_evidence_counts = source_counts(&lookup, &accepted, false);
+    let mut extractor_metadata = component_identity(extractor);
+    extractor_metadata.insert("schema_version".into(), json!(SCHEMA_VERSION));
+    let verifier_metadata = verifier_identity(verifier);
     let run_metadata = json!({
         "pipeline_version": config.pipeline_version,
         "dataset": prepared.get("dataset").cloned().unwrap_or_else(|| json!({})),
         "source_hash": stable_hash(std::slice::from_ref(prepared)),
         "normalizer_version": NORMALIZER_VERSION,
         "config": config,
-        "extractor": {
-            "model": extractor.model(), "prompt_version": extractor.prompt_version(),
-            "schema_version": SCHEMA_VERSION, "implementation": extractor.implementation()
-        },
-        "verifier": {
-            "model": verifier.model(), "prompt_version": verifier.prompt_version(),
-            "implementation": verifier.implementation()
-        },
+        "extractor": extractor_metadata,
+        "verifier": verifier_metadata,
         "cache_version": cache.map(|value| value.version.clone()),
     });
     let stats = json!({
@@ -500,6 +497,9 @@ fn verifier_identity(verifier: &(impl GroundingVerifier + ?Sized)) -> Map<String
     ]);
     if let Some(tokens) = verifier.max_output_tokens() {
         identity.insert("max_output_tokens".into(), json!(tokens));
+    }
+    if let Some(compatibility) = verifier.compatibility_identity() {
+        identity.insert("compatibility".into(), compatibility);
     }
     identity
 }

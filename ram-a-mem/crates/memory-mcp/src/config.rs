@@ -335,6 +335,13 @@ impl LimitsConfig {
 pub struct PipelineServiceConfig {
     pub fail_fast: bool,
     pub max_memory_chars: usize,
+    pub max_candidate_tokens: usize,
+    pub max_window_tokens: usize,
+    pub extractor_max_output_tokens: usize,
+    pub verifier_max_output_tokens: usize,
+    pub extractor_context_window_tokens: Option<usize>,
+    pub verifier_context_window_tokens: Option<usize>,
+    pub reasoning_reserve_tokens: usize,
 }
 
 impl Default for PipelineServiceConfig {
@@ -343,6 +350,13 @@ impl Default for PipelineServiceConfig {
         Self {
             fail_fast: defaults.fail_fast,
             max_memory_chars: defaults.validation.max_memory_chars,
+            max_candidate_tokens: defaults.window.max_candidate_tokens,
+            max_window_tokens: defaults.window.max_window_tokens,
+            extractor_max_output_tokens: 1600,
+            verifier_max_output_tokens: 1000,
+            extractor_context_window_tokens: None,
+            verifier_context_window_tokens: None,
+            reasoning_reserve_tokens: 0,
         }
     }
 }
@@ -352,12 +366,40 @@ impl PipelineServiceConfig {
         let mut config = memory_pipeline::pipeline::PipelineConfig::default();
         config.fail_fast = self.fail_fast;
         config.validation.max_memory_chars = self.max_memory_chars;
+        config.window.max_candidate_tokens = self.max_candidate_tokens;
+        config.window.max_window_tokens = self.max_window_tokens;
         config
     }
 
     fn validate(&self) -> Result<()> {
         if !(1..=crate::MAX_MESSAGE_TEXT_CHARS).contains(&self.max_memory_chars) {
             anyhow::bail!("pipeline max_memory_chars must be between 1 and 32000");
+        }
+        if self.max_candidate_tokens == 0 || self.max_window_tokens < self.max_candidate_tokens {
+            anyhow::bail!(
+                "pipeline token windows require 0 < max_candidate_tokens <= max_window_tokens"
+            );
+        }
+        if self.extractor_max_output_tokens == 0 || self.verifier_max_output_tokens == 0 {
+            anyhow::bail!("pipeline model output token budgets must be positive");
+        }
+        for (name, context, output) in [
+            (
+                "extractor",
+                self.extractor_context_window_tokens,
+                self.extractor_max_output_tokens,
+            ),
+            (
+                "verifier",
+                self.verifier_context_window_tokens,
+                self.verifier_max_output_tokens,
+            ),
+        ] {
+            if context.is_some_and(|value| value <= output + self.reasoning_reserve_tokens) {
+                anyhow::bail!(
+                    "pipeline {name} context window must exceed output and reasoning reserve"
+                );
+            }
         }
         Ok(())
     }
@@ -417,6 +459,20 @@ pub struct ProvidersConfig {
     #[serde(default)]
     pub reasoning_effort: Option<String>,
     #[serde(default)]
+    pub enable_thinking: Option<bool>,
+    #[serde(default = "default_true")]
+    pub send_temperature: bool,
+    #[serde(default)]
+    pub temperature: f64,
+    #[serde(default)]
+    pub output_token_parameter: memory_pipeline::client::OutputTokenParameter,
+    #[serde(default)]
+    pub structured_output: memory_pipeline::client::StructuredOutputMode,
+    #[serde(default)]
+    pub reasoning_only_retry: bool,
+    #[serde(default)]
+    pub json_repair_attempts: usize,
+    #[serde(default)]
     pub embedding_provider: EmbeddingProviderKind,
     #[serde(default)]
     pub embedding_api_key_env: Option<String>,
@@ -433,6 +489,19 @@ pub struct ProvidersConfig {
 }
 
 impl ProvidersConfig {
+    pub fn chat_compatibility(&self) -> memory_pipeline::client::ChatCompatibilityOptions {
+        memory_pipeline::client::ChatCompatibilityOptions {
+            reasoning_effort: self.reasoning_effort.clone(),
+            enable_thinking: self.enable_thinking,
+            send_temperature: self.send_temperature,
+            temperature: self.temperature,
+            output_token_parameter: self.output_token_parameter,
+            structured_output: self.structured_output,
+            reasoning_only_retry: self.reasoning_only_retry,
+            json_repair_attempts: self.json_repair_attempts,
+        }
+    }
+
     pub fn resolved_embedding_api_key_env(&self) -> &str {
         self.embedding_api_key_env
             .as_deref()
@@ -833,6 +902,10 @@ fn default_provider_max_retries() -> usize {
     3
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_case_timeout_seconds() -> u64 {
     5
 }
@@ -949,6 +1022,15 @@ impl ServerConfig {
             if reasoning_effort.trim().is_empty() || reasoning_effort.trim() != reasoning_effort {
                 anyhow::bail!("provider reasoning effort must be canonical and non-empty");
             }
+        }
+        if providers.reasoning_effort.is_some() && providers.enable_thinking.is_some() {
+            anyhow::bail!("configure at most one of provider reasoning_effort and enable_thinking");
+        }
+        if !providers.temperature.is_finite() || !(-2.0..=2.0).contains(&providers.temperature) {
+            anyhow::bail!("provider temperature must be finite and between -2 and 2");
+        }
+        if providers.json_repair_attempts > 1 {
+            anyhow::bail!("provider json_repair_attempts must be 0 or 1");
         }
         if let Some(embedding_base_url) = providers.embedding_base_url.as_deref() {
             validate_provider_base_url(embedding_base_url, "embedding base URL")?;
@@ -1112,6 +1194,19 @@ mod tests {
         .expect("parse provider defaults");
         assert_eq!(providers.base_url, "https://openrouter.ai/api/v1");
         assert_eq!(providers.reasoning_effort, None);
+        assert_eq!(providers.enable_thinking, None);
+        assert!(providers.send_temperature);
+        assert_eq!(providers.temperature, 0.0);
+        assert_eq!(
+            providers.output_token_parameter,
+            memory_pipeline::client::OutputTokenParameter::MaxTokens
+        );
+        assert_eq!(
+            providers.structured_output,
+            memory_pipeline::client::StructuredOutputMode::PromptOnly
+        );
+        assert!(!providers.reasoning_only_retry);
+        assert_eq!(providers.json_repair_attempts, 0);
         assert_eq!(
             providers.embedding_provider,
             EmbeddingProviderKind::OpenAiCompatible
@@ -1138,6 +1233,10 @@ mod tests {
         assert_eq!(minimal.limits.max_body_bytes, 16 * 1024 * 1024);
         assert!(minimal.pipeline.fail_fast);
         assert_eq!(minimal.pipeline.max_memory_chars, 500);
+        assert_eq!(minimal.pipeline.max_candidate_tokens, 320);
+        assert_eq!(minimal.pipeline.max_window_tokens, 640);
+        assert_eq!(minimal.pipeline.extractor_max_output_tokens, 1600);
+        assert_eq!(minimal.pipeline.verifier_max_output_tokens, 1000);
         assert!(minimal.storage.is_none());
         assert!(minimal.providers.is_none());
         assert_eq!(minimal.retrieval.mode, SearchMode::Hybrid);
@@ -1164,6 +1263,23 @@ mod tests {
             .expect("providers")
             .reasoning_effort = Some(" ".to_string());
 
+        assert!(config.validate_runtime().is_err());
+    }
+
+    #[test]
+    fn provider_compatibility_rejects_ambiguous_or_unbounded_values() {
+        let mut config = packaged_config();
+        let providers = config.providers.as_mut().unwrap();
+        providers.reasoning_effort = Some("none".into());
+        providers.enable_thinking = Some(false);
+        assert!(config.validate_runtime().is_err());
+
+        let mut config = packaged_config();
+        config.providers.as_mut().unwrap().json_repair_attempts = 2;
+        assert!(config.validate_runtime().is_err());
+
+        let mut config = packaged_config();
+        config.providers.as_mut().unwrap().temperature = f64::NAN;
         assert!(config.validate_runtime().is_err());
     }
 
@@ -1712,12 +1828,17 @@ mod tests {
         let defaults = PipelineServiceConfig::default();
         assert!(defaults.fail_fast);
         assert_eq!(defaults.max_memory_chars, 500);
+        assert_eq!(defaults.max_candidate_tokens, 320);
+        assert_eq!(defaults.max_window_tokens, 640);
+        assert_eq!(defaults.extractor_max_output_tokens, 1600);
+        assert_eq!(defaults.verifier_max_output_tokens, 1000);
         assert!(defaults.validate().is_ok());
 
         for max_memory_chars in [1, crate::MAX_MESSAGE_TEXT_CHARS] {
             let config = PipelineServiceConfig {
                 fail_fast: false,
                 max_memory_chars,
+                ..PipelineServiceConfig::default()
             };
             assert!(config.validate().is_ok());
             let pipeline = config.pipeline_config();
@@ -1728,10 +1849,26 @@ mod tests {
             assert!(PipelineServiceConfig {
                 fail_fast: true,
                 max_memory_chars,
+                ..PipelineServiceConfig::default()
             }
             .validate()
             .is_err());
         }
+    }
+
+    #[test]
+    fn pipeline_rejects_invalid_model_token_budgets() {
+        let mut config = PipelineServiceConfig::default();
+        config.max_window_tokens = config.max_candidate_tokens - 1;
+        assert!(config.validate().is_err());
+
+        let mut config = PipelineServiceConfig::default();
+        config.extractor_max_output_tokens = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = PipelineServiceConfig::default();
+        config.extractor_context_window_tokens = Some(1600);
+        assert!(config.validate().is_err());
     }
 
     #[test]
