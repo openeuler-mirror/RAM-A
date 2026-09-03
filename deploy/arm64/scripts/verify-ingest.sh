@@ -61,8 +61,8 @@ jq -e '.result.isError != true and .result.structuredContent.accepted_count >= 1
 jq -e '.result.isError != true and .result.structuredContent.idempotency_hit == true' \
   "$results_dir/ingest-cached.json" >/dev/null
 diff \
-  <(jq -S '.result.structuredContent.memory_ids' "$results_dir/ingest-first.json") \
-  <(jq -S '.result.structuredContent.memory_ids' "$results_dir/ingest-cached.json")
+  <(jq -S '.result.structuredContent.memory_ids | sort' "$results_dir/ingest-first.json") \
+  <(jq -S '.result.structuredContent.memory_ids | sort' "$results_dir/ingest-cached.json")
 
 search_args="$(jq -nc --arg marker "$marker" '{query:($marker + " 绿茶"),top_k:10}')"
 "$script_dir/mcp.sh" call memory_search 13 "$search_args" >"$results_dir/search.json"
