@@ -99,9 +99,11 @@ RAM-A 服务端不会主动判断用户意图或自动触发工具。xiaoO 建�
 }
 ```
 
-RAM-A 会移除内部 `dataset_id` 和原始 `source_path`，并将单个引用内容截断到
-4000 字符。案例库不可用时返回 `CASE_UNAVAILABLE`（可重试）；未配置、越权或
-检索结果无效会返回对应的结构化工具错误。
+RAM-A 会移除内部 `dataset_id` 和原始 `source_path`，并将单个引用内容截断到4000 字符。请求的案例库不存在时返回非重试错误 `CASE_LIBRARY_NOT_FOUND`；案例库存在但没有匹配案例时成功返回 `references: []`。案例服务不可用时返回`CASE_UNAVAILABLE`（可重试）；未配置、越权或检索结果无效会返回对应的结构化工具错误。
+
+`CASE_LIBRARY_NOT_FOUND` 与 `CASE_FORBIDDEN` 的区分会使拥有 `cases:read` 权限的已认证调用者能够判断某个 library 别名是否已配置：未知别名返回`CASE_LIBRARY_NOT_FOUND`，已配置但当前 tenant 未获授权的别名返回 `CASE_FORBIDDEN`。这是为了准确区分配置缺失与跨租户访问而接受的设计权衡。
+
+library 是服务端配置的公开别名，不应包含敏感信息；该行为不会暴露内部 `dataset_id`、案例内容或 tenant 授权列表。
 
 ## 案例上传、更新和删除确认流程
 
