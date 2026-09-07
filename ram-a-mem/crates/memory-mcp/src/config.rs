@@ -855,6 +855,12 @@ fn is_loopback_host(value: &str) -> bool {
 }
 
 fn default_max_body_bytes() -> usize {
+    // Sized to admit the largest request the field-level limits in
+    // `types.rs` already permit (100 ingest messages × 32_000 chars, or a
+    // 512_000-char case document, each up to 4 UTF-8 bytes per char) plus
+    // JSON structure overhead. The field-level validation — not this body
+    // cap — is what bounds how much text enters the pipeline; the hard
+    // ceiling stays MAX_MCP_BODY_BYTES.
     16 * 1024 * 1024
 }
 

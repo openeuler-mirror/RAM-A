@@ -158,6 +158,18 @@ impl PipelineError {
         }
     }
 
+    /// Whether a caller retrying the same request could plausibly succeed.
+    ///
+    /// Invalid input, malformed JSON payloads, and schema violations are
+    /// permanent for the same request body; transient provider, network, and
+    /// I/O failures are not.
+    pub fn is_retriable(&self) -> bool {
+        !matches!(
+            self.source_error_kind(),
+            "invalid_input" | "invalid_json" | "schema_invalid"
+        )
+    }
+
     fn root(&self) -> &Self {
         match self {
             Self::Located { source, .. } | Self::Stage { source, .. } => source.root(),

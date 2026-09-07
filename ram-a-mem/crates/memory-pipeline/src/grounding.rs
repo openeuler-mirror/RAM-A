@@ -143,11 +143,18 @@ impl GroundingVerifier for LlmGroundingVerifier {
             .await?;
         let mut parsed = parse_extraction_json(&result.content)
             .and_then(|payload| parse_grounding_results(&payload, memories));
-        if parsed.is_err() && self.client.compatibility().json_repair_attempts == 1 {
+        // json_repair_attempts is the number of times the model is asked to
+        // repair a response that is not valid JSON (0 disables the repair
+        // path). The server configuration currently caps it at 1 because a
+        // second repair round rarely recovers a response the first could not.
+        for attempt in 1..=self.client.compatibility().json_repair_attempts {
+            if parsed.is_ok() {
+                break;
+            }
             tracing::warn!(
                 event = "ram_a.provider.json_repair",
                 stage = "ground",
-                attempt = 1
+                attempt
             );
             let repair_payload = repair_messages(&result.content, &spec.schema);
             self.client.validate_context_budget(
@@ -162,7 +169,7 @@ impl GroundingVerifier for LlmGroundingVerifier {
                     &self.model,
                     repair_payload,
                     self.max_output_tokens,
-                    Some(spec),
+                    Some(spec.clone()),
                 )
                 .await?;
             result.usage = combine_usage(result.usage, &repaired.usage);

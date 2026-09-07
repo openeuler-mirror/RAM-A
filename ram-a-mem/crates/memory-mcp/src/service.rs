@@ -714,6 +714,7 @@ fn map_idempotency_error(error: IdempotencyError, operation: &'static str) -> Se
 
 #[track_caller]
 fn map_pipeline_error(error: PipelineError) -> ServiceError {
+    let retriable = error.is_retriable();
     let stage = error.stage();
     let source_error_kind = error.source_error_kind();
     let source_error_message = error.safe_summary();
@@ -722,7 +723,7 @@ fn map_pipeline_error(error: PipelineError) -> ServiceError {
     ServiceError::Observed {
         code: "PIPELINE_FAILED",
         message: "memory pipeline failed",
-        retriable: true,
+        retriable,
         stage,
         error_site: origin
             .map(|origin| origin.site)
@@ -786,7 +787,10 @@ fn map_memory_error(error: MemoryError, operation: &'static str, persist: bool) 
         _ if persist => observed_error(
             "VECTOR_PERSIST_FAILED",
             "memory vector persistence failed",
-            true,
+            // Unrecognized persistence failures are usually permanent states
+            // (disk full, read-only filesystem, corrupt store); a blind retry
+            // would not clear them.
+            false,
             None,
             operation,
             "storage",
@@ -1208,6 +1212,32 @@ mod tests {
     }
 
     #[test]
+    fn permanent_pipeline_failures_are_not_retriable() {
+        for (error, kind) in [
+            (
+                PipelineError::InvalidInput("max_memory_chars must be positive".to_string()),
+                "invalid_input",
+            ),
+            (
+                PipelineError::Protocol(
+                    "extractor response did not match the required schema: fields are invalid"
+                        .to_string(),
+                ),
+                "schema_invalid",
+            ),
+            (
+                PipelineError::Protocol("extractor did not return valid JSON".to_string()),
+                "invalid_json",
+            ),
+        ] {
+            let mapped = map_pipeline_error(error.at_stage(PipelineStage::Validate));
+            assert_eq!(mapped.code(), "PIPELINE_FAILED");
+            assert!(!mapped.retriable());
+            assert_eq!(mapped.source_error_kind(), Some(kind));
+        }
+    }
+
+    #[test]
     fn storage_failures_map_to_specific_public_codes() {
         let embedding = map_persist_error(memory_core::MemoryError::Embedding {
             message: "PRIVATE_PROVIDER_BODY".to_string(),
@@ -1220,6 +1250,7 @@ mod tests {
             message: "PRIVATE_SQL_DETAIL".to_string(),
         });
         assert_eq!(vector.code(), "VECTOR_PERSIST_FAILED");
+        assert!(!vector.retriable());
         assert!(!vector.to_string().contains("PRIVATE_SQL_DETAIL"));
 
         for (sqlite_code, expected, retriable) in [

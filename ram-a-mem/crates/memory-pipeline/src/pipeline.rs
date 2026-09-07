@@ -191,7 +191,7 @@ pub async fn run_memory_pipeline<E: MemoryExtractor + ?Sized, V: GroundingVerifi
                     event = "ram_a.memory.ingest.stage.window_skipped",
                     stage = "extract",
                     error_code = "PIPELINE_EXTRACT_FAILED",
-                    retriable = true,
+                    retriable = error.is_retriable(),
                     completed_units = window_index,
                     total_units = windows.len(),
                     elapsed_ms = unit_started.elapsed().as_millis() as u64
@@ -272,9 +272,9 @@ pub async fn run_memory_pipeline<E: MemoryExtractor + ?Sized, V: GroundingVerifi
             Err(error) => {
                 tracing::warn!(
                     event = "ram_a.memory.ingest.stage.window_skipped",
-                    stage = "verify",
-                    error_code = "PIPELINE_VERIFY_FAILED",
-                    retriable = true,
+                    stage = "ground",
+                    error_code = "PIPELINE_GROUND_FAILED",
+                    retriable = error.is_retriable(),
                     completed_units = window_index,
                     total_units = windows.len(),
                     elapsed_ms = verify_started.elapsed().as_millis() as u64

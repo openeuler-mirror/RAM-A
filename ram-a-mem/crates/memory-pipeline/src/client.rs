@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::error::{PipelineError, Result};
-use crate::extraction::ModelUsage;
+use crate::extraction::{combine_usage, ModelUsage};
 
 #[derive(Clone)]
 pub struct OpenAiCompatibleClient {
@@ -173,6 +173,9 @@ impl OpenAiCompatibleClient {
         } else {
             1
         };
+        // Token usage is accumulated across semantic attempts so reported
+        // usage reflects every provider call made for this request.
+        let mut accumulated_usage = ModelUsage::default();
         for semantic_attempt in 0..semantic_attempts {
             let mut attempt_messages = messages.clone();
             if semantic_attempt > 0 {
@@ -189,10 +192,11 @@ impl OpenAiCompatibleClient {
                 semantic_attempt > 0,
             )?;
             let response = self.send_with_retries(model, &payload).await?;
+            accumulated_usage = combine_usage(accumulated_usage, &response.usage);
             if !response.content.is_empty() {
                 return Ok(ChatResult {
                     content: response.content,
-                    usage: response.usage,
+                    usage: accumulated_usage,
                 });
             }
             if response.has_reasoning {
@@ -321,10 +325,17 @@ impl OpenAiCompatibleClient {
                         .unwrap_or("")
                         .trim()
                         .to_owned();
+                    // GLM/DeepSeek-style models inline their reasoning as
+                    // <think>...</think> inside message.content instead of the
+                    // separate reasoning_content field. Detect it so the
+                    // reasoning-only retry path triggers, and strip it so it
+                    // never reaches JSON parsing or the repair prompt.
+                    let (content, thinking) = split_think_tags(&content);
                     let has_reasoning = raw
                         .pointer("/choices/0/message/reasoning_content")
                         .and_then(Value::as_str)
-                        .is_some_and(|value| !value.trim().is_empty());
+                        .is_some_and(|value| !value.trim().is_empty())
+                        || thinking;
                     let prompt = raw
                         .pointer("/usage/prompt_tokens")
                         .and_then(Value::as_i64)
@@ -441,6 +452,37 @@ fn retryable(status: StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504)
 }
 
+/// Split `<think>...</think>` blocks out of `message.content`.
+///
+/// Returns the content with every think block removed and a flag telling
+/// whether any reasoning text was present. Unclosed think tags are treated as
+/// reasoning-only output: everything after the opening tag is reasoning.
+fn split_think_tags(content: &str) -> (String, bool) {
+    if !content.contains("<think>") {
+        return (content.trim().to_owned(), false);
+    }
+    let mut thinking = false;
+    let mut cleaned = String::with_capacity(content.len());
+    let mut rest = content;
+    while let Some(start) = rest.find("<think>") {
+        cleaned.push_str(&rest[..start]);
+        rest = &rest[start + "<think>".len()..];
+        match rest.find("</think>") {
+            Some(end) => {
+                thinking = true;
+                rest = &rest[end + "</think>".len()..];
+            }
+            None => {
+                // Unclosed tag: the remainder is reasoning without final
+                // content.
+                return (cleaned.trim_end().to_owned(), true);
+            }
+        }
+    }
+    cleaned.push_str(rest);
+    (cleaned.trim().to_owned(), thinking)
+}
+
 fn estimate_value_tokens(value: &Value) -> i64 {
     estimate_text_tokens(&value.to_string())
 }
@@ -476,6 +518,82 @@ mod tests {
         ] {
             assert_eq!(llm_error_kind(message), expected);
         }
+    }
+
+    #[test]
+    fn think_tags_are_stripped_and_detected() {
+        for (content, expected_clean, expected_thinking) in [
+            ("<think>private</think>{\"ok\":true}", "{\"ok\":true}", true),
+            (
+                "prefix <think>a</think> middle <think>b</think> suffix",
+                "prefix  middle  suffix",
+                true,
+            ),
+            ("{\"ok\":true}", "{\"ok\":true}", false),
+            // Unclosed tag: everything after it is reasoning.
+            ("<think>still reasoning", "", true),
+            ("<think></think>answer", "answer", true),
+        ] {
+            let (cleaned, thinking) = split_think_tags(content);
+            assert_eq!(cleaned, expected_clean, "content: {content}");
+            assert_eq!(thinking, expected_thinking, "content: {content}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reasoning_only_think_tag_response_gets_corrective_retry() {
+        let (base_url, requests, server) = sequence_server(vec![
+            json!({
+                "choices": [{"finish_reason": "stop", "message": {"content": "<think>chain of thought</think>"}}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 10, "total_tokens": 12}
+            }),
+            json!({
+                "choices": [{"finish_reason": "stop", "message": {"content": "{\"ok\":true}"}}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+            }),
+        ]);
+        let client = OpenAiCompatibleClient::new("key", &base_url, 2, 1)
+            .unwrap()
+            .with_compatibility(ChatCompatibilityOptions {
+                reasoning_only_retry: true,
+                ..ChatCompatibilityOptions::default()
+            });
+
+        let result = client
+            .chat("model", vec![json!({"role": "user", "content": "hi"})], 64)
+            .await
+            .unwrap();
+
+        assert_eq!(result.content, "{\"ok\":true}");
+        assert!(requests.recv().is_ok());
+        assert!(requests.recv().is_ok());
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn think_tag_wrapped_content_is_stripped_without_retry() {
+        let (base_url, requests, server) = sequence_server(vec![json!({
+            "choices": [{"finish_reason": "stop", "message": {"content": "<think>reasoning first</think>{\"ok\":true}"}}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 2, "total_tokens": 4}
+        })]);
+        let client = OpenAiCompatibleClient::new("key", &base_url, 2, 1)
+            .unwrap()
+            .with_compatibility(ChatCompatibilityOptions {
+                reasoning_only_retry: true,
+                ..ChatCompatibilityOptions::default()
+            });
+
+        let result = client
+            .chat("model", vec![json!({"role": "user", "content": "hi"})], 64)
+            .await
+            .unwrap();
+
+        // Content alongside reasoning is final content; only the think block
+        // is removed and no second request is made.
+        assert_eq!(result.content, "{\"ok\":true}");
+        assert!(requests.recv().is_ok());
+        assert!(requests.try_recv().is_err());
+        server.join().unwrap();
     }
 
     async fn complete_captured_chat_request(client: OpenAiCompatibleClient) {
@@ -661,6 +779,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.content, "{\"ok\":true}");
+        // Usage accumulates across both semantic attempts (12 + 5 tokens).
+        assert_eq!(result.usage.total_tokens, 17);
+        assert_eq!(result.usage.prompt_tokens, 5);
+        assert_eq!(result.usage.completion_tokens, 12);
         let first = requests.recv().unwrap();
         let second = requests.recv().unwrap();
         assert_eq!(first["reasoning_effort"], "high");

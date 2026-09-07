@@ -14,7 +14,10 @@
 3. 日志默认不包含源码文件名和行号，现场排障后仍需二次搜索代码。
 4. MCP 工具错误响应未返回 `request_id`，调用方难以将失败响应与服务端日志关联。
 5. Pipeline 错误已经保留 `stage`，但根因在映射为 `PIPELINE_FAILED` 时仍会丢失；
-   `STORAGE_FAILED` 仍同时覆盖 embedding、幂等表和记忆存储错误。
+   embedding、幂等表、SQLite busy/readonly 与记忆存储错误在代码中已区分为
+   `EMBEDDING_FAILED`、`IDEMPOTENCY_STORAGE_FAILED`、`SQLITE_BUSY`、
+   `SQLITE_READONLY`、`VECTOR_PERSIST_FAILED` 等具体错误码，`STORAGE_FAILED`
+   仅作为无法归类的兜底。
 6. Extract 处理多消息或复杂窗口失败时，当前信息不足以区分网络错误、空模型输出、
    Extract JSON 非法、Extract schema 不匹配等情况；Provider 日志中的
    `error_kind=request` 仍然过粗。
@@ -374,17 +377,18 @@ origin 和 source 的结构，或为每个错误变体保留 `#[source]` 和 ori
 | `IDEMPOTENCY_CONFLICT` | 同一幂等消息的 content hash 改变。 | `false` |
 | `PIPELINE_FAILED` | Normalize 至 Aggregate 阶段失败；用 `stage` 区分。 | 由根因决定 |
 | `RERANK_FAILED` | Rerank 已启用且调用失败，同时 `fail_open=false`。 | `true` |
-| `EMBEDDING_FAILED` | 摄入或检索调用 embedding Provider 失败或返回无效向量。 | 由根因决定 |
+| `EMBEDDING_FAILED` | 摄入或检索调用 embedding Provider 失败或返回无效向量。 | `true`（`map_memory_error` 对 embedding 网络失败按瞬态处理） |
 | `IDEMPOTENCY_STORAGE_FAILED` | 幂等 reserve/complete 失败，且未命中更具体的 SQLite 错误。 | `true` |
 | `SQLITE_BUSY` | 任意 SQLite 操作返回 busy/locked。 | `true` |
 | `SQLITE_READONLY` | SQLite 数据库或目录不可写。 | `false` |
-| `VECTOR_PERSIST_FAILED` | embedding 已完成，但记忆记录或向量写入失败，且未命中具体 SQLite 错误。 | `true` |
+| `VECTOR_PERSIST_FAILED` | embedding 已完成，但记忆记录或向量写入失败，且未命中具体 SQLite 错误。兜底分支默认 `false`（磁盘满、只读文件系统等常见根因重试无益），命中 `SQLITE_BUSY` 等瞬态错误时按对应错误码返回 `true`。 | `false` |
 | `STORAGE_FAILED` | 无法归入上述类别的兼容性兜底。 | `true` |
 
 Provider 根因的 `retriable` 规则：连接失败、超时、HTTP 408/425/429/5xx 为 `true`；
-其他明确的 HTTP 4xx、配置错误和 embedding 维度不匹配为 `false`。模型返回空内容、
-非法 JSON 或 schema 错误在内部重试耗尽后仍映射为 `PIPELINE_FAILED`；由于下一次模型
-生成可能不同，第一阶段将其标记为 `true`。
+其他明确的 HTTP 4xx、配置错误和 embedding 维度不匹配为 `false`。模型返回空内容在内部
+重试耗尽后仍映射为 `PIPELINE_FAILED`（下一次生成可能不同，标记为 `true`）；而输入、
+非法 JSON 和 schema 错误对同一请求体是永久性的，映射为 `PIPELINE_FAILED` 时标记为
+`false`（`PipelineError::is_retriable` 按根因类别区分）。
 
 错误码选择优先级如下：
 

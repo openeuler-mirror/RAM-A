@@ -129,8 +129,17 @@ impl MemoryExtractor for LlmMemoryExtractor {
             .await?;
         let mut parsed = parse_extraction_json(&result.content)
             .and_then(|payload| batch_from_payload(&window.id, &payload, &result.content));
-        if parsed.is_err() && self.client.compatibility().json_repair_attempts == 1 {
-            let repaired = self.repair_json(&result.content, spec).await?;
+        // json_repair_attempts is the number of times the model is asked to
+        // repair a response that is not valid JSON (0 disables the repair
+        // path). The server configuration currently caps it at 1 because a
+        // second repair round rarely recovers a response the first could not.
+        for attempt in 1..=self.client.compatibility().json_repair_attempts {
+            if parsed.is_ok() {
+                break;
+            }
+            let repaired = self
+                .repair_json(&result.content, spec.clone(), attempt)
+                .await?;
             result.usage = combine_usage(result.usage, &repaired.usage);
             result.content = repaired.content;
             parsed = parse_extraction_json(&result.content)
@@ -208,11 +217,12 @@ impl LlmMemoryExtractor {
         &self,
         invalid_content: &str,
         spec: StructuredOutputSpec,
+        attempt: usize,
     ) -> Result<crate::client::ChatResult> {
         tracing::warn!(
             event = "ram_a.provider.json_repair",
             stage = "extract",
-            attempt = 1
+            attempt
         );
         let messages = repair_messages(invalid_content, &spec.schema);
         self.client.validate_context_budget(
@@ -241,7 +251,44 @@ pub fn extraction_output_spec() -> StructuredOutputSpec {
             "type": "object",
             "properties": {
                 "schema_version": {"type": "string", "const": SCHEMA_VERSION},
-                "memories": {"type": "array", "items": {"type": "object"}}
+                "memories": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        // Field-level constraints are enforced by
+                        // `validate_extraction` after parsing; the schema only
+                        // pins the common shape so strict json_schema mode
+                        // accepts it.
+                        "properties": {
+                            "text": {"type": "string"},
+                            "memory_type": {"type": "string"},
+                            "subject": {"type": "object"},
+                            "predicate": {"type": "string"},
+                            "object": {"type": ["object", "string", "null"]},
+                            "modality": {"type": "string"},
+                            "event_time": {"type": ["object", "null"]},
+                            "attributes": {"type": "object"},
+                            "evidence": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "message_id": {"type": "string"},
+                                        "quote": {"type": "string"},
+                                        "evidence_role": {"type": "string"}
+                                    },
+                                    "required": ["message_id", "quote", "evidence_role"],
+                                    "additionalProperties": false
+                                }
+                            },
+                            "model_confidence": {"type": "number"}
+                        },
+                        "required": [
+                            "text", "memory_type", "subject", "predicate",
+                            "modality", "evidence", "model_confidence"
+                        ]
+                    }
+                }
             },
             "required": ["schema_version", "memories"],
             "additionalProperties": false
