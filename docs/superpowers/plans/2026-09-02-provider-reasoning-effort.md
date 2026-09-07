@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make the memory pipeline's chat completion reasoning effort configurable and select `none` for the ARM64 GLM deployment.
+**Goal:** Make the memory pipeline's chat completion reasoning effort configurable and select `none` for the GLM deployment.
 
 **Architecture:** Extend the existing provider configuration with an optional pass-through string. Configure the shared `OpenAiCompatibleClient` once at startup so both extraction and grounding requests receive the same conditional payload field.
 
-**Tech Stack:** Rust, serde/serde_json, reqwest, Tokio tests, Python unittest, Docker ARM64/QEMU
+**Tech Stack:** Rust, serde/serde_json, reqwest, Tokio tests
 
 ---
 
@@ -34,23 +34,15 @@
 ### Task 3: Select the GLM deployment setting
 
 **Files:**
-- Modify: `deploy/arm64/config/ram-a-mem.json`
-- Modify: `deploy/arm64/tests/test_assets.py`
-- Modify: `deploy/arm64/config/xiaoo.toml`
-- Modify: `deploy/arm64/scripts/verify-ingest.sh`
 - Modify: `ram-a-mem/plugins/mcp/ram-a-mem.json`
 - Modify: `ram-a-mem/plugins/mcp/xiaoo-config.toml`
 
-- [ ] Add a failing asset assertion for `reasoning_effort == "none"`.
-- [ ] Set the RAM-A field in the ARM64 config and document it as `null` in the generic bundled example.
+- [ ] Set the RAM-A field in the deployment config and document it as `null` in the generic bundled example.
 - [ ] Replace xiaoO's unsupported `off` value with `none`; make the GLM smoke request use `none`, require final `content`, and retry transient HTTP failures.
-- [ ] Run `python deploy/arm64/tests/test_assets.py` and confirm all asset checks pass.
 
 ### Task 4: Full and live verification
 
 **Files:** None
 
 - [ ] Run rustfmt checks on the touched Rust files and the relevant Rust workspace tests. Record unrelated platform-specific baseline failures separately.
-- [ ] Rebuild the binary inside `xiaoo-rama`, restart the service, and run `/opt/ram-a/scripts/verify-ingest.sh` against GLM.
-- [ ] Inspect the service log for a successful completed ingestion and no empty-content provider failure.
-- [ ] Review the diff, commit the feature, and push `pr18` to the existing PR branch.
+- [ ] Review the diff, commit the feature, and push to the existing PR branch.
