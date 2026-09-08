@@ -141,7 +141,7 @@ impl MemoryMcpServer {
                 biased;
                 _ = self.cancellation_token.cancelled() => {
                     tracing::warn!(event = "ram_a.memory.ingest.failed", stage = "cancelled", error_code = "CANCELLED", retriable = true, latency_ms = started.elapsed().as_millis() as u64);
-                    return tool_error("CANCELLED", true);
+                    return tool_error_with_request("CANCELLED", true, &request_id);
                 }
                 result = self.service.ingest(principal, request) => result,
             };
@@ -163,8 +163,21 @@ impl MemoryMcpServer {
                     )
                 }
                 Err(error) => {
-                    tracing::error!(event = "ram_a.memory.ingest.failed", stage = "service", error_code = error.code(), retriable = error.retriable(), latency_ms = started.elapsed().as_millis() as u64);
-                    service_error(error)
+                    let (origin_file, origin_line) =
+                        error.error_origin().unwrap_or((file!(), line!()));
+                    tracing::error!(
+                        event = "ram_a.memory.ingest.failed",
+                        stage = error.stage().unwrap_or("service"),
+                        error_code = error.code(),
+                        retriable = error.retriable(),
+                        error_site = error.error_site().unwrap_or("memory_mcp.ingest.service"),
+                        error_origin_file = origin_file,
+                        error_origin_line = origin_line,
+                        source_error_kind = error.source_error_kind().unwrap_or("internal"),
+                        source_error_message = error.source_error_message().unwrap_or("memory ingest failed"),
+                        latency_ms = started.elapsed().as_millis() as u64
+                    );
+                    service_error(error, &request_id)
                 }
             }
         }
@@ -202,7 +215,7 @@ impl MemoryMcpServer {
                 biased;
                 _ = self.cancellation_token.cancelled() => {
                     tracing::warn!(event = "ram_a.memory.search.failed", stage = "cancelled", error_code = "CANCELLED", retriable = true, latency_ms = started.elapsed().as_millis() as u64);
-                    return tool_error("CANCELLED", true);
+                    return tool_error_with_request("CANCELLED", true, &request_id);
                 }
                 result = self.service.search(principal, request) => result,
             };
@@ -214,8 +227,21 @@ impl MemoryMcpServer {
                     )
                 }
                 Err(error) => {
-                    tracing::error!(event = "ram_a.memory.search.failed", stage = "service", error_code = error.code(), retriable = error.retriable(), latency_ms = started.elapsed().as_millis() as u64);
-                    service_error(error)
+                    let (origin_file, origin_line) =
+                        error.error_origin().unwrap_or((file!(), line!()));
+                    tracing::error!(
+                        event = "ram_a.memory.search.failed",
+                        stage = error.stage().unwrap_or("service"),
+                        error_code = error.code(),
+                        retriable = error.retriable(),
+                        error_site = error.error_site().unwrap_or("memory_mcp.search.service"),
+                        error_origin_file = origin_file,
+                        error_origin_line = origin_line,
+                        source_error_kind = error.source_error_kind().unwrap_or("internal"),
+                        source_error_message = error.source_error_message().unwrap_or("memory search failed"),
+                        latency_ms = started.elapsed().as_millis() as u64
+                    );
+                    service_error(error, &request_id)
                 }
             }
         }
@@ -506,11 +532,29 @@ fn tool_span(tool: &'static str, request_id: &str, principal: &Principal) -> tra
     )
 }
 
-fn service_error(error: ServiceError) -> CallToolResult {
-    CallToolResult::structured_error(serde_json::json!({
+fn service_error(error: ServiceError, request_id: &str) -> CallToolResult {
+    let mut content = serde_json::json!({
         "code": error.code(),
         "message": error.to_string(),
         "retriable": error.retriable(),
+        "request_id": request_id,
+    });
+    if let Some(stage) = error.stage() {
+        content["stage"] = serde_json::json!(stage);
+    }
+    CallToolResult::structured_error(content)
+}
+
+fn tool_error_with_request(
+    code: &'static str,
+    retriable: bool,
+    request_id: &str,
+) -> CallToolResult {
+    CallToolResult::structured_error(serde_json::json!({
+        "code": code,
+        "message": "memory tool request was rejected",
+        "retriable": retriable,
+        "request_id": request_id,
     }))
 }
 
@@ -528,6 +572,47 @@ fn tool_error(code: &'static str, retriable: bool) -> CallToolResult {
         "message": "memory tool request was rejected",
         "retriable": retriable,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use memory_pipeline::error::PipelineStage;
+    use serde_json::json;
+
+    use super::{service_error, ServiceError};
+
+    #[test]
+    fn structured_service_errors_expose_stable_pipeline_and_rerank_contracts() {
+        for stage in [PipelineStage::Extract, PipelineStage::Ground] {
+            let result = service_error(
+                ServiceError::Pipeline { stage: Some(stage) },
+                "request-test",
+            );
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(
+                result.structured_content,
+                Some(json!({
+                    "code": "PIPELINE_FAILED",
+                    "message": "memory pipeline failed",
+                    "retriable": true,
+                    "request_id": "request-test",
+                    "stage": stage.as_str(),
+                }))
+            );
+        }
+
+        let rerank = service_error(ServiceError::Rerank, "request-test");
+        assert_eq!(rerank.is_error, Some(true));
+        assert_eq!(
+            rerank.structured_content,
+            Some(json!({
+                "code": "RERANK_FAILED",
+                "message": "memory rerank failed",
+                "retriable": true,
+                "request_id": "request-test",
+            }))
+        );
+    }
 }
 
 impl ServerHandler for MemoryMcpServer {

@@ -66,8 +66,8 @@ def test_run_config_matches_approved_settings_without_serializing_secret(
     assert "SECRET_CANARY" not in serialized
     assert config.public_manifest()["credential_env"] == "OPENROUTER_API_KEY"
     assert config.public_manifest()["prompt_versions"] == {
-        "extraction": "extract_v2",
-        "grounding": "ground_v1",
+        "extraction": "extract_v3",
+        "grounding": "ground_v2",
         "answer": "locomo_answer_v1",
         "judge": "locomo_accuracy_v1",
     }

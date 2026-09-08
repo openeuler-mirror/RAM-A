@@ -696,7 +696,55 @@ fn blob_to_embedding(bytes: &[u8]) -> MemoryResult<Vec<f32>> {
         });
     }
     Ok(bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::normalize_lower_is_better_scores;
+    use crate::{MemoryRecord, ScoredMemory};
+
+    fn candidate(id: &str, score: f32) -> ScoredMemory {
+        ScoredMemory {
+            record: MemoryRecord {
+                id: id.to_string(),
+                text: id.to_string(),
+                metadata: json!({}),
+                embedding: Vec::new(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            score,
+        }
+    }
+
+    #[test]
+    fn bm25_scores_are_reverse_min_max_normalized() {
+        let mut candidates = vec![
+            candidate("best", -3.0),
+            candidate("middle", -2.0),
+            candidate("worst", -1.0),
+        ];
+
+        normalize_lower_is_better_scores(&mut candidates);
+
+        assert_eq!(candidates[0].score, 1.0);
+        assert_eq!(candidates[1].score, 0.5);
+        assert_eq!(candidates[2].score, 0.0);
+    }
+
+    #[test]
+    fn equal_bm25_scores_normalize_to_one() {
+        let mut candidates = vec![candidate("a", -1.0), candidate("b", -1.0)];
+
+        normalize_lower_is_better_scores(&mut candidates);
+
+        assert!(candidates.iter().all(|candidate| candidate.score == 1.0));
+    }
 }

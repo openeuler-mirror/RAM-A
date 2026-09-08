@@ -29,6 +29,11 @@ delete confirmation tools, `memory_search`, and `memory_ingest` are MCP tools on
 
 Create `config/ram-a-mem.json`:
 
+The checked-in [`plugins/mcp/ram-a-mem.json`](../../plugins/mcp/ram-a-mem.json) explicitly
+lists every current server configuration field. For a field-by-field explanation and the
+seven-stage ingest data contract, see the
+[Chinese configuration and pipeline reference](ram-a-mem-configuration-and-pipeline.zh-CN.md).
+
 ```json
 {
   "auth": {
@@ -60,7 +65,7 @@ Create `config/ram-a-mem.json`:
     "allowed_hosts": ["127.0.0.1:18081"]
   },
   "limits": {
-    "max_body_bytes": 1048576,
+    "max_body_bytes": 16777216,
     "requests_per_second": 20,
     "rate_burst": 40,
     "max_in_flight_per_principal_tool": 4,
@@ -70,12 +75,31 @@ Create `config/ram-a-mem.json`:
     "max_active_sessions_global": 256,
     "session_idle_timeout_seconds": 1800
   },
+  "pipeline": {
+    "fail_fast": true,
+    "max_memory_chars": 500,
+    "max_candidate_tokens": 320,
+    "max_window_tokens": 640,
+    "extractor_max_output_tokens": 1600,
+    "verifier_max_output_tokens": 1000,
+    "extractor_context_window_tokens": null,
+    "verifier_context_window_tokens": null,
+    "reasoning_reserve_tokens": 0
+  },
   "storage": {
     "database_path": "data/ram-a-memory.sqlite"
   },
   "providers": {
     "api_key_env": "LLM_API_KEY",
     "base_url": "http://127.0.0.1:8000/v1",
+    "reasoning_effort": null,
+    "enable_thinking": null,
+    "send_temperature": true,
+    "temperature": 0.0,
+    "output_token_parameter": "max_tokens",
+    "structured_output": "prompt_only",
+    "reasoning_only_retry": false,
+    "json_repair_attempts": 0,
     "embedding_provider": "hash",
     "embedding_model": "hash",
     "embedding_dimensions": 1024,
@@ -121,6 +145,42 @@ Create `config/ram-a-mem.json`:
   }
 }
 ```
+
+The `limits` values are service-level controls and are not MCP tool arguments:
+
+| Field | Default | Accepted range |
+| --- | ---: | ---: |
+| `max_body_bytes` | 16777216 | 1..=67108864 |
+| `requests_per_second` | 20 | 1..=10000 |
+| `rate_burst` | 40 | 1..=100000 |
+| `max_in_flight_per_principal_tool` | 4 | 1..=1024 |
+| `initialize_requests_per_second` | 4 | 1..=1000 |
+| `initialize_rate_burst` | 8 | 1..=10000 |
+| `max_active_sessions_per_principal` | 8 | 1..=1024 |
+| `max_active_sessions_global` | 256 | 1..=100000 |
+| `session_idle_timeout_seconds` | 1800 | 1..=86400; shared by RAM-A session admission and the underlying rmcp session worker |
+
+`max_active_sessions_global` must be greater than or equal to
+`max_active_sessions_per_principal`. Tool rate and concurrency limits are keyed by authenticated
+`scope_id + agent_id + tool name`; initialize and per-principal session limits are keyed by
+`scope_id + agent_id`. Concurrency excess is rejected without queueing. A rejected request returns
+HTTP 429, `Retry-After: 1`, and an `x-ram-a-limit-reason` value of `tool_rate_limit`,
+`tool_concurrency`, `initialize_rate_limit`, or `session_admission`.
+
+The `pipeline` object controls ingest processing for the whole service. `fail_fast` defaults to
+`true`; an Extract or Ground provider failure terminates the request. The MCP tool error uses
+`code=PIPELINE_FAILED`, `retriable=true`, and `stage=extract` or `stage=ground`. With
+`fail_fast=false`, a failed Extract window is counted as rejected and a failed Ground window is
+counted as quarantined; remaining windows continue. `max_memory_chars` defaults to 500 and accepts
+1..=32000 Unicode characters. A longer extracted memory is quarantined rather than truncating or
+failing the request.
+
+Window and model token budgets are configurable under `pipeline`. Optional context-window values
+enable a deterministic preflight estimate; `null` preserves the previous behavior. Provider
+thinking controls, output-token parameter choice, Structured Output, reasoning-only correction,
+and JSON repair are documented in the
+[model compatibility guide](model-compatibility.zh-CN.md). These options do not change
+`fail_fast` semantics.
 
 Set secrets in the environment, not in config files:
 
@@ -322,7 +382,31 @@ pre-rerank hybrid order and emits a `ram_a.memory.search.degraded` event.
 
 ## Structured progress logs
 
-`ram-a-mem` writes one-line JSON logs. Use `RUST_LOG` to select the level; the default is `info`.
+`ram-a-mem` writes logs to stderr. Use `RUST_LOG` to select the level; the default is `info`.
+The rendering format and source location are configured before the service configuration is loaded:
+
+```bash
+# Production/log collector (defaults shown explicitly)
+export RAM_A_LOG_FORMAT=json
+export RAM_A_LOG_SOURCE=false
+
+# Terminal debugging
+export RAM_A_LOG_FORMAT=compact
+export RAM_A_LOG_SOURCE=true
+```
+
+`RAM_A_LOG_FORMAT` accepts only `json` or `compact`. `RAM_A_LOG_SOURCE` accepts only `true`
+or `false`. Invalid, differently cased, or whitespace-padded values make startup fail before the
+listener and storage are initialized. JSON is one object per line. Compact output has this shape:
+
+```text
+[2026-08-20T08:30:00.123Z] [ERROR] [crates/memory-pipeline/src/extraction.rs:91] [memory_ingest/extract] PIPELINE_FAILED: model returned invalid JSON | request_id=... pipeline_run_id=... error_site=memory_pipeline.extract.parse_response source_error_kind=invalid_json
+```
+
+RAM-A failure events include the error origin regardless of `RAM_A_LOG_SOURCE`. Enabling source
+adds the location of each tracing call as `filename`/`line_number` in JSON or `log_at` in compact
+output; it is useful for debug sessions but is not a stable alerting field.
+
 Every MCP tool call carries the HTTP `request_id` in its tracing span. Memory ingest emits stage
 events for validation, idempotency, normalization, episode/window construction, extraction,
 verification, vector persistence, optional graph build, and completion. Hybrid search emits
@@ -343,6 +427,8 @@ memory text, or provider response bodies. Successful ingest events include gener
 case task events include `task_id`, `dataset_id`, and `document_id` for operational correlation.
 `window_skipped` is emitted only for fail-open extraction or verification errors where the
 pipeline continues; `failed` means the current ingest operation stops.
+The process does not create or rotate log files; journald, the container runtime, or an external
+collector owns persistence and retention.
 
 ## Storage boundary
 

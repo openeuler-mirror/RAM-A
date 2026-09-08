@@ -16,6 +16,8 @@ pub struct ServerConfig {
     #[serde(default)]
     pub limits: LimitsConfig,
     #[serde(default)]
+    pub pipeline: PipelineServiceConfig,
+    #[serde(default)]
     pub storage: Option<StorageConfig>,
     #[serde(default)]
     pub providers: Option<ProvidersConfig>,
@@ -26,6 +28,20 @@ pub struct ServerConfig {
     #[serde(default)]
     pub graph_memory: Option<GraphMemoryServiceConfig>,
 }
+
+pub const MAX_MCP_BODY_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_REQUESTS_PER_SECOND: u32 = 10_000;
+pub const MAX_RATE_BURST: u32 = 100_000;
+pub const MAX_IN_FLIGHT_PER_PRINCIPAL_TOOL: usize = 1_024;
+pub const MAX_INITIALIZE_REQUESTS_PER_SECOND: u32 = 1_000;
+pub const MAX_INITIALIZE_RATE_BURST: u32 = 10_000;
+pub const MAX_ACTIVE_SESSIONS_PER_PRINCIPAL: usize = 1_024;
+pub const MAX_ACTIVE_SESSIONS_GLOBAL: usize = 100_000;
+pub const MAX_SESSION_IDLE_TIMEOUT_SECONDS: u64 = 86_400;
+pub const DEFAULT_RERANK_TIMEOUT_MS: u64 = 30_000;
+pub const MAX_RERANK_TIMEOUT_MS: u64 = 120_000;
+const SUPPORTED_PERMISSIONS: [&str; 4] =
+    ["memory:read", "memory:write", "cases:read", "cases:write"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FeatureFlags {
@@ -284,6 +300,111 @@ impl Default for LimitsConfig {
     }
 }
 
+impl LimitsConfig {
+    fn validate(&self) -> Result<()> {
+        let within_bounds = self.max_body_bytes <= MAX_MCP_BODY_BYTES
+            && self.requests_per_second <= MAX_REQUESTS_PER_SECOND
+            && self.rate_burst <= MAX_RATE_BURST
+            && self.max_in_flight_per_principal_tool <= MAX_IN_FLIGHT_PER_PRINCIPAL_TOOL
+            && self.initialize_requests_per_second <= MAX_INITIALIZE_REQUESTS_PER_SECOND
+            && self.initialize_rate_burst <= MAX_INITIALIZE_RATE_BURST
+            && self.max_active_sessions_per_principal <= MAX_ACTIVE_SESSIONS_PER_PRINCIPAL
+            && self.max_active_sessions_global <= MAX_ACTIVE_SESSIONS_GLOBAL
+            && self.session_idle_timeout_seconds <= MAX_SESSION_IDLE_TIMEOUT_SECONDS;
+        let all_nonzero = self.max_body_bytes > 0
+            && self.requests_per_second > 0
+            && self.rate_burst > 0
+            && self.max_in_flight_per_principal_tool > 0
+            && self.initialize_requests_per_second > 0
+            && self.initialize_rate_burst > 0
+            && self.max_active_sessions_per_principal > 0
+            && self.max_active_sessions_global > 0
+            && self.session_idle_timeout_seconds > 0;
+        if !all_nonzero || !within_bounds {
+            anyhow::bail!("HTTP limits are outside the supported range");
+        }
+        if self.max_active_sessions_global < self.max_active_sessions_per_principal {
+            anyhow::bail!("global active session limit must be at least the per-principal limit");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PipelineServiceConfig {
+    pub fail_fast: bool,
+    pub max_memory_chars: usize,
+    pub max_candidate_tokens: usize,
+    pub max_window_tokens: usize,
+    pub extractor_max_output_tokens: usize,
+    pub verifier_max_output_tokens: usize,
+    pub extractor_context_window_tokens: Option<usize>,
+    pub verifier_context_window_tokens: Option<usize>,
+    pub reasoning_reserve_tokens: usize,
+}
+
+impl Default for PipelineServiceConfig {
+    fn default() -> Self {
+        let defaults = memory_pipeline::pipeline::PipelineConfig::default();
+        Self {
+            fail_fast: defaults.fail_fast,
+            max_memory_chars: defaults.validation.max_memory_chars,
+            max_candidate_tokens: defaults.window.max_candidate_tokens,
+            max_window_tokens: defaults.window.max_window_tokens,
+            extractor_max_output_tokens: 1600,
+            verifier_max_output_tokens: 1000,
+            extractor_context_window_tokens: None,
+            verifier_context_window_tokens: None,
+            reasoning_reserve_tokens: 0,
+        }
+    }
+}
+
+impl PipelineServiceConfig {
+    pub fn pipeline_config(&self) -> memory_pipeline::pipeline::PipelineConfig {
+        let mut config = memory_pipeline::pipeline::PipelineConfig::default();
+        config.fail_fast = self.fail_fast;
+        config.validation.max_memory_chars = self.max_memory_chars;
+        config.window.max_candidate_tokens = self.max_candidate_tokens;
+        config.window.max_window_tokens = self.max_window_tokens;
+        config
+    }
+
+    fn validate(&self) -> Result<()> {
+        if !(1..=crate::MAX_MESSAGE_TEXT_CHARS).contains(&self.max_memory_chars) {
+            anyhow::bail!("pipeline max_memory_chars must be between 1 and 32000");
+        }
+        if self.max_candidate_tokens == 0 || self.max_window_tokens < self.max_candidate_tokens {
+            anyhow::bail!(
+                "pipeline token windows require 0 < max_candidate_tokens <= max_window_tokens"
+            );
+        }
+        if self.extractor_max_output_tokens == 0 || self.verifier_max_output_tokens == 0 {
+            anyhow::bail!("pipeline model output token budgets must be positive");
+        }
+        for (name, context, output) in [
+            (
+                "extractor",
+                self.extractor_context_window_tokens,
+                self.extractor_max_output_tokens,
+            ),
+            (
+                "verifier",
+                self.verifier_context_window_tokens,
+                self.verifier_max_output_tokens,
+            ),
+        ] {
+            if context.is_some_and(|value| value <= output + self.reasoning_reserve_tokens) {
+                anyhow::bail!(
+                    "pipeline {name} context window must exceed output and reasoning reserve"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageConfig {
@@ -336,6 +457,22 @@ pub struct ProvidersConfig {
     #[serde(default = "default_provider_base_url")]
     pub base_url: String,
     #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub enable_thinking: Option<bool>,
+    #[serde(default = "default_true")]
+    pub send_temperature: bool,
+    #[serde(default)]
+    pub temperature: f64,
+    #[serde(default)]
+    pub output_token_parameter: memory_pipeline::client::OutputTokenParameter,
+    #[serde(default)]
+    pub structured_output: memory_pipeline::client::StructuredOutputMode,
+    #[serde(default)]
+    pub reasoning_only_retry: bool,
+    #[serde(default)]
+    pub json_repair_attempts: usize,
+    #[serde(default)]
     pub embedding_provider: EmbeddingProviderKind,
     #[serde(default)]
     pub embedding_api_key_env: Option<String>,
@@ -349,6 +486,31 @@ pub struct ProvidersConfig {
     pub timeout_seconds: u64,
     #[serde(default = "default_provider_max_retries")]
     pub max_retries: usize,
+}
+
+impl ProvidersConfig {
+    pub fn chat_compatibility(&self) -> memory_pipeline::client::ChatCompatibilityOptions {
+        memory_pipeline::client::ChatCompatibilityOptions {
+            reasoning_effort: self.reasoning_effort.clone(),
+            enable_thinking: self.enable_thinking,
+            send_temperature: self.send_temperature,
+            temperature: self.temperature,
+            output_token_parameter: self.output_token_parameter,
+            structured_output: self.structured_output,
+            reasoning_only_retry: self.reasoning_only_retry,
+            json_repair_attempts: self.json_repair_attempts,
+        }
+    }
+
+    pub fn resolved_embedding_api_key_env(&self) -> &str {
+        self.embedding_api_key_env
+            .as_deref()
+            .unwrap_or(&self.api_key_env)
+    }
+
+    pub fn resolved_embedding_base_url(&self) -> &str {
+        self.embedding_base_url.as_deref().unwrap_or(&self.base_url)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -440,7 +602,7 @@ impl Default for RerankServiceConfig {
             api_key_env: Some(defaults.api_key_env),
             base_url: defaults.base_url,
             input_k: defaults.input_k,
-            timeout_ms: defaults.timeout_ms,
+            timeout_ms: Some(DEFAULT_RERANK_TIMEOUT_MS),
             fail_open: defaults.fail_open,
         }
     }
@@ -485,8 +647,10 @@ impl RerankServiceConfig {
         if !(1..=500).contains(&self.input_k) {
             anyhow::bail!("rerank input_k must be between 1 and 500");
         }
-        if self.timeout_ms == Some(0) {
-            anyhow::bail!("rerank timeout_ms must be non-zero when configured");
+        if !matches!(self.timeout_ms, Some(1..=MAX_RERANK_TIMEOUT_MS)) {
+            anyhow::bail!(
+                "enabled rerank timeout_ms must be between 1 and {MAX_RERANK_TIMEOUT_MS}"
+            );
         }
         Ok(())
     }
@@ -572,6 +736,30 @@ impl CaseServiceConfig {
 }
 
 impl CaseLibraryServiceConfig {
+    pub fn resolved_embedding_api_key_env<'a>(&'a self, providers: &'a ProvidersConfig) -> &'a str {
+        self.embedding_api_key_env
+            .as_deref()
+            .unwrap_or(&providers.api_key_env)
+    }
+
+    pub fn resolved_embedding_base_url<'a>(&'a self, providers: &'a ProvidersConfig) -> &'a str {
+        self.embedding_base_url
+            .as_deref()
+            .unwrap_or(&providers.base_url)
+    }
+
+    pub fn resolved_summary_api_key_env<'a>(&'a self, providers: &'a ProvidersConfig) -> &'a str {
+        self.summary_llm_api_key_env
+            .as_deref()
+            .unwrap_or(&providers.api_key_env)
+    }
+
+    pub fn resolved_summary_base_url<'a>(&'a self, providers: &'a ProvidersConfig) -> &'a str {
+        self.summary_llm_base_url
+            .as_deref()
+            .unwrap_or(&providers.base_url)
+    }
+
     pub fn validate(&self, memory_database_path: Option<&Path>) -> Result<()> {
         validate_case_library_mappings(self.default_library.as_str(), &self.libraries)?;
         if self.rag_store.as_os_str().is_empty()
@@ -627,6 +815,13 @@ impl CaseLibraryServiceConfig {
         if let Some(summary_base_url) = self.summary_llm_base_url.as_deref() {
             validate_provider_base_url(summary_base_url, "case library summary LLM base URL")?;
         }
+        if self
+            .summary_llm_model
+            .as_deref()
+            .is_some_and(|model| model.trim().is_empty())
+        {
+            anyhow::bail!("case library summary LLM model must not be empty when configured");
+        }
         Ok(())
     }
 }
@@ -660,7 +855,13 @@ fn is_loopback_host(value: &str) -> bool {
 }
 
 fn default_max_body_bytes() -> usize {
-    1_048_576
+    // Sized to admit the largest request the field-level limits in
+    // `types.rs` already permit (100 ingest messages × 32_000 chars, or a
+    // 512_000-char case document, each up to 4 UTF-8 bytes per char) plus
+    // JSON structure overhead. The field-level validation — not this body
+    // cap — is what bounds how much text enters the pipeline; the hard
+    // ceiling stays MAX_MCP_BODY_BYTES.
+    16 * 1024 * 1024
 }
 
 fn default_requests_per_second() -> u32 {
@@ -705,6 +906,10 @@ fn default_provider_timeout_seconds() -> u64 {
 
 fn default_provider_max_retries() -> usize {
     3
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_case_timeout_seconds() -> u64 {
@@ -762,7 +967,10 @@ impl ServerConfig {
 
     pub fn validate_runtime(&self) -> Result<()> {
         self.http.validate_bind()?;
+        self.limits.validate()?;
+        self.pipeline.validate()?;
         self.retrieval.validate()?;
+        self.auth.validate()?;
         if self.features.case_library.enabled == Some(true) && self.case_library.is_none() {
             anyhow::bail!("case_library feature requires case_library configuration");
         }
@@ -771,21 +979,6 @@ impl ServerConfig {
         }
         if self.features.graph_memory.enabled && !self.features.memory.enabled {
             anyhow::bail!("graph_memory feature requires the memory feature");
-        }
-        if self.auth.tokens.is_empty() {
-            anyhow::bail!("production runtime requires at least one authenticated principal");
-        }
-        if self.limits.max_body_bytes == 0
-            || self.limits.requests_per_second == 0
-            || self.limits.rate_burst == 0
-            || self.limits.max_in_flight_per_principal_tool == 0
-            || self.limits.initialize_requests_per_second == 0
-            || self.limits.initialize_rate_burst == 0
-            || self.limits.max_active_sessions_per_principal == 0
-            || self.limits.max_active_sessions_global == 0
-            || self.limits.session_idle_timeout_seconds == 0
-        {
-            anyhow::bail!("HTTP limits must all be non-zero");
         }
         let storage = self
             .storage
@@ -831,53 +1024,43 @@ impl ServerConfig {
                 anyhow::bail!("embedding API key environment name must not be empty");
             }
         }
+        if let Some(reasoning_effort) = providers.reasoning_effort.as_deref() {
+            if reasoning_effort.trim().is_empty() || reasoning_effort.trim() != reasoning_effort {
+                anyhow::bail!("provider reasoning effort must be canonical and non-empty");
+            }
+        }
+        if providers.reasoning_effort.is_some() && providers.enable_thinking.is_some() {
+            anyhow::bail!("configure at most one of provider reasoning_effort and enable_thinking");
+        }
+        if !providers.temperature.is_finite() || !(-2.0..=2.0).contains(&providers.temperature) {
+            anyhow::bail!("provider temperature must be finite and between -2 and 2");
+        }
+        if providers.json_repair_attempts > 1 {
+            anyhow::bail!("provider json_repair_attempts must be 0 or 1");
+        }
         if let Some(embedding_base_url) = providers.embedding_base_url.as_deref() {
             validate_provider_base_url(embedding_base_url, "embedding base URL")?;
         }
         if providers.embedding_provider == EmbeddingProviderKind::OpenAiCompatible {
             validate_authenticated_provider_base_url(
-                providers
-                    .embedding_base_url
-                    .as_deref()
-                    .unwrap_or(&providers.base_url),
+                providers.resolved_embedding_base_url(),
                 "embedding base URL",
-                Some(
-                    providers
-                        .embedding_api_key_env
-                        .as_deref()
-                        .unwrap_or(&providers.api_key_env),
-                ),
+                Some(providers.resolved_embedding_api_key_env()),
             )?;
         }
         if let Some(case_library) = &self.case_library {
             if case_library.embedding_provider == EmbeddingProviderKind::OpenAiCompatible {
                 validate_authenticated_provider_base_url(
-                    case_library
-                        .embedding_base_url
-                        .as_deref()
-                        .unwrap_or(&providers.base_url),
+                    case_library.resolved_embedding_base_url(providers),
                     "case library embedding base URL",
-                    Some(
-                        case_library
-                            .embedding_api_key_env
-                            .as_deref()
-                            .unwrap_or(&providers.api_key_env),
-                    ),
+                    Some(case_library.resolved_embedding_api_key_env(providers)),
                 )?;
             }
             if case_library.summary_llm_model.is_some() {
                 validate_authenticated_provider_base_url(
-                    case_library
-                        .summary_llm_base_url
-                        .as_deref()
-                        .unwrap_or(&providers.base_url),
+                    case_library.resolved_summary_base_url(providers),
                     "case library summary LLM base URL",
-                    Some(
-                        case_library
-                            .summary_llm_api_key_env
-                            .as_deref()
-                            .unwrap_or(&providers.api_key_env),
-                    ),
+                    Some(case_library.resolved_summary_api_key_env(providers)),
                 )?;
             }
         }
@@ -981,10 +1164,813 @@ fn is_loopback_or_private(value: &url::Url) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_provider_base_url, EmbeddingProviderKind, RerankServiceConfig,
-        RetrievalServiceConfig, ServerConfig,
+        validate_provider_base_url, AuthConfig, CaseLibraryServiceConfig, EmbeddingProviderKind,
+        FeaturesConfig, GraphMemoryRetrievalConfig, GraphMemoryServiceConfig, HttpConfig,
+        LimitsConfig, PipelineServiceConfig, ProvidersConfig, RerankServiceConfig,
+        RetrievalServiceConfig, ServerConfig, TokenConfig, DEFAULT_RERANK_TIMEOUT_MS,
+        MAX_ACTIVE_SESSIONS_GLOBAL, MAX_ACTIVE_SESSIONS_PER_PRINCIPAL, MAX_INITIALIZE_RATE_BURST,
+        MAX_INITIALIZE_REQUESTS_PER_SECOND, MAX_IN_FLIGHT_PER_PRINCIPAL_TOOL, MAX_MCP_BODY_BYTES,
+        MAX_RATE_BURST, MAX_REQUESTS_PER_SECOND, MAX_RERANK_TIMEOUT_MS,
+        MAX_SESSION_IDLE_TIMEOUT_SECONDS,
     };
     use memory_core::SearchMode;
+
+    #[test]
+    fn feature_http_and_provider_defaults_are_stable() {
+        let features = FeaturesConfig::default();
+        assert!(features.memory.enabled);
+        assert_eq!(features.case_library.enabled, None);
+        assert!(!features.graph_memory.enabled);
+
+        let http = HttpConfig::default();
+        assert_eq!(http.bind_address.to_string(), "127.0.0.1");
+        assert_eq!(http.port, 8080);
+        assert!(http.allowed_origins.is_empty());
+        assert_eq!(http.allowed_hosts, ["localhost", "127.0.0.1", "::1"]);
+        assert!(!http.tls_termination_acknowledged);
+        assert!(http.validate_bind().is_ok());
+
+        let providers: ProvidersConfig = serde_json::from_value(serde_json::json!({
+            "api_key_env": "RAM_A_PROVIDER_KEY",
+            "embedding_model": "embedding-model",
+            "embedding_dimensions": 1024,
+            "extractor_model": "extractor-model",
+            "verifier_model": "verifier-model"
+        }))
+        .expect("parse provider defaults");
+        assert_eq!(providers.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(providers.reasoning_effort, None);
+        assert_eq!(providers.enable_thinking, None);
+        assert!(providers.send_temperature);
+        assert_eq!(providers.temperature, 0.0);
+        assert_eq!(
+            providers.output_token_parameter,
+            memory_pipeline::client::OutputTokenParameter::MaxTokens
+        );
+        assert_eq!(
+            providers.structured_output,
+            memory_pipeline::client::StructuredOutputMode::PromptOnly
+        );
+        assert!(!providers.reasoning_only_retry);
+        assert_eq!(providers.json_repair_attempts, 0);
+        assert_eq!(
+            providers.embedding_provider,
+            EmbeddingProviderKind::OpenAiCompatible
+        );
+        assert_eq!(providers.embedding_api_key_env, None);
+        assert_eq!(providers.embedding_base_url, None);
+        assert_eq!(
+            providers.resolved_embedding_api_key_env(),
+            "RAM_A_PROVIDER_KEY"
+        );
+        assert_eq!(
+            providers.resolved_embedding_base_url(),
+            "https://openrouter.ai/api/v1"
+        );
+        assert_eq!(providers.timeout_seconds, 120);
+        assert_eq!(providers.max_retries, 3);
+
+        let minimal: ServerConfig = serde_json::from_value(serde_json::json!({
+            "auth": {"tokens": []}
+        }))
+        .expect("parse top-level defaults");
+        assert!(minimal.features.memory.enabled);
+        assert_eq!(minimal.http.port, 8080);
+        assert_eq!(minimal.limits.max_body_bytes, 16 * 1024 * 1024);
+        assert!(minimal.pipeline.fail_fast);
+        assert_eq!(minimal.pipeline.max_memory_chars, 500);
+        assert_eq!(minimal.pipeline.max_candidate_tokens, 320);
+        assert_eq!(minimal.pipeline.max_window_tokens, 640);
+        assert_eq!(minimal.pipeline.extractor_max_output_tokens, 1600);
+        assert_eq!(minimal.pipeline.verifier_max_output_tokens, 1000);
+        assert!(minimal.storage.is_none());
+        assert!(minimal.providers.is_none());
+        assert_eq!(minimal.retrieval.mode, SearchMode::Hybrid);
+        assert!(minimal.case_library.is_none());
+        assert!(minimal.graph_memory.is_none());
+    }
+
+    #[test]
+    fn provider_reasoning_effort_is_configurable() {
+        let mut source: serde_json::Value =
+            serde_json::from_str(include_str!("../../../plugins/mcp/ram-a-mem.json"))
+                .expect("packaged config is JSON");
+        source["providers"]["reasoning_effort"] = serde_json::json!("none");
+
+        assert!(serde_json::from_value::<ServerConfig>(source).is_ok());
+    }
+
+    #[test]
+    fn provider_reasoning_effort_rejects_blank_value() {
+        let mut config = packaged_config();
+        config
+            .providers
+            .as_mut()
+            .expect("providers")
+            .reasoning_effort = Some(" ".to_string());
+
+        assert!(config.validate_runtime().is_err());
+    }
+
+    #[test]
+    fn provider_compatibility_rejects_ambiguous_or_unbounded_values() {
+        let mut config = packaged_config();
+        let providers = config.providers.as_mut().unwrap();
+        providers.reasoning_effort = Some("none".into());
+        providers.enable_thinking = Some(false);
+        assert!(config.validate_runtime().is_err());
+
+        let mut config = packaged_config();
+        config.providers.as_mut().unwrap().json_repair_attempts = 2;
+        assert!(config.validate_runtime().is_err());
+
+        let mut config = packaged_config();
+        config.providers.as_mut().unwrap().temperature = f64::NAN;
+        assert!(config.validate_runtime().is_err());
+    }
+
+    #[test]
+    fn graph_and_case_library_defaults_are_stable() {
+        let graph: GraphMemoryServiceConfig = serde_json::from_value(serde_json::json!({
+            "llm_api_key_env": "RAM_A_GRAPH_KEY",
+            "llm_model": "graph-model"
+        }))
+        .expect("parse graph defaults");
+        assert_eq!(graph.llm_base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(graph.llm_timeout_ms, 60_000);
+        assert_eq!(graph.build_concurrency, 1);
+        assert_eq!(
+            graph.retrieval,
+            GraphMemoryRetrievalConfig {
+                weight: 0.2,
+                rerank_with_graph: false,
+                allow_graph_only: false,
+                max_graph_only_results: None,
+                seed_limit: None,
+                max_evidence_records_per_fact: None,
+                fail_open: false,
+            }
+        );
+        assert!(graph.validate().is_ok());
+
+        let cases: CaseLibraryServiceConfig = serde_json::from_value(serde_json::json!({
+            "default_library": "ops",
+            "libraries": [{
+                "name": "ops",
+                "dataset_id": "ops-dataset",
+                "tenant_ids": ["tenant-a"]
+            }]
+        }))
+        .expect("parse case library defaults");
+        assert_eq!(
+            cases.rag_store.to_string_lossy(),
+            "data/memory-cases.sqlite"
+        );
+        assert_eq!(
+            cases.index_store.to_string_lossy(),
+            "data/memory-cases-index.sqlite"
+        );
+        assert_eq!(cases.source_dir, None);
+        assert_eq!(cases.api_token_env, None);
+        assert_eq!(cases.ingestion_poll_ms, 1_000);
+        assert_eq!(
+            cases.embedding_provider,
+            EmbeddingProviderKind::OpenAiCompatible
+        );
+        assert_eq!(cases.embedding_api_key_env, None);
+        assert_eq!(cases.embedding_base_url, None);
+        assert_eq!(cases.embedding_model, "hash");
+        assert_eq!(cases.embedding_dimensions, 1_024);
+        assert_eq!(cases.chunk_size, 160);
+        assert_eq!(cases.summary_llm_model, None);
+        assert_eq!(cases.summary_llm_api_key_env, None);
+        assert_eq!(cases.summary_llm_base_url, None);
+        assert_eq!(cases.summary_llm_timeout_ms, 30_000);
+        assert!(cases
+            .validate(Some(std::path::Path::new("memory.sqlite")))
+            .is_ok());
+    }
+
+    #[test]
+    fn graph_configuration_rejects_invalid_configurable_values() {
+        let valid: GraphMemoryServiceConfig = serde_json::from_value(serde_json::json!({
+            "llm_api_key_env": "RAM_A_GRAPH_KEY",
+            "llm_model": "graph-model"
+        }))
+        .expect("parse graph config");
+
+        let mut invalid = Vec::new();
+        let mut config = valid.clone();
+        config.llm_api_key_env.clear();
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.llm_model.clear();
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.llm_api_key_env = " ".to_string();
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.llm_model = " ".to_string();
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.llm_base_url = "not-a-url".to_string();
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.llm_timeout_ms = 0;
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.build_concurrency = 0;
+        invalid.push(config);
+        for weight in [-0.1, 1.1, f32::NAN] {
+            let mut config = valid.clone();
+            config.retrieval.weight = weight;
+            invalid.push(config);
+        }
+        let mut config = valid.clone();
+        config.retrieval.max_graph_only_results = Some(0);
+        invalid.push(config);
+        for seed_limit in [Some(0), Some(memory_core::MAX_GRAPH_SEED_LIMIT + 1)] {
+            let mut config = valid.clone();
+            config.retrieval.seed_limit = seed_limit;
+            invalid.push(config);
+        }
+        for evidence_limit in [
+            Some(0),
+            Some(memory_core::MAX_GRAPH_EVIDENCE_RECORDS_PER_FACT + 1),
+        ] {
+            let mut config = valid.clone();
+            config.retrieval.max_evidence_records_per_fact = evidence_limit;
+            invalid.push(config);
+        }
+
+        assert!(invalid.into_iter().all(|config| config.validate().is_err()));
+    }
+
+    #[test]
+    fn graph_configuration_accepts_all_documented_boundaries() {
+        let base: GraphMemoryServiceConfig = serde_json::from_value(serde_json::json!({
+            "llm_api_key_env": "RAM_A_GRAPH_KEY",
+            "llm_model": "graph-model"
+        }))
+        .expect("parse graph config");
+
+        for weight in [0.0, 1.0] {
+            let mut config = base.clone();
+            config.llm_timeout_ms = 1;
+            config.build_concurrency = 1;
+            config.retrieval.weight = weight;
+            config.retrieval.max_graph_only_results = Some(1);
+            config.retrieval.seed_limit = Some(memory_core::MAX_GRAPH_SEED_LIMIT);
+            config.retrieval.max_evidence_records_per_fact =
+                Some(memory_core::MAX_GRAPH_EVIDENCE_RECORDS_PER_FACT);
+            assert!(config.validate().is_ok(), "weight={weight}");
+        }
+
+        let mut lower = base;
+        lower.retrieval.seed_limit = Some(1);
+        lower.retrieval.max_evidence_records_per_fact = Some(1);
+        assert!(lower.validate().is_ok());
+    }
+
+    #[test]
+    fn case_library_configuration_rejects_invalid_configurable_values() {
+        let valid: CaseLibraryServiceConfig = serde_json::from_value(serde_json::json!({
+            "default_library": "ops",
+            "libraries": [{
+                "name": "ops",
+                "dataset_id": "ops-dataset",
+                "tenant_ids": ["tenant-a"]
+            }]
+        }))
+        .expect("parse case library config");
+
+        let validate = |config: &CaseLibraryServiceConfig| {
+            config.validate(Some(std::path::Path::new("memory.sqlite")))
+        };
+        let mut invalid = Vec::new();
+        let mut config = valid.clone();
+        config.rag_store = ":memory:".into();
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.index_store = config.rag_store.clone();
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.index_store = "memory.sqlite".into();
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.source_dir = Some("".into());
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.api_token_env = Some(" RAM_A_CASE_TOKEN".to_string());
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.ingestion_poll_ms = 0;
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.embedding_model.clear();
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.embedding_dimensions = 0;
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.chunk_size = 0;
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.summary_llm_timeout_ms = 0;
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.summary_llm_model = Some(" ".to_string());
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.embedding_api_key_env = Some(" ".to_string());
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.summary_llm_api_key_env = Some(" ".to_string());
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.default_library = "missing".to_string();
+        invalid.push(config);
+        let mut config = valid.clone();
+        config.libraries.push(config.libraries[0].clone());
+        invalid.push(config);
+
+        assert!(invalid.into_iter().all(|config| validate(&config).is_err()));
+    }
+
+    #[test]
+    fn case_library_positive_only_fields_accept_one() {
+        let mut config: CaseLibraryServiceConfig = serde_json::from_value(serde_json::json!({
+            "default_library": "ops",
+            "libraries": [{
+                "name": "ops",
+                "dataset_id": "ops-dataset",
+                "tenant_ids": ["tenant-a"]
+            }]
+        }))
+        .expect("parse case library config");
+        config.ingestion_poll_ms = 1;
+        config.embedding_dimensions = 1;
+        config.chunk_size = 1;
+        config.summary_llm_timeout_ms = 1;
+        assert!(config
+            .validate(Some(std::path::Path::new("memory.sqlite")))
+            .is_ok());
+    }
+
+    #[test]
+    fn provider_configuration_rejects_incomplete_configurable_values() {
+        let valid = packaged_config();
+        let mut invalid = Vec::new();
+        for field in [
+            "api_key_env",
+            "base_url",
+            "embedding_model",
+            "extractor_model",
+            "verifier_model",
+        ] {
+            let mut config = valid.clone();
+            let providers = config.providers.as_mut().expect("providers");
+            match field {
+                "api_key_env" => providers.api_key_env.clear(),
+                "base_url" => providers.base_url.clear(),
+                "embedding_model" => providers.embedding_model.clear(),
+                "extractor_model" => providers.extractor_model.clear(),
+                "verifier_model" => providers.verifier_model.clear(),
+                _ => unreachable!(),
+            }
+            invalid.push(config);
+        }
+        let mut config = valid.clone();
+        config
+            .providers
+            .as_mut()
+            .expect("providers")
+            .embedding_dimensions = 0;
+        invalid.push(config);
+        let mut config = valid.clone();
+        config
+            .providers
+            .as_mut()
+            .expect("providers")
+            .timeout_seconds = 0;
+        invalid.push(config);
+        let mut config = valid;
+        config.providers.as_mut().expect("providers").max_retries = 0;
+        invalid.push(config);
+        let mut config = packaged_config();
+        config
+            .providers
+            .as_mut()
+            .expect("providers")
+            .embedding_api_key_env = Some(" ".to_string());
+        invalid.push(config);
+        let mut config = packaged_config();
+        config
+            .providers
+            .as_mut()
+            .expect("providers")
+            .embedding_base_url = Some("not-a-url".to_string());
+        invalid.push(config);
+
+        assert!(invalid
+            .into_iter()
+            .all(|config| config.validate_runtime().is_err()));
+    }
+
+    #[test]
+    fn provider_positive_only_fields_accept_one() {
+        let mut config = packaged_config();
+        let providers = config.providers.as_mut().expect("providers");
+        providers.embedding_dimensions = 1;
+        providers.timeout_seconds = 1;
+        providers.max_retries = 1;
+        assert!(config.validate_runtime().is_ok());
+    }
+
+    #[test]
+    fn provider_and_case_library_fallbacks_are_explicit_and_overridable() {
+        let mut config = packaged_config();
+        let providers = config.providers.as_mut().expect("providers");
+        providers.api_key_env = "PRIMARY_KEY".to_string();
+        providers.base_url = "https://primary.example/v1".to_string();
+        providers.embedding_api_key_env = None;
+        providers.embedding_base_url = None;
+        assert_eq!(providers.resolved_embedding_api_key_env(), "PRIMARY_KEY");
+        assert_eq!(
+            providers.resolved_embedding_base_url(),
+            "https://primary.example/v1"
+        );
+
+        let cases = config.case_library.as_ref().expect("case library");
+        assert_eq!(
+            cases.resolved_embedding_api_key_env(providers),
+            "PRIMARY_KEY"
+        );
+        assert_eq!(
+            cases.resolved_embedding_base_url(providers),
+            "https://primary.example/v1"
+        );
+        assert_eq!(cases.resolved_summary_api_key_env(providers), "PRIMARY_KEY");
+        assert_eq!(
+            cases.resolved_summary_base_url(providers),
+            "https://primary.example/v1"
+        );
+
+        let providers = config.providers.as_mut().expect("providers");
+        providers.embedding_api_key_env = Some("EMBEDDING_KEY".to_string());
+        providers.embedding_base_url = Some("https://embedding.example/v1".to_string());
+        let cases = config.case_library.as_mut().expect("case library");
+        cases.embedding_api_key_env = Some("CASE_EMBEDDING_KEY".to_string());
+        cases.embedding_base_url = Some("https://case-embedding.example/v1".to_string());
+        cases.summary_llm_model = Some("summary-model".to_string());
+        cases.summary_llm_api_key_env = Some("SUMMARY_KEY".to_string());
+        cases.summary_llm_base_url = Some("https://summary.example/v1".to_string());
+
+        assert_eq!(providers.resolved_embedding_api_key_env(), "EMBEDDING_KEY");
+        assert_eq!(
+            providers.resolved_embedding_base_url(),
+            "https://embedding.example/v1"
+        );
+        assert_eq!(
+            cases.resolved_embedding_api_key_env(providers),
+            "CASE_EMBEDDING_KEY"
+        );
+        assert_eq!(
+            cases.resolved_embedding_base_url(providers),
+            "https://case-embedding.example/v1"
+        );
+        assert_eq!(cases.resolved_summary_api_key_env(providers), "SUMMARY_KEY");
+        assert_eq!(
+            cases.resolved_summary_base_url(providers),
+            "https://summary.example/v1"
+        );
+        assert!(config.validate_runtime().is_ok());
+    }
+
+    #[test]
+    fn storage_configuration_rejects_nonpersistent_paths_and_accepts_file_paths() {
+        for database_path in ["", ":memory:"] {
+            let mut config = packaged_config();
+            config.storage.as_mut().expect("storage").database_path = database_path.into();
+            assert!(config.validate_runtime().is_err(), "path={database_path}");
+        }
+
+        for database_path in [
+            "data/ram-a-memory.sqlite",
+            "/var/lib/ram-a/ram-a-memory.sqlite",
+        ] {
+            let mut config = packaged_config();
+            config.storage.as_mut().expect("storage").database_path = database_path.into();
+            assert!(config.validate_runtime().is_ok(), "path={database_path}");
+        }
+    }
+
+    #[test]
+    fn case_library_paths_and_mappings_reject_every_invalid_shape() {
+        let valid = packaged_config();
+        let mut invalid = Vec::new();
+
+        for field in ["rag_empty", "index_empty", "index_memory"] {
+            let mut config = valid.clone();
+            let cases = config.case_library.as_mut().expect("case library");
+            match field {
+                "rag_empty" => cases.rag_store = "".into(),
+                "index_empty" => cases.index_store = "".into(),
+                "index_memory" => cases.index_store = ":memory:".into(),
+                _ => unreachable!(),
+            }
+            invalid.push(config);
+        }
+
+        for field in [
+            "default_empty",
+            "libraries_empty",
+            "name_empty",
+            "name_noncanonical",
+            "dataset_empty",
+            "dataset_noncanonical",
+            "tenants_empty",
+            "tenant_empty",
+            "tenant_noncanonical",
+        ] {
+            let mut config = valid.clone();
+            let cases = config.case_library.as_mut().expect("case library");
+            match field {
+                "default_empty" => cases.default_library.clear(),
+                "libraries_empty" => cases.libraries.clear(),
+                "name_empty" => cases.libraries[0].name.clear(),
+                "name_noncanonical" => cases.libraries[0].name = " ops".to_string(),
+                "dataset_empty" => cases.libraries[0].dataset_id.clear(),
+                "dataset_noncanonical" => {
+                    cases.libraries[0].dataset_id = "ops-dataset ".to_string()
+                }
+                "tenants_empty" => cases.libraries[0].tenant_ids.clear(),
+                "tenant_empty" => cases.libraries[0].tenant_ids[0].clear(),
+                "tenant_noncanonical" => {
+                    cases.libraries[0].tenant_ids[0] = " tenant-local".to_string()
+                }
+                _ => unreachable!(),
+            }
+            invalid.push(config);
+        }
+
+        for field in ["embedding_url", "summary_url"] {
+            let mut config = valid.clone();
+            let cases = config.case_library.as_mut().expect("case library");
+            match field {
+                "embedding_url" => cases.embedding_base_url = Some("not-a-url".to_string()),
+                "summary_url" => {
+                    cases.summary_llm_model = Some("summary-model".to_string());
+                    cases.summary_llm_base_url = Some("not-a-url".to_string());
+                }
+                _ => unreachable!(),
+            }
+            invalid.push(config);
+        }
+
+        assert!(invalid
+            .into_iter()
+            .all(|config| config.validate_runtime().is_err()));
+    }
+
+    #[test]
+    fn http_configuration_covers_host_and_port_boundaries() {
+        let default = HttpConfig::default();
+        for port in [0_u16, 1, u16::MAX] {
+            let config: HttpConfig = serde_json::from_value(serde_json::json!({"port": port}))
+                .expect("port must fit u16");
+            assert_eq!(config.port, port);
+            assert!(config.validate_bind().is_ok());
+        }
+        assert!(serde_json::from_value::<HttpConfig>(serde_json::json!({"port": 65_536})).is_err());
+        assert!(serde_json::from_value::<HttpConfig>(serde_json::json!({"port": -1})).is_err());
+
+        for allowed_hosts in [Vec::new(), vec![String::new()], vec![" ".to_string()]] {
+            let config = HttpConfig {
+                allowed_hosts,
+                ..default.clone()
+            };
+            assert!(config.validate_bind().is_err());
+        }
+
+        let external = HttpConfig {
+            bind_address: "0.0.0.0".parse().unwrap(),
+            allowed_hosts: vec!["memory.example.test".to_string()],
+            tls_termination_acknowledged: true,
+            ..default
+        };
+        assert!(external.validate_bind().is_ok());
+    }
+
+    #[test]
+    fn authentication_configuration_enforces_fixed_permissions_and_canonical_ids() {
+        let valid = AuthConfig {
+            tokens: vec![TokenConfig {
+                token_env: "RAM_A_TOKEN".to_string(),
+                tenant_id: "tenant-a".to_string(),
+                user_id: "alice".to_string(),
+                agent_id: "xiaoo".to_string(),
+                permissions: vec![
+                    "memory:read".to_string(),
+                    "memory:write".to_string(),
+                    "cases:read".to_string(),
+                    "cases:write".to_string(),
+                ],
+            }],
+        };
+        assert!(valid.validate().is_ok());
+
+        let mut unknown_permission = valid.clone();
+        unknown_permission.tokens[0].permissions = vec!["memory:admin".to_string()];
+        assert!(unknown_permission.validate().is_err());
+
+        let mut duplicate_permission = valid.clone();
+        duplicate_permission.tokens[0].permissions =
+            vec!["memory:read".to_string(), "memory:read".to_string()];
+        assert!(duplicate_permission.validate().is_err());
+
+        for field in ["token_env", "tenant_id", "user_id", "agent_id"] {
+            let mut noncanonical = valid.clone();
+            match field {
+                "token_env" => noncanonical.tokens[0].token_env = " RAM_A_TOKEN".to_string(),
+                "tenant_id" => noncanonical.tokens[0].tenant_id = "tenant-a ".to_string(),
+                "user_id" => noncanonical.tokens[0].user_id.clear(),
+                "agent_id" => noncanonical.tokens[0].agent_id = " ".to_string(),
+                _ => unreachable!(),
+            }
+            assert!(noncanonical.validate().is_err(), "field={field}");
+        }
+
+        let mut duplicate_environment = valid.clone();
+        duplicate_environment.tokens.push(valid.tokens[0].clone());
+        assert!(duplicate_environment.validate().is_err());
+    }
+
+    #[test]
+    fn configurable_enums_reject_unsupported_values() {
+        assert!(serde_json::from_str::<EmbeddingProviderKind>(r#""hash""#).is_ok());
+        assert!(serde_json::from_str::<EmbeddingProviderKind>(r#""openai_compatible""#).is_ok());
+        assert_eq!(
+            serde_json::from_str::<EmbeddingProviderKind>(r#""open_router""#).unwrap(),
+            EmbeddingProviderKind::OpenAiCompatible
+        );
+        assert!(serde_json::from_str::<EmbeddingProviderKind>(r#""unknown""#).is_err());
+        assert!(serde_json::from_str::<SearchMode>(r#""dense""#).is_ok());
+        assert!(serde_json::from_str::<SearchMode>(r#""bm25""#).is_ok());
+        assert!(serde_json::from_str::<SearchMode>(r#""hybrid""#).is_ok());
+        assert!(serde_json::from_str::<SearchMode>(r#""unknown""#).is_err());
+        assert!(serde_json::from_str::<memory_core::RerankProvider>(r#""openrouter""#).is_ok());
+        assert!(serde_json::from_str::<memory_core::RerankProvider>(r#""unknown""#).is_err());
+
+        let graph_mode = RetrievalServiceConfig {
+            mode: SearchMode::Graph,
+            ..RetrievalServiceConfig::default()
+        };
+        assert!(graph_mode.validate().is_err());
+    }
+
+    #[test]
+    fn pipeline_defaults_and_boundaries_are_stable() {
+        let defaults = PipelineServiceConfig::default();
+        assert!(defaults.fail_fast);
+        assert_eq!(defaults.max_memory_chars, 500);
+        assert_eq!(defaults.max_candidate_tokens, 320);
+        assert_eq!(defaults.max_window_tokens, 640);
+        assert_eq!(defaults.extractor_max_output_tokens, 1600);
+        assert_eq!(defaults.verifier_max_output_tokens, 1000);
+        assert!(defaults.validate().is_ok());
+
+        for max_memory_chars in [1, crate::MAX_MESSAGE_TEXT_CHARS] {
+            let config = PipelineServiceConfig {
+                fail_fast: false,
+                max_memory_chars,
+                ..PipelineServiceConfig::default()
+            };
+            assert!(config.validate().is_ok());
+            let pipeline = config.pipeline_config();
+            assert!(!pipeline.fail_fast);
+            assert_eq!(pipeline.validation.max_memory_chars, max_memory_chars);
+        }
+        for max_memory_chars in [0, crate::MAX_MESSAGE_TEXT_CHARS + 1] {
+            assert!(PipelineServiceConfig {
+                fail_fast: true,
+                max_memory_chars,
+                ..PipelineServiceConfig::default()
+            }
+            .validate()
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn pipeline_rejects_invalid_model_token_budgets() {
+        let mut config = PipelineServiceConfig::default();
+        config.max_window_tokens = config.max_candidate_tokens - 1;
+        assert!(config.validate().is_err());
+
+        let mut config = PipelineServiceConfig::default();
+        config.extractor_max_output_tokens = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = PipelineServiceConfig::default();
+        config.extractor_context_window_tokens = Some(1600);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn http_limit_defaults_are_stable_and_supported() {
+        let limits = LimitsConfig::default();
+        assert_eq!(limits.max_body_bytes, 16 * 1024 * 1024);
+        assert_eq!(limits.requests_per_second, 20);
+        assert_eq!(limits.rate_burst, 40);
+        assert_eq!(limits.max_in_flight_per_principal_tool, 4);
+        assert_eq!(limits.initialize_requests_per_second, 4);
+        assert_eq!(limits.initialize_rate_burst, 8);
+        assert_eq!(limits.max_active_sessions_per_principal, 8);
+        assert_eq!(limits.max_active_sessions_global, 256);
+        assert_eq!(limits.session_idle_timeout_seconds, 1_800);
+        assert!(limits.validate().is_ok());
+    }
+
+    #[test]
+    fn http_limits_accept_documented_upper_boundaries() {
+        let limits = LimitsConfig {
+            max_body_bytes: MAX_MCP_BODY_BYTES,
+            requests_per_second: MAX_REQUESTS_PER_SECOND,
+            rate_burst: MAX_RATE_BURST,
+            max_in_flight_per_principal_tool: MAX_IN_FLIGHT_PER_PRINCIPAL_TOOL,
+            initialize_requests_per_second: MAX_INITIALIZE_REQUESTS_PER_SECOND,
+            initialize_rate_burst: MAX_INITIALIZE_RATE_BURST,
+            max_active_sessions_per_principal: MAX_ACTIVE_SESSIONS_PER_PRINCIPAL,
+            max_active_sessions_global: MAX_ACTIVE_SESSIONS_GLOBAL,
+            session_idle_timeout_seconds: MAX_SESSION_IDLE_TIMEOUT_SECONDS,
+        };
+        assert!(limits.validate().is_ok());
+    }
+
+    #[test]
+    fn http_limits_accept_documented_lower_boundaries() {
+        let limits = LimitsConfig {
+            max_body_bytes: 1,
+            requests_per_second: 1,
+            rate_burst: 1,
+            max_in_flight_per_principal_tool: 1,
+            initialize_requests_per_second: 1,
+            initialize_rate_burst: 1,
+            max_active_sessions_per_principal: 1,
+            max_active_sessions_global: 1,
+            session_idle_timeout_seconds: 1,
+        };
+        assert!(limits.validate().is_ok());
+    }
+
+    #[test]
+    fn http_limits_reject_zero_out_of_range_and_inconsistent_sessions() {
+        let mut invalid = Vec::new();
+        macro_rules! invalid_limit {
+            ($field:ident, $value:expr) => {{
+                let mut limits = LimitsConfig::default();
+                limits.$field = $value;
+                invalid.push(limits);
+            }};
+        }
+        invalid_limit!(max_body_bytes, 0);
+        invalid_limit!(max_body_bytes, MAX_MCP_BODY_BYTES + 1);
+        invalid_limit!(requests_per_second, 0);
+        invalid_limit!(requests_per_second, MAX_REQUESTS_PER_SECOND + 1);
+        invalid_limit!(rate_burst, 0);
+        invalid_limit!(rate_burst, MAX_RATE_BURST + 1);
+        invalid_limit!(max_in_flight_per_principal_tool, 0);
+        invalid_limit!(
+            max_in_flight_per_principal_tool,
+            MAX_IN_FLIGHT_PER_PRINCIPAL_TOOL + 1
+        );
+        invalid_limit!(initialize_requests_per_second, 0);
+        invalid_limit!(
+            initialize_requests_per_second,
+            MAX_INITIALIZE_REQUESTS_PER_SECOND + 1
+        );
+        invalid_limit!(initialize_rate_burst, 0);
+        invalid_limit!(initialize_rate_burst, MAX_INITIALIZE_RATE_BURST + 1);
+        invalid_limit!(max_active_sessions_per_principal, 0);
+        invalid_limit!(
+            max_active_sessions_per_principal,
+            MAX_ACTIVE_SESSIONS_PER_PRINCIPAL + 1
+        );
+        invalid_limit!(max_active_sessions_global, 0);
+        invalid_limit!(max_active_sessions_global, MAX_ACTIVE_SESSIONS_GLOBAL + 1);
+        invalid_limit!(session_idle_timeout_seconds, 0);
+        invalid_limit!(
+            session_idle_timeout_seconds,
+            MAX_SESSION_IDLE_TIMEOUT_SECONDS + 1
+        );
+        let mut inconsistent = LimitsConfig::default();
+        inconsistent.max_active_sessions_per_principal = 9;
+        inconsistent.max_active_sessions_global = 8;
+        invalid.push(inconsistent);
+
+        assert!(invalid.into_iter().all(|limits| limits.validate().is_err()));
+    }
 
     #[test]
     fn provider_base_url_rejects_credentials_query_and_fragment() {
@@ -1014,6 +2000,19 @@ mod tests {
         assert_eq!(config.bm25_weight, 0.3);
         assert_eq!(config.candidate_k, None);
         assert!(!config.rerank.enabled);
+        assert_eq!(
+            config.rerank.provider,
+            memory_core::RerankProvider::OpenRouter
+        );
+        assert_eq!(config.rerank.model, "cohere/rerank-v3.5");
+        assert_eq!(
+            config.rerank.api_key_env.as_deref(),
+            Some("OPENROUTER_API_KEY")
+        );
+        assert_eq!(config.rerank.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(config.rerank.input_k, 40);
+        assert_eq!(config.rerank.timeout_ms, Some(DEFAULT_RERANK_TIMEOUT_MS));
+        assert!(!config.rerank.fail_open);
         assert!(config.validate().is_ok());
     }
 
@@ -1145,12 +2144,23 @@ mod tests {
 
     #[test]
     fn retrieval_rejects_invalid_weights_and_non_hybrid_rerank() {
-        let invalid_weights = RetrievalServiceConfig {
-            embedding_weight: 0.8,
-            bm25_weight: 0.3,
-            ..RetrievalServiceConfig::default()
-        };
-        assert!(invalid_weights.validate().is_err());
+        for (embedding_weight, bm25_weight) in [
+            (0.8, 0.3),
+            (-0.1, 1.1),
+            (1.1, -0.1),
+            (f32::NAN, 0.0),
+            (f32::INFINITY, 0.0),
+        ] {
+            let invalid_weights = RetrievalServiceConfig {
+                embedding_weight,
+                bm25_weight,
+                ..RetrievalServiceConfig::default()
+            };
+            assert!(
+                invalid_weights.validate().is_err(),
+                "embedding_weight={embedding_weight}, bm25_weight={bm25_weight}"
+            );
+        }
 
         let dense_rerank = RetrievalServiceConfig {
             mode: SearchMode::Dense,
@@ -1164,10 +2174,159 @@ mod tests {
     }
 
     #[test]
+    fn retrieval_accepts_hybrid_weight_boundaries() {
+        for (embedding_weight, bm25_weight) in [(0.0, 1.0), (1.0, 0.0), (0.7, 0.3)] {
+            let config = RetrievalServiceConfig {
+                embedding_weight,
+                bm25_weight,
+                ..RetrievalServiceConfig::default()
+            };
+            assert!(config.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn disabled_rerank_ignores_inactive_provider_fields() {
+        let config = RetrievalServiceConfig {
+            rerank: RerankServiceConfig {
+                enabled: false,
+                model: String::new(),
+                api_key_env: Some(String::new()),
+                base_url: String::new(),
+                input_k: 0,
+                timeout_ms: None,
+                fail_open: true,
+                ..RerankServiceConfig::default()
+            },
+            ..RetrievalServiceConfig::default()
+        };
+
+        assert!(config.validate().is_ok());
+        let core = config.core_config(memory_core::GraphRetrievalConfig::default());
+        assert!(!core.rerank.enabled);
+        assert!(core.rerank.fail_open);
+    }
+
+    #[test]
+    fn enabled_rerank_rejects_every_invalid_provider_field() {
+        let mut invalid = Vec::new();
+        for field in ["model", "base_url", "api_key_env"] {
+            let mut config = RetrievalServiceConfig::default();
+            config.rerank.enabled = true;
+            match field {
+                "model" => config.rerank.model = " ".to_string(),
+                "base_url" => config.rerank.base_url = " ".to_string(),
+                "api_key_env" => config.rerank.api_key_env = Some(" ".to_string()),
+                _ => unreachable!(),
+            }
+            invalid.push(config);
+        }
+        let mut invalid_url = RetrievalServiceConfig::default();
+        invalid_url.rerank.enabled = true;
+        invalid_url.rerank.base_url = "not-a-url".to_string();
+        invalid.push(invalid_url);
+
+        assert!(invalid.into_iter().all(|config| config.validate().is_err()));
+    }
+
+    #[test]
+    fn retrieval_candidate_and_rerank_limits_accept_boundaries() {
+        for candidate_k in [1, 500] {
+            let config = RetrievalServiceConfig {
+                candidate_k: Some(candidate_k),
+                ..RetrievalServiceConfig::default()
+            };
+            assert!(config.validate().is_ok(), "candidate_k={candidate_k}");
+        }
+
+        for input_k in [1, 500] {
+            let config = RetrievalServiceConfig {
+                rerank: RerankServiceConfig {
+                    enabled: true,
+                    input_k,
+                    timeout_ms: Some(1),
+                    ..RerankServiceConfig::default()
+                },
+                ..RetrievalServiceConfig::default()
+            };
+            assert!(config.validate().is_ok(), "input_k={input_k}");
+        }
+
+        for timeout_ms in [1, MAX_RERANK_TIMEOUT_MS] {
+            let config = RetrievalServiceConfig {
+                rerank: RerankServiceConfig {
+                    enabled: true,
+                    timeout_ms: Some(timeout_ms),
+                    ..RerankServiceConfig::default()
+                },
+                ..RetrievalServiceConfig::default()
+            };
+            assert!(config.validate().is_ok(), "timeout_ms={timeout_ms}");
+        }
+    }
+
+    #[test]
+    fn retrieval_rejects_candidate_and_rerank_values_outside_limits() {
+        for candidate_k in [0, 501] {
+            let config = RetrievalServiceConfig {
+                candidate_k: Some(candidate_k),
+                ..RetrievalServiceConfig::default()
+            };
+            assert!(config.validate().is_err(), "candidate_k={candidate_k}");
+        }
+
+        for input_k in [0, 501] {
+            let config = RetrievalServiceConfig {
+                rerank: RerankServiceConfig {
+                    enabled: true,
+                    input_k,
+                    ..RerankServiceConfig::default()
+                },
+                ..RetrievalServiceConfig::default()
+            };
+            assert!(config.validate().is_err(), "input_k={input_k}");
+        }
+
+        let zero_timeout = RetrievalServiceConfig {
+            rerank: RerankServiceConfig {
+                enabled: true,
+                timeout_ms: Some(0),
+                ..RerankServiceConfig::default()
+            },
+            ..RetrievalServiceConfig::default()
+        };
+        assert!(zero_timeout.validate().is_err());
+
+        for timeout_ms in [None, Some(MAX_RERANK_TIMEOUT_MS + 1)] {
+            let invalid_timeout = RetrievalServiceConfig {
+                rerank: RerankServiceConfig {
+                    enabled: true,
+                    timeout_ms,
+                    ..RerankServiceConfig::default()
+                },
+                ..RetrievalServiceConfig::default()
+            };
+            assert!(invalid_timeout.validate().is_err());
+        }
+    }
+
+    #[test]
     fn packaged_rpm_example_matches_server_schema() {
-        let config = packaged_config();
+        let source: serde_json::Value =
+            serde_json::from_str(include_str!("../../../plugins/mcp/ram-a-mem.json"))
+                .expect("packaged config is JSON");
+        let config: ServerConfig =
+            serde_json::from_value(source.clone()).expect("packaged config parses");
 
         assert!(config.validate_runtime().is_ok());
+        assert_eq!(
+            serde_json::to_value(&config).expect("config serializes"),
+            source,
+            "the full example must explicitly contain every serializable config field"
+        );
+        assert_eq!(config.limits.max_body_bytes, 16 * 1024 * 1024);
+        assert!(config.pipeline.fail_fast);
+        assert_eq!(config.pipeline.max_memory_chars, 500);
         assert_eq!(config.retrieval.mode, SearchMode::Hybrid);
         assert_eq!(config.retrieval.embedding_weight, 0.7);
         assert_eq!(config.retrieval.bm25_weight, 0.3);
@@ -1193,4 +2352,40 @@ pub struct TokenConfig {
     pub user_id: String,
     pub agent_id: String,
     pub permissions: Vec<String>,
+}
+
+impl AuthConfig {
+    fn validate(&self) -> Result<()> {
+        if self.tokens.is_empty() {
+            anyhow::bail!("production runtime requires at least one authenticated principal");
+        }
+
+        let mut token_environments = HashSet::with_capacity(self.tokens.len());
+        for token in &self.tokens {
+            for (label, value) in [
+                ("token_env", token.token_env.as_str()),
+                ("tenant_id", token.tenant_id.as_str()),
+                ("user_id", token.user_id.as_str()),
+                ("agent_id", token.agent_id.as_str()),
+            ] {
+                if value.trim().is_empty() || value.trim() != value {
+                    anyhow::bail!("authentication {label} must be canonical and non-empty");
+                }
+            }
+            if !token_environments.insert(token.token_env.as_str()) {
+                anyhow::bail!("authentication token environment names must be unique");
+            }
+
+            let mut permissions = HashSet::with_capacity(token.permissions.len());
+            for permission in &token.permissions {
+                if !SUPPORTED_PERMISSIONS.contains(&permission.as_str()) {
+                    anyhow::bail!("authentication permission `{permission}` is not supported");
+                }
+                if !permissions.insert(permission.as_str()) {
+                    anyhow::bail!("authentication permissions must be unique per token");
+                }
+            }
+        }
+        Ok(())
+    }
 }

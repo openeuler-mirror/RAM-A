@@ -205,6 +205,81 @@ fn asserted_plan_is_quarantined() {
 }
 
 #[test]
+fn memory_text_limit_accepts_500_unicode_characters_and_quarantines_501() {
+    let (window, lookup) = setup();
+    let mut exact = raw_memory("planned");
+    exact["text"] = json!("界".repeat(500));
+    let exact_batch = validate_extraction(&[exact], &window, &lookup, &ValidationConfig::default());
+    assert_eq!(exact_batch.valid.len(), 1);
+    assert!(exact_batch.quarantined.is_empty());
+
+    let mut over = raw_memory("planned");
+    over["text"] = json!("界".repeat(501));
+    let over_batch = validate_extraction(&[over], &window, &lookup, &ValidationConfig::default());
+    assert!(over_batch.valid.is_empty());
+    assert_eq!(over_batch.quarantined[0].code, "memory_text_too_long");
+}
+
+#[test]
+fn unknown_memory_type_or_modality_is_rejected() {
+    let (window, lookup) = setup();
+    for (field, value) in [("memory_type", "unknown"), ("modality", "unknown")] {
+        let mut raw = raw_memory("planned");
+        raw[field] = json!(value);
+        let batch = validate_extraction(&[raw], &window, &lookup, &ValidationConfig::default());
+        assert!(batch.valid.is_empty());
+        assert_eq!(batch.rejected[0].code, "unknown_enum");
+    }
+}
+
+#[test]
+fn all_documented_memory_types_and_modalities_are_accepted() {
+    let (window, lookup) = setup();
+    for memory_type in [
+        "fact",
+        "preference",
+        "relationship",
+        "event",
+        "state",
+        "procedure",
+        "other",
+    ] {
+        let mut raw = raw_memory("planned");
+        raw["memory_type"] = json!(memory_type);
+        let batch = validate_extraction(&[raw], &window, &lookup, &ValidationConfig::default());
+        assert_eq!(batch.valid.len(), 1, "memory type {memory_type}");
+    }
+
+    for modality in [
+        "asserted",
+        "negated",
+        "possible",
+        "planned",
+        "conditional",
+        "reported",
+    ] {
+        let mut raw = raw_memory(modality);
+        if modality == "asserted" {
+            raw["evidence"][0]["quote"] = json!("去杭州");
+        }
+        let batch = validate_extraction(&[raw], &window, &lookup, &ValidationConfig::default());
+        assert_eq!(batch.valid.len(), 1, "modality {modality}");
+    }
+}
+
+#[test]
+fn evidence_quote_must_match_the_referenced_span_exactly() {
+    let (window, lookup) = setup();
+    let mut raw = raw_memory("planned");
+    raw["evidence"][0]["quote"] = json!("计划 去杭州");
+
+    let batch = validate_extraction(&[raw], &window, &lookup, &ValidationConfig::default());
+
+    assert!(batch.valid.is_empty());
+    assert_eq!(batch.quarantined[0].code, "evidence_quote_not_found");
+}
+
+#[test]
 fn empty_event_time_becomes_null_and_integer_confidence_is_preserved() {
     let (window, lookup) = setup();
     let mut raw = raw_memory("planned");

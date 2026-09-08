@@ -30,8 +30,8 @@ from common.rust_memory_pipeline import (
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 PROMPT_VERSIONS = {
-    "extraction": "extract_v2",
-    "grounding": "ground_v1",
+    "extraction": "extract_v3",
+    "grounding": "ground_v2",
     "answer": "locomo_answer_v1",
     "judge": "locomo_accuracy_v1",
 }

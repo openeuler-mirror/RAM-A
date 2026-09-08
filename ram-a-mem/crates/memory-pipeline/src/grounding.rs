@@ -2,11 +2,11 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
-use crate::client::OpenAiCompatibleClient;
+use crate::client::{OpenAiCompatibleClient, StructuredOutputSpec};
 use crate::error::{PipelineError, Result};
-use crate::extraction::{parse_extraction_json, ModelUsage};
+use crate::extraction::{combine_usage, parse_extraction_json, repair_messages, ModelUsage};
 use crate::models::{AtomicMemory, ExtractionWindow, NormalizedMessage};
 
 const STATUSES: [&str; 4] = [
@@ -39,6 +39,9 @@ pub trait GroundingVerifier: Send + Sync {
     fn max_output_tokens(&self) -> Option<usize> {
         None
     }
+    fn compatibility_identity(&self) -> Option<Value> {
+        None
+    }
     async fn verify(
         &self,
         window: &ExtractionWindow,
@@ -56,6 +59,8 @@ pub struct LlmGroundingVerifier {
     model: String,
     prompt_version: String,
     max_output_tokens: usize,
+    context_window_tokens: Option<usize>,
+    reasoning_reserve_tokens: usize,
 }
 
 impl LlmGroundingVerifier {
@@ -63,9 +68,23 @@ impl LlmGroundingVerifier {
         Self {
             client,
             model: model.into(),
-            prompt_version: "ground_v1".into(),
+            prompt_version: "ground_v2".into(),
             max_output_tokens: 1000,
+            context_window_tokens: None,
+            reasoning_reserve_tokens: 0,
         }
+    }
+
+    pub fn with_token_budget(
+        mut self,
+        max_output_tokens: usize,
+        context_window_tokens: Option<usize>,
+        reasoning_reserve_tokens: usize,
+    ) -> Self {
+        self.max_output_tokens = max_output_tokens;
+        self.context_window_tokens = context_window_tokens;
+        self.reasoning_reserve_tokens = reasoning_reserve_tokens;
+        self
     }
 }
 
@@ -83,6 +102,9 @@ impl GroundingVerifier for LlmGroundingVerifier {
     fn max_output_tokens(&self) -> Option<usize> {
         Some(self.max_output_tokens)
     }
+    fn compatibility_identity(&self) -> Option<Value> {
+        serde_json::to_value(self.client.compatibility()).ok()
+    }
 
     async fn verify(
         &self,
@@ -99,18 +121,102 @@ impl GroundingVerifier for LlmGroundingVerifier {
             });
         }
         let prompt = build_grounding_prompt(memories, messages)?;
-        let result = self.client.chat(&self.model, vec![
+        let messages_payload = vec![
             serde_json::json!({"role": "system", "content": "You verify whether each candidate memory is fully supported by its quoted source evidence. Return only JSON."}),
             serde_json::json!({"role": "user", "content": prompt}),
-        ], self.max_output_tokens).await?;
-        let payload = parse_extraction_json(&result.content)
-            .map_err(|error| PipelineError::Protocol(format!("invalid grounding JSON: {error}")))?;
+        ];
+        self.client.validate_context_budget(
+            &messages_payload,
+            self.max_output_tokens,
+            self.context_window_tokens,
+            self.reasoning_reserve_tokens,
+        )?;
+        let spec = grounding_output_spec();
+        let mut result = self
+            .client
+            .chat_with_schema(
+                &self.model,
+                messages_payload,
+                self.max_output_tokens,
+                Some(spec.clone()),
+            )
+            .await?;
+        let mut parsed = parse_extraction_json(&result.content)
+            .and_then(|payload| parse_grounding_results(&payload, memories));
+        // json_repair_attempts is the number of times the model is asked to
+        // repair a response that is not valid JSON (0 disables the repair
+        // path). The server configuration currently caps it at 1 because a
+        // second repair round rarely recovers a response the first could not.
+        for attempt in 1..=self.client.compatibility().json_repair_attempts {
+            if parsed.is_ok() {
+                break;
+            }
+            tracing::warn!(
+                event = "ram_a.provider.json_repair",
+                stage = "ground",
+                attempt
+            );
+            let repair_payload = repair_messages(&result.content, &spec.schema);
+            self.client.validate_context_budget(
+                &repair_payload,
+                self.max_output_tokens,
+                self.context_window_tokens,
+                self.reasoning_reserve_tokens,
+            )?;
+            let repaired = self
+                .client
+                .chat_with_schema(
+                    &self.model,
+                    repair_payload,
+                    self.max_output_tokens,
+                    Some(spec.clone()),
+                )
+                .await?;
+            result.usage = combine_usage(result.usage, &repaired.usage);
+            result.content = repaired.content;
+            parsed = parse_extraction_json(&result.content)
+                .and_then(|payload| parse_grounding_results(&payload, memories));
+        }
         Ok(GroundingBatch {
             window_id: window.id.clone(),
-            results: parse_grounding_results(&payload, memories)?,
+            results: parsed
+                .map_err(|error| {
+                    PipelineError::Protocol(format!("invalid grounding JSON: {error}"))
+                })
+                .map_err(|error| error.at_site("memory_pipeline.ground.parse_response"))?,
             usage: result.usage,
             raw_response: result.content,
         })
+    }
+}
+
+pub fn grounding_output_spec() -> StructuredOutputSpec {
+    StructuredOutputSpec {
+        name: "memory_grounding",
+        // Fully closed (every object sets `additionalProperties: false` and
+        // lists every property in `required`), so it is safe to request
+        // strict json_schema validation.
+        strict: true,
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "results": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "memory_id": {"type": "string"},
+                            "status": {"type": "string", "enum": STATUSES},
+                            "reason": {"type": "string"}
+                        },
+                        "required": ["memory_id", "status", "reason"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["results"],
+            "additionalProperties": false
+        }),
     }
 }
 

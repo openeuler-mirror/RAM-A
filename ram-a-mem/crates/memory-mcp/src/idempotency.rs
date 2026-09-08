@@ -27,6 +27,8 @@ pub enum Reservation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IdempotencyError {
     Conflict,
+    Busy,
+    ReadOnly,
     Storage,
 }
 
@@ -34,6 +36,8 @@ impl fmt::Display for IdempotencyError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Conflict => "idempotency key conflicts with an earlier request",
+            Self::Busy => "idempotency database is busy",
+            Self::ReadOnly => "idempotency database is read-only",
             Self::Storage => "idempotency storage operation failed",
         })
     }
@@ -102,14 +106,14 @@ fn open_connection(path: &Path) -> Result<Connection, IdempotencyError> {
             std::fs::create_dir_all(parent).map_err(|_| IdempotencyError::Storage)?;
         }
     }
-    let connection = Connection::open(path).map_err(|_| IdempotencyError::Storage)?;
+    let connection = Connection::open(path).map_err(map_sqlite_error)?;
     connection
         .busy_timeout(Duration::from_millis(5_000))
-        .map_err(|_| IdempotencyError::Storage)?;
+        .map_err(map_sqlite_error)?;
     if path != Path::new(":memory:") {
         connection
             .query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))
-            .map_err(|_| IdempotencyError::Storage)?;
+            .map_err(map_sqlite_error)?;
     }
     connection
         .execute_batch(
@@ -128,7 +132,7 @@ fn open_connection(path: &Path) -> Result<Connection, IdempotencyError> {
             );
             "#,
         )
-        .map_err(|_| IdempotencyError::Storage)?;
+        .map_err(map_sqlite_error)?;
     Ok(connection)
 }
 
@@ -138,9 +142,7 @@ fn reserve_sync(
     pipeline_run_id: &str,
 ) -> Result<Reservation, IdempotencyError> {
     let mut connection = open_connection(path)?;
-    let transaction = connection
-        .transaction()
-        .map_err(|_| IdempotencyError::Storage)?;
+    let transaction = connection.transaction().map_err(map_sqlite_error)?;
     let mut cached = Vec::new();
     let mut candidate_message_ids = Vec::new();
     let now = current_time_ms();
@@ -160,7 +162,7 @@ fn reserve_sync(
                 },
             )
             .optional()
-            .map_err(|_| IdempotencyError::Storage)?;
+            .map_err(map_sqlite_error)?;
 
         match existing {
             Some((stored_hash, _, _)) if stored_hash != entry.content_hash => {
@@ -183,7 +185,7 @@ fn reserve_sync(
                             now,
                         ],
                     )
-                    .map_err(|_| IdempotencyError::Storage)?;
+                    .map_err(map_sqlite_error)?;
                 candidate_message_ids.push(entry.message_id.clone());
             }
             None => {
@@ -202,15 +204,13 @@ fn reserve_sync(
                             now,
                         ],
                     )
-                    .map_err(|_| IdempotencyError::Storage)?;
+                    .map_err(map_sqlite_error)?;
                 candidate_message_ids.push(entry.message_id.clone());
             }
         }
     }
 
-    transaction
-        .commit()
-        .map_err(|_| IdempotencyError::Storage)?;
+    transaction.commit().map_err(map_sqlite_error)?;
     if candidate_message_ids.is_empty() {
         Ok(Reservation::Cached { results: cached })
     } else {
@@ -228,9 +228,7 @@ fn complete_sync(
     result_json: &str,
 ) -> Result<(), IdempotencyError> {
     let mut connection = open_connection(path)?;
-    let transaction = connection
-        .transaction()
-        .map_err(|_| IdempotencyError::Storage)?;
+    let transaction = connection.transaction().map_err(map_sqlite_error)?;
     let now = current_time_ms();
     for entry in entries {
         let updated = transaction
@@ -249,12 +247,32 @@ fn complete_sync(
                     now,
                 ],
             )
-            .map_err(|_| IdempotencyError::Storage)?;
+            .map_err(map_sqlite_error)?;
         if updated != 1 {
             return Err(IdempotencyError::Storage);
         }
     }
-    transaction.commit().map_err(|_| IdempotencyError::Storage)
+    transaction.commit().map_err(map_sqlite_error)
+}
+
+fn map_sqlite_error(error: rusqlite::Error) -> IdempotencyError {
+    match error {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked,
+                ..
+            },
+            _,
+        ) => IdempotencyError::Busy,
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::ReadOnly,
+                ..
+            },
+            _,
+        ) => IdempotencyError::ReadOnly,
+        _ => IdempotencyError::Storage,
+    }
 }
 
 fn current_time_ms() -> i64 {
@@ -269,6 +287,19 @@ mod tests {
     use serde_json::json;
 
     use super::{IdempotencyEntry, IdempotencyError, IdempotencyRepository, Reservation};
+
+    #[test]
+    fn sqlite_errors_keep_busy_and_read_only_classification() {
+        for (sqlite_code, expected) in [
+            (rusqlite::ffi::SQLITE_BUSY, IdempotencyError::Busy),
+            (rusqlite::ffi::SQLITE_LOCKED, IdempotencyError::Busy),
+            (rusqlite::ffi::SQLITE_READONLY, IdempotencyError::ReadOnly),
+        ] {
+            let error =
+                rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(sqlite_code), None);
+            assert_eq!(super::map_sqlite_error(error), expected);
+        }
+    }
 
     fn entry(hash: &str) -> IdempotencyEntry {
         IdempotencyEntry {

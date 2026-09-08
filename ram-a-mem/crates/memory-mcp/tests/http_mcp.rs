@@ -12,8 +12,9 @@ use memory_core::{HashEmbedding, MemoryManager, SqliteMemoryStore};
 use memory_mcp::{
     create_http_router, AuthConfig, CaseLibraryConfig, DynCaseSearchProvider,
     EmbeddedCaseSearchProvider, EmbeddingProviderKind, FeatureFlags, GraphMemoryRetrievalConfig,
-    HttpConfig, HttpRuntime, IdempotencyRepository, LimitsConfig, MemoryService, ProvidersConfig,
-    ServerConfig, StorageConfig, TokenAuthenticator, TokenConfig,
+    HttpConfig, HttpRuntime, IdempotencyRepository, LimitsConfig, MemoryService,
+    PipelineServiceConfig, ProvidersConfig, ServerConfig, StorageConfig, TokenAuthenticator,
+    TokenConfig,
 };
 use memory_pipeline::error::Result as PipelineResult;
 use memory_pipeline::extraction::{ExtractionBatch, MemoryExtractor, ModelUsage, SCHEMA_VERSION};
@@ -671,16 +672,16 @@ async fn idle_session_expiry_closes_the_session_and_releases_its_slot() {
         initialize_rate_burst: 100,
         max_active_sessions_per_principal: 1,
         max_active_sessions_global: 1,
-        session_idle_timeout_seconds: 1,
+        session_idle_timeout_seconds: 2,
         ..LimitsConfig::default()
     };
     let fixture = fixture_router_with_permissions(&["memory:read"], limits).await;
     let (expired_session_id, _) = initialize(&fixture.app).await;
-    tokio::time::advance(Duration::from_secs(2)).await;
+    tokio::time::advance(Duration::from_secs(3)).await;
 
-    let _ = initialize(&fixture.app).await;
     let expired = fixture
         .app
+        .clone()
         .oneshot(session_request(
             &expired_session_id,
             json!({"jsonrpc": "2.0", "id": 102, "method": "tools/list", "params": {}}),
@@ -688,6 +689,61 @@ async fn idle_session_expiry_closes_the_session_and_releases_its_slot() {
         .await
         .unwrap();
     assert_eq!(expired.status(), StatusCode::NOT_FOUND);
+    let body = to_bytes(expired.into_body(), 1024).await.unwrap();
+    assert_eq!(body.as_ref(), b"session not found");
+
+    let _ = initialize(&fixture.app).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn session_remains_available_before_the_configured_idle_timeout() {
+    let limits = LimitsConfig {
+        initialize_requests_per_second: 100,
+        initialize_rate_burst: 100,
+        session_idle_timeout_seconds: 30,
+        ..LimitsConfig::default()
+    };
+    let fixture = fixture_router_with_permissions(&["memory:read"], limits).await;
+    let (session_id, _) = initialize(&fixture.app).await;
+
+    tokio::time::advance(Duration::from_secs(3)).await;
+
+    let response = fixture
+        .app
+        .oneshot(session_request(
+            &session_id,
+            json!({"jsonrpc": "2.0", "id": 106, "method": "tools/list", "params": {}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response_json(response).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn configured_idle_timeout_is_applied_to_the_rmcp_session_worker() {
+    let limits = LimitsConfig {
+        initialize_requests_per_second: 100,
+        initialize_rate_burst: 100,
+        session_idle_timeout_seconds: 600,
+        ..LimitsConfig::default()
+    };
+    let fixture = fixture_router_with_permissions(&["memory:read"], limits).await;
+    let (session_id, _) = initialize(&fixture.app).await;
+
+    tokio::time::advance(Duration::from_secs(301)).await;
+    tokio::task::yield_now().await;
+
+    let response = fixture
+        .app
+        .oneshot(session_request(
+            &session_id,
+            json!({"jsonrpc": "2.0", "id": 103, "method": "tools/list", "params": {}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response_json(response).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -715,6 +771,18 @@ async fn authenticated_session_activity_refreshes_the_idle_deadline() {
     assert_eq!(active.status(), StatusCode::OK);
     let _ = response_json(active).await;
     tokio::time::advance(Duration::from_millis(1_500)).await;
+
+    let still_active = fixture
+        .app
+        .clone()
+        .oneshot(session_request(
+            &session_id,
+            json!({"jsonrpc": "2.0", "id": 105, "method": "tools/list", "params": {}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(still_active.status(), StatusCode::OK);
+    let _ = response_json(still_active).await;
 
     let still_at_cap = fixture
         .app
@@ -958,6 +1026,40 @@ async fn memory_search_returns_structured_content_and_json_text_fallback() {
 }
 
 #[tokio::test]
+async fn memory_search_failure_exposes_the_http_request_id() {
+    let fixture = fixture_router().await;
+    let (session_id, _) = initialize(&fixture.app).await;
+    std::fs::remove_file(&fixture.database_path).expect("remove SQLite database");
+    std::fs::create_dir(&fixture.database_path).expect("replace SQLite file with a directory");
+    let called = call_tool(
+        &fixture.app,
+        &session_id,
+        204,
+        "memory_search",
+        json!({"query": "window seat", "top_k": 5}),
+    )
+    .await;
+    assert_eq!(called.status(), StatusCode::OK);
+    let request_id = called
+        .headers()
+        .get("x-request-id")
+        .expect("response request id")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let called = response_json(called).await;
+    assert_eq!(called["result"]["isError"], json!(true));
+    assert_eq!(
+        called["result"]["structuredContent"]["code"],
+        json!("STORAGE_FAILED")
+    );
+    assert_eq!(
+        called["result"]["structuredContent"]["request_id"],
+        json!(request_id)
+    );
+}
+
+#[tokio::test]
 async fn invalid_tool_input_is_a_tool_execution_error_not_a_protocol_error() {
     let fixture = fixture_router().await;
     let (session_id, _) = initialize(&fixture.app).await;
@@ -1057,8 +1159,7 @@ async fn missing_case_search_permission_is_rejected_with_http_forbidden() {
 
 #[tokio::test]
 async fn case_document_mutation_tools_require_cases_write_permission() {
-    let read_only =
-        fixture_router_with_permissions(&["cases:read"], LimitsConfig::default()).await;
+    let read_only = fixture_router_with_permissions(&["cases:read"], LimitsConfig::default()).await;
     let (read_only_session, _) = initialize(&read_only.app).await;
     let denied = call_tool(
         &read_only.app,
@@ -1264,10 +1365,12 @@ async fn mcp_upload_update_and_delete_flow_reaches_the_embedded_case_library() {
     )
     .await;
     let new_search = response_json(new_search).await;
-    assert!(new_search["result"]["structuredContent"]["references"][0]["content"]
-        .as_str()
-        .unwrap()
-        .contains("mcpnewdnsneedle"));
+    assert!(
+        new_search["result"]["structuredContent"]["references"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("mcpnewdnsneedle")
+    );
 
     let delete_proposal = call_tool(
         &fixture.app,
@@ -1687,6 +1790,7 @@ fn production_runtime_config_requires_live_components_and_nonzero_limits() {
         features: Default::default(),
         http: HttpConfig::default(),
         limits: LimitsConfig::default(),
+        pipeline: PipelineServiceConfig::default(),
         storage: None,
         providers: None,
         retrieval: Default::default(),
@@ -1700,12 +1804,21 @@ fn production_runtime_config_requires_live_components_and_nonzero_limits() {
         features: Default::default(),
         http: HttpConfig::default(),
         limits: LimitsConfig::default(),
+        pipeline: PipelineServiceConfig::default(),
         storage: Some(StorageConfig {
             database_path: "memory.sqlite".into(),
         }),
         providers: Some(ProvidersConfig {
             api_key_env: "RAM_A_PROVIDER_KEY".to_string(),
             base_url: "https://provider.example/v1".to_string(),
+            reasoning_effort: None,
+            enable_thinking: None,
+            send_temperature: true,
+            temperature: 0.0,
+            output_token_parameter: Default::default(),
+            structured_output: Default::default(),
+            reasoning_only_retry: false,
+            json_repair_attempts: 0,
             embedding_provider: EmbeddingProviderKind::OpenAiCompatible,
             embedding_api_key_env: None,
             embedding_base_url: None,
@@ -2209,6 +2322,10 @@ fn server_binary_supports_a_default_config_path() {
         .unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("Usage: ram-a-mem [OPTIONS]"), "{stdout}");
+    assert!(
+        stdout.contains("Usage: ram-a-mem [OPTIONS]")
+            || stdout.contains("Usage: ram-a-mem.exe [OPTIONS]"),
+        "{stdout}"
+    );
     assert!(stdout.contains("--config <CONFIG>"), "{stdout}");
 }

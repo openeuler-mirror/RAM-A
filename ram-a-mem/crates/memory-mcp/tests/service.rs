@@ -88,7 +88,10 @@ impl MemoryExtractor for PreferenceExtractor {
     }
 }
 
-struct SupportingVerifier;
+#[derive(Default)]
+struct SupportingVerifier {
+    calls: AtomicUsize,
+}
 
 struct PreferenceGraphExtractor;
 
@@ -198,6 +201,7 @@ impl GroundingVerifier for SupportingVerifier {
         memories: &[AtomicMemory],
         _messages: &HashMap<String, NormalizedMessage>,
     ) -> PipelineResult<GroundingBatch> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(GroundingBatch {
             window_id: window.id.clone(),
             results: memories
@@ -218,6 +222,7 @@ struct Fixture {
     _temp: tempfile::TempDir,
     service: MemoryService<PreferenceExtractor, SupportingVerifier>,
     extractor: Arc<PreferenceExtractor>,
+    verifier: Arc<SupportingVerifier>,
     database_path: std::path::PathBuf,
 }
 
@@ -233,15 +238,12 @@ async fn fixture_service_with_extractor(extractor: Arc<PreferenceExtractor>) -> 
         Arc::new(HashEmbedding::new(32)),
     ));
     let idempotency = IdempotencyRepository::open(&database_path).await.unwrap();
+    let verifier = Arc::new(SupportingVerifier::default());
     Fixture {
         _temp: temp,
-        service: MemoryService::new(
-            manager,
-            idempotency,
-            extractor.clone(),
-            Arc::new(SupportingVerifier),
-        ),
+        service: MemoryService::new(manager, idempotency, extractor.clone(), verifier.clone()),
         extractor,
+        verifier,
         database_path,
     }
 }
@@ -274,16 +276,13 @@ async fn fixture_graph_service_with_extractor(graph_extractor: Arc<dyn GraphExtr
     ));
     let idempotency = IdempotencyRepository::open(&database_path).await.unwrap();
     let extractor = Arc::new(PreferenceExtractor::default());
+    let verifier = Arc::new(SupportingVerifier::default());
     Fixture {
         _temp: temp,
-        service: MemoryService::new(
-            manager,
-            idempotency,
-            extractor.clone(),
-            Arc::new(SupportingVerifier),
-        )
-        .with_graph_memory(graph_pipeline, 2),
+        service: MemoryService::new(manager, idempotency, extractor.clone(), verifier.clone())
+            .with_graph_memory(graph_pipeline, 2),
         extractor,
+        verifier,
         database_path,
     }
 }
@@ -436,7 +435,7 @@ async fn graph_ingest_retries_an_incomplete_build_without_duplicating_memory() {
             .ingest(&principal, preference_ingest())
             .await
             .unwrap_err(),
-        ServiceError::Pipeline
+        ServiceError::Pipeline { stage: None }
     );
     let retry = fixture
         .service
@@ -473,7 +472,7 @@ async fn graph_ingest_retry_is_stable_when_another_agent_resumes_the_request() {
             .ingest(&first_agent, preference_ingest())
             .await
             .unwrap_err(),
-        ServiceError::Pipeline
+        ServiceError::Pipeline { stage: None }
     );
     let retry = fixture
         .service
@@ -515,6 +514,35 @@ async fn repeated_message_id_reuses_successful_ingest() {
 }
 
 #[tokio::test]
+async fn context_only_ingest_returns_empty_without_model_calls_or_idempotency_rows() {
+    let fixture = fixture_service().await;
+    let mut request = preference_ingest();
+    request.messages[0].candidate = false;
+
+    let response = fixture
+        .service
+        .ingest(&principal("t", "u", "agent-a"), request)
+        .await
+        .unwrap();
+
+    assert_eq!(response.accepted_count, 0);
+    assert_eq!(response.rejected_count, 0);
+    assert_eq!(response.quarantined_count, 0);
+    assert!(response.memory_ids.is_empty());
+    assert!(!response.idempotency_hit);
+    assert_eq!(fixture.extractor.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.verifier.calls.load(Ordering::SeqCst), 0);
+
+    let connection = rusqlite::Connection::open(&fixture.database_path).unwrap();
+    let row_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM mcp_ingest_idempotency", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(row_count, 0);
+}
+
+#[tokio::test]
 async fn same_message_key_with_different_content_is_rejected_before_pipeline() {
     let fixture = fixture_service().await;
     let principal = principal("tenant-secret", "user-secret", "agent-a");
@@ -536,6 +564,85 @@ async fn same_message_key_with_different_content_is_rejected_before_pipeline() {
     let rendered = format!("{error:?} {error}");
     assert!(!rendered.contains("tenant-secret"));
     assert!(!rendered.contains("user-secret"));
+}
+
+#[tokio::test]
+async fn changing_hashed_message_metadata_returns_conflict_before_pipeline() {
+    let fixture = fixture_service().await;
+    let principal = principal("t", "u", "agent-a");
+    fixture
+        .service
+        .ingest(&principal, preference_ingest())
+        .await
+        .unwrap();
+
+    let variants = [
+        {
+            let mut request = preference_ingest();
+            request.messages[0].role = "assistant".to_string();
+            request
+        },
+        {
+            let mut request = preference_ingest();
+            request.messages[0].speaker = Some("Bob".to_string());
+            request
+        },
+        {
+            let mut request = preference_ingest();
+            request.messages[0].timestamp = Some("2026-07-22T10:01:00Z".to_string());
+            request
+        },
+    ];
+
+    for request in variants {
+        let error = fixture
+            .service
+            .ingest(&principal, request)
+            .await
+            .unwrap_err();
+        assert_eq!(error, ServiceError::IdempotencyConflict);
+    }
+    assert_eq!(fixture.extractor.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.verifier.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn idempotency_key_is_scoped_by_principal_and_conversation() {
+    let fixture = fixture_service().await;
+    let base = preference_ingest();
+    fixture
+        .service
+        .ingest(&principal("tenant-a", "user-a", "agent-a"), base.clone())
+        .await
+        .unwrap();
+
+    let mut other_conversation = base.clone();
+    other_conversation.conversation_id = "conversation-2".to_string();
+    let conversation_response = fixture
+        .service
+        .ingest(
+            &principal("tenant-a", "user-a", "agent-a"),
+            other_conversation,
+        )
+        .await
+        .unwrap();
+    let scope_response = fixture
+        .service
+        .ingest(&principal("tenant-a", "user-b", "agent-a"), base)
+        .await
+        .unwrap();
+
+    assert!(!conversation_response.idempotency_hit);
+    assert!(!scope_response.idempotency_hit);
+    assert_eq!(fixture.extractor.calls.load(Ordering::SeqCst), 3);
+
+    let connection = rusqlite::Connection::open(&fixture.database_path).unwrap();
+    let row_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM mcp_ingest_idempotency", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(row_count, 3);
 }
 
 #[tokio::test]
@@ -608,8 +715,8 @@ async fn search_filters_type_and_event_time_after_scoped_retrieval() {
         query: "window trip".to_string(),
         top_k: 10,
         memory_types: vec!["event".to_string()],
-        event_time_from: Some("2026-07-31T00:00:00Z".to_string()),
-        event_time_to: Some("2026-08-02T00:00:00Z".to_string()),
+        event_time_from: Some("2026-08-01T00:00:00Z".to_string()),
+        event_time_to: Some("2026-08-01T00:00:00Z".to_string()),
     };
     let result = fixture.service.search(&principal, request).await.unwrap();
     assert_eq!(result.memories.len(), 1);

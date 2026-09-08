@@ -5,9 +5,10 @@ use std::time::Instant;
 
 use chrono::{DateTime, NaiveDate, Utc};
 use memory_core::{
-    AddMemoryRequest, GraphAddMemoryRequest, GraphBuildPipeline, LongTermMemory, MemoryManager,
-    MemoryRecord, SearchMemoryRequest as CoreSearchRequest,
+    AddMemoryRequest, GraphAddMemoryRequest, GraphBuildPipeline, LongTermMemory, MemoryError,
+    MemoryManager, MemoryRecord, SearchMemoryRequest as CoreSearchRequest,
 };
+use memory_pipeline::error::{PipelineError, PipelineStage};
 use memory_pipeline::extraction::MemoryExtractor;
 use memory_pipeline::grounding::GroundingVerifier;
 use memory_pipeline::pipeline::{run_memory_pipeline, PipelineConfig};
@@ -70,22 +71,92 @@ struct GraphMemoryRuntime {
 pub enum ServiceError {
     InvalidRequest,
     IdempotencyConflict,
-    Pipeline,
+    Pipeline {
+        stage: Option<PipelineStage>,
+    },
+    Rerank,
     Storage,
+    Observed {
+        code: &'static str,
+        message: &'static str,
+        retriable: bool,
+        stage: Option<PipelineStage>,
+        error_site: &'static str,
+        error_origin_file: &'static str,
+        error_origin_line: u32,
+        source_error_kind: &'static str,
+        source_error_message: &'static str,
+    },
 }
 
 impl ServiceError {
-    pub fn code(self) -> &'static str {
+    pub fn code(&self) -> &'static str {
         match self {
             Self::InvalidRequest => "INVALID_REQUEST",
             Self::IdempotencyConflict => "IDEMPOTENCY_CONFLICT",
-            Self::Pipeline => "PIPELINE_FAILED",
+            Self::Pipeline { .. } => "PIPELINE_FAILED",
+            Self::Rerank => "RERANK_FAILED",
             Self::Storage => "STORAGE_FAILED",
+            Self::Observed { code, .. } => code,
         }
     }
 
-    pub fn retriable(self) -> bool {
-        matches!(self, Self::Pipeline | Self::Storage)
+    pub fn retriable(&self) -> bool {
+        match self {
+            Self::Observed { retriable, .. } => *retriable,
+            error => matches!(error, Self::Pipeline { .. } | Self::Rerank | Self::Storage),
+        }
+    }
+
+    pub fn stage(&self) -> Option<&'static str> {
+        match self {
+            Self::Pipeline { stage: Some(stage) } => Some(stage.as_str()),
+            Self::Observed {
+                stage: Some(stage), ..
+            } => Some(stage.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn error_site(&self) -> Option<&'static str> {
+        match self {
+            Self::Observed { error_site, .. } => Some(error_site),
+            _ => None,
+        }
+    }
+
+    pub fn error_origin(&self) -> Option<(&'static str, u32)> {
+        match self {
+            Self::Observed {
+                error_origin_file,
+                error_origin_line,
+                ..
+            } => Some((error_origin_file, *error_origin_line)),
+            _ => None,
+        }
+    }
+
+    pub fn source_error_kind(&self) -> Option<&'static str> {
+        match self {
+            Self::Observed {
+                source_error_kind, ..
+            } => Some(source_error_kind),
+            _ => None,
+        }
+    }
+
+    pub fn source_error_message(&self) -> Option<&'static str> {
+        match self {
+            Self::Observed {
+                source_error_message,
+                ..
+            } => Some(source_error_message),
+            _ => None,
+        }
+    }
+
+    fn pipeline(stage: Option<PipelineStage>) -> Self {
+        Self::Pipeline { stage }
     }
 }
 
@@ -94,8 +165,10 @@ impl fmt::Display for ServiceError {
         formatter.write_str(match self {
             Self::InvalidRequest => "memory request is invalid",
             Self::IdempotencyConflict => "idempotency key conflicts with an earlier request",
-            Self::Pipeline => "memory pipeline failed",
+            Self::Pipeline { .. } => "memory pipeline failed",
+            Self::Rerank => "memory rerank failed",
             Self::Storage => "memory storage failed",
+            Self::Observed { message, .. } => message,
         })
     }
 }
@@ -188,12 +261,12 @@ where
         let mut stage_started = Instant::now();
         tracing::info!(
             event = "ram_a.memory.ingest.stage.started",
-            stage = "validate"
+            stage = "request_validate"
         );
         request.validate().map_err(|_| {
             tracing::error!(
                 event = "ram_a.memory.ingest.stage.failed",
-                stage = "validate",
+                stage = "request_validate",
                 error_code = ServiceError::InvalidRequest.code(),
                 retriable = false,
                 elapsed_ms = stage_started.elapsed().as_millis() as u64
@@ -202,7 +275,7 @@ where
         })?;
         tracing::info!(
             event = "ram_a.memory.ingest.stage.completed",
-            stage = "validate",
+            stage = "request_validate",
             elapsed_ms = stage_started.elapsed().as_millis() as u64
         );
         let scope_id = principal.scope_id();
@@ -234,12 +307,23 @@ where
                 .reserve(&entries, &proposed_run_id)
                 .await
                 .map_err(|error| {
-                    let mapped = map_idempotency_error(error);
+                    let mapped = map_idempotency_error(error, "memory_mcp.idempotency.reserve");
+                    let (origin_file, origin_line) =
+                        mapped.error_origin().unwrap_or((file!(), line!()));
                     tracing::error!(
                         event = "ram_a.memory.ingest.stage.failed",
                         stage = "idempotency_reserve",
                         error_code = mapped.code(),
                         retriable = mapped.retriable(),
+                        error_site = mapped
+                            .error_site()
+                            .unwrap_or("memory_mcp.idempotency.reserve"),
+                        error_origin_file = origin_file,
+                        error_origin_line = origin_line,
+                        source_error_kind = mapped.source_error_kind().unwrap_or("internal"),
+                        source_error_message = mapped
+                            .source_error_message()
+                            .unwrap_or("idempotency reserve failed"),
                         elapsed_ms = stage_started.elapsed().as_millis() as u64
                     );
                     mapped
@@ -277,15 +361,24 @@ where
             None,
         )
         .await
-        .map_err(|_| {
+        .map_err(|error| {
+            let mapped = map_pipeline_error(error);
+            let (origin_file, origin_line) =
+                mapped.error_origin().unwrap_or((file!(), line!()));
             tracing::error!(
                 event = "ram_a.memory.ingest.stage.failed",
                 stage = "memory_pipeline",
-                error_code = ServiceError::Pipeline.code(),
-                retriable = true,
+                pipeline_run_id = %pipeline_run_id,
+                error_code = mapped.code(),
+                retriable = mapped.retriable(),
+                error_site = mapped.error_site().unwrap_or("memory_pipeline.failed"),
+                error_origin_file = origin_file,
+                error_origin_line = origin_line,
+                source_error_kind = mapped.source_error_kind().unwrap_or("internal"),
+                source_error_message = mapped.source_error_message().unwrap_or("memory pipeline failed"),
                 elapsed_ms = stage_started.elapsed().as_millis() as u64
             );
-            ServiceError::Pipeline
+            mapped
         })?;
         tracing::info!(
             event = "ram_a.memory.ingest.stage.completed",
@@ -311,15 +404,24 @@ where
             .manager
             .add_many(requests)
             .await
-            .map_err(|_| {
+            .map_err(|error| {
+                let mapped = map_persist_error(error);
+                let (origin_file, origin_line) =
+                    mapped.error_origin().unwrap_or((file!(), line!()));
                 tracing::error!(
                     event = "ram_a.memory.ingest.stage.failed",
                     stage = "vector_persist",
-                    error_code = ServiceError::Storage.code(),
-                    retriable = true,
+                    pipeline_run_id = %pipeline_run_id,
+                    error_code = mapped.code(),
+                    retriable = mapped.retriable(),
+                    error_site = mapped.error_site().unwrap_or("memory_mcp.ingest.vector_persist"),
+                    error_origin_file = origin_file,
+                    error_origin_line = origin_line,
+                    source_error_kind = mapped.source_error_kind().unwrap_or("internal"),
+                    source_error_message = mapped.source_error_message().unwrap_or("memory vector persistence failed"),
                     elapsed_ms = stage_started.elapsed().as_millis() as u64
                 );
-                ServiceError::Storage
+                mapped
             })?
             .into_iter()
             .map(|response| response.id)
@@ -379,12 +481,23 @@ where
                 .complete(&pending_entries, &pipeline_run_id, &result)
                 .await
                 .map_err(|error| {
-                    let mapped = map_idempotency_error(error);
+                    let mapped = map_idempotency_error(
+                        error,
+                        "memory_mcp.idempotency.complete",
+                    );
+                    let (origin_file, origin_line) =
+                        mapped.error_origin().unwrap_or((file!(), line!()));
                     tracing::error!(
                         event = "ram_a.memory.ingest.stage.failed",
                         stage = "idempotency_complete",
+                        pipeline_run_id = %pipeline_run_id,
                         error_code = mapped.code(),
                         retriable = mapped.retriable(),
+                        error_site = mapped.error_site().unwrap_or("memory_mcp.idempotency.complete"),
+                        error_origin_file = origin_file,
+                        error_origin_line = origin_line,
+                        source_error_kind = mapped.source_error_kind().unwrap_or("internal"),
+                        source_error_message = mapped.source_error_message().unwrap_or("idempotency complete failed"),
                         elapsed_ms = stage_started.elapsed().as_millis() as u64
                     );
                     mapped
@@ -448,15 +561,25 @@ where
                 graph_target_evidence_speaker: None,
             })
             .await
-            .map_err(|_| {
+            .map_err(|error| {
+                let mapped = map_search_error(error);
+                let (origin_file, origin_line) =
+                    mapped.error_origin().unwrap_or((file!(), line!()));
                 tracing::error!(
                     event = "ram_a.memory.search.stage.failed",
                     stage = "retrieve",
-                    error_code = ServiceError::Storage.code(),
-                    retriable = true,
+                    error_code = mapped.code(),
+                    retriable = mapped.retriable(),
+                    error_site = mapped.error_site().unwrap_or("memory_mcp.search.retrieve"),
+                    error_origin_file = origin_file,
+                    error_origin_line = origin_line,
+                    source_error_kind = mapped.source_error_kind().unwrap_or("internal"),
+                    source_error_message = mapped
+                        .source_error_message()
+                        .unwrap_or("memory retrieval failed"),
                     elapsed_ms = stage_started.elapsed().as_millis() as u64
                 );
-                ServiceError::Storage
+                mapped
             })?;
         let candidate_count = candidates.len();
         tracing::info!(
@@ -555,11 +678,184 @@ fn content_hash(message: &IngestMessage) -> String {
     format!("{:x}", digest.finalize())
 }
 
-fn map_idempotency_error(error: IdempotencyError) -> ServiceError {
+#[track_caller]
+fn map_idempotency_error(error: IdempotencyError, operation: &'static str) -> ServiceError {
     match error {
         IdempotencyError::Conflict => ServiceError::IdempotencyConflict,
-        IdempotencyError::Storage => ServiceError::Storage,
+        IdempotencyError::Busy => observed_error(
+            "SQLITE_BUSY",
+            "SQLite database is busy",
+            true,
+            None,
+            operation,
+            "sqlite_busy",
+            "SQLite database is busy",
+        ),
+        IdempotencyError::ReadOnly => observed_error(
+            "SQLITE_READONLY",
+            "SQLite database is read-only",
+            false,
+            None,
+            operation,
+            "sqlite_readonly",
+            "SQLite database is read-only",
+        ),
+        IdempotencyError::Storage => observed_error(
+            "IDEMPOTENCY_STORAGE_FAILED",
+            "idempotency storage failed",
+            true,
+            None,
+            operation,
+            "sqlite_other",
+            "idempotency storage operation failed",
+        ),
     }
+}
+
+#[track_caller]
+fn map_pipeline_error(error: PipelineError) -> ServiceError {
+    let retriable = error.is_retriable();
+    let stage = error.stage();
+    let source_error_kind = error.source_error_kind();
+    let source_error_message = error.safe_summary();
+    let origin = error.origin();
+    let caller = std::panic::Location::caller();
+    ServiceError::Observed {
+        code: "PIPELINE_FAILED",
+        message: "memory pipeline failed",
+        retriable,
+        stage,
+        error_site: origin
+            .map(|origin| origin.site)
+            .unwrap_or("memory_pipeline.failed"),
+        error_origin_file: origin.map(|origin| origin.file).unwrap_or(caller.file()),
+        error_origin_line: origin.map(|origin| origin.line).unwrap_or(caller.line()),
+        source_error_kind,
+        source_error_message,
+    }
+}
+
+#[track_caller]
+fn map_search_error(error: MemoryError) -> ServiceError {
+    map_memory_error(error, "memory_mcp.search.retrieve", false)
+}
+
+#[track_caller]
+fn map_persist_error(error: MemoryError) -> ServiceError {
+    map_memory_error(error, "memory_mcp.ingest.vector_persist", true)
+}
+
+#[track_caller]
+fn map_memory_error(error: MemoryError, operation: &'static str, persist: bool) -> ServiceError {
+    match &error {
+        MemoryError::Embedding { .. } => observed_error(
+            "EMBEDDING_FAILED",
+            "embedding provider failed",
+            true,
+            None,
+            operation,
+            "embedding",
+            "embedding provider request failed",
+        ),
+        MemoryError::Rerank { .. } => observed_error(
+            "RERANK_FAILED",
+            "memory rerank failed",
+            true,
+            None,
+            operation,
+            "rerank",
+            "memory rerank request failed",
+        ),
+        MemoryError::Sqlite(error) if sqlite_error_is_busy(error) => observed_error(
+            "SQLITE_BUSY",
+            "SQLite database is busy",
+            true,
+            None,
+            operation,
+            "sqlite_busy",
+            "SQLite database is busy",
+        ),
+        MemoryError::Sqlite(error) if sqlite_error_is_read_only(error) => observed_error(
+            "SQLITE_READONLY",
+            "SQLite database is read-only",
+            false,
+            None,
+            operation,
+            "sqlite_readonly",
+            "SQLite database is read-only",
+        ),
+        _ if persist => observed_error(
+            "VECTOR_PERSIST_FAILED",
+            "memory vector persistence failed",
+            // Unrecognized persistence failures are usually permanent states
+            // (disk full, read-only filesystem, corrupt store); a blind retry
+            // would not clear them.
+            false,
+            None,
+            operation,
+            "storage",
+            "memory vector persistence failed",
+        ),
+        _ => observed_error(
+            "STORAGE_FAILED",
+            "memory storage failed",
+            true,
+            None,
+            operation,
+            "storage",
+            "memory storage operation failed",
+        ),
+    }
+}
+
+#[track_caller]
+fn observed_error(
+    code: &'static str,
+    message: &'static str,
+    retriable: bool,
+    stage: Option<PipelineStage>,
+    error_site: &'static str,
+    source_error_kind: &'static str,
+    source_error_message: &'static str,
+) -> ServiceError {
+    let caller = std::panic::Location::caller();
+    ServiceError::Observed {
+        code,
+        message,
+        retriable,
+        stage,
+        error_site,
+        error_origin_file: caller.file(),
+        error_origin_line: caller.line(),
+        source_error_kind,
+        source_error_message,
+    }
+}
+
+fn sqlite_error_is_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked,
+                ..
+            },
+            _
+        )
+    )
+}
+
+fn sqlite_error_is_read_only(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::ReadOnly,
+                ..
+            },
+            _
+        )
+    )
 }
 
 fn cached_response(results: Vec<Value>) -> Result<IngestResponse, ServiceError> {
@@ -605,23 +901,23 @@ fn stored_memory_requests(
     let memories = prepared
         .get("memories")
         .and_then(Value::as_array)
-        .ok_or(ServiceError::Pipeline)?;
+        .ok_or_else(|| ServiceError::pipeline(Some(PipelineStage::Aggregate)))?;
     memories
         .iter()
         .map(|memory| {
             let id = memory
                 .get("id")
                 .and_then(Value::as_str)
-                .ok_or(ServiceError::Pipeline)?;
+                .ok_or_else(|| ServiceError::pipeline(Some(PipelineStage::Aggregate)))?;
             let text = memory
                 .get("text")
                 .and_then(Value::as_str)
-                .ok_or(ServiceError::Pipeline)?;
+                .ok_or_else(|| ServiceError::pipeline(Some(PipelineStage::Aggregate)))?;
             let mut metadata = memory
                 .get("metadata")
                 .and_then(Value::as_object)
                 .cloned()
-                .ok_or(ServiceError::Pipeline)?;
+                .ok_or_else(|| ServiceError::pipeline(Some(PipelineStage::Aggregate)))?;
             metadata.insert("scope_id".to_string(), json!(principal.scope_id()));
             metadata.insert("source_agent_id".to_string(), json!(principal.agent_id));
             metadata.insert("pipeline_run_id".to_string(), json!(pipeline_run_id));
@@ -641,12 +937,15 @@ fn build_graph_add_requests(
     requests
         .iter()
         .map(|request| {
-            let id = request.id.as_deref().ok_or(ServiceError::Pipeline)?;
+            let id = request
+                .id
+                .as_deref()
+                .ok_or_else(|| ServiceError::pipeline(Some(PipelineStage::Aggregate)))?;
             let mut metadata = request
                 .metadata
                 .as_object()
                 .cloned()
-                .ok_or(ServiceError::Pipeline)?;
+                .ok_or_else(|| ServiceError::pipeline(Some(PipelineStage::Aggregate)))?;
             metadata.remove("pipeline_run_id");
             metadata.remove("source_agent_id");
             if !metadata.contains_key("graph_source_entity") {
@@ -723,8 +1022,8 @@ async fn build_graph_memories(
     }
     while let Some(result) = tasks.join_next().await {
         result
-            .map_err(|_| ServiceError::Pipeline)?
-            .map_err(|_| ServiceError::Pipeline)?;
+            .map_err(|_| ServiceError::pipeline(None))?
+            .map_err(|_| ServiceError::pipeline(None))?;
         if let Some(request) = requests.next() {
             spawn_graph_build(&mut tasks, runtime.pipeline.clone(), request);
         }
@@ -887,10 +1186,85 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        bounded_candidate_limit, build_graph_add_requests, build_prepared_input, search_result,
-        stable_source_id, MemoryService,
+        bounded_candidate_limit, build_graph_add_requests, build_prepared_input, map_persist_error,
+        map_pipeline_error, map_search_error, search_result, stable_source_id, MemoryService,
     };
     use crate::{IdempotencyRepository, IngestMessage, IngestRequest, Principal};
+    use memory_pipeline::error::{PipelineError, PipelineStage};
+
+    #[test]
+    fn provider_failures_keep_pipeline_stage_and_rerank_classification() {
+        for stage in [PipelineStage::Extract, PipelineStage::Ground] {
+            let error = PipelineError::Protocol("provider failed".to_string()).at_stage(stage);
+            let mapped = map_pipeline_error(error);
+            assert_eq!(mapped.code(), "PIPELINE_FAILED");
+            assert_eq!(mapped.stage(), Some(stage.as_str()));
+            assert!(mapped.retriable());
+        }
+
+        let rerank = map_search_error(memory_core::MemoryError::Rerank {
+            message: "reranker unavailable".to_string(),
+        });
+        assert_eq!(rerank.code(), "RERANK_FAILED");
+        assert!(rerank.retriable());
+        assert_eq!(rerank.source_error_kind(), Some("rerank"));
+        assert!(rerank.error_origin().is_some());
+    }
+
+    #[test]
+    fn permanent_pipeline_failures_are_not_retriable() {
+        for (error, kind) in [
+            (
+                PipelineError::InvalidInput("max_memory_chars must be positive".to_string()),
+                "invalid_input",
+            ),
+            (
+                PipelineError::Protocol(
+                    "extractor response did not match the required schema: fields are invalid"
+                        .to_string(),
+                ),
+                "schema_invalid",
+            ),
+            (
+                PipelineError::Protocol("extractor did not return valid JSON".to_string()),
+                "invalid_json",
+            ),
+        ] {
+            let mapped = map_pipeline_error(error.at_stage(PipelineStage::Validate));
+            assert_eq!(mapped.code(), "PIPELINE_FAILED");
+            assert!(!mapped.retriable());
+            assert_eq!(mapped.source_error_kind(), Some(kind));
+        }
+    }
+
+    #[test]
+    fn storage_failures_map_to_specific_public_codes() {
+        let embedding = map_persist_error(memory_core::MemoryError::Embedding {
+            message: "PRIVATE_PROVIDER_BODY".to_string(),
+        });
+        assert_eq!(embedding.code(), "EMBEDDING_FAILED");
+        assert_eq!(embedding.source_error_kind(), Some("embedding"));
+        assert!(!embedding.to_string().contains("PRIVATE_PROVIDER_BODY"));
+
+        let vector = map_persist_error(memory_core::MemoryError::StoreBackend {
+            message: "PRIVATE_SQL_DETAIL".to_string(),
+        });
+        assert_eq!(vector.code(), "VECTOR_PERSIST_FAILED");
+        assert!(!vector.retriable());
+        assert!(!vector.to_string().contains("PRIVATE_SQL_DETAIL"));
+
+        for (sqlite_code, expected, retriable) in [
+            (rusqlite::ffi::SQLITE_BUSY, "SQLITE_BUSY", true),
+            (rusqlite::ffi::SQLITE_READONLY, "SQLITE_READONLY", false),
+        ] {
+            let mapped = map_persist_error(memory_core::MemoryError::Sqlite(
+                rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(sqlite_code), None),
+            ));
+            assert_eq!(mapped.code(), expected);
+            assert_eq!(mapped.retriable(), retriable);
+            assert!(mapped.error_origin().is_some());
+        }
+    }
 
     fn principal(user: &str, agent: &str) -> Principal {
         Principal {

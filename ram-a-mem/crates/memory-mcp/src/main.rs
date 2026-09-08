@@ -12,6 +12,7 @@ use memory_core::{
     sqlite::GraphRepository, EmbeddingProvider, GraphBuildPipeline, HashEmbedding, MemoryManager,
     OpenRouterEmbedding, OpenRouterReranker, RerankProvider, SqliteMemoryStore,
 };
+use memory_mcp::observability::{LogSettings, RamLogFormatter};
 use memory_mcp::{
     create_http_router, EmbeddingProviderKind, HttpRuntime, IdempotencyRepository, MemoryService,
     ServerConfig, TokenAuthenticator,
@@ -21,6 +22,7 @@ use memory_pipeline::extraction::{LlmMemoryExtractor, MemoryExtractor};
 use memory_pipeline::grounding::{GroundingVerifier, LlmGroundingVerifier};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
+use tracing_subscriber::fmt::format::JsonFields;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use uuid::Uuid;
 
@@ -35,7 +37,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing()?;
+    let log_settings = init_tracing()?;
     let startup_run_id = Uuid::new_v4().to_string();
     let args = Args::parse();
     let config_path = resolve_config_path(args.config)?;
@@ -75,20 +77,16 @@ async fn main() -> Result<()> {
         embedding_dimensions = providers.embedding_dimensions,
         rerank_enabled = config.retrieval.rerank.enabled,
         rerank_provider = ?config.retrieval.rerank.provider,
-        rerank_model = config.retrieval.rerank.model
+        rerank_model = config.retrieval.rerank.model,
+        log_format = log_settings.format.as_str(),
+        log_source = log_settings.source
     );
     let provider_key = resolve_secret_env(&providers.api_key_env)?;
     let embedder: Arc<dyn EmbeddingProvider> = match providers.embedding_provider {
         EmbeddingProviderKind::OpenAiCompatible => {
-            let embedding_key_env = providers
-                .embedding_api_key_env
-                .as_deref()
-                .unwrap_or(&providers.api_key_env);
+            let embedding_key_env = providers.resolved_embedding_api_key_env();
             let embedding_key = resolve_secret_env(embedding_key_env)?;
-            let embedding_base_url = providers
-                .embedding_base_url
-                .as_deref()
-                .unwrap_or(&providers.base_url);
+            let embedding_base_url = providers.resolved_embedding_base_url();
             Arc::new(OpenRouterEmbedding::with_base_url(
                 embedding_key,
                 embedding_base_url,
@@ -104,15 +102,23 @@ async fn main() -> Result<()> {
         providers.timeout_seconds,
         providers.max_retries,
     )
-    .context("failed to construct model client")?;
-    let extractor: Arc<dyn MemoryExtractor> = Arc::new(LlmMemoryExtractor::new(
-        model_client.clone(),
-        &providers.extractor_model,
-    ));
-    let verifier: Arc<dyn GroundingVerifier> = Arc::new(LlmGroundingVerifier::new(
-        model_client,
-        &providers.verifier_model,
-    ));
+    .context("failed to construct model client")?
+    .with_compatibility(providers.chat_compatibility());
+    let extractor: Arc<dyn MemoryExtractor> = Arc::new(
+        LlmMemoryExtractor::new(model_client.clone(), &providers.extractor_model)
+            .with_token_budget(
+                config.pipeline.extractor_max_output_tokens,
+                config.pipeline.extractor_context_window_tokens,
+                config.pipeline.reasoning_reserve_tokens,
+            ),
+    );
+    let verifier: Arc<dyn GroundingVerifier> = Arc::new(
+        LlmGroundingVerifier::new(model_client, &providers.verifier_model).with_token_budget(
+            config.pipeline.verifier_max_output_tokens,
+            config.pipeline.verifier_context_window_tokens,
+            config.pipeline.reasoning_reserve_tokens,
+        ),
+    );
     let graph_retrieval = if features.memory && config.features.graph_memory.enabled {
         config
             .graph_memory
@@ -153,7 +159,13 @@ async fn main() -> Result<()> {
             retrieval_config,
         ))
     };
-    let mut service = MemoryService::new(manager, idempotency, extractor, verifier);
+    let mut service = MemoryService::with_pipeline_config(
+        manager,
+        idempotency,
+        extractor,
+        verifier,
+        config.pipeline.pipeline_config(),
+    );
     if features.memory && config.features.graph_memory.enabled {
         let graph = config
             .graph_memory
@@ -209,25 +221,21 @@ async fn main() -> Result<()> {
                 }
             },
             embedding_api_key_env: case_library
-                .embedding_api_key_env
-                .clone()
-                .unwrap_or_else(|| providers.api_key_env.clone()),
+                .resolved_embedding_api_key_env(providers)
+                .to_string(),
             embedding_base_url: case_library
-                .embedding_base_url
-                .clone()
-                .unwrap_or_else(|| providers.base_url.clone()),
+                .resolved_embedding_base_url(providers)
+                .to_string(),
             embedding_model: case_library.embedding_model.clone(),
             embedding_dimensions: case_library.embedding_dimensions,
             chunk_size: case_library.chunk_size,
             summary_llm_model: case_library.summary_llm_model.clone(),
             summary_llm_api_key_env: case_library
-                .summary_llm_api_key_env
-                .clone()
-                .unwrap_or_else(|| providers.api_key_env.clone()),
+                .resolved_summary_api_key_env(providers)
+                .to_string(),
             summary_llm_base_url: case_library
-                .summary_llm_base_url
-                .clone()
-                .unwrap_or_else(|| providers.base_url.clone()),
+                .resolved_summary_base_url(providers)
+                .to_string(),
             summary_llm_timeout_ms: case_library.summary_llm_timeout_ms,
         };
         let case_service = memory_cases::build_service(&case_options)
@@ -344,13 +352,20 @@ async fn main() -> Result<()> {
     server_result.context("HTTP server failed")
 }
 
-fn init_tracing() -> Result<()> {
+fn init_tracing() -> Result<LogSettings> {
+    let settings = LogSettings::from_env()?;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::registry()
         .with(filter)
-        .with(tracing_subscriber::fmt::layer().json())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .fmt_fields(JsonFields::new())
+                .event_format(RamLogFormatter::new(settings))
+                .with_writer(std::io::stderr),
+        )
         .try_init()
-        .context("failed to initialize structured logging")
+        .context("failed to initialize structured logging")?;
+    Ok(settings)
 }
 
 fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {

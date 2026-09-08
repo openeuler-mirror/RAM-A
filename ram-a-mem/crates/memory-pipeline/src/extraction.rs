@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use crate::client::OpenAiCompatibleClient;
+use crate::client::{OpenAiCompatibleClient, StructuredOutputSpec};
 use crate::error::{PipelineError, Result};
 use crate::models::{ExtractionWindow, NormalizedMessage};
 use crate::window::render_window;
@@ -36,6 +36,9 @@ pub trait MemoryExtractor: Send + Sync {
     fn max_output_tokens(&self) -> Option<usize> {
         None
     }
+    fn compatibility_identity(&self) -> Option<Value> {
+        None
+    }
     async fn extract(
         &self,
         window: &ExtractionWindow,
@@ -52,6 +55,8 @@ pub struct LlmMemoryExtractor {
     model: String,
     prompt_version: String,
     max_output_tokens: usize,
+    context_window_tokens: Option<usize>,
+    reasoning_reserve_tokens: usize,
 }
 
 impl LlmMemoryExtractor {
@@ -59,9 +64,23 @@ impl LlmMemoryExtractor {
         Self {
             client,
             model: model.into(),
-            prompt_version: "extract_v2".into(),
+            prompt_version: "extract_v3".into(),
             max_output_tokens: 1600,
+            context_window_tokens: None,
+            reasoning_reserve_tokens: 0,
         }
+    }
+
+    pub fn with_token_budget(
+        mut self,
+        max_output_tokens: usize,
+        context_window_tokens: Option<usize>,
+        reasoning_reserve_tokens: usize,
+    ) -> Self {
+        self.max_output_tokens = max_output_tokens;
+        self.context_window_tokens = context_window_tokens;
+        self.reasoning_reserve_tokens = reasoning_reserve_tokens;
+        self
     }
 }
 
@@ -79,6 +98,9 @@ impl MemoryExtractor for LlmMemoryExtractor {
     fn max_output_tokens(&self) -> Option<usize> {
         Some(self.max_output_tokens)
     }
+    fn compatibility_identity(&self) -> Option<Value> {
+        serde_json::to_value(self.client.compatibility()).ok()
+    }
 
     async fn extract(
         &self,
@@ -94,16 +116,246 @@ impl MemoryExtractor for LlmMemoryExtractor {
                 (!timestamp.is_empty()).then_some(timestamp.as_str())
             })
             .unwrap_or("");
-        let prompt = build_extraction_prompt(window, messages, observed_at)?;
-        let result = self.client.chat(&self.model, vec![
-            json!({"role": "system", "content": "You are a source-faithful long-term-memory extractor. Output only the requested JSON object. Never invent evidence identifiers."}),
-            json!({"role": "user", "content": prompt}),
-        ], self.max_output_tokens).await?;
-        let payload = parse_extraction_json(&result.content)?;
-        let mut batch = batch_from_payload(&window.id, &payload, &result.content)?;
+        let messages = self.messages_within_budget(window, messages, observed_at)?;
+        let spec = extraction_output_spec();
+        let mut result = self
+            .client
+            .chat_with_schema(
+                &self.model,
+                messages,
+                self.max_output_tokens,
+                Some(spec.clone()),
+            )
+            .await?;
+        let mut parsed = parse_extraction_json(&result.content)
+            .and_then(|payload| batch_from_payload(&window.id, &payload, &result.content));
+        // json_repair_attempts is the number of times the model is asked to
+        // repair a response that is not valid JSON (0 disables the repair
+        // path). The server configuration currently caps it at 1 because a
+        // second repair round rarely recovers a response the first could not.
+        for attempt in 1..=self.client.compatibility().json_repair_attempts {
+            if parsed.is_ok() {
+                break;
+            }
+            let repaired = self
+                .repair_json(&result.content, spec.clone(), attempt)
+                .await?;
+            result.usage = combine_usage(result.usage, &repaired.usage);
+            result.content = repaired.content;
+            parsed = parse_extraction_json(&result.content)
+                .and_then(|payload| batch_from_payload(&window.id, &payload, &result.content));
+        }
+        let mut batch =
+            parsed.map_err(|error| error.at_site("memory_pipeline.extract.parse_response"))?;
         batch.usage = result.usage;
         Ok(batch)
     }
+}
+
+impl LlmMemoryExtractor {
+    fn messages_within_budget(
+        &self,
+        window: &ExtractionWindow,
+        messages_by_id: &HashMap<String, NormalizedMessage>,
+        observed_at: &str,
+    ) -> Result<Vec<Value>> {
+        let mut prompt_window = window.clone();
+        let mut trimmed_before = 0usize;
+        let mut trimmed_after = 0usize;
+        loop {
+            let messages = extraction_prompt_messages(build_extraction_prompt(
+                &prompt_window,
+                messages_by_id,
+                observed_at,
+            )?);
+            match self.client.validate_context_budget(
+                &messages,
+                self.max_output_tokens,
+                self.context_window_tokens,
+                self.reasoning_reserve_tokens,
+            ) {
+                Ok(()) => {
+                    if trimmed_before > 0 || trimmed_after > 0 {
+                        tracing::info!(
+                            event = "ram_a.provider.context_trimmed",
+                            stage = "extract",
+                            trimmed_context_before = trimmed_before,
+                            trimmed_context_after = trimmed_after,
+                            remaining_context_before = prompt_window.context_before_refs.len(),
+                            remaining_context_after = prompt_window.context_after_refs.len()
+                        );
+                    }
+                    return Ok(messages);
+                }
+                Err(error)
+                    if !prompt_window.context_after_refs.is_empty()
+                        || !prompt_window.context_before_refs.is_empty() =>
+                {
+                    if prompt_window.context_after_refs.pop().is_some() {
+                        trimmed_after += 1;
+                    } else {
+                        prompt_window.context_before_refs.remove(0);
+                        trimmed_before += 1;
+                    }
+                    prompt_window.total_token_count =
+                        prompt_window.candidate_token_count.saturating_add(
+                            prompt_window
+                                .context_before_refs
+                                .iter()
+                                .chain(prompt_window.context_after_refs.iter())
+                                .map(|reference| crate::canonical::estimate_tokens(&reference.text))
+                                .sum::<usize>(),
+                        );
+                    let _ = error;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn repair_json(
+        &self,
+        invalid_content: &str,
+        spec: StructuredOutputSpec,
+        attempt: usize,
+    ) -> Result<crate::client::ChatResult> {
+        tracing::warn!(
+            event = "ram_a.provider.json_repair",
+            stage = "extract",
+            attempt
+        );
+        let messages = repair_messages(invalid_content, &spec.schema);
+        self.client.validate_context_budget(
+            &messages,
+            self.max_output_tokens,
+            self.context_window_tokens,
+            self.reasoning_reserve_tokens,
+        )?;
+        self.client
+            .chat_with_schema(&self.model, messages, self.max_output_tokens, Some(spec))
+            .await
+    }
+}
+
+fn extraction_prompt_messages(prompt: String) -> Vec<Value> {
+    vec![
+        json!({"role": "system", "content": "You are a source-faithful long-term-memory extractor. Output only the requested JSON object. Never invent evidence identifiers."}),
+        json!({"role": "user", "content": prompt}),
+    ]
+}
+
+pub fn extraction_output_spec() -> StructuredOutputSpec {
+    StructuredOutputSpec {
+        name: "atomic_memory_extraction",
+        // Not fully closed under OpenAI strict rules: `attributes` allows
+        // arbitrary keys and several fields are optional without
+        // `anyOf` + `null` wrappers, which strict validation rejects.
+        // We rely on lenient json_schema implementations (e.g. GLM) plus
+        // `validate_extraction` after parsing, so `strict` stays false.
+        strict: false,
+        schema: json!({
+            // Nested objects still carry properties/required definitions so
+            // lenient json_schema implementations can guide generation; the
+            // authoritative check is `validate_extraction` after parsing.
+            "type": "object",
+            "properties": {
+                "schema_version": {"type": "string", "const": SCHEMA_VERSION},
+                "memories": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string"},
+                            "memory_type": {"type": "string"},
+                            "subject": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "source_speaker": {"type": "string"}
+                                },
+                                "required": ["name"],
+                                "additionalProperties": true
+                            },
+                            "predicate": {"type": "string"},
+                            "object": {
+                                "anyOf": [
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "name": {"type": "string"},
+                                            "type": {"type": "string"}
+                                        },
+                                        "required": ["name"],
+                                        "additionalProperties": true
+                                    },
+                                    {"type": "string"},
+                                    {"type": "null"}
+                                ]
+                            },
+                            "modality": {"type": "string"},
+                            "event_time": {
+                                "anyOf": [
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "raw": {"type": "string"},
+                                            "normalized": {"type": "string"},
+                                            "precision": {"type": "string"}
+                                        },
+                                        "additionalProperties": true
+                                    },
+                                    {"type": "null"}
+                                ]
+                            },
+                            "attributes": {
+                                "type": "object",
+                                // Arbitrary key/value pairs; values are
+                                // validated by `validate_extraction`.
+                                "additionalProperties": true
+                            },
+                            "evidence": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "message_id": {"type": "string"},
+                                        "quote": {"type": "string"},
+                                        "evidence_role": {"type": "string"}
+                                    },
+                                    "required": ["message_id", "quote", "evidence_role"],
+                                    "additionalProperties": false
+                                }
+                            },
+                            "model_confidence": {"type": "number"}
+                        },
+                        "required": [
+                            "text", "memory_type", "subject", "predicate",
+                            "modality", "evidence", "model_confidence"
+                        ],
+                        "additionalProperties": true
+                    }
+                }
+            },
+            "required": ["schema_version", "memories"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+pub(crate) fn repair_messages(invalid_content: &str, schema: &Value) -> Vec<Value> {
+    let bounded = invalid_content.chars().take(16_000).collect::<String>();
+    vec![
+        json!({"role": "system", "content": "Repair the supplied model output into valid JSON matching the schema. Preserve its facts exactly; do not add, infer, or remove facts. Return only the repaired JSON object."}),
+        json!({"role": "user", "content": format!("Schema:\n{}\n\nInvalid output:\n{}", schema, bounded)}),
+    ]
+}
+
+pub(crate) fn combine_usage(mut total: ModelUsage, added: &ModelUsage) -> ModelUsage {
+    total.latency_ms += added.latency_ms;
+    total.prompt_tokens += added.prompt_tokens;
+    total.completion_tokens += added.completion_tokens;
+    total.total_tokens += added.total_tokens;
+    total
 }
 
 impl StaticMemoryExtractor {
@@ -223,6 +475,9 @@ pub fn component_identity(component: &(impl MemoryExtractor + ?Sized)) -> Map<St
     ]);
     if let Some(tokens) = component.max_output_tokens() {
         value.insert("max_output_tokens".into(), json!(tokens));
+    }
+    if let Some(compatibility) = component.compatibility_identity() {
+        value.insert("compatibility".into(), compatibility);
     }
     value
 }
