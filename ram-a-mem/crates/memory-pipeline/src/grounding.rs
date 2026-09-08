@@ -193,6 +193,10 @@ impl GroundingVerifier for LlmGroundingVerifier {
 pub fn grounding_output_spec() -> StructuredOutputSpec {
     StructuredOutputSpec {
         name: "memory_grounding",
+        // Fully closed (every object sets `additionalProperties: false` and
+        // lists every property in `required`), so it is safe to request
+        // strict json_schema validation.
+        strict: true,
         schema: json!({
             "type": "object",
             "properties": {

@@ -49,7 +49,10 @@ RAM-A 不要求模型必须是“推理模型”或“非推理模型”。兼�
 
 `prompt_only` 只依赖提示词；兼容范围最大、约束最弱。`json_object` 发送
 `response_format={"type":"json_object"}`。`json_schema` 为 Extract 和 Ground 分别发送
-严格命名 schema。
+命名 schema：Ground 的 schema 完全封闭（全字段 `required` +
+`additionalProperties: false`），以 `strict: true` 发送；Extract 的 schema 因
+`attributes` 允许任意键、部分字段可选，无法满足 OpenAI strict 硬规则，以
+`strict: false` 发送并依赖宽松实现，解析后仍由 `validate_extraction` 完整校验。
 
 格式修复由业务阶段发起，而不是 HTTP 客户端发起，因为只有 Extract/Ground 知道目标
 schema。repair 请求只允许修复格式，不得新增事实；结果仍完整经过 schema 校验、Validation

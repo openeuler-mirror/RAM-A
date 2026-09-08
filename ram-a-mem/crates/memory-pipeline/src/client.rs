@@ -63,6 +63,13 @@ impl Default for ChatCompatibilityOptions {
 #[derive(Clone, Debug)]
 pub struct StructuredOutputSpec {
     pub name: &'static str,
+    /// Whether the schema is sent with `strict: true`. Only specs that are
+    /// fully closed under OpenAI strict rules (every object has
+    /// `additionalProperties: false` and lists every property in `required`,
+    /// with optional fields expressed via `anyOf` + `null`) may set this;
+    /// lenient schemas must send `strict: false` and rely on post-parse
+    /// validation instead.
+    pub strict: bool,
     pub schema: Value,
 }
 
@@ -263,7 +270,7 @@ impl OpenAiCompatibleClient {
                 })?;
                 payload["response_format"] = json!({
                     "type": "json_schema",
-                    "json_schema": {"name": spec.name, "strict": true, "schema": spec.schema}
+                    "json_schema": {"name": spec.name, "strict": spec.strict, "schema": spec.schema}
                 });
             }
         }
@@ -733,6 +740,7 @@ mod tests {
                 10,
                 Some(StructuredOutputSpec {
                     name: "test_output",
+                    strict: false,
                     schema: json!({"type": "object"}),
                 }),
             )
@@ -750,6 +758,7 @@ mod tests {
             request["response_format"]["json_schema"]["name"],
             "test_output"
         );
+        assert_eq!(request["response_format"]["json_schema"]["strict"], false);
         server.join().unwrap();
     }
 

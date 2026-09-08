@@ -247,11 +247,16 @@ fn extraction_prompt_messages(prompt: String) -> Vec<Value> {
 pub fn extraction_output_spec() -> StructuredOutputSpec {
     StructuredOutputSpec {
         name: "atomic_memory_extraction",
+        // Not fully closed under OpenAI strict rules: `attributes` allows
+        // arbitrary keys and several fields are optional without
+        // `anyOf` + `null` wrappers, which strict validation rejects.
+        // We rely on lenient json_schema implementations (e.g. GLM) plus
+        // `validate_extraction` after parsing, so `strict` stays false.
+        strict: false,
         schema: json!({
-            // Nested objects are given full properties/required definitions
-            // so OpenAI-style strict json_schema validation accepts the
-            // schema; only the fields the pipeline actually reads are pinned
-            // and the rest is left to `validate_extraction` after parsing.
+            // Nested objects still carry properties/required definitions so
+            // lenient json_schema implementations can guide generation; the
+            // authoritative check is `validate_extraction` after parsing.
             "type": "object",
             "properties": {
                 "schema_version": {"type": "string", "const": SCHEMA_VERSION},
