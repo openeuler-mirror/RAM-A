@@ -50,6 +50,17 @@ async fn unavailable_stub() -> StatusCode {
     StatusCode::SERVICE_UNAVAILABLE
 }
 
+async fn not_found_stub() -> StatusCode {
+    StatusCode::NOT_FOUND
+}
+
+async fn dataset_not_found_stub() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"error": "dataset not found"})),
+    )
+}
+
 async fn spawn_stub(app: Router) -> (String, tokio::task::JoinHandle<()>) {
     // Keep loopback integration traffic out of any CI/container HTTP proxy.
     std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
@@ -182,9 +193,71 @@ async fn client_rejects_unknown_libraries_and_tenant_crossing_before_http() {
         .unwrap_err();
 
     server.abort();
-    assert_eq!(unknown, CaseServiceError::Forbidden);
+    assert_eq!(unknown, CaseServiceError::LibraryNotFound);
+    assert_eq!(unknown.code(), "CASE_LIBRARY_NOT_FOUND");
+    assert_eq!(
+        unknown.to_string(),
+        "requested case library was not found"
+    );
+    assert!(!unknown.retriable());
     assert_eq!(crossing, CaseServiceError::Forbidden);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn client_maps_upstream_dataset_not_found_to_library_not_found() {
+    std::env::set_var(CASE_TOKEN_ENV, CASE_TOKEN);
+    let app = Router::new().route(
+        "/api/v1/datasets/openeuler-ops-cases/search",
+        post(dataset_not_found_stub),
+    );
+    let (base_url, server) = spawn_stub(app).await;
+    let client = CaseServiceClient::from_config(&config(base_url)).unwrap();
+
+    let error = client
+        .search(
+            &principal("tenant-a"),
+            CaseSearchRequest {
+                query: "DNS failure".to_owned(),
+                library: None,
+                top_k: 3,
+            },
+        )
+        .await
+        .unwrap_err();
+
+    server.abort();
+    assert_eq!(error, CaseServiceError::LibraryNotFound);
+    assert_eq!(error.code(), "CASE_LIBRARY_NOT_FOUND");
+    assert!(!error.retriable());
+}
+
+#[tokio::test]
+async fn client_maps_generic_upstream_not_found_to_retriable_tool_error() {
+    std::env::set_var(CASE_TOKEN_ENV, CASE_TOKEN);
+    let app = Router::new().route(
+        "/api/v1/datasets/openeuler-ops-cases/search",
+        post(not_found_stub),
+    );
+    let (base_url, server) = spawn_stub(app).await;
+    let client = CaseServiceClient::from_config(&config(base_url)).unwrap();
+
+    let error = client
+        .search(
+            &principal("tenant-a"),
+            CaseSearchRequest {
+                query: "DNS failure".to_owned(),
+                library: None,
+                top_k: 3,
+            },
+        )
+        .await
+        .unwrap_err();
+
+    server.abort();
+    assert_eq!(error, CaseServiceError::Unavailable);
+    assert_eq!(error.code(), "CASE_UNAVAILABLE");
+    assert!(error.retriable());
 }
 
 #[tokio::test]

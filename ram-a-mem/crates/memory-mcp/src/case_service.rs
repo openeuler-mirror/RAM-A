@@ -86,6 +86,7 @@ pub struct CaseDocumentDeleteResponse {
 pub enum CaseServiceError {
     InvalidRequest,
     Forbidden,
+    LibraryNotFound,
     DocumentNotFound,
     DocumentConflict,
     ConfirmationRequired,
@@ -101,6 +102,7 @@ impl CaseServiceError {
         match self {
             Self::InvalidRequest => "CASE_INVALID_REQUEST",
             Self::Forbidden => "CASE_FORBIDDEN",
+            Self::LibraryNotFound => "CASE_LIBRARY_NOT_FOUND",
             Self::DocumentNotFound => "CASE_DOCUMENT_NOT_FOUND",
             Self::DocumentConflict => "CASE_DOCUMENT_CONFLICT",
             Self::ConfirmationRequired => "CASE_USER_CONFIRMATION_REQUIRED",
@@ -122,6 +124,7 @@ impl fmt::Display for CaseServiceError {
         formatter.write_str(match self {
             Self::InvalidRequest => "case library request is invalid",
             Self::Forbidden => "case library access is forbidden",
+            Self::LibraryNotFound => "requested case library was not found",
             Self::DocumentNotFound => "case document was not found",
             Self::DocumentConflict => "case document already exists",
             Self::ConfirmationRequired => "explicit user confirmation is required",
@@ -326,8 +329,10 @@ impl EmbeddedCaseSearchProvider {
         let library = self
             .libraries
             .get(library_name)
-            .filter(|library| library.tenant_ids.contains(&principal.tenant_id))
-            .ok_or(CaseServiceError::Forbidden)?;
+            .ok_or(CaseServiceError::LibraryNotFound)?;
+        if !library.tenant_ids.contains(&principal.tenant_id) {
+            return Err(CaseServiceError::Forbidden);
+        }
         Ok((library_name.to_owned(), library.dataset_id.clone()))
     }
 
@@ -377,14 +382,20 @@ impl EmbeddedCaseSearchProvider {
             .any(|dataset| dataset.id == dataset_id))
     }
 
+    fn require_existing_dataset(&self, dataset_id: &str) -> Result<(), CaseServiceError> {
+        if self.dataset_exists(dataset_id)? {
+            Ok(())
+        } else {
+            Err(CaseServiceError::LibraryNotFound)
+        }
+    }
+
     fn document_exists(
         &self,
         dataset_id: &str,
         document_id: &str,
     ) -> Result<bool, CaseServiceError> {
-        if !self.dataset_exists(dataset_id)? {
-            return Ok(false);
-        }
+        self.require_existing_dataset(dataset_id)?;
         Ok(self
             .service
             .list_documents(dataset_id)
@@ -399,9 +410,7 @@ impl EmbeddedCaseSearchProvider {
         dataset_id: &str,
         document_id: &str,
     ) -> Result<memory_cases::model::Document, CaseServiceError> {
-        if !self.dataset_exists(dataset_id)? {
-            return Err(CaseServiceError::DocumentNotFound);
-        }
+        self.require_existing_dataset(dataset_id)?;
         self.service
             .list_documents(dataset_id)
             .map_err(|_| CaseServiceError::Unavailable)?
@@ -689,6 +698,7 @@ impl CaseSearchProvider for EmbeddedCaseSearchProvider {
             .map_err(|_| CaseServiceError::InvalidRequest)?;
         let (library_name, dataset_id) =
             self.authorized_library(principal, request.library.as_deref())?;
+        self.require_existing_dataset(&dataset_id)?;
 
         let response = self
             .service
@@ -745,7 +755,9 @@ impl CaseSearchProvider for EmbeddedCaseSearchProvider {
             .document_id
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
-        if self.document_exists(&dataset_id, &document_id)? {
+        if self.dataset_exists(&dataset_id)?
+            && self.document_exists(&dataset_id, &document_id)?
+        {
             return Err(CaseServiceError::DocumentConflict);
         }
         request.document_id = Some(document_id.clone());
@@ -972,6 +984,31 @@ impl CaseServiceClient {
         drop(segments);
         Ok(url)
     }
+
+    async fn response_body(
+        &self,
+        response: &mut reqwest::Response,
+    ) -> Result<Vec<u8>, CaseServiceError> {
+        if response
+            .content_length()
+            .is_some_and(|length| length > self.max_response_bytes as u64)
+        {
+            return Err(CaseServiceError::InvalidResponse);
+        }
+
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| CaseServiceError::Unavailable)?
+        {
+            if bytes.len().saturating_add(chunk.len()) > self.max_response_bytes {
+                return Err(CaseServiceError::InvalidResponse);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
+    }
 }
 
 #[derive(Serialize)]
@@ -983,6 +1020,11 @@ struct UpstreamSearchRequest<'a> {
 #[derive(Deserialize)]
 struct UpstreamSearchResponse {
     chunks: Vec<UpstreamChunk>,
+}
+
+#[derive(Deserialize)]
+struct UpstreamErrorResponse {
+    error: String,
 }
 
 #[derive(Deserialize)]
@@ -1009,12 +1051,14 @@ impl CaseSearchProvider for CaseServiceClient {
         let library = self
             .libraries
             .get(library_name)
-            .filter(|library| library.tenant_ids.contains(&principal.tenant_id))
-            .ok_or(CaseServiceError::Forbidden)?;
+            .ok_or(CaseServiceError::LibraryNotFound)?;
+        if !library.tenant_ids.contains(&principal.tenant_id) {
+            return Err(CaseServiceError::Forbidden);
+        }
         let url = self.search_url(&library.dataset_id)?;
         let mut response = self
             .http
-            .post(url)
+            .post(url.clone())
             .bearer_auth(self.bearer_token.as_ref())
             .json(&UpstreamSearchRequest {
                 query: &request.query,
@@ -1023,27 +1067,33 @@ impl CaseSearchProvider for CaseServiceClient {
             .send()
             .await
             .map_err(|_| CaseServiceError::Unavailable)?;
-        if !response.status().is_success() {
-            return Err(CaseServiceError::Unavailable);
-        }
-        if response
-            .content_length()
-            .is_some_and(|length| length > self.max_response_bytes as u64)
-        {
-            return Err(CaseServiceError::InvalidResponse);
+        let status = response.status();
+        if !status.is_success() {
+            let dataset_not_found = if status == reqwest::StatusCode::NOT_FOUND {
+                self.response_body(&mut response)
+                    .await
+                    .ok()
+                    .and_then(|body| serde_json::from_slice::<UpstreamErrorResponse>(&body).ok())
+                    .is_some_and(|body| body.error == "dataset not found")
+            } else {
+                false
+            };
+            let error = if dataset_not_found {
+                CaseServiceError::LibraryNotFound
+            } else {
+                CaseServiceError::Unavailable
+            };
+            tracing::warn!(
+                event = "ram_a.case.upstream_search.failed",
+                url = %url,
+                upstream_status = status.as_u16(),
+                error_code = error.code(),
+                retriable = error.retriable(),
+            );
+            return Err(error);
         }
 
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| CaseServiceError::Unavailable)?
-        {
-            if bytes.len().saturating_add(chunk.len()) > self.max_response_bytes {
-                return Err(CaseServiceError::InvalidResponse);
-            }
-            bytes.extend_from_slice(&chunk);
-        }
+        let bytes = self.response_body(&mut response).await?;
         let upstream: UpstreamSearchResponse =
             serde_json::from_slice(&bytes).map_err(|_| CaseServiceError::InvalidResponse)?;
 
@@ -1113,6 +1163,207 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    fn embedded_provider_without_dataset() -> (TempDir, EmbeddedCaseSearchProvider) {
+        let temp = TempDir::new().unwrap();
+        let service = build_service(&CaseServiceOptions {
+            rag_store: temp.path().join("cases.sqlite"),
+            memory_store: temp.path().join("case-index.sqlite"),
+            embedding_provider: EmbeddingProviderKind::Hash,
+            embedding_api_key_env: "UNUSED_CASE_EMBEDDING_KEY".to_owned(),
+            embedding_base_url: "http://127.0.0.1:1/v1".to_owned(),
+            embedding_model: "hash".to_owned(),
+            embedding_dimensions: 32,
+            chunk_size: 64,
+            summary_llm_model: None,
+            summary_llm_api_key_env: "UNUSED_CASE_SUMMARY_KEY".to_owned(),
+            summary_llm_base_url: "http://127.0.0.1:1/v1".to_owned(),
+            summary_llm_timeout_ms: 1_000,
+        })
+        .unwrap();
+        let provider = EmbeddedCaseSearchProvider::new(
+            service,
+            "ops".to_owned(),
+            &[CaseLibraryConfig {
+                name: "ops".to_owned(),
+                dataset_id: "ops-cases".to_owned(),
+                tenant_ids: vec!["tenant-a".to_owned()],
+            }],
+        );
+        (temp, provider)
+    }
+
+    fn case_writer() -> Principal {
+        Principal {
+            tenant_id: "tenant-a".to_owned(),
+            user_id: "admin".to_owned(),
+            agent_id: "case-admin".to_owned(),
+            permissions: vec!["cases:read".to_owned(), "cases:write".to_owned()],
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_search_distinguishes_missing_libraries_from_empty_results() {
+        let temp = TempDir::new().unwrap();
+        let service = build_service(&CaseServiceOptions {
+            rag_store: temp.path().join("cases.sqlite"),
+            memory_store: temp.path().join("case-index.sqlite"),
+            embedding_provider: EmbeddingProviderKind::Hash,
+            embedding_api_key_env: "UNUSED_CASE_EMBEDDING_KEY".to_owned(),
+            embedding_base_url: "http://127.0.0.1:1/v1".to_owned(),
+            embedding_model: "hash".to_owned(),
+            embedding_dimensions: 32,
+            chunk_size: 64,
+            summary_llm_model: None,
+            summary_llm_api_key_env: "UNUSED_CASE_SUMMARY_KEY".to_owned(),
+            summary_llm_base_url: "http://127.0.0.1:1/v1".to_owned(),
+            summary_llm_timeout_ms: 1_000,
+        })
+        .unwrap();
+        let provider = EmbeddedCaseSearchProvider::new(
+            service.clone(),
+            "ops".to_owned(),
+            &[CaseLibraryConfig {
+                name: "ops".to_owned(),
+                dataset_id: "ops-cases".to_owned(),
+                tenant_ids: vec!["tenant-a".to_owned()],
+            }],
+        );
+        let principal = Principal {
+            tenant_id: "tenant-a".to_owned(),
+            user_id: "alice".to_owned(),
+            agent_id: "case-reader".to_owned(),
+            permissions: vec!["cases:read".to_owned()],
+        };
+
+        let unknown_library = provider
+            .search(
+                &principal,
+                CaseSearchRequest {
+                    query: "DNS failure".to_owned(),
+                    library: Some("missing-library".to_owned()),
+                    top_k: 5,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(unknown_library, CaseServiceError::LibraryNotFound);
+        assert_eq!(unknown_library.code(), "CASE_LIBRARY_NOT_FOUND");
+        assert_eq!(
+            unknown_library.to_string(),
+            "requested case library was not found"
+        );
+        assert!(!unknown_library.retriable());
+
+        let mut other_tenant = principal.clone();
+        other_tenant.tenant_id = "tenant-b".to_owned();
+        let tenant_crossing = provider
+            .search(
+                &other_tenant,
+                CaseSearchRequest {
+                    query: "DNS failure".to_owned(),
+                    library: Some("ops".to_owned()),
+                    top_k: 5,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(tenant_crossing, CaseServiceError::Forbidden);
+        assert_eq!(tenant_crossing.code(), "CASE_FORBIDDEN");
+
+        let missing_dataset = provider
+            .search(
+                &principal,
+                CaseSearchRequest {
+                    query: "DNS failure".to_owned(),
+                    library: Some("ops".to_owned()),
+                    top_k: 5,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(missing_dataset, CaseServiceError::LibraryNotFound);
+
+        service
+            .create_dataset(CreateDatasetRequest {
+                id: Some("ops-cases".to_owned()),
+                name: "Operations cases".to_owned(),
+                description: None,
+            })
+            .unwrap();
+        let empty = provider
+            .search(
+                &principal,
+                CaseSearchRequest {
+                    query: "DNS failure".to_owned(),
+                    library: Some("ops".to_owned()),
+                    top_k: 5,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            empty,
+            CaseSearchResponse {
+                library: "ops".to_owned(),
+                references: Vec::new(),
+                truncated: false,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_update_reports_missing_library_when_dataset_was_not_created() {
+        let (_temp, provider) = embedded_provider_without_dataset();
+        let principal = case_writer();
+        let request = CaseDocumentUpdateRequest {
+            library: Some("ops".to_owned()),
+            document_id: "dns-case".to_owned(),
+            file_name: "dns-case.md".to_owned(),
+            name: None,
+            diagnosis_summary: "The resolver must be restarted.".to_owned(),
+            content: "# Updated mitigation\n\nRestart the resolver.".to_owned(),
+        };
+
+        let prepare_error = provider
+            .prepare_update_document(&principal, request.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(prepare_error, CaseServiceError::LibraryNotFound);
+        assert_eq!(prepare_error.code(), "CASE_LIBRARY_NOT_FOUND");
+
+        let execute_error = provider
+            .execute_update(&principal, "update-operation", request)
+            .await
+            .unwrap_err();
+        assert_eq!(execute_error, CaseServiceError::LibraryNotFound);
+        assert_eq!(execute_error.code(), "CASE_LIBRARY_NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn embedded_delete_reports_missing_library_when_dataset_was_not_created() {
+        let (_temp, provider) = embedded_provider_without_dataset();
+        let principal = case_writer();
+        let request = CaseDocumentDeleteRequest {
+            library: Some("ops".to_owned()),
+            document_id: "dns-case".to_owned(),
+            deletion_reason: "The case is obsolete.".to_owned(),
+        };
+
+        let prepare_error = provider
+            .prepare_delete_document(&principal, request.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(prepare_error, CaseServiceError::LibraryNotFound);
+        assert_eq!(prepare_error.code(), "CASE_LIBRARY_NOT_FOUND");
+
+        let execute_error = provider
+            .execute_delete(&principal, request)
+            .await
+            .unwrap_err();
+        assert_eq!(execute_error, CaseServiceError::LibraryNotFound);
+        assert_eq!(execute_error.code(), "CASE_LIBRARY_NOT_FOUND");
+    }
 
     #[tokio::test]
     async fn embedded_provider_uploads_updates_and_deletes_case_documents() {

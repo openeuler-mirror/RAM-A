@@ -7,6 +7,7 @@ use axum::body::{to_bytes, Body};
 use axum::http::{header, Request, StatusCode};
 use axum::response::Response;
 use axum::Router;
+use memory_cases::model::CreateDatasetRequest;
 use memory_cases::{build_service, CaseServiceOptions};
 use memory_core::{HashEmbedding, MemoryManager, SqliteMemoryStore};
 use memory_mcp::{
@@ -1197,6 +1198,91 @@ async fn case_document_mutation_tools_require_cases_write_permission() {
     assert_eq!(
         accepted_by_transport["result"]["structuredContent"]["code"],
         json!("CASE_NOT_CONFIGURED")
+    );
+}
+
+#[tokio::test]
+async fn mcp_case_search_distinguishes_missing_library_from_empty_results() {
+    let case_temp = TempDir::new().unwrap();
+    let case_service = build_service(&CaseServiceOptions {
+        rag_store: case_temp.path().join("cases.sqlite"),
+        memory_store: case_temp.path().join("case-index.sqlite"),
+        embedding_provider: memory_cases::EmbeddingProviderKind::Hash,
+        embedding_api_key_env: "UNUSED_CASE_EMBEDDING_KEY".to_owned(),
+        embedding_base_url: "http://127.0.0.1:1/v1".to_owned(),
+        embedding_model: "hash".to_owned(),
+        embedding_dimensions: 32,
+        chunk_size: 64,
+        summary_llm_model: None,
+        summary_llm_api_key_env: "UNUSED_CASE_SUMMARY_KEY".to_owned(),
+        summary_llm_base_url: "http://127.0.0.1:1/v1".to_owned(),
+        summary_llm_timeout_ms: 1_000,
+    })
+    .unwrap();
+    let case_provider: DynCaseSearchProvider = Arc::new(EmbeddedCaseSearchProvider::new(
+        case_service.clone(),
+        "ops".to_owned(),
+        &[CaseLibraryConfig {
+            name: "ops".to_owned(),
+            dataset_id: "ops-cases".to_owned(),
+            tenant_ids: vec!["tenant-a".to_owned()],
+        }],
+    ));
+    let fixture = fixture_router_with_schema_and_features(
+        &["cases:read"],
+        LimitsConfig::default(),
+        Duration::ZERO,
+        true,
+        true,
+        FeatureFlags::all(),
+        Some(case_provider),
+    )
+    .await;
+    let (session_id, _) = initialize(&fixture.app).await;
+
+    for (id, library) in [(110, "missing-library"), (111, "ops")] {
+        let missing = call_tool(
+            &fixture.app,
+            &session_id,
+            id,
+            "memory_case_search",
+            json!({"query": "DNS failure", "library": library, "top_k": 5}),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::OK);
+        let missing = response_json(missing).await;
+        assert_eq!(missing["result"]["isError"], json!(true));
+        assert_eq!(
+            missing["result"]["structuredContent"],
+            json!({
+                "code": "CASE_LIBRARY_NOT_FOUND",
+                "message": "requested case library was not found",
+                "retriable": false
+            })
+        );
+    }
+
+    case_service
+        .create_dataset(CreateDatasetRequest {
+            id: Some("ops-cases".to_owned()),
+            name: "Operations cases".to_owned(),
+            description: None,
+        })
+        .unwrap();
+    let empty = call_tool(
+        &fixture.app,
+        &session_id,
+        112,
+        "memory_case_search",
+        json!({"query": "DNS failure", "library": "ops", "top_k": 5}),
+    )
+    .await;
+    assert_eq!(empty.status(), StatusCode::OK);
+    let empty = response_json(empty).await;
+    assert_eq!(empty["result"]["isError"], json!(false));
+    assert_eq!(
+        empty["result"]["structuredContent"],
+        json!({"library": "ops", "references": [], "truncated": false})
     );
 }
 
