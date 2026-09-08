@@ -19,7 +19,8 @@ RPM 验收和源码自动化测试验证的是不同对象：
 - 发布仓中已有的旧 RPM 只能用于旧版本回归。Rerank `fail_open`、HTTP 并发限制和 Pipeline
   阶段错误契约必须使用包含对应源码提交的候选 RPM 才能作为交付验收结论。
 
-测试前必须记录 RPM 的 NEVRA 和 SHA-256，并从打包流水线记录确认其源码提交。RAM-A 当前二进制
+测试前必须记录 RPM 的 NEVRA 和 SHA-256，并从打包流水线记录确认其源码提交；下载后按第 2 节
+的 `sha256sum --check` 与期望值比对，不匹配即中止。RAM-A 当前二进制
 没有提供可用于核对提交号的 `--version` 输出，仅凭文件时间或包名不能证明包含某次修改。如果
 候选 RPM 尚未构建，应先运行下列源码测试；这些结果标记为“源码验证”，不能标记为“RPM 验收”：
 
@@ -93,13 +94,16 @@ rustc --version
 
 ```bash
 : "${RAM_A_RPM_URL:?请设置 RAM_A_RPM_URL}"
+: "${RAM_A_RPM_SHA256:?请设置 RAM_A_RPM_SHA256 为该 RPM 的期望 sha256}"
 curl --fail --location --retry 3 "$RAM_A_RPM_URL" -o /tmp/ram-a.rpm
 ```
 
-若使用本地 RPM，在启动容器时把它挂载为 `/tmp/ram-a.rpm`，跳过下载。随后执行：
+若使用本地 RPM，在启动容器时把它挂载为 `/tmp/ram-a.rpm`，跳过下载；此时由提供方直接
+给出该文件的 sha256 作为 `RAM_A_RPM_SHA256`。随后执行：
 
 ```bash
-sha256sum /tmp/ram-a.rpm | tee /root/ram-a-selftest/results/ram-a-rpm.sha256
+echo "$RAM_A_RPM_SHA256  /tmp/ram-a.rpm" | sha256sum --check --strict \
+  | tee /root/ram-a-selftest/results/ram-a-rpm.sha256
 rpm -qip /tmp/ram-a.rpm | tee /root/ram-a-selftest/results/ram-a-rpm-info.txt
 dnf install -y /tmp/ram-a.rpm
 
@@ -527,12 +531,17 @@ Extract、Validate 和 Ground 的结果决定。
 
 ```bash
 if [[ -n "${XIAOO_RPM_URL:-}" ]]; then
+  : "${XIAOO_RPM_SHA256:?请设置 XIAOO_RPM_SHA256 为该 RPM 的期望 sha256}"
   curl --fail --location --retry 3 "$XIAOO_RPM_URL" -o /tmp/xiaoo.rpm
-  sha256sum /tmp/xiaoo.rpm | tee /root/ram-a-selftest/results/xiaoo-rpm.sha256
+  echo "$XIAOO_RPM_SHA256  /tmp/xiaoo.rpm" | sha256sum --check --strict \
+    | tee /root/ram-a-selftest/results/xiaoo-rpm.sha256
   rpm -qip /tmp/xiaoo.rpm | tee /root/ram-a-selftest/results/xiaoo-rpm-info.txt
   dnf install -y /tmp/xiaoo.rpm
 fi
 ```
+
+`XIAOO_RPM_URL` 应指向固定版本的 RPM 发布地址，`XIAOO_RPM_SHA256` 由测试人员从打包
+流水线记录中提供；下载后校验失败会中止自测，避免把校验退化为“仅记录”。
 
 没有 Agent RPM 时，从目标仓库构建：
 

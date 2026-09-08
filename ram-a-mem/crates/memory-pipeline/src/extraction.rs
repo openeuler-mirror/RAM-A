@@ -248,6 +248,10 @@ pub fn extraction_output_spec() -> StructuredOutputSpec {
     StructuredOutputSpec {
         name: "atomic_memory_extraction",
         schema: json!({
+            // Nested objects are given full properties/required definitions
+            // so OpenAI-style strict json_schema validation accepts the
+            // schema; only the fields the pipeline actually reads are pinned
+            // and the rest is left to `validate_extraction` after parsing.
             "type": "object",
             "properties": {
                 "schema_version": {"type": "string", "const": SCHEMA_VERSION},
@@ -255,19 +259,55 @@ pub fn extraction_output_spec() -> StructuredOutputSpec {
                     "type": "array",
                     "items": {
                         "type": "object",
-                        // Field-level constraints are enforced by
-                        // `validate_extraction` after parsing; the schema only
-                        // pins the common shape so strict json_schema mode
-                        // accepts it.
                         "properties": {
                             "text": {"type": "string"},
                             "memory_type": {"type": "string"},
-                            "subject": {"type": "object"},
+                            "subject": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "source_speaker": {"type": "string"}
+                                },
+                                "required": ["name"],
+                                "additionalProperties": true
+                            },
                             "predicate": {"type": "string"},
-                            "object": {"type": ["object", "string", "null"]},
+                            "object": {
+                                "anyOf": [
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "name": {"type": "string"},
+                                            "type": {"type": "string"}
+                                        },
+                                        "required": ["name"],
+                                        "additionalProperties": true
+                                    },
+                                    {"type": "string"},
+                                    {"type": "null"}
+                                ]
+                            },
                             "modality": {"type": "string"},
-                            "event_time": {"type": ["object", "null"]},
-                            "attributes": {"type": "object"},
+                            "event_time": {
+                                "anyOf": [
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "raw": {"type": "string"},
+                                            "normalized": {"type": "string"},
+                                            "precision": {"type": "string"}
+                                        },
+                                        "additionalProperties": true
+                                    },
+                                    {"type": "null"}
+                                ]
+                            },
+                            "attributes": {
+                                "type": "object",
+                                // Arbitrary key/value pairs; values are
+                                // validated by `validate_extraction`.
+                                "additionalProperties": true
+                            },
                             "evidence": {
                                 "type": "array",
                                 "items": {
@@ -286,7 +326,8 @@ pub fn extraction_output_spec() -> StructuredOutputSpec {
                         "required": [
                             "text", "memory_type", "subject", "predicate",
                             "modality", "evidence", "model_confidence"
-                        ]
+                        ],
+                        "additionalProperties": true
                     }
                 }
             },

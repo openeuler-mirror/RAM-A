@@ -842,6 +842,12 @@ Hybrid 融合值或 Rerank relevance score，含义取决于运行配置，不�
 | --- | --- |
 | 请求参数非法 | `INVALID_REQUEST`，不可重试 |
 | Rerank 失败且 fail-open 关闭 | `RERANK_FAILED`，可重试 |
-| Embedding、SQLite 或 fail-closed Graph 检索失败 | 当前统一映射为 `STORAGE_FAILED`，可重试 |
+| Embedding 检索失败 | `EMBEDDING_FAILED`，可重试 |
+| SQLite busy/locked | `SQLITE_BUSY`，可重试 |
+| SQLite 只读/不可写 | `SQLITE_READONLY`，不可重试 |
+| fail-closed Graph 检索失败及其他未归类存储错误 | `STORAGE_FAILED` 兜底，可重试 |
 
-最后一项是当前错误映射的实际行为，不表示所有这类故障在语义上都是 SQLite 存储错误。
+检索路径的具体错误码由 `map_memory_error` 分类：embedding 调用失败、SQLite busy/readonly
+各有专属错误码和可重试性；`STORAGE_FAILED` 仅作无法归类的兜底。摄入路径另有
+`VECTOR_PERSIST_FAILED`（兜底不可重试）和 `IDEMPOTENCY_STORAGE_FAILED`，详见
+`docs/design/ram-a-mem-logging-and-error-observability.md` 第 8 节。
