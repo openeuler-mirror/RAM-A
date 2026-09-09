@@ -22,6 +22,11 @@ pub enum SessionStoreError {
 }
 
 impl SqliteSessionStore {
+    // Mutex policy: `load`/`list_all` are on the daemon restart recovery path,
+    // so they tolerate a poisoned lock (log + return empty) rather than abort
+    // the recovery. `save`/`remove`/`pin_session`/`is_pinned` are on the request
+    // path and keep panic-on-poison (Rust idiom): a poisoned lock means another
+    // thread already panicked and daemon state is suspect.
     // Open (or create) the DB file and ensure the sessions table exists.
     // Schema: sessions(session_id TEXT PK, map_json TEXT NOT NULL, turn_count INTEGER NOT NULL DEFAULT 0)
     pub fn new(path: &str) -> Result<Self, rusqlite::Error> {
@@ -65,23 +70,47 @@ impl SqliteSessionStore {
         Ok(())
     }
 
-    // Returns (KvCacheMap, turn_count), or None if the row is missing or JSON parsing fails.
+    // Returns (KvCacheMap, turn_count), or None if the row is missing.
     pub fn load(&self, session_id: &str) -> Option<(KvCacheMap, u32)> {
-        let db = self.db.lock().unwrap();
-        let mut stmt = db
-            .prepare("SELECT map_json, turn_count FROM sessions WHERE session_id = ?1")
-            .ok()?;
-        stmt.query_row(rusqlite::params![session_id], |row| {
+        let db = match self.db.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::error!(session_id = %session_id, error = %e, "load: store mutex poisoned");
+                return None;
+            }
+        };
+        let mut stmt =
+            match db.prepare("SELECT map_json, turn_count FROM sessions WHERE session_id = ?1") {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(session_id = %session_id, error = %e, "load: prepare failed");
+                    return None;
+                }
+            };
+        let row = match stmt.query_row(rusqlite::params![session_id], |row| {
             let map_json: String = row.get(0)?;
             let turn_count: u32 = row.get(1)?;
             Ok((map_json, turn_count))
-        })
-        .ok()
-        .and_then(|(map_json, turn_count)| {
-            serde_json::from_str(&map_json)
-                .ok()
-                .map(|map| (map, turn_count))
-        })
+        }) {
+            Ok(r) => r,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return None,
+            Err(e) => {
+                tracing::error!(session_id = %session_id, error = %e, "load: query failed");
+                return None;
+            }
+        };
+        let (map_json, turn_count) = row;
+        match serde_json::from_str::<KvCacheMap>(&map_json) {
+            Ok(map) => Some((map, turn_count)),
+            Err(e) => {
+                tracing::error!(
+                    session_id = %session_id,
+                    error = %e,
+                    "load: map_json deserialization failed, row is corrupt"
+                );
+                None
+            }
+        }
     }
 
     pub fn remove(&self, session_id: &str) {
@@ -142,5 +171,60 @@ impl SqliteSessionStore {
             |_| Ok(()),
         )
         .is_ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_store(name: &str) -> SqliteSessionStore {
+        // Each test gets a unique path so parallel `cargo test` runs don't
+        // trip over each other removing/opening the same db file.
+        let path = format!("/tmp/ram-a-kv-test-{name}-{}.db", std::process::id());
+        let _ = std::fs::remove_file(&path);
+        SqliteSessionStore::new(&path).expect("open test store")
+    }
+
+    #[test]
+    fn load_returns_none_for_missing_session() {
+        let store = tmp_store("missing");
+        assert!(store.load("nope").is_none());
+    }
+
+    #[test]
+    fn load_returns_none_for_corrupt_json_row() {
+        // Restart recovery must not panic when a row's map_json is not valid
+        // JSON (e.g., file corruption). The row is left in place; load just
+        // returns None and emits an error log.
+        let store = tmp_store("corrupt");
+        // Insert a well-formed row first so the table is set up.
+        store
+            .save("s1", &KvCacheMap(vec!["A".into()]), 1)
+            .expect("save");
+        // Corrupt the row directly via the connection.
+        {
+            let db = store.db.lock().unwrap();
+            db.execute(
+                "UPDATE sessions SET map_json = ?1 WHERE session_id = ?2",
+                rusqlite::params!["not json", "s1"],
+            )
+            .expect("corrupt row");
+        }
+        assert!(
+            store.load("s1").is_none(),
+            "corrupt row must yield None, not panic"
+        );
+    }
+
+    #[test]
+    fn save_and_load_round_trip() {
+        let store = tmp_store("roundtrip");
+        store
+            .save("s1", &KvCacheMap(vec!["A".into(), "B".into()]), 7)
+            .expect("save");
+        let (map, turn_count) = store.load("s1").expect("load");
+        assert_eq!(map.chunk_hashes(), vec!["A".to_string(), "B".to_string()]);
+        assert_eq!(turn_count, 7);
     }
 }
