@@ -45,6 +45,24 @@ RAM-A 不要求模型必须是“推理模型”或“非推理模型”。兼�
 没有任意 `extra_body` 透传。新增私有 Provider 参数前，应先在强类型配置中定义语义、边界
 和脱敏测试。
 
+## 传输重试（`max_retries`）
+
+`providers.max_retries` 是单个 Chat 请求的最大尝试次数（含首次），默认 3，只作用于
+Extract/Ground 共用的 Chat 客户端。没有固定"重试 8 次"的内置规则；实际重试次数始终
+由该配置决定。
+
+- **会重试**：传输层错误（连接拒绝、超时、DNS 失败等服务不可达情形）、HTTP
+  `408/425/429/500/502/503/504`、响应体读取失败、响应不是合法 JSON。
+- **不重试**：其余 HTTP 状态码（如 `400/401/403/404`，包括 base_url 路径写错的
+  情形）和请求前预算预检失败——重试也不会成功，立即失败。
+- 退避按 1s、2s、4s…… 指数递增，单次最长 64s。每次重试记录 `ram_a.provider.retry`
+  WARN，耗尽后记录 `ram_a.provider.failed` ERROR。
+
+该机制与 `reasoning_only_retry`（reasoning-only 纠正，至多一次）、`json_repair_attempts`
+（JSON 修复，0 或 1 次）三套独立且有界，针对不同失败类型、不互相触发；纠正/修复调用
+本身也是独立的 Chat 请求，同样受 `max_retries` 保护。Embedding/Rerank/Case 客户端
+不继承 `max_retries`。
+
 ## Structured Output 和 JSON repair
 
 `prompt_only` 只依赖提示词；兼容范围最大、约束最弱。`json_object` 发送
@@ -57,7 +75,7 @@ RAM-A 不要求模型必须是“推理模型”或“非推理模型”。兼�
 格式修复由业务阶段发起，而不是 HTTP 客户端发起，因为只有 Extract/Ground 知道目标
 schema。repair 请求只允许修复格式，不得新增事实；结果仍完整经过 schema 校验、Validation
 与 Grounding，不绕过任何质量门。transport retry、reasoning-only correction 和 JSON repair
-是三套独立且有界的机制。
+是三套独立且有界的机制，触发条件见上文"传输重试"。
 
 ## Token 预算
 

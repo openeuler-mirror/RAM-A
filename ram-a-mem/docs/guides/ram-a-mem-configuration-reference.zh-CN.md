@@ -154,7 +154,7 @@ OpenAI-compatible API 或本地确定性 hash。
 | `extractor_model` | 部署必配 | 无 | 使用已验证能稳定输出 JSON 的 Chat 模型 | 非空；模型是否存在由联通测试验证 |
 | `verifier_model` | 部署必配 | 无 | 推荐与 `extractor_model` 使用相同模型 | 非空；用于 Ground，也支持独立配置 |
 | `timeout_seconds` | 推荐可配置 | 120 | 120 | 大于 0；Chat 请求超时 |
-| `max_retries` | 推荐可配置 | 3 | 3 | 大于 0；仅作用于 Extract/Ground 共用的 Chat 客户端 |
+| `max_retries` | 推荐可配置 | 3 | 3 | 大于 0；单个 Chat 请求的最大尝试次数（含首次），默认 3 即首次 + 最多 2 次重试；仅作用于 Extract/Ground 共用的 Chat 客户端；传输错误和可重试 HTTP 状态码（408/425/429/500/502/503/504）触发重试，其余 HTTP 错误立即失败；无"固定重试 8 次"规则 |
 | `reasoning_effort` | 条件配置 | `null` | GLM Coding Plan 已验证可用 `none` | 配置时非空；透传给 Chat 请求；与 `enable_thinking` 不能同时配置 |
 | `enable_thinking` | 条件配置 | `null` | 仅在 Provider 明确支持时使用 `false` | 布尔值；透传给 Chat 请求；与 `reasoning_effort` 不能同时配置 |
 | `send_temperature` | 推荐可配置 | `true` | 兼容服务不接受 temperature 时设 `false` | `true` 时发送 `temperature`，`false` 时省略 |
