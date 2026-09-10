@@ -38,24 +38,17 @@ use axum::routing::post;
 use axum::Router;
 use tokio::net::TcpListener;
 
-// Load config from $RAM_A_KV_CONFIG (default /etc/ram-a-kv/config.toml); fall back to defaults on any error.
-fn load_config() -> DaemonConfig {
+fn load_config() -> Result<DaemonConfig, String> {
     let config_path = std::env::var("RAM_A_KV_CONFIG")
         .unwrap_or_else(|_| "/etc/ram-a-kv/config.toml".to_string());
-    if std::path::Path::new(&config_path).exists() {
-        let content = std::fs::read_to_string(&config_path)
-            .unwrap_or_else(|e| {
-                tracing::warn!(path = %config_path, error = %e, "config file read failed, using defaults");
-                String::new()
-            });
-        DaemonConfig::from_toml_str(&content).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "config parse failed, using defaults");
-            DaemonConfig::default()
-        })
-    } else {
+    if !std::path::Path::new(&config_path).exists() {
         tracing::info!("no config file found, using defaults");
-        DaemonConfig::default()
+        return Ok(DaemonConfig::default());
     }
+    let content = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("read config file {config_path}: {e}"))?;
+    DaemonConfig::from_toml_str(&content)
+        .map_err(|e| format!("parse config file {config_path}: {e}"))
 }
 
 // Returns true when `listen_addr` binds to a non-loopback interface, i.e. the
@@ -86,22 +79,38 @@ async fn require_auth(
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|h| h.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "));
-        match provided {
-            Some(token) if token == expected => {}
-            _ => {
-                return (StatusCode::UNAUTHORIZED, "invalid or missing bearer token")
-                    .into_response();
-            }
+        let ok = provided
+            .map(|t| constant_time_eq(t.as_bytes(), expected.as_bytes()))
+            .unwrap_or(false);
+        if !ok {
+            return (StatusCode::UNAUTHORIZED, "invalid or missing bearer token").into_response();
         }
     }
     next.run(request).await
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let config = load_config();
+    let config = match load_config() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "refusing to start: config load failed");
+            std::process::exit(1);
+        }
+    };
 
     // Refuse to start when the daemon would expose an unauthenticated /event
     // endpoint to non-loopback callers.
@@ -197,4 +206,52 @@ async fn main() {
         tracing::error!(error = %e, "server terminated with error");
         std::process::exit(1);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constant_time_eq_handles_equal_slices() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"a", b"a"));
+    }
+
+    #[test]
+    fn constant_time_eq_handles_same_length_different_bytes() {
+        assert!(!constant_time_eq(b"secret", b"secreu"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"\x00", b"\x01"));
+    }
+
+    #[test]
+    fn constant_time_eq_handles_different_lengths() {
+        assert!(!constant_time_eq(b"short", b"longer"));
+        assert!(!constant_time_eq(b"a", b"ab"));
+        assert!(!constant_time_eq(b"", b"a"));
+    }
+
+    // load_config must reject a file that exists but contains invalid TOML,
+    // and must fall back to defaults only when the file is missing. The env
+    // var is process-global, so this test is the only one touching it here.
+    #[test]
+    fn load_config_fails_on_invalid_toml_and_defaults_when_missing() {
+        // Missing file -> Ok(defaults).
+        let missing = "/tmp/ram-a-kv-config-does-not-exist-12345.toml";
+        std::env::set_var("RAM_A_KV_CONFIG", missing);
+        let cfg = load_config().expect("missing file must fall back to defaults");
+        assert_eq!(cfg.listen_addr, "127.0.0.1:6998");
+
+        // Existing file with invalid TOML -> Err.
+        let bad_path = "/tmp/ram-a-kv-config-invalid-test.toml";
+        std::fs::write(bad_path, "this is = not valid = toml ][").unwrap();
+        std::env::set_var("RAM_A_KV_CONFIG", bad_path);
+        let res = load_config();
+        assert!(res.is_err(), "invalid TOML must be rejected, not defaulted");
+        let _ = std::fs::remove_file(bad_path);
+
+        std::env::remove_var("RAM_A_KV_CONFIG");
+    }
 }

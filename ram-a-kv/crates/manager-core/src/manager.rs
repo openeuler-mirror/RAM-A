@@ -197,16 +197,7 @@ impl KvCacheManager {
                 .collect();
 
             let mut refcounts = self.refcounts.lock().await;
-            let mut to_evict = Vec::new();
-            for hash in &to_decrement {
-                if let Some(count) = refcounts.get_mut(hash) {
-                    *count -= 1;
-                    if *count == 0 {
-                        to_evict.push(hash.clone());
-                        refcounts.remove(hash);
-                    }
-                }
-            }
+            let to_evict = decrement_refcounts(&mut refcounts, &to_decrement);
             for hash in &to_increment {
                 *refcounts.entry(hash.clone()).or_insert(0) += 1;
             }
@@ -298,16 +289,7 @@ impl KvCacheManager {
                 .collect();
 
             let mut refcounts = self.refcounts.lock().await;
-            let mut to_evict = Vec::new();
-            for hash in &to_decrement {
-                if let Some(count) = refcounts.get_mut(hash) {
-                    *count -= 1;
-                    if *count == 0 {
-                        to_evict.push(hash.clone());
-                        refcounts.remove(hash);
-                    }
-                }
-            }
+            let to_evict = decrement_refcounts(&mut refcounts, &to_decrement);
             for hash in &to_increment {
                 *refcounts.entry(hash.clone()).or_insert(0) += 1;
             }
@@ -398,17 +380,7 @@ impl KvCacheManager {
             let unique = unique_hashes(&state.map.chunk_hashes());
 
             let mut refcounts = self.refcounts.lock().await;
-            let mut to_evict = Vec::new();
-            for hash in &unique {
-                if let Some(count) = refcounts.get_mut(hash) {
-                    *count -= 1;
-                    if *count == 0 {
-                        to_evict.push(hash.clone());
-                        refcounts.remove(hash);
-                    }
-                }
-            }
-            to_evict
+            decrement_refcounts(&mut refcounts, &unique)
         };
 
         if !to_evict.is_empty() {
@@ -482,7 +454,18 @@ impl KvCacheManager {
         let to_evict = {
             let mut snapshots = self.fork_snapshots.lock().await;
             let snapshot = if let Some(id) = fork_id {
-                snapshots.remove(&id)
+                match snapshots.get(&id) {
+                    Some(s) if s.session_id == session_id => snapshots.remove(&id),
+                    Some(_) => {
+                        tracing::warn!(
+                            fork_id = id,
+                            session_id = %session_id,
+                            "fork_id does not belong to this session, ignoring fork_end"
+                        );
+                        None
+                    }
+                    None => None,
+                }
             } else {
                 // No fork_id: pick the most recent fork for this session.
                 // fork_id is monotonically increasing, so max == latest.
@@ -499,17 +482,7 @@ impl KvCacheManager {
             };
 
             let mut refcounts = self.refcounts.lock().await;
-            let mut to_evict = Vec::new();
-            for hash in &snapshot.hashes {
-                if let Some(count) = refcounts.get_mut(hash) {
-                    *count -= 1;
-                    if *count == 0 {
-                        to_evict.push(hash.clone());
-                        refcounts.remove(hash);
-                    }
-                }
-            }
-            to_evict
+            decrement_refcounts(&mut refcounts, &snapshot.hashes)
         };
 
         if !to_evict.is_empty() {
@@ -606,6 +579,28 @@ fn old_unique_iter(old_hashes: &[String], new_set: &HashSet<&String>) -> Vec<Str
         .filter(|h| !new_set.contains(h))
         .cloned()
         .collect()
+}
+
+fn decrement_refcounts(refcounts: &mut HashMap<String, u64>, hashes: &[String]) -> Vec<String> {
+    let mut to_evict = Vec::new();
+    for hash in hashes {
+        match refcounts.get_mut(hash) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                if *count == 0 {
+                    to_evict.push(hash.clone());
+                    refcounts.remove(hash);
+                }
+            }
+            Some(_) => {
+                tracing::warn!(hash = %hash, "refcount underflow detected, skipping decrement");
+            }
+            None => {
+                tracing::warn!(hash = %hash, "refcount entry missing, skipping decrement");
+            }
+        }
+    }
+    to_evict
 }
 
 #[cfg(test)]
@@ -855,5 +850,101 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mgr.session_turn_count("s1").await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn fork_end_rejects_fork_id_from_another_session() {
+        // Two sessions each fork. Session A must not be able to release session B's
+        // fork snapshot by passing B's fork_id — the ownership check must reject it.
+        let mgr = KvCacheManager::new_noop(test_config());
+
+        mgr.on_turn_end("A", vec!["X".into()], None).await.unwrap();
+        mgr.on_turn_end("B", vec!["Y".into()], None).await.unwrap();
+        let fork_a = mgr.on_session_fork("A").await.unwrap();
+        let fork_b = mgr.on_session_fork("B").await.unwrap();
+
+        // A attempts to release B's fork. Before the ownership guard this would
+        // wrongly drop B's snapshot references; now it must be a no-op.
+        let outcome = mgr
+            .on_session_fork_end("A", Some(fork_b.fork_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.evicted_count, 0,
+            "cross-session fork_id must not evict"
+        );
+
+        // B's snapshot must still be intact so B's own fork_end can release it.
+        {
+            let snapshots = mgr.fork_snapshots.lock().await;
+            assert!(
+                snapshots.contains_key(&fork_b.fork_id),
+                "B's fork snapshot must still be present"
+            );
+        }
+        // B's reference to Y must still be 2 (parent.map + fork snapshot).
+        {
+            let refcounts = mgr.refcounts.lock().await;
+            assert_eq!(refcounts.get("Y"), Some(&2), "B's refs untouched");
+        }
+
+        // B's own fork_end must succeed (ownership matches). Y stays referenced
+        // by B's session map, so it is not evicted here; only the fork snapshot
+        // reference is released (refcount Y: 2 -> 1).
+        let outcome = mgr
+            .on_session_fork_end("B", Some(fork_b.fork_id))
+            .await
+            .unwrap();
+        assert_eq!(outcome.evicted_count, 0, "Y still held by B.map, no evict");
+        {
+            let refcounts = mgr.refcounts.lock().await;
+            assert_eq!(refcounts.get("Y"), Some(&1), "fork snapshot ref released");
+        }
+
+        // A's own fork_end must still work too (X's fork ref is released).
+        let outcome = mgr
+            .on_session_fork_end("A", Some(fork_a.fork_id))
+            .await
+            .unwrap();
+        assert_eq!(outcome.evicted_count, 0, "X still held by A.map, no evict");
+        {
+            let refcounts = mgr.refcounts.lock().await;
+            assert_eq!(refcounts.get("X"), Some(&1), "A's fork ref released");
+        }
+    }
+
+    #[tokio::test]
+    async fn refcount_underflow_guard_prevents_u64_wraparound() {
+        // If refcounts somehow contains a 0 entry (broken invariant), decrementing
+        // must NOT wrap to u64::MAX and leave the chunk un-evictable. The guard
+        // skips the decrement and emits a warn log instead.
+        let mgr = KvCacheManager::new_noop(test_config());
+        // Restore a session that references Z, so on_session_close will put Z
+        // into the decrement path. We then manually zero its refcount to
+        // simulate a broken invariant.
+        mgr.restore_session(
+            "s1",
+            SessionKvState {
+                map: KvCacheMap(vec!["Z".into()]),
+                turn_count: 1,
+            },
+        )
+        .await;
+        mgr.rebuild_refcounts().await; // refcount[Z] = 1
+        {
+            let mut refcounts = mgr.refcounts.lock().await;
+            refcounts.insert("Z".to_string(), 0); // simulate corruption
+        }
+        // Close the session: the decrement path must hit the underflow guard
+        // and skip Z (no wraparound, no to_evict push).
+        let outcome = mgr.on_session_close("s1").await.unwrap();
+        assert_eq!(outcome.evicted_count, 0, "Z must not be pushed to to_evict");
+        {
+            let refcounts = mgr.refcounts.lock().await;
+            match refcounts.get("Z") {
+                Some(v) => assert_eq!(*v, 0, "Z must not wrap to u64::MAX"),
+                None => { /* acceptable: caller may have cleaned up */ }
+            }
+        }
     }
 }
