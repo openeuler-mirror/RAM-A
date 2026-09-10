@@ -1124,6 +1124,7 @@ name = "memory-cases"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "memory-core",
  "reqwest",

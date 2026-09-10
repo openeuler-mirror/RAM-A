@@ -1,11 +1,14 @@
 use std::{
+    fmt,
     path::{Path, PathBuf},
     thread,
     time::Duration,
 };
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, ErrorCode, OptionalExtension, TransactionBehavior};
+use rusqlite::{
+    params, Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior,
+};
 use uuid::Uuid;
 
 use crate::model::{Chunk, Dataset, Document, IngestionTask, StoredDocument};
@@ -17,6 +20,27 @@ const SQLITE_LOCK_RETRY_MAX_DELAY: Duration = Duration::from_millis(500);
 
 pub struct RagRepository {
     path: PathBuf,
+}
+
+#[derive(Debug)]
+struct BusinessDatabaseMissing {
+    path: PathBuf,
+}
+
+impl fmt::Display for BusinessDatabaseMissing {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "case business database is missing: {}",
+            self.path.display()
+        )
+    }
+}
+
+impl std::error::Error for BusinessDatabaseMissing {}
+
+pub(crate) fn is_business_database_missing(error: &anyhow::Error) -> bool {
+    error.is::<BusinessDatabaseMissing>()
 }
 
 pub struct DocumentMutation<'a> {
@@ -35,8 +59,17 @@ impl RagRepository {
 
     pub fn initialize(&self) -> Result<()> {
         retry_sqlite_locked(|| {
-            let connection = open_connection(&self.path)?;
+            let connection = open_or_create_connection(&self.path)?;
             initialize_schema(&connection)
+        })
+    }
+
+    pub(crate) fn database_exists(&self) -> Result<bool> {
+        self.path.try_exists().with_context(|| {
+            format!(
+                "failed to inspect case business database {}",
+                self.path.display()
+            )
         })
     }
 
@@ -50,7 +83,7 @@ impl RagRepository {
         anyhow::ensure!(!name.is_empty(), "dataset name must not be empty");
 
         retry_sqlite_locked(|| {
-            let connection = open_connection(&self.path)?;
+            let connection = open_existing_connection(&self.path)?;
             let now = current_time_ms();
             let dataset = Dataset {
                 id: request_id_or_uuid(id, "dataset id")?,
@@ -80,7 +113,7 @@ impl RagRepository {
 
     pub fn list_datasets(&self) -> Result<Vec<Dataset>> {
         retry_sqlite_locked(|| {
-            let connection = open_connection(&self.path)?;
+            let connection = open_existing_connection(&self.path)?;
             let mut statement = connection.prepare(
                 r#"
                 SELECT id, name, description, created_at_ms, updated_at_ms
@@ -93,9 +126,22 @@ impl RagRepository {
         })
     }
 
+    /// Returns whether the business database contains canonical chunk data
+    /// that must have a corresponding retrieval index.
+    pub fn has_indexable_chunks(&self) -> Result<bool> {
+        retry_sqlite_locked(|| {
+            let connection = open_existing_connection(&self.path)?;
+            connection
+                .query_row("SELECT EXISTS(SELECT 1 FROM rag_chunks LIMIT 1)", [], |row| {
+                    row.get(0)
+                })
+                .map_err(Into::into)
+        })
+    }
+
     pub fn get_dataset(&self, dataset_id: &str) -> Result<Option<Dataset>> {
         retry_sqlite_locked(|| {
-            let connection = open_connection(&self.path)?;
+            let connection = open_existing_connection(&self.path)?;
             connection
                 .query_row(
                     r#"
@@ -125,7 +171,7 @@ impl RagRepository {
         );
 
         retry_sqlite_locked(|| {
-            let mut connection = open_connection(&self.path)?;
+            let mut connection = open_existing_connection(&self.path)?;
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let dataset_exists: bool = transaction.query_row(
@@ -214,7 +260,7 @@ impl RagRepository {
 
     pub fn list_documents(&self, dataset_id: &str) -> Result<Vec<Document>> {
         retry_sqlite_locked(|| {
-            let connection = open_connection(&self.path)?;
+            let connection = open_existing_connection(&self.path)?;
             let mut statement = connection.prepare(
                 r#"
                 SELECT
@@ -254,7 +300,7 @@ impl RagRepository {
         );
 
         retry_sqlite_locked(|| {
-            let mut connection = open_connection(&self.path)?;
+            let mut connection = open_existing_connection(&self.path)?;
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let existing = transaction
@@ -364,7 +410,7 @@ impl RagRepository {
 
     pub fn delete_document(&self, dataset_id: &str, document_id: &str) -> Result<Option<Document>> {
         retry_sqlite_locked(|| {
-            let mut connection = open_connection(&self.path)?;
+            let mut connection = open_existing_connection(&self.path)?;
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let document = transaction
@@ -414,7 +460,7 @@ impl RagRepository {
 
     pub fn get_task(&self, task_id: &str) -> Result<Option<IngestionTask>> {
         retry_sqlite_locked(|| {
-            let connection = open_connection(&self.path)?;
+            let connection = open_existing_connection(&self.path)?;
             connection
                 .query_row(
                     r#"
@@ -432,7 +478,7 @@ impl RagRepository {
 
     pub fn lease_next_pending_task(&self) -> Result<Option<IngestionTask>> {
         retry_sqlite_locked(|| {
-            let mut connection = open_connection(&self.path)?;
+            let mut connection = open_existing_connection(&self.path)?;
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let task = transaction
@@ -486,7 +532,7 @@ impl RagRepository {
 
     pub fn recover_running_tasks(&self) -> Result<usize> {
         retry_sqlite_locked(|| {
-            let mut connection = open_connection(&self.path)?;
+            let mut connection = open_existing_connection(&self.path)?;
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let now = current_time_ms();
@@ -520,7 +566,7 @@ impl RagRepository {
 
     pub fn get_stored_document(&self, document_id: &str) -> Result<Option<StoredDocument>> {
         retry_sqlite_locked(|| {
-            let connection = open_connection(&self.path)?;
+            let connection = open_existing_connection(&self.path)?;
             connection
                 .query_row(
                     r#"
@@ -551,7 +597,7 @@ impl RagRepository {
         chunks: &[Chunk],
     ) -> Result<()> {
         retry_sqlite_locked(|| {
-            let mut connection = open_connection(&self.path)?;
+            let mut connection = open_existing_connection(&self.path)?;
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             transaction.execute(
@@ -607,7 +653,7 @@ impl RagRepository {
         chunk_count: usize,
     ) -> Result<()> {
         retry_sqlite_locked(|| {
-            let mut connection = open_connection(&self.path)?;
+            let mut connection = open_existing_connection(&self.path)?;
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let now = current_time_ms();
@@ -634,7 +680,7 @@ impl RagRepository {
 
     pub fn fail_task(&self, task_id: &str, document_id: &str, error: &str) -> Result<()> {
         retry_sqlite_locked(|| {
-            let mut connection = open_connection(&self.path)?;
+            let mut connection = open_existing_connection(&self.path)?;
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let now = current_time_ms();
@@ -661,7 +707,7 @@ impl RagRepository {
 
     pub fn list_chunks(&self, dataset_id: &str, document_id: &str) -> Result<Vec<Chunk>> {
         retry_sqlite_locked(|| {
-            let connection = open_connection(&self.path)?;
+            let connection = open_existing_connection(&self.path)?;
             let mut statement = connection.prepare(
                 r#"
                 SELECT
@@ -688,15 +734,44 @@ impl RagRepository {
     }
 }
 
-fn open_connection(path: &Path) -> Result<Connection> {
+// Runtime operations must never replace a missing source-of-truth database with
+// a new empty file. Database creation is restricted to `initialize`.
+fn open_existing_connection(path: &Path) -> Result<Connection> {
+    let connection = Connection::open_with_flags(path, existing_database_open_flags()).map_err(
+        |error| {
+            let error = anyhow::Error::new(error);
+            if matches!(path.try_exists(), Ok(false)) {
+                error.context(BusinessDatabaseMissing {
+                    path: path.to_path_buf(),
+                })
+            } else {
+                error.context(format!(
+                    "case business database does not exist or cannot be opened: {}",
+                    path.display()
+                ))
+            }
+        },
+    )?;
+    configure_connection(&connection)?;
+    Ok(connection)
+}
+
+fn open_or_create_connection(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let connection =
-        Connection::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let connection = Connection::open_with_flags(
+        path,
+        existing_database_open_flags() | OpenFlags::SQLITE_OPEN_CREATE,
+    )
+    .with_context(|| format!("failed to open or create {}", path.display()))?;
     configure_connection(&connection)?;
     Ok(connection)
+}
+
+fn existing_database_open_flags() -> OpenFlags {
+    OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX
 }
 
 fn configure_connection(connection: &Connection) -> Result<()> {
@@ -996,6 +1071,81 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
         }
+    }
+
+    fn assert_missing_database_error(error: anyhow::Error, path: &Path) {
+        assert!(
+            is_business_database_missing(&error),
+            "missing database error was not classified: {error:#}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("case business database is missing"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            !path.exists(),
+            "runtime operation recreated deleted database {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn runtime_open_flags_require_an_existing_filesystem_database() {
+        let flags = existing_database_open_flags();
+
+        assert!(flags.contains(OpenFlags::SQLITE_OPEN_READ_WRITE));
+        assert!(flags.contains(OpenFlags::SQLITE_OPEN_NO_MUTEX));
+        assert!(!flags.contains(OpenFlags::SQLITE_OPEN_CREATE));
+        assert!(!flags.contains(OpenFlags::SQLITE_OPEN_URI));
+        assert!(!flags.contains(OpenFlags::SQLITE_OPEN_MEMORY));
+    }
+
+    #[test]
+    fn runtime_operations_do_not_recreate_deleted_database() {
+        let (repo, path) = test_repo();
+        repo.create_dataset(Some("dataset-1"), "Dataset", None)
+            .expect("create dataset");
+        repo.create_document_with_task(
+            "dataset-1",
+            DocumentMutation {
+                document_id: Some("doc-1"),
+                task_id: Some("task-1"),
+                name: "old.md",
+                file_path: "/tmp/old.md",
+                mime_type: Some("text/markdown"),
+                size_bytes: 12,
+            },
+        )
+        .expect("create document");
+        remove_repo_files(&path);
+
+        let query_error = repo
+            .get_dataset("dataset-1")
+            .expect_err("query must fail after database deletion");
+        assert_missing_database_error(query_error, &path);
+
+        let update_error = repo
+            .update_document_with_task(
+                "dataset-1",
+                "doc-1",
+                DocumentMutation {
+                    document_id: None,
+                    task_id: Some("task-2"),
+                    name: "new.md",
+                    file_path: "/tmp/new.md",
+                    mime_type: Some("text/markdown"),
+                    size_bytes: 24,
+                },
+            )
+            .expect_err("update must fail after database deletion");
+        assert_missing_database_error(update_error, &path);
+
+        let polling_error = repo
+            .lease_next_pending_task()
+            .expect_err("polling must fail after database deletion");
+        assert_missing_database_error(polling_error, &path);
     }
 
     #[test]

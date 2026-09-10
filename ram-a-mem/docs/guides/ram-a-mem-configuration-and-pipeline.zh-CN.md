@@ -165,7 +165,9 @@ Chat 请求，同样受 `max_retries` 传输重试保护。Embedding、Rerank、
 - `rag_store`：案例源数据、任务和 chunk 的 SQLite 文件。
 - `index_store`：案例检索索引 SQLite 文件，必须与 `rag_store` 和个人记忆库不同。
 - `source_dir`：可选的本地案例导入目录。
-- `api_token_env`：可选的案例管理 REST API 独立管理员 Token 环境变量。
+- `api_token_env`：可选的案例管理 REST API 管理员凭证环境变量。配置后托管 `/api/v1/**`
+  管理端点（含 dataset/document 变更与全量索引重建）；该凭证不得下发给普通调用方，普通
+  客户端请通过 MCP 访问案例库。未配置时管理端点不会挂载。
 - `ingestion_poll_ms`：内置摄入 Worker 的轮询间隔，必须大于 0。
 - `embedding_*`、`chunk_size`：案例 chunk 的向量化配置。
 - `summary_llm_*`：可选的案例摘要模型配置；`summary_llm_model=null` 表示不启用模型摘要。

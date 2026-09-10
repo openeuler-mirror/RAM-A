@@ -47,18 +47,46 @@ pub struct CaseServiceOptions {
     pub summary_llm_timeout_ms: u64,
 }
 
+/// Returns whether an operation failed because the case business database file is missing.
+pub fn is_business_database_missing(error: &anyhow::Error) -> bool {
+    repo::is_business_database_missing(error)
+}
+
+/// Returns whether an operation failed because the case index database file is missing.
+pub fn is_case_index_database_missing(error: &anyhow::Error) -> bool {
+    service::is_case_index_database_missing(error)
+}
+
+/// Returns whether an administrator-requested index rebuild is already active.
+pub fn is_case_index_rebuild_in_progress(error: &anyhow::Error) -> bool {
+    service::is_case_index_rebuild_in_progress(error)
+}
+
 pub fn build_service(options: &CaseServiceOptions) -> Result<Arc<RagService>> {
     let repo = Arc::new(RagRepository::new(&options.rag_store));
     repo.initialize()?;
 
-    let store = Arc::new(SqliteMemoryStore::new(&options.memory_store));
+    let store = Arc::new(SqliteMemoryStore::new_existing(&options.memory_store));
+    let index_exists = options.memory_store.try_exists().with_context(|| {
+        format!(
+            "failed to inspect case index database {}",
+            options.memory_store.display()
+        )
+    })?;
+    if !index_exists && !repo.has_indexable_chunks()? {
+        store
+            .initialize_blocking()
+            .context("failed to initialize empty case index database during daemon startup")?;
+    }
     let embedder = build_embedding_provider(options)?;
     let retrieval = RetrievalConfig {
         mode: SearchMode::Hybrid,
         ..RetrievalConfig::default()
     };
     let memory = Arc::new(MemoryManager::with_retrieval_config(
-        store, embedder, retrieval,
+        store.clone(),
+        embedder.clone(),
+        retrieval,
     ));
     let file_root = options
         .rag_store
@@ -69,6 +97,8 @@ pub fn build_service(options: &CaseServiceOptions) -> Result<Arc<RagService>> {
     Ok(Arc::new(RagService::new(
         repo,
         memory,
+        embedder,
+        store,
         RagConfig {
             file_root,
             chunk_size: options.chunk_size,

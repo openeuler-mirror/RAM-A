@@ -8,7 +8,9 @@ use std::{
 };
 
 use async_trait::async_trait;
-use rusqlite::{ffi::sqlite3_auto_extension, params, Connection, ErrorCode, TransactionBehavior};
+use rusqlite::{
+    ffi::sqlite3_auto_extension, params, Connection, ErrorCode, OpenFlags, TransactionBehavior,
+};
 use sqlite_vec::sqlite3_vec_init;
 
 use crate::{
@@ -31,21 +33,45 @@ type SqliteAutoExtensionEntry = unsafe extern "C" fn(
 
 pub struct SqliteMemoryStore {
     path: PathBuf,
+    create_if_missing: bool,
 }
 
 impl SqliteMemoryStore {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            create_if_missing: true,
+        }
+    }
+
+    /// Builds a store whose ordinary operations require an existing database.
+    /// [`Self::initialize`] remains the explicit creation boundary.
+    pub fn new_existing(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            create_if_missing: false,
+        }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// Creates the database and initializes its schema on the current thread.
+    ///
+    /// This is intended for daemon startup, before request processing begins.
+    pub fn initialize_blocking(&self) -> MemoryResult<()> {
+        let path = self.path.clone();
+        retry_sqlite_locked(|| {
+            let _connection = open_connection(&path, true)?;
+            Ok(())
+        })
+    }
+
     pub async fn initialize(&self) -> MemoryResult<()> {
         let path = self.path.clone();
         run_sqlite_operation(move || {
-            let _connection = open_connection(&path)?;
+            let _connection = open_connection(&path, true)?;
             Ok(())
         })
         .await
@@ -67,9 +93,10 @@ impl SqliteMemoryStore {
         }
 
         let path = self.path.clone();
+        let create_if_missing = self.create_if_missing;
         let filter = filter.cloned();
         run_sqlite_operation(move || {
-            let connection = open_connection(&path)?;
+            let connection = open_connection(&path, create_if_missing)?;
             bm25_candidates(&connection, &query, filter.as_ref(), limit)
         })
         .await
@@ -86,10 +113,11 @@ impl SqliteMemoryStore {
         }
 
         let path = self.path.clone();
+        let create_if_missing = self.create_if_missing;
         let query_embedding = query_embedding.to_vec();
         let filter = filter.cloned();
         run_sqlite_operation(move || {
-            let connection = open_connection(&path)?;
+            let connection = open_connection(&path, create_if_missing)?;
             dense_candidates(&connection, &query_embedding, filter.as_ref(), limit)
         })
         .await
@@ -104,9 +132,10 @@ impl MemoryStore for SqliteMemoryStore {
 
     async fn add_record(&self, record: &MemoryRecord) -> MemoryResult<()> {
         let path = self.path.clone();
+        let create_if_missing = self.create_if_missing;
         let record = record.clone();
         run_sqlite_operation(move || {
-            let mut connection = open_connection(&path)?;
+            let mut connection = open_connection(&path, create_if_missing)?;
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             upsert_record(&transaction, &record)?;
@@ -118,9 +147,10 @@ impl MemoryStore for SqliteMemoryStore {
 
     async fn add_records(&self, records: &[MemoryRecord]) -> MemoryResult<()> {
         let path = self.path.clone();
+        let create_if_missing = self.create_if_missing;
         let records = records.to_vec();
         run_sqlite_operation(move || {
-            let mut connection = open_connection(&path)?;
+            let mut connection = open_connection(&path, create_if_missing)?;
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             for record in &records {
@@ -134,8 +164,9 @@ impl MemoryStore for SqliteMemoryStore {
 
     async fn list_records(&self) -> MemoryResult<Vec<MemoryRecord>> {
         let path = self.path.clone();
+        let create_if_missing = self.create_if_missing;
         run_sqlite_operation(move || {
-            let connection = open_connection(&path)?;
+            let connection = open_connection(&path, create_if_missing)?;
             list_records(&connection)
         })
         .await
@@ -143,9 +174,10 @@ impl MemoryStore for SqliteMemoryStore {
 
     async fn replace_all(&self, records: &[MemoryRecord]) -> MemoryResult<()> {
         let path = self.path.clone();
+        let create_if_missing = self.create_if_missing;
         let records = records.to_vec();
         run_sqlite_operation(move || {
-            let mut connection = open_connection(&path)?;
+            let mut connection = open_connection(&path, create_if_missing)?;
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             transaction.execute("DELETE FROM memories", [])?;
@@ -172,12 +204,19 @@ where
         })?
 }
 
-fn open_connection(path: &Path) -> MemoryResult<Connection> {
+fn open_connection(path: &Path, create_if_missing: bool) -> MemoryResult<Connection> {
     register_sqlite_vec_extension();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let connection = Connection::open(path)?;
+    let connection = if create_if_missing {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        Connection::open(path)?
+    } else {
+        Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?
+    };
     configure_connection(&connection)?;
     initialize_schema(&connection)?;
     Ok(connection)
@@ -707,8 +746,8 @@ fn blob_to_embedding(bytes: &[u8]) -> MemoryResult<Vec<f32>> {
 mod tests {
     use serde_json::json;
 
-    use super::normalize_lower_is_better_scores;
-    use crate::{MemoryRecord, ScoredMemory};
+    use super::{normalize_lower_is_better_scores, SqliteMemoryStore};
+    use crate::{MemoryRecord, MemoryStore, ScoredMemory};
 
     fn candidate(id: &str, score: f32) -> ScoredMemory {
         ScoredMemory {
@@ -746,5 +785,25 @@ mod tests {
         normalize_lower_is_better_scores(&mut candidates);
 
         assert!(candidates.iter().all(|candidate| candidate.score == 1.0));
+    }
+
+    #[tokio::test]
+    async fn existing_store_requires_explicit_initialization_before_creation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("index.sqlite");
+        let store = SqliteMemoryStore::new_existing(&path);
+
+        store
+            .list_records()
+            .await
+            .expect_err("ordinary access must not create a missing database");
+        assert!(!path.exists());
+
+        store
+            .initialize()
+            .await
+            .expect("explicit initialization should create the database");
+        assert!(path.exists());
+        assert!(store.list_records().await.expect("list records").is_empty());
     }
 }
