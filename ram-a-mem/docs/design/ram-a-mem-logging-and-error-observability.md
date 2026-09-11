@@ -330,8 +330,8 @@ pub struct ErrorOrigin {
 | `ram_a.memory.search.started` | INFO | `request_id`、`scope_id_hash`、`query_hash`、`top_k`、检索模式 |
 | `ram_a.memory.search.completed` | INFO | `request_id`、返回数量、检索模式、`latency_ms` |
 | `ram_a.memory.search.failed` | ERROR | `request_id`、`stage`、错误诊断字段、`latency_ms` |
-| `ram_a.provider.retry` | WARN | 关联 ID、`component`、Provider、model、attempt、backoff、错误分类 |
-| `ram_a.provider.failed` | ERROR | 关联 ID、`component`、Provider、model、attempts、错误分类 |
+| `ram_a.provider.retry` | WARN | 关联 ID、`component`、Provider、model、attempt、backoff、`elapsed_ms`、`timeout_configured`、`timeout_ms`、错误分类 |
+| `ram_a.provider.failed` | ERROR | 关联 ID、`component`、Provider、model、attempts、`elapsed_ms`、`timeout_configured`、`timeout_ms`、错误分类 |
 | `ram_a.storage.operation.failed` | ERROR | 关联 ID、`component`、`storage_operation`、错误分类 |
 
 七阶段 Pipeline 的 `stage` 固定为：
