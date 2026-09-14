@@ -1168,6 +1168,7 @@ dependencies = [
  "chrono",
  "clap",
  "governor",
+ "http-body",
  "http-body-util",
  "memory-cases",
  "memory-core",
