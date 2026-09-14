@@ -1,0 +1,10 @@
+label: ram-a-kv 用户手册
+isManual: true
+description: ram-a-kv 是面向多轮 AI Agent 推理的 KV 缓存协调守护进程，提供语义感知的预取/驱逐/降级调度
+sections:
+  - label: 介绍
+    href: ./user_guide/introduce.md
+  - label: 一键部署
+    href: ./deploy_guide/deployment.md
+  - label: 使用说明
+    href: ./user_guide/user_guide.md
