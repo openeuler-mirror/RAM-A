@@ -88,7 +88,10 @@ metadata 字段主动切分；Window 向前取 2 条上下文、向后取 0 条�
 - `api_key_env`、`base_url`：Extract 和 Ground 共用的 OpenAI-compatible Chat API。
 - `extractor_model`：Extract 阶段模型名。
 - `verifier_model`：Ground 阶段模型名；可以与 Extract 相同，也可以独立配置。
-- `timeout_seconds`、`max_retries`：上述 Chat API 客户端的单次超时和最大尝试次数配置。
+- `timeout_seconds`：上述 Chat API 客户端的单次请求超时。
+- `max_retries`：单个 Chat 请求的最大尝试次数（含首次），默认 3，必须大于 0。注意它是
+  尝试总次数而不是"首次之外的重试次数"：`max_retries=3` 表示至多发出 3 次请求，其中
+  最多 2 次是重试。触发与豁免规则见下文"LLM 请求重试语义"。
 - `reasoning_effort`、`enable_thinking`：可选的 thinking/reasoning 控制字段，最多启用一种；
   Provider 不支持时应省略或在 smoke test 后再开启。
 - `send_temperature`、`temperature`：是否发送 temperature，以及发送时的数值。
@@ -105,6 +108,43 @@ metadata 字段主动切分；Window 向前取 2 条上下文、向后取 0 条�
 仍调用 Chat 模型。
 模型兼容性字段和 GLM Coding Plan 的已验证注意事项见
 [`model-compatibility.zh-CN.md`](model-compatibility.zh-CN.md)。
+
+#### LLM 请求重试语义
+
+`max_retries` 只作用于 Extract/Ground 共用的 Chat 客户端，每次 Chat 请求独立计数：
+一次请求失败后按指数退避重试，总尝试次数不超过 `max_retries`（默认 3，即首次 + 最多
+2 次重试）。该 Chat 客户端不存在也不会自动使用"固定重试 8 次"的规则；它的尝试次数
+始终由该配置项决定。
+
+**会触发重试的失败：**
+
+- 传输层错误：连接被拒绝、连接中断、DNS 解析失败、请求超时（含 `timeout_seconds`
+  到期）等，即 LLM 服务完全不可达的情形；
+- 可重试 HTTP 状态码：`408`、`425`、`429`、`500`、`502`、`503`、`504`；
+- 响应体读取失败；
+- 响应体不是合法 JSON。
+
+**不会触发重试的失败（立即终止）：**
+
+- 其余 HTTP 状态码，如 `400`（请求参数非法）、`401`（鉴权失败）、`403`、`404`
+  （URL 路径不存在，例如 base_url 写错）。这类错误重试也不会成功，因此直接失败；
+- 请求前预算预检失败（仅在配置了 `extractor_context_window_tokens` 或
+  `verifier_context_window_tokens` 时存在预检；上下文预算超限时不会发起请求）。
+
+两次尝试之间的退避为指数递增：1s、2s、4s…… 单次最长 64s。每次重试输出
+`ram_a.provider.retry` WARN 日志（含 `attempt`、`max_attempts`、`backoff_ms`、
+`error_kind`）；全部尝试耗尽后输出 `ram_a.provider.failed` ERROR 日志并返回失败。
+例如 `max_retries=3` 时，LLM 服务持续不可用会在日志中看到 2 条 `retry`（attempt
+1、2）和 1 条 `failed`（attempts=3），随后 `fail_fast` 决定整个摄入终止还是跳过该窗口。
+
+该机制与另外两套有界机制相互独立：`reasoning_only_retry`（content 为空但
+reasoning 非空时的纠正重试，至多一次）和 `json_repair_attempts`（JSON 格式修复，
+至多一次）。三者针对不同的失败类型，不互相触发；纠正/修复调用本身也是一次独立的
+Chat 请求，同样受 `max_retries` 传输重试保护。Embedding、Rerank、Case 和 Graph
+客户端使用各自的错误处理（`EMBEDDING_FAILED`、`RERANK_FAILED` 等），不继承
+`max_retries`。其中 Graph LLM 客户端固定最多尝试 5 次，但同样输出
+`ram_a.provider.retry` / `ram_a.provider.failed`；排查日志时应结合 `provider_kind`、
+`operation` 和 `max_attempts` 区分，不能只凭事件名归因于 `max_retries`。
 
 ### `retrieval`
 
