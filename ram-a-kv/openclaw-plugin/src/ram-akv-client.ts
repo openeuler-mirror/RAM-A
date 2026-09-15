@@ -74,15 +74,8 @@ export class RamAkvClient {
     return (res.data ?? {}) as unknown as TurnEndResult;
   }
 
-  async snapshotRestore(
-    sessionId: string,
-    sourceSessionId?: string,
-  ): Promise<SnapshotRestoreResult> {
-    const payload: Record<string, unknown> = { session_id: sessionId };
-    if (sourceSessionId) {
-      payload.source_session_id = sourceSessionId;
-    }
-    const res = await this.sendEvent("snapshot_restore", payload);
+  async snapshotRestore(sessionId: string): Promise<SnapshotRestoreResult> {
+    const res = await this.sendEvent("snapshot_restore", { session_id: sessionId });
     return (res.data ?? {}) as unknown as SnapshotRestoreResult;
   }
 

@@ -23,12 +23,6 @@
         "default": true,
         "description": "Automatically restore KV cache when a session resumes from a previous one"
       },
-      "skipRestoreReasons": {
-        "type": "array",
-        "items": { "type": "string" },
-        "default": ["new", "reset", "deleted"],
-        "description": "Session end reasons that should NOT trigger KV cache restore"
-      },
       "prefetchOnTurnStart": {
         "type": "boolean",
         "default": true,

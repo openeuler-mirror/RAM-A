@@ -254,19 +254,6 @@ impl KvCacheManager {
         session_id: &str,
         hashes: Vec<String>,
     ) -> ManagerResult<OperationOutcome> {
-        self.on_snapshot_restore_from(session_id, session_id, hashes)
-            .await
-    }
-
-    // Restore `target_session_id` from a snapshot read out of `source_session_id`.
-    // Used by session resume flows where the new session must inherit references from
-    // the previous one.
-    pub async fn on_snapshot_restore_from(
-        &self,
-        source_session_id: &str,
-        target_session_id: &str,
-        hashes: Vec<String>,
-    ) -> ManagerResult<OperationOutcome> {
         let mut outcome = OperationOutcome::default();
         let new_unique = unique_hashes(&hashes);
         let mut new_map = KvCacheMap::default();
@@ -275,7 +262,7 @@ impl KvCacheManager {
         let to_evict = {
             let mut sessions = self.sessions.lock().await;
             let old_hashes = sessions
-                .get(target_session_id)
+                .get(session_id)
                 .map(|s| unique_hashes(&s.map.chunk_hashes()))
                 .unwrap_or_default();
             let old_set: HashSet<&String> = old_hashes.iter().collect();
@@ -296,12 +283,9 @@ impl KvCacheManager {
             drop(refcounts);
 
             // Preserve turn_count so restore is not a reset.
-            let turn_count = sessions
-                .get(target_session_id)
-                .map(|s| s.turn_count)
-                .unwrap_or(0);
+            let turn_count = sessions.get(session_id).map(|s| s.turn_count).unwrap_or(0);
             sessions.insert(
-                target_session_id.to_string(),
+                session_id.to_string(),
                 SessionKvState {
                     map: new_map,
                     turn_count,
@@ -329,7 +313,7 @@ impl KvCacheManager {
             outcome.prefetch_count = hashes.len();
             let result = self
                 .backend
-                .prefetch(hashes, format!("snapshot_prefetch_{}", target_session_id))
+                .prefetch(hashes, format!("snapshot_prefetch_{}", session_id))
                 .await;
             if !backend_ok(&result) {
                 tracing::warn!(
@@ -343,7 +327,6 @@ impl KvCacheManager {
             }
         }
 
-        let _ = source_session_id; // source is read by the caller (handler), not here.
         Ok(outcome)
     }
 
@@ -571,7 +554,7 @@ impl KvCacheManager {
     }
 }
 
-// Helper used by `on_snapshot_restore_from` to compute the hashes that need their
+// Helper used by `on_snapshot_restore` to compute the hashes that need their
 // refcount decremented (those in `old_hashes` but not in `new_set`).
 fn old_unique_iter(old_hashes: &[String], new_set: &HashSet<&String>) -> Vec<String> {
     old_hashes
@@ -817,26 +800,6 @@ mod tests {
         mgr.rebuild_refcounts().await;
         let refcounts = mgr.refcounts.lock().await;
         assert_eq!(refcounts.get("A"), Some(&1));
-    }
-
-    #[tokio::test]
-    async fn snapshot_restore_from_reads_source_session_into_target() {
-        // Plugin resume flow: a new session must inherit hashes from the previous one.
-        let mgr = KvCacheManager::new_noop(test_config());
-        // Persist previous session with [A, B].
-        mgr.on_turn_end("prev", vec!["A".into(), "B".into()], None)
-            .await
-            .unwrap();
-        // Now resume into a new session id, sourcing hashes from prev.
-        let outcome = mgr
-            .on_snapshot_restore_from("prev", "new", vec!["A".into(), "B".into()])
-            .await
-            .unwrap();
-        assert!(outcome.prefetch_sent);
-        // Both sessions reference A and B, so refcount must be 2 each.
-        let refcounts = mgr.refcounts.lock().await;
-        assert_eq!(refcounts.get("A"), Some(&2));
-        assert_eq!(refcounts.get("B"), Some(&2));
     }
 
     #[tokio::test]

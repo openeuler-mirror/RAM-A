@@ -54,7 +54,6 @@ export interface RamAkvPluginConfig {
   daemonUrl: string;
   authToken: string;
   restoreOnSessionStart: boolean;
-  skipRestoreReasons: string[];
   prefetchOnTurnStart: boolean;
   requestTimeoutMs: number;
 }

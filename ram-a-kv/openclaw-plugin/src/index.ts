@@ -18,7 +18,6 @@ const DEFAULT_CONFIG: RamAkvPluginConfig = {
   daemonUrl: "http://127.0.0.1:6998",
   authToken: "",
   restoreOnSessionStart: true,
-  skipRestoreReasons: ["new", "reset", "deleted"],
   prefetchOnTurnStart: true,
   requestTimeoutMs: 6000,
 };
@@ -34,9 +33,6 @@ function resolveConfig(
       typeof raw.restoreOnSessionStart === "boolean"
         ? raw.restoreOnSessionStart
         : DEFAULT_CONFIG.restoreOnSessionStart,
-    skipRestoreReasons: Array.isArray(raw.skipRestoreReasons)
-      ? raw.skipRestoreReasons.map(String)
-      : DEFAULT_CONFIG.skipRestoreReasons,
     prefetchOnTurnStart:
       typeof raw.prefetchOnTurnStart === "boolean"
         ? raw.prefetchOnTurnStart
@@ -220,9 +216,6 @@ export default definePluginEntry({
       if (nextSessionKey && nextSessionId) {
         sessionKeyToId.set(nextSessionKey, nextSessionId);
       }
-      if (nextSessionId) {
-        try { await chunkStore.saveReason(nextSessionId, reason); } catch { /* ignore */ }
-      }
 
       const terminalReasons = ["deleted"];
       if (!nextSessionId && terminalReasons.includes(reason)) {
@@ -243,29 +236,11 @@ export default definePluginEntry({
       }
     });
 
-    api.on("session_start", async (event: { sessionId: string; sessionKey?: string; resumedFrom?: string }) => {
+    api.on("session_start", async (event: { sessionId: string; sessionKey?: string }) => {
       const sessionId = event.sessionId;
       const sessionKey = event.sessionKey;
       if (sessionKey) {
         sessionKeyToId.set(sessionKey, sessionId);
-      }
-      if (!config.restoreOnSessionStart) return;
-      if (!event.resumedFrom) return;
-
-      const resumedFrom = event.resumedFrom;
-      let reason: string | undefined;
-      try { reason = await chunkStore.consumeReason(sessionId); } catch { /* ignore */ }
-
-      if (reason && config.skipRestoreReasons.includes(reason)) {
-        log.info(`ram-a-kv skip snapshot_restore: ${sessionId} (reason=${reason} is in skip list)`);
-        return;
-      }
-
-      try {
-        const result = await client.snapshotRestore(sessionId, resumedFrom);
-        log.info(`ram-a-kv snapshot_restore: ${sessionId} from ${resumedFrom} (prefetch_sent=${result.prefetch_sent}, count=${result.prefetch_count})`);
-      } catch (err) {
-        log.warn(`ram-a-kv snapshot_restore failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`);
       }
     });
 
@@ -322,9 +297,8 @@ export default definePluginEntry({
             s.end?.(JSON.stringify({ ok: true, skipped: true }));
             return;
           }
-          // snapshot_restore for a switch always sources from the same session id
-          // (no resume). source_session_id is omitted so the daemon falls back
-          // to session_id.
+          // snapshot_restore for a switch reads from the same session id
+          // (the session was suspended/pinned earlier, so its SQLite row is intact).
           const result = await client.snapshotRestore(sessionId);
           log.info(`ram-a-kv switch prefetch: ${sessionId} (prefetch_sent=${result.prefetch_sent}, count=${result.prefetch_count})`);
           const s = res as { setHeader?: (k: string, v: string) => void; end?: (s: string) => void; statusCode?: number };
