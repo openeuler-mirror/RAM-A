@@ -113,8 +113,8 @@ metadata 字段主动切分；Window 向前取 2 条上下文、向后取 0 条�
 
 `max_retries` 只作用于 Extract/Ground 共用的 Chat 客户端，每次 Chat 请求独立计数：
 一次请求失败后按指数退避重试，总尝试次数不超过 `max_retries`（默认 3，即首次 + 最多
-2 次重试）。配置中不存在也不会自动使用"固定重试 8 次"的规则；观察到的重试次数始终
-由该配置项决定。
+2 次重试）。该 Chat 客户端不存在也不会自动使用"固定重试 8 次"的规则；它的尝试次数
+始终由该配置项决定。
 
 **会触发重试的失败：**
 
@@ -128,7 +128,8 @@ metadata 字段主动切分；Window 向前取 2 条上下文、向后取 0 条�
 
 - 其余 HTTP 状态码，如 `400`（请求参数非法）、`401`（鉴权失败）、`403`、`404`
   （URL 路径不存在，例如 base_url 写错）。这类错误重试也不会成功，因此直接失败；
-- 请求前预算预检失败（上下文预算超限时根本不会发起请求）。
+- 请求前预算预检失败（仅在配置了 `extractor_context_window_tokens` 或
+  `verifier_context_window_tokens` 时存在预检；上下文预算超限时不会发起请求）。
 
 两次尝试之间的退避为指数递增：1s、2s、4s…… 单次最长 64s。每次重试输出
 `ram_a.provider.retry` WARN 日志（含 `attempt`、`max_attempts`、`backoff_ms`、
@@ -141,7 +142,9 @@ reasoning 非空时的纠正重试，至多一次）和 `json_repair_attempts`�
 至多一次）。三者针对不同的失败类型，不互相触发；纠正/修复调用本身也是一次独立的
 Chat 请求，同样受 `max_retries` 传输重试保护。Embedding、Rerank、Case 和 Graph
 客户端使用各自的错误处理（`EMBEDDING_FAILED`、`RERANK_FAILED` 等），不继承
-`max_retries`。
+`max_retries`。其中 Graph LLM 客户端固定最多尝试 5 次，但同样输出
+`ram_a.provider.retry` / `ram_a.provider.failed`；排查日志时应结合 `provider_kind`、
+`operation` 和 `max_attempts` 区分，不能只凭事件名归因于 `max_retries`。
 
 ### `retrieval`
 

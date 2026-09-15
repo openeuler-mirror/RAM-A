@@ -48,20 +48,23 @@ RAM-A 不要求模型必须是“推理模型”或“非推理模型”。兼�
 ## 传输重试（`max_retries`）
 
 `providers.max_retries` 是单个 Chat 请求的最大尝试次数（含首次），默认 3，只作用于
-Extract/Ground 共用的 Chat 客户端。没有固定"重试 8 次"的内置规则；实际重试次数始终
-由该配置决定。
+Extract/Ground 共用的 Chat 客户端。该客户端没有固定"重试 8 次"的内置规则；它的实际
+尝试次数始终由该配置决定。
 
 - **会重试**：传输层错误（连接拒绝、超时、DNS 失败等服务不可达情形）、HTTP
   `408/425/429/500/502/503/504`、响应体读取失败、响应不是合法 JSON。
 - **不重试**：其余 HTTP 状态码（如 `400/401/403/404`，包括 base_url 路径写错的
-  情形）和请求前预算预检失败——重试也不会成功，立即失败。
+  情形）和请求前预算预检失败——后者仅在配置了 `extractor_context_window_tokens` 或
+  `verifier_context_window_tokens` 时存在；这些失败重试也不会成功，会立即返回。
 - 退避按 1s、2s、4s…… 指数递增，单次最长 64s。每次重试记录 `ram_a.provider.retry`
   WARN，耗尽后记录 `ram_a.provider.failed` ERROR。
 
 该机制与 `reasoning_only_retry`（reasoning-only 纠正，至多一次）、`json_repair_attempts`
 （JSON 修复，0 或 1 次）三套独立且有界，针对不同失败类型、不互相触发；纠正/修复调用
 本身也是独立的 Chat 请求，同样受 `max_retries` 保护。Embedding/Rerank/Case 客户端
-不继承 `max_retries`。
+不继承 `max_retries`。Graph LLM 客户端同样不继承该配置，固定最多尝试 5 次，但会复用
+`ram_a.provider.retry` / `ram_a.provider.failed` 事件；应结合日志中的 `provider_kind`、
+`operation` 和 `max_attempts` 区分具体客户端。
 
 ## Structured Output 和 JSON repair
 
