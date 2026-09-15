@@ -41,7 +41,7 @@
 - `*_env` 的值是环境变量名称，不是 Token 或 API Key 本身。密钥必须通过进程环境注入。
 - 顶层可选对象一旦存在，服务仍会校验其字段；功能开关只决定是否构建和对外暴露该能力。
   因此不要在关闭功能时保留一份无效的 `case_library` 或 `graph_memory` 配置。
-- 带 API Key 的公网 Provider URL 固定要求 HTTPS；loopback、私网和 link-local 地址允许 HTTP。
+- 带 API Key 的非 loopback Provider URL 固定要求 HTTPS；只有 loopback 地址允许携带密钥使用 HTTP。
 - URL 不允许携带用户名、密码、query 或 fragment。
 - 配置文件查找优先级固定为：`--config`、`RAM_A_MEM_CONFIG`、
   `config/ram-a-mem.json`、`$HOME/.config/ram-a/ram-a-mem.json`、
@@ -163,7 +163,7 @@ OpenAI-compatible API 或本地确定性 hash。
 | 字段 | 类别 | 未设置兜底值 | 交付配置默认值 | 约束与回退 |
 | --- | --- | --- | --- | --- |
 | `api_key_env` | 部署必配 | 无（必填） | `LLM_API_KEY`（示例，按 Provider 替换） | 非空且环境变量必须存在；即使 Embedding 使用 hash 也必需 |
-| `base_url` | 部署可配置 | `https://openrouter.ai/api/v1` | `http://127.0.0.1:8000/v1`（本地端点，按环境替换） | 绝对 HTTP(S) URL；带密钥的公网地址必须 HTTPS；生产部署建议：写实际 Chat Provider 的 OpenAI-compatible `/v1` 基址 |
+| `base_url` | 部署可配置 | `https://openrouter.ai/api/v1` | `http://127.0.0.1:8000/v1`（本地端点，按环境替换） | 绝对 HTTP(S) URL；带密钥的非 loopback 地址必须 HTTPS；生产部署建议：写实际 Chat Provider 的 OpenAI-compatible `/v1` 基址 |
 | `embedding_provider` | 固定值枚举 | `openai_compatible` | `hash` | 只接受 `openai_compatible`、兼容别名 `open_router`、`hash`；生产部署建议：`openai_compatible`，交付默认 `hash` 面向离线自测 |
 | `embedding_api_key_env` | 条件配置 | `null` | `null` | `null` 回退到 `api_key_env`；配置时非空；独立 Embedding 服务才填写 |
 | `embedding_base_url` | 条件配置 | `null` | `null` | `null` 回退到 `base_url`；URL 规则同上；独立 Embedding 服务才填写 |
@@ -207,12 +207,12 @@ Hybrid 推荐使用 0.7/0.3 权重组合。Dense 或 BM25 单通道模式不使�
 | `provider` | 固定值 | `openrouter` | `openrouter` | 当前只接受 `openrouter`；可指向兼容该请求协议的自托管端点 |
 | `model` | 部署可配置 | `cohere/rerank-v3.5` | `cohere/rerank-v3.5` | 启用时非空；需与端点实际模型一致 |
 | `api_key_env` | 条件配置 | `OPENROUTER_API_KEY` | `OPENROUTER_API_KEY` | 可设 `null` 以访问无需认证的可信本地端点；非空时环境变量必须存在 |
-| `base_url` | 部署可配置 | `https://openrouter.ai/api/v1` | `https://openrouter.ai/api/v1` | 启用时必须是合法 URL；公网带密钥固定要求 HTTPS |
+| `base_url` | 部署可配置 | `https://openrouter.ai/api/v1` | `https://openrouter.ai/api/v1` | 启用时必须是合法 URL；非 loopback 带密钥固定要求 HTTPS |
 | `input_k` | 推荐可配置 | 40 | 40 | 1..=500；运行时实际送入数至少为请求 `top_k` |
 | `timeout_ms` | 推荐可配置 | 30000 | 30000 | 启用时必须为 1..=120000；禁用时不生效 |
 | `fail_open` | 推荐可配置 | `false` | `false` | `false`：Rerank 异常使本次 search 返回 `RERANK_FAILED`；`true`：返回 Rerank 前 Hybrid 顺序 |
 
-测试必须覆盖启用/禁用、非 Hybrid 启用失败、input/timeout 边界、无认证本地端点、公网 HTTP
+测试必须覆盖启用/禁用、非 Hybrid 启用失败、input/timeout 边界、无认证本地端点、非 loopback HTTP
 拒绝，以及 `fail_open` 两种故障结果。排序效果和稳定性不能只靠配置测试证明。
 
 ## 11. `case_library`

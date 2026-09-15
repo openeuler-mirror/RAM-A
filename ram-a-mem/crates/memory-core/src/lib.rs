@@ -26,3 +26,10 @@ pub use rerank::{OpenRouterReranker, Reranker};
 pub use sqlite_store::SqliteMemoryStore;
 pub use store::{FileMemoryStore, MemoryStore};
 pub use vector::cosine_similarity;
+
+fn fixed_endpoint_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("fixed-endpoint HTTP client should build")
+}

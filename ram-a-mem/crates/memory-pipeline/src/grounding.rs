@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -320,10 +320,15 @@ pub fn parse_grounding_results(
         .get("results")
         .and_then(Value::as_array)
         .ok_or_else(|| PipelineError::Protocol("grounding results must be a list".into()))?;
-    let expected = memories
-        .iter()
-        .map(|memory| memory.id.as_str())
-        .collect::<Vec<_>>();
+    let mut expected = HashSet::with_capacity(memories.len());
+    for memory in memories {
+        if !expected.insert(memory.id.as_str()) {
+            return Err(PipelineError::Protocol(format!(
+                "duplicate memory id in grounding input: {}",
+                memory.id
+            )));
+        }
+    }
     let mut by_id = HashMap::new();
     for result in raw {
         let object = result.as_object().ok_or_else(|| {
@@ -342,7 +347,7 @@ pub fn parse_grounding_results(
                 "duplicate grounding result for {id}"
             )));
         }
-        if !expected.contains(&id) {
+        if !expected.contains(id) {
             return Err(PipelineError::Protocol(format!(
                 "unexpected grounding result for {id}"
             )));
@@ -361,14 +366,21 @@ pub fn parse_grounding_results(
             },
         );
     }
+    if let Some(memory_id) = memories
+        .iter()
+        .map(|memory| memory.id.as_str())
+        .find(|id| !by_id.contains_key(*id))
+    {
+        return Err(PipelineError::Protocol(format!(
+            "grounding response omitted memory {memory_id}"
+        )));
+    }
     Ok(memories
         .iter()
         .map(|memory| {
-            by_id.remove(&memory.id).unwrap_or_else(|| GroundingResult {
-                memory_id: memory.id.clone(),
-                status: "UNCERTAIN".into(),
-                reason: "verifier omitted this memory_id".into(),
-            })
+            by_id
+                .remove(&memory.id)
+                .expect("missing grounding results were rejected above")
         })
         .collect())
 }
@@ -380,4 +392,71 @@ fn validate_status(status: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{json, Map};
+
+    use super::parse_grounding_results;
+    use crate::models::AtomicMemory;
+
+    fn memory(id: &str) -> AtomicMemory {
+        AtomicMemory {
+            id: id.to_owned(),
+            scope_id: "scope-a".into(),
+            text: "A supported fact".into(),
+            memory_type: "fact".into(),
+            subject: Map::new(),
+            predicate: "is".into(),
+            object: None,
+            modality: "asserted".into(),
+            evidence: Vec::new(),
+            event_time: None,
+            attributes: Map::new(),
+            model_confidence: None,
+            observed_at: "2026-09-15T00:00:00Z".into(),
+            source_episode_id: "episode-a".into(),
+            source_window_id: "window-a".into(),
+            observation_refs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn omitted_memory_is_a_protocol_error() {
+        let memories = vec![memory("memory-a"), memory("memory-b")];
+        let error = parse_grounding_results(
+            &json!({
+                "results": [{
+                    "memory_id": "memory-a",
+                    "status": "SUPPORTED",
+                    "reason": "supported"
+                }]
+            }),
+            &memories,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("omitted memory memory-b"));
+    }
+
+    #[test]
+    fn duplicate_input_memory_id_is_a_protocol_error() {
+        let memories = vec![memory("memory-a"), memory("memory-a")];
+        let error = parse_grounding_results(
+            &json!({
+                "results": [{
+                    "memory_id": "memory-a",
+                    "status": "SUPPORTED",
+                    "reason": "supported"
+                }]
+            }),
+            &memories,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("duplicate memory id in grounding input: memory-a"));
+    }
 }

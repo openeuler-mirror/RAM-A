@@ -295,7 +295,11 @@ Graph construction currently runs synchronously before a successful ingest respo
 `build_concurrency` bounds concurrent graph embedding and LLM extraction work during one ingest
 request; SQLite operations remain short, serialized transactions. Run one RAM-A service process
 per SQLite database. Multi-process workers sharing one database require a future persisted lease
-and heartbeat protocol. Deployments that need ingest latency independent of the graph provider
+and heartbeat protocol. Session admission, per-tool concurrency guards, ingest coordination, and
+case-mutation confirmation tokens are also process-local. Do not place multiple RAM-A replicas
+behind a load balancer for the same database; confirmation tokens are invalid in another process
+and are intentionally lost on restart, so clients must prepare the mutation again. Deployments
+that need ingest latency independent of the graph provider
 should put ingestion behind an application queue; the current service deliberately favors a
 completed graph on every successful response. Because graph construction is synchronous, a reverse
 proxy or load balancer in front of this endpoint must use request/read timeouts longer than the
@@ -303,8 +307,9 @@ configured graph LLM timeout plus its retry backoff. SSE keep-alive settings do 
 request timeout requirement for a tool call that is still being processed.
 
 Provider base URLs are trusted operator configuration and intentionally support self-hosted
-services on loopback or private networks. Use HTTPS for remote providers and protect configuration
-write access: RAM-A sends the configured API credential to that endpoint.
+services. When an API credential is configured, plain HTTP is accepted only for loopback hosts;
+private, unique-local, and link-local network endpoints must use HTTPS because RAM-A sends the
+configured credential to that endpoint. Protect configuration write access.
 
 ## Model and embedding providers
 
@@ -370,8 +375,8 @@ The endpoint must return indexes into the original `documents` array:
 ```
 
 For OpenRouter or another authenticated endpoint, set `api_key_env` to the environment
-variable holding the Bearer credential. Authenticated public endpoints must use HTTPS; plain HTTP
-is accepted only for loopback, RFC1918/unique-local, or link-local hosts. An unauthenticated local service may set
+variable holding the Bearer credential. Every authenticated non-loopback endpoint must use HTTPS;
+plain HTTP is accepted only for loopback hosts. An unauthenticated local service may set
 `api_key_env` to `null`; RAM-A then omits the `Authorization` header. Setting it to `null` is an
 explicit operator acknowledgement: expose that endpoint only on a trusted loopback, container,
 or private network. A local inference server using another request or response schema needs a

@@ -29,6 +29,8 @@ pub const REQUEST_ID_HEADER: &str = "x-request-id";
 const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 const LIMIT_REASON_HEADER: &str = "x-ram-a-limit-reason";
+const MAX_SESSION_ID_BYTES: usize = 128;
+const MAX_INITIALIZE_RESPONSE_BYTES: usize = 1024 * 1024;
 
 pub struct HttpRuntime {
     service: DynMemoryService,
@@ -493,7 +495,12 @@ async fn authorize_mcp(
         reservation = Some(pending);
     }
 
-    let session_id = request_session_id(&request);
+    let session_id = match request_session_id(&request) {
+        Ok(session_id) => session_id,
+        Err(()) => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid session id", &request_id)
+        }
+    };
     if let Some(session_id) = session_id.as_ref() {
         match state
             .session_admission
@@ -569,9 +576,27 @@ async fn authorize_mcp(
         .insert(RequestId(request_id.clone()));
     let mut response = next.run(request).await;
     if let Some(pending) = reservation {
-        if response.status().is_success() {
-            if let Some(session_id) = response_session_id(&response) {
-                pending.commit(session_id);
+        let created_session_id = response_session_id(&response);
+        match initialize_response_succeeded(&mut response, MAX_INITIALIZE_RESPONSE_BYTES).await {
+            Ok(true) => {
+                if let Some(session_id) = created_session_id {
+                    pending.commit(session_id);
+                }
+            }
+            Ok(false) => {
+                if let Some(session_id) = created_session_id {
+                    let _ = state.session_manager.close_session(&session_id).await;
+                }
+            }
+            Err(()) => {
+                if let Some(session_id) = created_session_id {
+                    let _ = state.session_manager.close_session(&session_id).await;
+                }
+                response = error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "initialize response too large",
+                    &request_id,
+                );
             }
         }
     }
@@ -588,13 +613,15 @@ async fn authorize_mcp(
     response
 }
 
-fn request_session_id(request: &Request) -> Option<SessionId> {
-    request
-        .headers()
-        .get("mcp-session-id")
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.is_empty())
-        .map(Arc::<str>::from)
+fn request_session_id(request: &Request) -> Result<Option<SessionId>, ()> {
+    let Some(value) = request.headers().get("mcp-session-id") else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| ())?;
+    if value.len() > MAX_SESSION_ID_BYTES {
+        return Err(());
+    }
+    Ok((!value.is_empty()).then(|| Arc::<str>::from(value)))
 }
 
 fn response_session_id(response: &Response) -> Option<SessionId> {
@@ -694,52 +721,93 @@ async fn requested_operation(
     request: &mut Request,
     max_body_bytes: usize,
 ) -> Result<RequestedOperation, ()> {
+    if request.method() != axum::http::Method::POST {
+        return Ok(RequestedOperation::Other);
+    }
+    if request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > max_body_bytes)
+    {
+        return Err(());
+    }
     let body = std::mem::replace(request.body_mut(), Body::empty());
     let bytes = to_bytes(body, max_body_bytes).await.map_err(|_| ())?;
-    *request.body_mut() = Body::from(bytes.clone());
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return Ok(RequestedOperation::Other);
+    let operation = parse_requested_operation(&bytes);
+    *request.body_mut() = Body::from(bytes);
+    Ok(operation)
+}
+
+fn parse_requested_operation(bytes: &[u8]) -> RequestedOperation {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return RequestedOperation::Other;
     };
     let method = value.get("method").and_then(serde_json::Value::as_str);
     if method == Some("initialize") {
-        return Ok(
-            if value
-                .pointer("/params/protocolVersion")
-                .and_then(serde_json::Value::as_str)
-                == Some(MCP_PROTOCOL_VERSION)
-            {
-                RequestedOperation::Initialize
-            } else {
-                RequestedOperation::UnsupportedProtocol
-            },
-        );
+        return if value
+            .pointer("/params/protocolVersion")
+            .and_then(serde_json::Value::as_str)
+            == Some(MCP_PROTOCOL_VERSION)
+        {
+            RequestedOperation::Initialize
+        } else {
+            RequestedOperation::UnsupportedProtocol
+        };
     }
     if method != Some("tools/call") {
-        return Ok(RequestedOperation::Other);
+        return RequestedOperation::Other;
     }
-    Ok(
-        match value
-            .pointer("/params/name")
-            .and_then(serde_json::Value::as_str)
-        {
-            Some("memory_ingest") => RequestedOperation::Tool(RequestedTool::Ingest),
-            Some("memory_search") => RequestedOperation::Tool(RequestedTool::Search),
-            Some("memory_case_search") => RequestedOperation::Tool(RequestedTool::CaseSearch),
-            Some("memory_case_prepare_upload") => {
-                RequestedOperation::Tool(RequestedTool::CasePrepareUpload)
-            }
-            Some("memory_case_upload") => RequestedOperation::Tool(RequestedTool::CaseUpload),
-            Some("memory_case_prepare_update") => {
-                RequestedOperation::Tool(RequestedTool::CasePrepareUpdate)
-            }
-            Some("memory_case_update") => RequestedOperation::Tool(RequestedTool::CaseUpdate),
-            Some("memory_case_prepare_delete") => {
-                RequestedOperation::Tool(RequestedTool::CasePrepareDelete)
-            }
-            Some("memory_case_delete") => RequestedOperation::Tool(RequestedTool::CaseDelete),
-            _ => RequestedOperation::Other,
-        },
-    )
+    match value
+        .pointer("/params/name")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("memory_ingest") => RequestedOperation::Tool(RequestedTool::Ingest),
+        Some("memory_search") => RequestedOperation::Tool(RequestedTool::Search),
+        Some("memory_case_search") => RequestedOperation::Tool(RequestedTool::CaseSearch),
+        Some("memory_case_prepare_upload") => {
+            RequestedOperation::Tool(RequestedTool::CasePrepareUpload)
+        }
+        Some("memory_case_upload") => RequestedOperation::Tool(RequestedTool::CaseUpload),
+        Some("memory_case_prepare_update") => {
+            RequestedOperation::Tool(RequestedTool::CasePrepareUpdate)
+        }
+        Some("memory_case_update") => RequestedOperation::Tool(RequestedTool::CaseUpdate),
+        Some("memory_case_prepare_delete") => {
+            RequestedOperation::Tool(RequestedTool::CasePrepareDelete)
+        }
+        Some("memory_case_delete") => RequestedOperation::Tool(RequestedTool::CaseDelete),
+        _ => RequestedOperation::Other,
+    }
+}
+
+async fn initialize_response_succeeded(
+    response: &mut Response,
+    max_body_bytes: usize,
+) -> Result<bool, ()> {
+    if !response.status().is_success() {
+        return Ok(false);
+    }
+    let body = std::mem::replace(response.body_mut(), Body::empty());
+    let bytes = to_bytes(body, max_body_bytes).await.map_err(|_| ())?;
+    let succeeded = parse_json_rpc_response(&bytes).is_some_and(|value| {
+        value
+            .get("result")
+            .is_some_and(serde_json::Value::is_object)
+            && value.get("error").is_none()
+    });
+    *response.body_mut() = Body::from(bytes);
+    Ok(succeeded)
+}
+
+fn parse_json_rpc_response(bytes: &[u8]) -> Option<serde_json::Value> {
+    serde_json::from_slice(bytes).ok().or_else(|| {
+        std::str::from_utf8(bytes).ok()?.lines().find_map(|line| {
+            line.strip_prefix("data:")
+                .and_then(|data| serde_json::from_str(data.trim()).ok())
+        })
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -794,6 +862,63 @@ fn error_response(status: StatusCode, message: &'static str, request_id: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_id_has_an_explicit_length_limit() {
+        let accepted = Request::builder()
+            .header("mcp-session-id", "a".repeat(MAX_SESSION_ID_BYTES))
+            .body(Body::empty())
+            .unwrap();
+        assert!(request_session_id(&accepted).unwrap().is_some());
+
+        let rejected = Request::builder()
+            .header("mcp-session-id", "a".repeat(MAX_SESSION_ID_BYTES + 1))
+            .body(Body::empty())
+            .unwrap();
+        assert!(request_session_id(&rejected).is_err());
+    }
+
+    #[tokio::test]
+    async fn bodyless_mcp_methods_are_not_buffered_for_routing() {
+        let mut request = Request::builder()
+            .method("GET")
+            .body(Body::from("body-that-must-remain-untouched"))
+            .unwrap();
+
+        assert!(matches!(
+            requested_operation(&mut request, 1).await,
+            Ok(RequestedOperation::Other)
+        ));
+        let body = to_bytes(request.into_body(), 1024).await.unwrap();
+        assert_eq!(body.as_ref(), b"body-that-must-remain-untouched");
+    }
+
+    #[tokio::test]
+    async fn initialize_requires_a_json_rpc_result_before_session_commit() {
+        for (body, expected) in [
+            (r#"{"jsonrpc":"2.0","id":1,"result":{}}"#, true),
+            (
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+                true,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid params"}}"#,
+                false,
+            ),
+        ] {
+            let mut response = Response::new(Body::from(body));
+            assert_eq!(
+                initialize_response_succeeded(&mut response, 1024)
+                    .await
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(
+                to_bytes(response.into_body(), 1024).await.unwrap().as_ref(),
+                body.as_bytes()
+            );
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn expired_session_is_tombstoned_before_async_close() {

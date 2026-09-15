@@ -49,7 +49,7 @@ impl OpenRouterEmbedding {
         dimensions: usize,
     ) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: crate::fixed_endpoint_http_client(),
             api_key: api_key.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             model: model.into(),

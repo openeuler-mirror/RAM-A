@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 
 const PREPARED_SCHEMA_VERSION: &str = "benchmark-prepared-v1";
+static ATOMIC_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Parser)]
 #[command(name = "memory-bench")]
@@ -439,7 +441,10 @@ async fn run_add(
     }
 
     if !requests.is_empty() {
-        let mut progress = ProgressReporter::new("Adding memories", requests.len());
+        let attempted = requests.len();
+        let mut progress = ProgressReporter::new("Adding memories", attempted);
+        // MemoryManager validates and embeds the full input before its single
+        // store write, so this operation persists either all attempted rows or none.
         manager
             .add_many_with_batch_size_and_progress(requests, options.batch_size, |count| {
                 progress.inc(count);
@@ -447,9 +452,10 @@ async fn run_add(
             .await
             .with_context(|| format!("failed to add memories from {}", options.dataset.display()))
             .inspect_err(|_| {
-                summary.failed += 1;
+                summary.failed += attempted;
                 print_add_summary(&summary);
             })?;
+        summary.added += attempted;
         progress.finish();
     }
     if let Some(graph_pipeline) = graph_pipeline {
@@ -461,8 +467,6 @@ async fn run_add(
         )
         .await?;
     }
-    summary.added = summary.total - summary.skipped_existing;
-
     println!(
         "added {} memories from {}",
         texts.len(),
@@ -560,7 +564,9 @@ async fn run_add_prepared_memories(
     }
 
     if !requests.is_empty() {
-        let mut progress = ProgressReporter::new("Adding prepared memories", requests.len());
+        let attempted = requests.len();
+        let mut progress = ProgressReporter::new("Adding prepared memories", attempted);
+        // Keep the summary aligned with MemoryManager's all-or-nothing batch write.
         manager
             .add_many_with_batch_size_and_progress(requests, options.batch_size, |count| {
                 progress.inc(count);
@@ -568,9 +574,10 @@ async fn run_add_prepared_memories(
             .await
             .with_context(|| "failed to add prepared memories in batch")
             .inspect_err(|_| {
-                summary.failed += 1;
+                summary.failed += attempted;
                 print_add_summary(&summary);
             })?;
+        summary.added += attempted;
         progress.finish();
     }
     if let Some(graph_pipeline) = graph_pipeline {
@@ -582,8 +589,6 @@ async fn run_add_prepared_memories(
         )
         .await?;
     }
-    summary.added = summary.total - summary.skipped_existing;
-
     println!(
         "added {} prepared memories from {}",
         memories.len(),
@@ -896,14 +901,16 @@ fn resume_completed_indexes(templates: &[QueryOutput], existing: &[QueryOutput])
     completed
 }
 
-/// Write `outputs` to `output` atomically: serialize to a `.tmp` sibling then
-/// rename over the target, so a crash mid-write cannot leave a truncated file.
+/// Write `outputs` to `output` atomically: serialize to a uniquely named sibling
+/// then rename over the target, so concurrent writers cannot corrupt one another's
+/// temporary file and a crash cannot leave a truncated target.
 async fn write_atomic_json(output: &Path, outputs: &[QueryOutput]) -> Result<()> {
     if let Some(parent) = output.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
     let bytes = serde_json::to_vec_pretty(outputs)?;
-    let temporary = output.with_extension("tmp");
+    let sequence = ATOMIC_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = output.with_extension(format!("{}.{}.tmp", std::process::id(), sequence));
     tokio::fs::write(&temporary, &bytes).await?;
     tokio::fs::rename(&temporary, output).await?;
     Ok(())
