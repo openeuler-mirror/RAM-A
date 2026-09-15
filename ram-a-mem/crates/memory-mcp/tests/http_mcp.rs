@@ -1573,6 +1573,22 @@ async fn mcp_body_limit_returns_payload_too_large() {
 }
 
 #[tokio::test]
+async fn overlong_session_id_is_rejected_explicitly() {
+    let fixture = fixture_router().await;
+    let request = session_request(
+        &"s".repeat(129),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+    );
+
+    let response = fixture.app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        to_bytes(response.into_body(), 1024).await.unwrap().as_ref(),
+        b"invalid session id"
+    );
+}
+
+#[tokio::test]
 async fn tool_rate_limit_is_scoped_to_the_authenticated_principal_and_tool() {
     let limits = LimitsConfig {
         requests_per_second: 1,

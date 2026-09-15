@@ -520,7 +520,9 @@ fn request_id(parts: &axum::http::request::Parts) -> String {
 
 fn tool_span(tool: &'static str, request_id: &str, principal: &Principal) -> tracing::Span {
     let digest = Sha256::digest(principal.scope_id().as_bytes());
-    let scope_id_hash = digest[..8]
+    // Keep logs pseudonymous while retaining enough entropy to make offline
+    // enumeration and accidental cross-scope collisions impractical.
+    let scope_id_hash = digest[..16]
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();

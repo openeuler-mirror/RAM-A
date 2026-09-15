@@ -523,7 +523,8 @@ The preparation call does not modify the case library. The client must display i
 ask the user, then end the turn. Only after a later explicit confirmation may it call the matching
 final tool with `{"confirmation_token":"...","user_confirmed":true}`. Tokens expire after ten
 minutes, are bound to tenant/user/agent and operation, are single-use, and are lost on service
-restart. Upload and update return `ingestion_status: "pending"`, and the background worker in
+restart. They are process-local, so run one RAM-A process per database and do not route prepare and
+confirm calls across replicas. Upload and update return `ingestion_status: "pending"`, and the background worker in
 `ram-a-mem` processes those tasks automatically. Delete completes synchronously and returns
 `deleted: true`. `case_library.api_token_env` is not required for these MCP tools—it only
 controls the separate REST management API.

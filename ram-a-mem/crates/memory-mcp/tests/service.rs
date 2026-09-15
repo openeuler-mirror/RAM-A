@@ -543,6 +543,30 @@ async fn context_only_ingest_returns_empty_without_model_calls_or_idempotency_ro
 }
 
 #[tokio::test]
+async fn context_message_can_later_be_promoted_to_a_candidate_with_the_same_id() {
+    let fixture = fixture_service().await;
+    let principal = principal("t", "u", "agent-a");
+    let mut context_only = preference_ingest();
+    context_only.messages[0].candidate = false;
+    fixture
+        .service
+        .ingest(&principal, context_only)
+        .await
+        .unwrap();
+
+    let promoted = fixture
+        .service
+        .ingest(&principal, preference_ingest())
+        .await
+        .unwrap();
+
+    assert_eq!(promoted.accepted_count, 1);
+    assert!(!promoted.idempotency_hit);
+    assert_eq!(fixture.extractor.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.verifier.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn same_message_key_with_different_content_is_rejected_before_pipeline() {
     let fixture = fixture_service().await;
     let principal = principal("tenant-secret", "user-secret", "agent-a");

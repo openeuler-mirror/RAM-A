@@ -498,6 +498,9 @@ impl EmbeddedCaseSearchProvider {
             .pending_confirmations
             .lock()
             .map_err(|_| CaseServiceError::Unavailable)?;
+        pending.retain(|token, mutation| {
+            token == &confirmation.confirmation_token || mutation.expires_at_ms > now
+        });
         let Some(mutation) = pending.get_mut(&confirmation.confirmation_token) else {
             return Err(CaseServiceError::ConfirmationInvalid);
         };
@@ -948,6 +951,7 @@ impl CaseServiceClient {
         }
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(config.timeout_seconds))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("failed to construct case service HTTP client")?;
         let libraries = config

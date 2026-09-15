@@ -1133,30 +1133,25 @@ fn validate_authenticated_provider_base_url(
     let parsed_base_url = validate_provider_base_url(value, label)?;
     if api_key_env.is_some()
         && parsed_base_url.scheme() != "https"
-        && !is_loopback_or_private(&parsed_base_url)
+        && !is_loopback(&parsed_base_url)
     {
         anyhow::bail!(
-            "{label} must use HTTPS when an API key is configured unless the host is loopback, private, or link-local"
+            "{label} must use HTTPS when an API key is configured unless the host is loopback"
         );
     }
     Ok(parsed_base_url)
 }
 
-fn is_loopback_or_private(value: &url::Url) -> bool {
+fn is_loopback(value: &url::Url) -> bool {
     match value.host() {
-        Some(url::Host::Ipv4(address)) => {
-            address.is_loopback() || address.is_private() || address.is_link_local()
-        }
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
         Some(url::Host::Ipv6(address)) => {
             if let Some(ipv4) = address.to_ipv4_mapped() {
-                return ipv4.is_loopback() || ipv4.is_private() || ipv4.is_link_local();
+                return ipv4.is_loopback();
             }
-            address.is_loopback() || address.is_unique_local() || address.is_unicast_link_local()
+            address.is_loopback()
         }
-        Some(url::Host::Domain(domain)) => {
-            domain.eq_ignore_ascii_case("localhost")
-                || domain.to_ascii_lowercase().ends_with(".localhost")
-        }
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
         None => false,
     }
 }
@@ -2065,15 +2060,34 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_rerank_allows_https_and_trusted_http_hosts() {
+    fn authenticated_rerank_allows_https_and_loopback_http_hosts() {
         for base_url in [
             "https://public.example.com/v1",
             "http://localhost:8080/v1",
             "http://127.0.0.1:8080/v1",
-            "http://10.0.0.1:8080/v1",
-            "http://169.254.1.1:8080/v1",
             "http://[::1]:8080/v1",
             "http://[::ffff:127.0.0.1]:8080/v1",
+        ] {
+            let config = RetrievalServiceConfig {
+                rerank: RerankServiceConfig {
+                    enabled: true,
+                    api_key_env: Some("OPENROUTER_API_KEY".to_string()),
+                    base_url: base_url.to_string(),
+                    ..RerankServiceConfig::default()
+                },
+                ..RetrievalServiceConfig::default()
+            };
+
+            assert!(config.validate().is_ok(), "{base_url}");
+        }
+    }
+
+    #[test]
+    fn authenticated_rerank_rejects_plain_http_non_loopback_hosts() {
+        for base_url in [
+            "http://api.localhost:8080/v1",
+            "http://10.0.0.1:8080/v1",
+            "http://169.254.1.1:8080/v1",
             "http://[fd00::1]:8080/v1",
             "http://[fe80::1]:8080/v1",
         ] {
@@ -2087,7 +2101,10 @@ mod tests {
                 ..RetrievalServiceConfig::default()
             };
 
-            assert!(config.validate().is_ok(), "{base_url}");
+            let error = config
+                .validate()
+                .expect_err("authenticated non-loopback HTTP must be rejected");
+            assert!(error.to_string().contains("must use HTTPS"), "{base_url}");
         }
     }
 

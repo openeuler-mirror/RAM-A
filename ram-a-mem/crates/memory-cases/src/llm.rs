@@ -22,7 +22,10 @@ impl DocumentSummaryClient {
         timeout: Duration,
     ) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("document summary HTTP client should build"),
             api_key: api_key.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             model: model.into(),

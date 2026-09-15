@@ -543,7 +543,9 @@ where
             .as_deref()
             .and_then(parse_event_time);
         let event_time_to = request.event_time_to.as_deref().and_then(parse_event_time);
-        let candidate_limit = bounded_candidate_limit(top_k);
+        let has_post_retrieval_filters =
+            !memory_types.is_empty() || event_time_from.is_some() || event_time_to.is_some();
+        let candidate_limit = bounded_candidate_limit(top_k, has_post_retrieval_filters);
         stage_started = Instant::now();
         tracing::info!(
             event = "ram_a.memory.search.stage.started",
@@ -1080,9 +1082,10 @@ fn metadata_text(metadata: &Value, key: &str) -> String {
         .to_string()
 }
 
-fn bounded_candidate_limit(top_k: usize) -> usize {
+fn bounded_candidate_limit(top_k: usize, has_post_retrieval_filters: bool) -> usize {
+    let multiplier = if has_post_retrieval_filters { 10 } else { 5 };
     top_k
-        .saturating_mul(5)
+        .saturating_mul(multiplier)
         .max(top_k)
         .min(MAX_SEARCH_CANDIDATES)
 }
@@ -1425,10 +1428,11 @@ mod tests {
 
     #[test]
     fn post_filter_candidate_pool_is_bounded() {
-        assert_eq!(bounded_candidate_limit(1), 5);
-        assert_eq!(bounded_candidate_limit(10), 50);
-        assert_eq!(bounded_candidate_limit(100), 500);
-        assert_eq!(bounded_candidate_limit(usize::MAX), 500);
+        assert_eq!(bounded_candidate_limit(1, false), 5);
+        assert_eq!(bounded_candidate_limit(10, false), 50);
+        assert_eq!(bounded_candidate_limit(10, true), 100);
+        assert_eq!(bounded_candidate_limit(100, true), 500);
+        assert_eq!(bounded_candidate_limit(usize::MAX, false), 500);
     }
 
     #[test]

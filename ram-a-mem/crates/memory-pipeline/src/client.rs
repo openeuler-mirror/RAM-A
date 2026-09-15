@@ -94,6 +94,7 @@ impl OpenAiCompatibleClient {
         }
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_seconds))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| {
                 PipelineError::Protocol(format!("cannot build HTTP client: {error}"))

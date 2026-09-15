@@ -276,7 +276,7 @@ async fn main() -> Result<()> {
                 startup_run_id = %startup_run_id,
                 dataset_id = default_dataset_id
             );
-            case_import_worker = Some(tokio::spawn(
+            let import_task = tokio::spawn(
                 async move {
                     match import_documents_from_dir(
                         &import_service,
@@ -306,7 +306,8 @@ async fn main() -> Result<()> {
                     }
                 }
                 .instrument(ingestion_span),
-            ));
+            );
+            case_import_worker = Some(tokio::spawn(monitor_case_import_worker(import_task)));
         }
         if let Some(api_token_env) = case_library.api_token_env.as_deref() {
             let api_token =
@@ -342,7 +343,7 @@ async fn main() -> Result<()> {
     if let Some(case_import_worker) = case_import_worker {
         case_import_worker
             .await
-            .context("case library import worker failed to join")?;
+            .context("case library import monitor failed to join")??;
     }
     if let Some(ingestion_worker) = ingestion_worker {
         ingestion_worker
@@ -350,6 +351,21 @@ async fn main() -> Result<()> {
             .context("case ingestion worker failed to join")?;
     }
     server_result.context("HTTP server failed")
+}
+
+async fn monitor_case_import_worker(import_task: tokio::task::JoinHandle<()>) -> Result<()> {
+    match import_task.await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            tracing::error!(
+                event = "ram_a.case.ingestion.worker_failed",
+                worker = "source_import",
+                panicked = error.is_panic(),
+                cancelled = error.is_cancelled()
+            );
+            Err(error).context("case library source import task failed")
+        }
+    }
 }
 
 fn init_tracing() -> Result<LogSettings> {
@@ -433,4 +449,34 @@ async fn shutdown_signal(cancellation_token: CancellationToken) {
         _ = terminate => {},
     }
     cancellation_token.cancel();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::monitor_case_import_worker;
+
+    #[tokio::test]
+    async fn case_import_worker_panic_is_propagated() {
+        let import_task = tokio::spawn(async { panic!("source import panic") });
+        let error = monitor_case_import_worker(import_task)
+            .await
+            .expect_err("panic must fail the monitored worker");
+
+        assert!(error
+            .to_string()
+            .contains("case library source import task failed"));
+    }
+
+    #[tokio::test]
+    async fn case_import_worker_cancellation_is_propagated() {
+        let import_task = tokio::spawn(std::future::pending::<()>());
+        import_task.abort();
+        let error = monitor_case_import_worker(import_task)
+            .await
+            .expect_err("cancellation must fail the monitored worker");
+
+        assert!(error
+            .to_string()
+            .contains("case library source import task failed"));
+    }
 }

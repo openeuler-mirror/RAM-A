@@ -57,7 +57,7 @@ impl OpenRouterReranker {
         model: impl Into<String>,
     ) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: crate::fixed_endpoint_http_client(),
             api_key: Some(api_key.into()),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             model: model.into(),
@@ -77,7 +77,7 @@ impl OpenRouterReranker {
         config: &RerankConfig,
     ) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: crate::fixed_endpoint_http_client(),
             api_key,
             base_url: config.base_url.trim_end_matches('/').to_string(),
             model: config.model.clone(),
