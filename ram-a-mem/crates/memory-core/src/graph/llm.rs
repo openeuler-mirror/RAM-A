@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -113,7 +113,7 @@ impl OpenAiCompatibleGraphLlmClient {
         }
 
         let mut response = http_request.send().await.map_err(|error| {
-            LlmAttemptError::retryable(format!("graph LLM request failed: {error}"))
+            LlmAttemptError::retryable(graph_llm_request_error(error, self.timeout))
         })?;
 
         let status = response.status();
@@ -123,7 +123,7 @@ impl OpenAiCompatibleGraphLlmClient {
                 message: format!("graph LLM API returned HTTP {status}"),
             });
         }
-        let body_text = read_bounded_response_body(&mut response).await?;
+        let body_text = read_bounded_response_body(&mut response, self.timeout).await?;
 
         let body: OpenAiChatResponse = serde_json::from_str(&body_text).map_err(|error| {
             LlmAttemptError::retryable(format!("decode failed for graph LLM response: {error}"))
@@ -162,7 +162,9 @@ impl GraphLlmClient for OpenAiCompatibleGraphLlmClient {
 
     async fn complete_json(&self, request: GraphLlmRequest) -> MemoryResult<GraphLlmResponse> {
         let mut last_error = None;
+        let timeout_ms = self.timeout.map(|timeout| timeout.as_millis() as u64);
         for attempt in 1..=LLM_MAX_ATTEMPTS {
+            let attempt_started = Instant::now();
             match self.complete_once(&request).await {
                 Ok(response) => return Ok(response),
                 Err(error) if error.retryable && attempt < LLM_MAX_ATTEMPTS => {
@@ -176,6 +178,9 @@ impl GraphLlmClient for OpenAiCompatibleGraphLlmClient {
                         attempt,
                         max_attempts = LLM_MAX_ATTEMPTS,
                         backoff_ms = backoff.as_millis() as u64,
+                        elapsed_ms = attempt_started.elapsed().as_millis() as u64,
+                        timeout_configured = timeout_ms.is_some(),
+                        timeout_ms = timeout_ms.unwrap_or(0),
                         error_kind = graph_llm_error_kind(&error.message)
                     );
                     tokio::time::sleep(backoff).await;
@@ -189,6 +194,9 @@ impl GraphLlmClient for OpenAiCompatibleGraphLlmClient {
                         model = self.model,
                         operation = "extract_graph",
                         attempts = attempt,
+                        elapsed_ms = attempt_started.elapsed().as_millis() as u64,
+                        timeout_configured = timeout_ms.is_some(),
+                        timeout_ms = timeout_ms.unwrap_or(0),
                         error_kind = graph_llm_error_kind(&error.message)
                     );
                     return Err(MemoryError::Extraction {
@@ -203,6 +211,21 @@ impl GraphLlmClient for OpenAiCompatibleGraphLlmClient {
                 .unwrap_or_else(|| "graph LLM request failed without an error".to_string()),
         })
     }
+}
+
+fn graph_llm_request_error(error: reqwest::Error, timeout: Option<Duration>) -> String {
+    if error.is_timeout() {
+        return timeout
+            .map(|timeout| {
+                format!(
+                    "graph LLM request timed out after {} ms",
+                    timeout.as_millis()
+                )
+            })
+            .unwrap_or_else(|| format!("graph LLM request timed out: {error}"));
+    }
+
+    format!("graph LLM request failed: {error}")
 }
 
 fn graph_llm_error_kind(message: &str) -> &'static str {
@@ -855,6 +878,7 @@ fn validate_json_content(content: &str) -> Result<(), LlmAttemptError> {
 
 async fn read_bounded_response_body(
     response: &mut reqwest::Response,
+    timeout: Option<Duration>,
 ) -> Result<String, LlmAttemptError> {
     if response
         .content_length()
@@ -870,7 +894,11 @@ async fn read_bounded_response_body(
 
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|error| {
-        LlmAttemptError::retryable(format!("failed to read graph LLM response body: {error}"))
+        LlmAttemptError::retryable(if error.is_timeout() {
+            graph_llm_request_error(error, timeout)
+        } else {
+            format!("failed to read graph LLM response body: {error}")
+        })
     })? {
         if body.len().saturating_add(chunk.len()) > MAX_GRAPH_LLM_RESPONSE_BYTES {
             return Err(LlmAttemptError {
@@ -1042,6 +1070,69 @@ mod tests {
             client.chat_completions_url(),
             "https://example.com/v1/chat/completions"
         );
+    }
+
+    #[tokio::test]
+    async fn openai_compatible_client_reports_configured_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        let client = OpenAiCompatibleGraphLlmClient::with_base_url(
+            "test-key",
+            format!("http://{address}/v1"),
+            "test-model",
+        )
+        .with_timeout_ms(Some(20));
+
+        let error = client
+            .complete_once(&GraphLlmRequest {
+                messages: Vec::new(),
+                temperature: 0.0,
+                response_format_json: true,
+            })
+            .await
+            .unwrap_err();
+
+        server.await.unwrap();
+        assert_eq!(error.message, "graph LLM request timed out after 20 ms");
+    }
+
+    #[tokio::test]
+    async fn openai_compatible_client_reports_response_body_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 8192];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = socket.write_all(b"{}").await;
+        });
+        let client = OpenAiCompatibleGraphLlmClient::with_base_url(
+            "test-key",
+            format!("http://{address}/v1"),
+            "test-model",
+        )
+        .with_timeout_ms(Some(20));
+
+        let error = client
+            .complete_once(&GraphLlmRequest {
+                messages: Vec::new(),
+                temperature: 0.0,
+                response_format_json: true,
+            })
+            .await
+            .unwrap_err();
+
+        server.await.unwrap();
+        assert_eq!(error.message, "graph LLM request timed out after 20 ms");
     }
 
     #[tokio::test]
