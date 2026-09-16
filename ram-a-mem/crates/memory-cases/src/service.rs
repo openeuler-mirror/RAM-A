@@ -1,12 +1,17 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use memory_core::{
-    AddMemoryRequest, LongTermMemory, MemoryManager, ScoredMemory, SearchMemoryRequest,
+    AddMemoryRequest, EmbeddingProvider, LongTermMemory, MemoryManager, ScoredMemory,
+    SearchMemoryRequest, SqliteMemoryStore,
 };
+use rusqlite::{Connection, OpenFlags};
 use tokio::fs;
+use tokio::sync::{RwLock, RwLockReadGuard};
 use uuid::Uuid;
 
 use crate::chunker::{chunk_parse_result, ChunkerConfig};
@@ -14,8 +19,9 @@ use crate::llm::DocumentSummaryClient;
 use crate::model::{
     ChatCompletionResponse, Chunk, CreateDatasetRequest, CreateDocumentFileRequest,
     CreateDocumentResponse, Dataset, DeleteDocumentResponse, IngestionTask, ListChunksResponse,
-    ListDatasetsResponse, ListDocumentsResponse, SearchChunk, SearchRequest, SearchResponse,
-    StoredDocument, UpdateDocumentFileRequest, UpdateDocumentResponse,
+    ListDatasetsResponse, ListDocumentsResponse, IndexRebuildPhase, IndexRebuildState,
+    IndexRebuildStatus, SearchChunk, SearchRequest, SearchResponse, StoredDocument,
+    UpdateDocumentFileRequest, UpdateDocumentResponse,
 };
 use crate::parser::ParserEngine;
 use crate::repo::{current_time_ms, DocumentMutation, RagRepository};
@@ -57,19 +63,197 @@ pub struct RagConfig {
 pub struct RagService {
     repo: Arc<RagRepository>,
     memory: Arc<MemoryManager>,
+    embedder: Arc<dyn EmbeddingProvider>,
+    index_store: Arc<SqliteMemoryStore>,
+    /// Read/write gate for the retrieval index during the atomic rebuild swap.
+    ///
+    /// Lock order contract: always acquire `index_mutations` before
+    /// `index_access`. The rebuild holds `index_mutations.write()` for its whole
+    /// run and takes `index_access.write()` for the swap, so acquiring the two
+    /// locks in the opposite order deadlocks against an active rebuild.
+    index_access: RwLock<()>,
+    /// Mutation and ingestion gate. See the lock order contract on
+    /// `index_access`.
+    index_mutations: RwLock<()>,
+    index_rebuild_status: Mutex<IndexRebuildStatusStore>,
     config: RagConfig,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CaseStorageAvailability {
+    pub business_database_exists: bool,
+    pub index_database_exists: bool,
+}
+
+#[derive(Debug)]
+struct CaseIndexDatabaseMissing {
+    path: PathBuf,
+}
+
+impl fmt::Display for CaseIndexDatabaseMissing {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "case index database is missing: {}; an administrator must start an index rebuild",
+            self.path.display()
+        )
+    }
+}
+
+impl std::error::Error for CaseIndexDatabaseMissing {}
+
+pub(crate) fn is_case_index_database_missing(error: &anyhow::Error) -> bool {
+    error.is::<CaseIndexDatabaseMissing>()
+}
+
+#[derive(Debug)]
+struct CaseIndexRebuildInProgress {
+    operation_id: String,
+}
+
+impl fmt::Display for CaseIndexRebuildInProgress {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "case index rebuild is already in progress: {}",
+            self.operation_id
+        )
+    }
+}
+
+impl std::error::Error for CaseIndexRebuildInProgress {}
+
+pub(crate) fn is_case_index_rebuild_in_progress(error: &anyhow::Error) -> bool {
+    error.is::<CaseIndexRebuildInProgress>()
+}
+
+/// Releases the rebuild concurrency gate if its task terminates without
+/// recording a terminal state, for example after an unexpected panic.
+///
+/// Without this guard the concurrency check in `RagService::start_index_rebuild`
+/// would keep rejecting new rebuilds forever once the spawned task dies while
+/// the status still reads `queued` or `running`.
+struct RebuildTaskGuard {
+    service: Arc<RagService>,
+    operation_id: String,
+    finalized: bool,
+}
+
+impl RebuildTaskGuard {
+    fn new(service: Arc<RagService>, operation_id: String) -> Self {
+        Self {
+            service,
+            operation_id,
+            finalized: false,
+        }
+    }
+
+    /// Records that `run_index_rebuild` already wrote a terminal state, so the
+    /// drop handler must not rewrite it.
+    fn mark_finalized(&mut self) {
+        self.finalized = true;
+    }
+}
+
+impl Drop for RebuildTaskGuard {
+    fn drop(&mut self) {
+        if !self.finalized {
+            self.service
+                .mark_index_rebuild_interrupted(&self.operation_id);
+        }
+    }
+}
+
+/// Number of finished rebuild records kept after newer rebuilds start, so an
+/// operation id that was polled before a retry stays queryable.
+const RETAINED_TERMINAL_INDEX_REBUILDS: usize = 8;
+
+/// In-memory rebuild history: the active rebuild plus a bounded list of recent
+/// finished rebuilds.
+///
+/// A single-slot store discarded the previous operation as soon as a retry
+/// started, so clients polling the previous id got an indistinguishable 404.
+#[derive(Default)]
+struct IndexRebuildStatusStore {
+    statuses: Vec<IndexRebuildStatus>,
+}
+
+impl IndexRebuildStatusStore {
+    fn active(&self) -> Option<&IndexRebuildStatus> {
+        self.statuses.iter().find(|status| status.state.is_active())
+    }
+
+    fn get(&self, operation_id: &str) -> Option<&IndexRebuildStatus> {
+        self.statuses
+            .iter()
+            .find(|status| status.operation_id == operation_id)
+    }
+
+    fn get_mut(&mut self, operation_id: &str) -> Option<&mut IndexRebuildStatus> {
+        self.statuses
+            .iter_mut()
+            .find(|status| status.operation_id == operation_id)
+    }
+
+    fn insert(&mut self, status: IndexRebuildStatus) {
+        self.statuses.push(status);
+        self.prune_terminal_history();
+    }
+
+    /// Drops the oldest finished records so only the most recent ones remain.
+    /// The active rebuild is never pruned.
+    fn prune_terminal_history(&mut self) {
+        let mut terminal_count = self
+            .statuses
+            .iter()
+            .filter(|status| !status.state.is_active())
+            .count();
+        let mut index = 0;
+        while terminal_count > RETAINED_TERMINAL_INDEX_REBUILDS && index < self.statuses.len() {
+            if self.statuses[index].state.is_active() {
+                index += 1;
+                continue;
+            }
+            self.statuses.remove(index);
+            terminal_count -= 1;
+        }
+    }
+}
+
+/// Guards held together for a case read session.
+///
+/// Both locks are acquired in the canonical order `index_mutations` then
+/// `index_access`; see the lock order contract on [`RagService`]'s fields.
+struct CaseReadSession<'a> {
+    _mutations: RwLockReadGuard<'a, ()>,
+    _access: RwLockReadGuard<'a, ()>,
+}
+
 impl RagService {
-    pub fn new(repo: Arc<RagRepository>, memory: Arc<MemoryManager>, config: RagConfig) -> Self {
+    pub fn new(
+        repo: Arc<RagRepository>,
+        memory: Arc<MemoryManager>,
+        embedder: Arc<dyn EmbeddingProvider>,
+        index_store: Arc<SqliteMemoryStore>,
+        config: RagConfig,
+    ) -> Self {
         Self {
             repo,
             memory,
+            embedder,
+            index_store,
+            index_access: RwLock::new(()),
+            index_mutations: RwLock::new(()),
+            index_rebuild_status: Mutex::new(IndexRebuildStatusStore::default()),
             config,
         }
     }
 
     pub fn create_dataset(&self, request: CreateDatasetRequest) -> Result<Dataset> {
+        // Preserve the business-database error as the primary failure when
+        // both stores are unavailable, then fail closed on a missing index.
+        self.repo.list_datasets()?;
+        self.ensure_index_database_exists()?;
         self.repo.create_dataset(
             request.id.as_deref(),
             &request.name,
@@ -90,6 +274,7 @@ impl RagService {
     ) -> Result<CreateDocumentResponse> {
         validate_path_component("dataset id", dataset_id)?;
         self.ensure_dataset_exists(dataset_id)?;
+        let _session = self.index_read_session().await?;
 
         let document_id = request
             .id
@@ -158,6 +343,7 @@ impl RagService {
         validate_path_component("dataset id", dataset_id)?;
         validate_path_component("document id", document_id)?;
         self.ensure_dataset_exists(dataset_id)?;
+        let _session = self.index_read_session().await?;
         let existing = self
             .repo
             .get_stored_document(document_id)?
@@ -253,6 +439,7 @@ impl RagService {
         validate_path_component("dataset id", dataset_id)?;
         validate_path_component("document id", document_id)?;
         self.ensure_dataset_exists(dataset_id)?;
+        let _session = self.index_read_session().await?;
         let existing = self
             .repo
             .get_stored_document(document_id)?
@@ -276,6 +463,20 @@ impl RagService {
         self.repo.get_task(task_id)
     }
 
+    pub(crate) fn storage_availability(&self) -> Result<CaseStorageAvailability> {
+        let business_database_exists = self.repo.database_exists()?;
+        let index_database_exists = self.index_store.path().try_exists().with_context(|| {
+            format!(
+                "failed to inspect case index database {}",
+                self.index_store.path().display()
+            )
+        })?;
+        Ok(CaseStorageAvailability {
+            business_database_exists,
+            index_database_exists,
+        })
+    }
+
     pub fn list_chunks(&self, dataset_id: &str, document_id: &str) -> Result<ListChunksResponse> {
         self.ensure_dataset_exists(dataset_id)?;
         let chunks = self.repo.list_chunks(dataset_id, document_id)?;
@@ -293,6 +494,7 @@ impl RagService {
         self.ensure_dataset_exists(dataset_id)?;
         let query = request.query.trim();
         anyhow::ensure!(!query.is_empty(), "query must not be empty");
+        let index_guard = self.index_read_guard().await?;
         if request.top_k == 0 {
             return Ok(SearchResponse { chunks: Vec::new() });
         }
@@ -307,7 +509,9 @@ impl RagService {
                 graph_target_subject: None,
                 graph_target_evidence_speaker: None,
             })
-            .await?;
+            .await
+            .map_err(|error| self.contextualize_index_error(error.into()))?;
+        drop(index_guard);
         let results = filter_unrelated_results(query, results);
         let results = filter_low_relevance_results(results);
 
@@ -364,6 +568,7 @@ impl RagService {
     }
 
     pub async fn run_next_ingestion_task(&self) -> Result<bool> {
+        let _session = self.index_read_session().await?;
         let Some(task) = self.repo.lease_next_pending_task()? else {
             return Ok(false);
         };
@@ -389,12 +594,14 @@ impl RagService {
                 );
             }
             Err(error) => {
-                let message = error.to_string();
                 let error_kind = observable_error_kind(&error);
                 let error_summary = observable_error_summary(&error);
+                let error_detail = error_chain_text(&error);
                 let retriable = ingestion_error_retriable(&error);
+                // Persist a sanitized message: task status is exposed through the
+                // HTTP API and must not embed document or database paths.
                 self.repo
-                    .fail_task(&task.id, &task.document_id, &message)
+                    .fail_task(&task.id, &task.document_id, error_summary)
                     .with_context(|| format!("failed to mark task {} failed", task.id))?;
                 tracing::error!(
                     event = "ram_a.case.ingestion.task.failed",
@@ -403,6 +610,7 @@ impl RagService {
                     document_id = task.document_id,
                     error_kind,
                     error = %error_summary,
+                    error_detail = %error_detail,
                     retriable,
                     latency_ms = started.elapsed().as_millis() as u64
                 );
@@ -436,7 +644,10 @@ impl RagService {
         let requests = self
             .build_memory_requests_for_document(&document, &chunks)
             .await;
-        self.memory.add_many(requests).await?;
+        self.memory
+            .add_many(requests)
+            .await
+            .map_err(|error| self.contextualize_index_error(error.into()))?;
         Ok(chunks.len())
     }
 
@@ -448,7 +659,306 @@ impl RagService {
         self.memory
             .delete_by_filters(document_memory_delete_filters(dataset_id, document_id))
             .await
-            .map_err(Into::into)
+            .map_err(|error| self.contextualize_index_error(error.into()))
+    }
+
+    async fn index_read_guard(&self) -> Result<RwLockReadGuard<'_, ()>> {
+        let read_guard = self.index_access.read().await;
+        self.ensure_index_database_exists()?;
+        Ok(read_guard)
+    }
+
+    /// Acquires both guards for an operation that reads the index while
+    /// excluding a concurrent rebuild, in the canonical lock order.
+    ///
+    /// Holding the mutation read guard keeps a rebuild from starting, and the
+    /// access read guard keeps the atomic swap out.
+    async fn index_read_session(&self) -> Result<CaseReadSession<'_>> {
+        let mutations = self.index_mutations.read().await;
+        let access = self.index_read_guard().await?;
+        Ok(CaseReadSession {
+            _mutations: mutations,
+            _access: access,
+        })
+    }
+
+    fn ensure_index_database_exists(&self) -> Result<()> {
+        let exists = self.index_store.path().try_exists().with_context(|| {
+            format!(
+                "failed to inspect case index database {}",
+                self.index_store.path().display()
+            )
+        })?;
+        if !exists {
+            return Err(anyhow::Error::new(CaseIndexDatabaseMissing {
+                path: self.index_store.path().to_path_buf(),
+            }));
+        }
+        Ok(())
+    }
+
+    fn contextualize_index_error(&self, error: anyhow::Error) -> anyhow::Error {
+        if matches!(self.index_store.path().try_exists(), Ok(false)) {
+            error.context(CaseIndexDatabaseMissing {
+                path: self.index_store.path().to_path_buf(),
+            })
+        } else {
+            error
+        }
+    }
+
+    /// Starts one administrator-requested index rebuild and returns immediately.
+    pub fn start_index_rebuild(self: &Arc<Self>) -> Result<IndexRebuildStatus> {
+        // Fail synchronously with the typed business-database error instead of
+        // accepting an operation that cannot possibly recover the index.
+        self.repo.list_datasets()?;
+
+        let operation_id = Uuid::new_v4().to_string();
+        let status = IndexRebuildStatus {
+            operation_id: operation_id.clone(),
+            state: IndexRebuildState::Queued,
+            phase: IndexRebuildPhase::Queued,
+            document_count: 0,
+            chunk_count: 0,
+            record_count: 0,
+            processed_record_count: 0,
+            started_at_ms: current_time_ms(),
+            completed_at_ms: None,
+            error: None,
+        };
+        {
+            let mut current = self
+                .index_rebuild_status
+                .lock()
+                .map_err(|_| anyhow::anyhow!("case index rebuild status lock is poisoned"))?;
+            let active_operation_id = current
+                .active()
+                .map(|status| status.operation_id.clone());
+            if let Some(operation_id) = active_operation_id {
+                return Err(anyhow::Error::new(CaseIndexRebuildInProgress { operation_id }));
+            }
+            current.insert(status.clone());
+        }
+
+        let service = self.clone();
+        tokio::spawn(async move {
+            service.run_index_rebuild(operation_id).await;
+        });
+        Ok(status)
+    }
+
+    /// Returns the recorded status for `operation_id`.
+    ///
+    /// The service keeps the active rebuild plus a bounded history of the most
+    /// recent finished rebuilds, so an operation started before a retry stays
+    /// queryable. Ids that were pruned or never existed return `Ok(None)`,
+    /// which the HTTP layer reports as 404.
+    pub fn get_index_rebuild_status(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<IndexRebuildStatus>> {
+        let current = self
+            .index_rebuild_status
+            .lock()
+            .map_err(|_| anyhow::anyhow!("case index rebuild status lock is poisoned"))?;
+        Ok(current.get(operation_id).cloned())
+    }
+
+    async fn run_index_rebuild(self: Arc<Self>, operation_id: String) {
+        let mut completion_guard = RebuildTaskGuard::new(self.clone(), operation_id.clone());
+        self.update_index_rebuild_status(&operation_id, |status| {
+            status.state = IndexRebuildState::Running;
+            status.phase = IndexRebuildPhase::ScanningBusinessDatabase;
+        });
+        let started = Instant::now();
+        tracing::warn!(
+            event = "ram_a.case.index.rebuild.started",
+            stage = "storage",
+            operation_id,
+            index_path = %self.index_store.path().display()
+        );
+
+        match self.rebuild_index(&operation_id).await {
+            Ok(()) => {
+                self.update_index_rebuild_status(&operation_id, |status| {
+                    status.state = IndexRebuildState::Completed;
+                    status.completed_at_ms = Some(current_time_ms());
+                });
+                tracing::info!(
+                    event = "ram_a.case.index.rebuild.completed",
+                    stage = "storage",
+                    operation_id,
+                    latency_ms = started.elapsed().as_millis() as u64
+                );
+            }
+            Err(error) => {
+                let error_detail = error_chain_text(&error);
+                self.update_index_rebuild_status(&operation_id, |status| {
+                    status.state = IndexRebuildState::Failed;
+                    status.completed_at_ms = Some(current_time_ms());
+                    // Client-safe text: the raw chain embeds temporary and target
+                    // database paths, which must not be exposed through the API.
+                    status.error = Some("case index rebuild failed".to_string());
+                });
+                tracing::error!(
+                    event = "ram_a.case.index.rebuild.failed",
+                    stage = "storage",
+                    operation_id,
+                    error_kind = observable_error_kind(&error),
+                    error = %observable_error_summary(&error),
+                    error_detail = %error_detail,
+                    latency_ms = started.elapsed().as_millis() as u64
+                );
+            }
+        }
+        completion_guard.mark_finalized();
+    }
+
+    fn update_index_rebuild_status<F>(&self, operation_id: &str, update: F)
+    where
+        F: FnOnce(&mut IndexRebuildStatus),
+    {
+        match self.index_rebuild_status.lock() {
+            Ok(mut current) => {
+                if let Some(status) = current.get_mut(operation_id) {
+                    update(status);
+                }
+                current.prune_terminal_history();
+            }
+            Err(_) => tracing::error!(
+                event = "ram_a.case.index.rebuild.status_update_failed",
+                stage = "storage",
+                operation_id
+            ),
+        }
+    }
+
+    /// Fails an active rebuild operation whose task died before recording an
+    /// outcome, so the concurrency gate accepts later rebuild requests again.
+    fn mark_index_rebuild_interrupted(&self, operation_id: &str) {
+        match self.index_rebuild_status.lock() {
+            Ok(mut current) => {
+                if let Some(status) = current
+                    .get_mut(operation_id)
+                    .filter(|status| status.state.is_active())
+                {
+                    status.state = IndexRebuildState::Failed;
+                    status.completed_at_ms = Some(current_time_ms());
+                    status.error =
+                        Some("case index rebuild task terminated unexpectedly".to_string());
+                    tracing::error!(
+                        event = "ram_a.case.index.rebuild.failed",
+                        stage = "storage",
+                        operation_id,
+                        error_kind = "task_terminated",
+                        error = "case index rebuild task terminated unexpectedly",
+                        retriable = true
+                    );
+                }
+                current.prune_terminal_history();
+            }
+            Err(_) => tracing::error!(
+                event = "ram_a.case.index.rebuild.status_update_failed",
+                stage = "storage",
+                operation_id
+            ),
+        }
+    }
+
+    async fn rebuild_index(&self, operation_id: &str) -> Result<()> {
+        // Block ingestion and case mutations while taking the business-data
+        // snapshot. Searches may continue against the old index until the
+        // short atomic-swap section below.
+        let _mutation_guard = self.index_mutations.write().await;
+        let temp_path = index_rebuild_temp_path(self.index_store.path());
+        remove_sqlite_database(&temp_path).await?;
+
+        let result = async {
+            let (requests, document_count, chunk_count) =
+                self.index_rebuild_requests().await?;
+            let record_count = requests.len();
+            self.update_index_rebuild_status(operation_id, |status| {
+                status.document_count = document_count;
+                status.chunk_count = chunk_count;
+                status.record_count = record_count;
+                status.phase = IndexRebuildPhase::Embedding;
+            });
+
+            let temp_store = Arc::new(SqliteMemoryStore::new_existing(&temp_path));
+            temp_store
+                .initialize()
+                .await
+                .context("failed to initialize temporary case index database")?;
+            let temp_memory = MemoryManager::new(temp_store, self.embedder.clone());
+            temp_memory
+                .add_many_with_batch_size_and_progress(requests, 64, |processed| {
+                    self.update_index_rebuild_status(operation_id, |status| {
+                        status.processed_record_count = status
+                            .processed_record_count
+                            .saturating_add(processed)
+                            .min(status.record_count);
+                    });
+                })
+                .await
+                .context("failed to populate temporary case index database")?;
+
+            self.update_index_rebuild_status(operation_id, |status| {
+                status.phase = IndexRebuildPhase::Validating;
+            });
+            checkpoint_and_validate_index_database(&temp_path, record_count).await?;
+
+            // Detect deletion of the source of truth after the initial scan and
+            // before making the rebuilt index visible.
+            self.repo.list_datasets()?;
+
+            self.update_index_rebuild_status(operation_id, |status| {
+                status.phase = IndexRebuildPhase::Swapping;
+            });
+            let _index_guard = self.index_access.write().await;
+            atomically_replace_index_database(&temp_path, self.index_store.path()).await?;
+            Ok(())
+        }
+        .await;
+
+        if result.is_err() {
+            if let Err(cleanup_error) = remove_sqlite_database(&temp_path).await {
+                tracing::warn!(
+                    event = "ram_a.case.index.rebuild.cleanup_failed",
+                    stage = "storage",
+                    operation_id,
+                    error = %cleanup_error
+                );
+            }
+        }
+        result
+    }
+
+    async fn index_rebuild_requests(&self) -> Result<(Vec<AddMemoryRequest>, usize, usize)> {
+        let mut requests = Vec::new();
+        let mut document_count = 0usize;
+        let mut chunk_count = 0usize;
+        for dataset in self.repo.list_datasets()? {
+            for document in self.repo.list_documents(&dataset.id)? {
+                let chunks = self.repo.list_chunks(&dataset.id, &document.id)?;
+                if chunks.is_empty() {
+                    continue;
+                }
+                let stored_document = StoredDocument {
+                    id: document.id,
+                    dataset_id: document.dataset_id,
+                    name: document.name,
+                    file_path: document.file_path,
+                    mime_type: document.mime_type,
+                };
+                chunk_count = chunk_count.saturating_add(chunks.len());
+                document_count = document_count.saturating_add(1);
+                requests.extend(
+                    self.build_memory_requests_for_document(&stored_document, &chunks)
+                        .await,
+                );
+            }
+        }
+        Ok((requests, document_count, chunk_count))
     }
 
     async fn build_memory_requests_for_document(
@@ -615,6 +1125,12 @@ impl RagService {
 }
 
 pub fn observable_error_kind(error: &anyhow::Error) -> &'static str {
+    if crate::is_business_database_missing(error) {
+        return "business_database_missing";
+    }
+    if crate::is_case_index_database_missing(error) {
+        return "index_database_missing";
+    }
     let message = error_chain_text(error).to_ascii_lowercase();
     if message.contains("429") || message.contains("too many requests") {
         "http_429"
@@ -656,6 +1172,8 @@ pub fn observable_error_summary(error: &anyhow::Error) -> &'static str {
         "timeout" => "provider request timed out",
         "connection" => "provider connection failed",
         "decode" => "provider response could not be decoded",
+        "business_database_missing" => "case business database is missing",
+        "index_database_missing" => "case index database is missing",
         "storage" => "case storage operation failed",
         "invalid_input" => "case ingestion input is invalid",
         _ => "case ingestion failed with an unclassified error",
@@ -665,7 +1183,13 @@ pub fn observable_error_summary(error: &anyhow::Error) -> &'static str {
 pub fn ingestion_error_retriable(error: &anyhow::Error) -> bool {
     matches!(
         observable_error_kind(error),
-        "http_429" | "http_5xx" | "timeout" | "connection" | "storage"
+        "http_429"
+            | "http_5xx"
+            | "timeout"
+            | "connection"
+            | "business_database_missing"
+            | "index_database_missing"
+            | "storage"
     )
 }
 
@@ -786,6 +1310,182 @@ fn document_memory_delete_filters(dataset_id: &str, document_id: &str) -> Vec<se
             "document_id": document_id,
         }),
     ]
+}
+
+fn index_rebuild_temp_path(index_path: &Path) -> PathBuf {
+    let mut temp = index_path.as_os_str().to_os_string();
+    temp.push(".rebuild.tmp");
+    PathBuf::from(temp)
+}
+
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(format!("-{suffix}"));
+    PathBuf::from(sidecar)
+}
+
+async fn remove_sqlite_database(path: &Path) -> Result<()> {
+    for candidate in [
+        path.to_path_buf(),
+        sqlite_sidecar_path(path, "wal"),
+        sqlite_sidecar_path(path, "shm"),
+    ] {
+        match fs::remove_file(&candidate).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to remove partial case index database {}",
+                        candidate.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn checkpoint_and_validate_index_database(path: &Path, expected_records: usize) -> Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let connection = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| {
+            format!(
+                "failed to open temporary case index database {}",
+                path.display()
+            )
+        })?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(30))
+            .context("failed to configure temporary case index busy timeout")?;
+        let _: (i64, i64, i64) = connection
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .context("failed to checkpoint temporary case index database")?;
+        drop(connection);
+        remove_sqlite_sidecars_sync(&path)?;
+
+        let connection = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| {
+            format!(
+                "failed to validate temporary case index database {}",
+                path.display()
+            )
+        })?;
+        let integrity: String = connection
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .context("temporary case index integrity check failed")?;
+        anyhow::ensure!(
+            integrity.eq_ignore_ascii_case("ok"),
+            "temporary case index integrity check returned: {integrity}"
+        );
+        let memory_count: usize = connection
+            .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+            .context("failed to count temporary case index records")?;
+        let fts_count: usize = connection
+            .query_row("SELECT COUNT(*) FROM memory_fts", [], |row| row.get(0))
+            .context("failed to count temporary case FTS records")?;
+        anyhow::ensure!(
+            memory_count == expected_records,
+            "temporary case index contains {memory_count} records; expected {expected_records}"
+        );
+        anyhow::ensure!(
+            fts_count == expected_records,
+            "temporary case FTS contains {fts_count} records; expected {expected_records}"
+        );
+        drop(connection);
+        remove_sqlite_sidecars_sync(&path)?;
+
+        std::fs::File::open(&path)
+            .with_context(|| format!("failed to open {} for sync", path.display()))?
+            .sync_all()
+            .with_context(|| format!("failed to sync {}", path.display()))?;
+        Ok(())
+    })
+    .await
+    .context("case index validation worker failed to join")?
+}
+
+async fn atomically_replace_index_database(temp_path: &Path, index_path: &Path) -> Result<()> {
+    let temp_path = temp_path.to_path_buf();
+    let index_path = index_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        anyhow::ensure!(
+            temp_path.parent() == index_path.parent(),
+            "temporary and target case index databases must share a directory"
+        );
+
+        if index_path.exists() {
+            // All in-process users are excluded by index_access at this point.
+            // Checkpointing makes removal of the old WAL/SHM files safe even if
+            // the final rename fails and the old main file remains in place.
+            let connection = Connection::open_with_flags(
+                &index_path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to open existing case index database {} before replacement",
+                    index_path.display()
+                )
+            })?;
+            connection
+                .busy_timeout(std::time::Duration::from_secs(30))
+                .context("failed to configure existing case index busy timeout")?;
+            let _: (i64, i64, i64) = connection
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .context("failed to checkpoint existing case index database")?;
+            drop(connection);
+            remove_sqlite_sidecars_sync(&index_path)?;
+        }
+
+        std::fs::rename(&temp_path, &index_path).with_context(|| {
+            format!(
+                "failed to atomically replace case index database {} with {}",
+                index_path.display(),
+                temp_path.display()
+            )
+        })?;
+
+        #[cfg(unix)]
+        if let Some(parent) = index_path.parent() {
+            std::fs::File::open(parent)
+                .with_context(|| format!("failed to open {} for sync", parent.display()))?
+                .sync_all()
+                .with_context(|| format!("failed to sync {}", parent.display()))?;
+        }
+        Ok(())
+    })
+    .await
+    .context("case index replacement worker failed to join")?
+}
+
+fn remove_sqlite_sidecars_sync(path: &Path) -> Result<()> {
+    for candidate in [
+        sqlite_sidecar_path(path, "wal"),
+        sqlite_sidecar_path(path, "shm"),
+    ] {
+        match std::fs::remove_file(&candidate) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to remove SQLite sidecar {}", candidate.display())
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn safe_file_name(file_name: &str) -> Result<String> {
@@ -2009,10 +2709,10 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
-    use memory_core::{
-        HashEmbedding, MemoryRecord, RetrievalConfig, SearchMode, SqliteMemoryStore,
-    };
+    use memory_core::{HashEmbedding, MemoryRecord, RetrievalConfig, SearchMode};
 
     use crate::token_counter::TestTokenCounter;
 
@@ -2073,6 +2773,15 @@ mod tests {
         test_service_with_chunk_size(512)
     }
 
+    fn remove_sqlite_database(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        for suffix in ["wal", "shm"] {
+            let mut sidecar = path.as_os_str().to_os_string();
+            sidecar.push(format!("-{suffix}"));
+            let _ = std::fs::remove_file(sidecar);
+        }
+    }
+
     fn test_service_with_chunk_size(chunk_size: usize) -> (RagService, tempfile::TempDir) {
         test_service_with_retrieval_config(
             chunk_size,
@@ -2094,14 +2803,21 @@ mod tests {
         let memory_db_path = temp.path().join("memory-cases-index.sqlite");
         let repo = Arc::new(RagRepository::new(&rag_db_path));
         repo.initialize().expect("initialize repo");
-        let store = Arc::new(SqliteMemoryStore::new(&memory_db_path));
+        let store = Arc::new(SqliteMemoryStore::new_existing(&memory_db_path));
+        store
+            .initialize_blocking()
+            .expect("initialize index store");
         let embedder = Arc::new(HashEmbedding::new(embedding_dimensions));
         let memory = Arc::new(MemoryManager::with_retrieval_config(
-            store, embedder, retrieval,
+            store.clone(),
+            embedder.clone(),
+            retrieval,
         ));
         let service = RagService::new(
             repo,
             memory,
+            embedder,
+            store,
             RagConfig {
                 file_root: temp.path().join("files"),
                 chunk_size,
@@ -2171,6 +2887,498 @@ mod tests {
             .into_iter()
             .map(|chunk| chunk.content)
             .collect()
+    }
+
+    async fn wait_for_rebuild_completion(
+        service: &Arc<RagService>,
+        operation_id: &str,
+    ) -> IndexRebuildStatus {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let status = service
+                    .get_index_rebuild_status(operation_id)
+                    .expect("read rebuild status")
+                    .expect("rebuild status should exist");
+                if !status.state.is_active() {
+                    break status;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("index rebuild should finish")
+    }
+
+    fn rebuild_status(operation_id: &str, state: IndexRebuildState) -> IndexRebuildStatus {
+        IndexRebuildStatus {
+            operation_id: operation_id.to_string(),
+            state,
+            phase: IndexRebuildPhase::Queued,
+            document_count: 0,
+            chunk_count: 0,
+            record_count: 0,
+            processed_record_count: 0,
+            started_at_ms: 1,
+            completed_at_ms: None,
+            error: None,
+        }
+    }
+
+    fn set_index_rebuild_status(
+        service: &RagService,
+        operation_id: &str,
+        state: IndexRebuildState,
+    ) {
+        let mut current = service
+            .index_rebuild_status
+            .lock()
+            .expect("lock rebuild status");
+        *current = IndexRebuildStatusStore::default();
+        current.insert(rebuild_status(operation_id, state));
+    }
+
+    fn assert_no_rebuild_temp_files(temp: &tempfile::TempDir) {
+        let leftovers = std::fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".rebuild"))
+            .count();
+        assert_eq!(leftovers, 0, "rebuild must not leave temp files");
+    }
+
+    #[test]
+    fn rebuild_status_store_keeps_recent_terminal_records_and_the_active_one() {
+        let mut store = IndexRebuildStatusStore::default();
+        for index in 0..(RETAINED_TERMINAL_INDEX_REBUILDS + 3) {
+            store.insert(rebuild_status(
+                &format!("finished-{index}"),
+                IndexRebuildState::Completed,
+            ));
+        }
+        assert_eq!(store.statuses.len(), RETAINED_TERMINAL_INDEX_REBUILDS);
+        assert!(
+            store.get("finished-0").is_none(),
+            "the oldest finished record must be evicted"
+        );
+        assert!(store
+            .get(&format!(
+                "finished-{}",
+                RETAINED_TERMINAL_INDEX_REBUILDS + 2
+            ))
+            .is_some());
+
+        // The active rebuild is never pruned, even beyond the terminal budget.
+        store.insert(rebuild_status("active-op", IndexRebuildState::Running));
+        assert!(store.active().is_some());
+        assert!(store.get("active-op").is_some());
+        assert_eq!(store.statuses.len(), RETAINED_TERMINAL_INDEX_REBUILDS + 1);
+    }
+
+    #[tokio::test]
+    async fn finished_rebuilds_stay_queryable_after_a_retry_starts() {
+        let (service, _temp) = test_service();
+        let service = Arc::new(service);
+        create_dataset_and_ingest_document(
+            &service,
+            "history-doc",
+            "history-task",
+            "history.txt",
+            "historyneedle guidance retained across rebuild retries",
+        )
+        .await;
+
+        let first = service.start_index_rebuild().expect("start first rebuild");
+        let first_completed = wait_for_rebuild_completion(&service, &first.operation_id).await;
+        assert_eq!(first_completed.state, IndexRebuildState::Completed);
+
+        let retry = service.start_index_rebuild().expect("start retry rebuild");
+
+        let first_after_retry = service
+            .get_index_rebuild_status(&first.operation_id)
+            .expect("read first rebuild status")
+            .expect("a finished rebuild stays queryable after a retry starts");
+        assert_eq!(first_after_retry.state, IndexRebuildState::Completed);
+
+        assert!(service
+            .get_index_rebuild_status("unknown-operation")
+            .expect("read unknown rebuild status")
+            .is_none());
+
+        let retry_completed = wait_for_rebuild_completion(&service, &retry.operation_id).await;
+        assert_eq!(retry_completed.state, IndexRebuildState::Completed);
+    }
+
+    /// Embedding provider that always fails, so rebuild failures can be forced
+    /// deterministically after the temporary index database already exists.
+    struct FailingEmbeddingProvider;
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for FailingEmbeddingProvider {
+        fn dimensions(&self) -> usize {
+            16
+        }
+
+        async fn embed(&self, _texts: &[String]) -> memory_core::MemoryResult<Vec<Vec<f32>>> {
+            Err(memory_core::MemoryError::Embedding {
+                message: "simulated embedding provider outage".to_string(),
+            })
+        }
+    }
+
+    /// Builds a second service over the same files as `test_service`, but using
+    /// the supplied embedding provider.
+    fn service_with_embedding_provider(
+        temp: &tempfile::TempDir,
+        embedder: Arc<dyn EmbeddingProvider>,
+    ) -> Arc<RagService> {
+        let repo = Arc::new(RagRepository::new(temp.path().join("memory-cases.sqlite")));
+        let store = Arc::new(SqliteMemoryStore::new_existing(
+            temp.path().join("memory-cases-index.sqlite"),
+        ));
+        let memory = Arc::new(MemoryManager::new(store.clone(), embedder.clone()));
+        Arc::new(RagService::new(
+            repo,
+            memory,
+            embedder,
+            store,
+            RagConfig {
+                file_root: temp.path().join("files"),
+                chunk_size: 512,
+                token_counter: Arc::new(TestTokenCounter),
+                summary_llm: None,
+            },
+        ))
+    }
+
+    #[tokio::test]
+    async fn deleted_index_database_stays_missing_until_an_administrator_rebuilds_it() {
+        let (service, temp) = test_service();
+        let service = Arc::new(service);
+        create_dataset_and_ingest_document(
+            &service,
+            "old-doc",
+            "old-task",
+            "old.txt",
+            "oldindexneedle guidance retained in the business database",
+        )
+        .await;
+        assert!(!search_contents(&service, "oldindexneedle").await.is_empty());
+
+        let index_path = temp.path().join("memory-cases-index.sqlite");
+        remove_sqlite_database(&index_path);
+        assert!(!index_path.exists());
+
+        let create_error = service
+            .create_dataset(CreateDatasetRequest {
+                id: Some("blocked-dataset".to_string()),
+                name: "Blocked while index is missing".to_string(),
+                description: None,
+            })
+            .expect_err("dataset mutation must report the missing index database");
+        assert!(is_case_index_database_missing(&create_error));
+
+        let error = service
+            .search_dataset(
+                "dataset-1",
+                SearchRequest {
+                    query: "oldindexneedle".to_string(),
+                    top_k: 5,
+                },
+            )
+            .await
+            .expect_err("search must report the missing index database");
+        assert!(
+            is_case_index_database_missing(&error),
+            "unexpected error: {error:#}"
+        );
+        let zero_limit_error = service
+            .search_dataset(
+                "dataset-1",
+                SearchRequest {
+                    query: "oldindexneedle".to_string(),
+                    top_k: 0,
+                },
+            )
+            .await
+            .expect_err("zero-result searches must still report the missing index database");
+        assert!(is_case_index_database_missing(&zero_limit_error));
+        assert!(!index_path.exists(), "search must not recreate the index DB");
+        assert!(!service
+            .list_chunks("dataset-1", "old-doc")
+            .expect("old business data should remain available")
+            .chunks
+            .is_empty());
+
+        let started = service
+            .start_index_rebuild()
+            .expect("administrator should be able to start a rebuild");
+        let completed = wait_for_rebuild_completion(&service, &started.operation_id).await;
+        assert_eq!(completed.state, IndexRebuildState::Completed);
+        assert_eq!(completed.document_count, 1);
+        assert!(completed.record_count >= 2);
+        assert_eq!(completed.processed_record_count, completed.record_count);
+        assert!(completed.error.is_none());
+        assert!(index_path.exists());
+        assert!(!search_contents(&service, "oldindexneedle").await.is_empty());
+
+        ingest_document(
+            &service,
+            "new-doc",
+            "new-task",
+            "new.txt",
+            "newindexneedle guidance written after index recreation",
+        )
+        .await;
+        assert!(!search_contents(&service, "newindexneedle").await.is_empty());
+        assert!(!search_contents(&service, "oldindexneedle").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_second_manual_index_rebuild_is_rejected_while_one_is_active() {
+        let (service, temp) = test_service();
+        let service = Arc::new(service);
+        create_dataset_and_ingest_document(
+            &service,
+            "recovery-doc",
+            "recovery-task",
+            "recovery.txt",
+            "interruptedrecoveryneedle guidance survives an interrupted rebuild",
+        )
+        .await;
+
+        let first = service.start_index_rebuild().expect("start first rebuild");
+        let error = service
+            .start_index_rebuild()
+            .expect_err("a concurrent rebuild must be rejected");
+        assert!(is_case_index_rebuild_in_progress(&error));
+        assert!(error.to_string().contains(&first.operation_id));
+
+        let completed = wait_for_rebuild_completion(&service, &first.operation_id).await;
+        assert_eq!(completed.state, IndexRebuildState::Completed);
+
+        assert_no_rebuild_temp_files(&temp);
+
+        // A finished rebuild must release the concurrency gate instead of
+        // rejecting every later rebuild.
+        let second = service
+            .start_index_rebuild()
+            .expect("a new rebuild must be accepted after the previous one completed");
+        assert_eq!(second.state, IndexRebuildState::Queued);
+        let second_completed = wait_for_rebuild_completion(&service, &second.operation_id).await;
+        assert_eq!(second_completed.state, IndexRebuildState::Completed);
+    }
+
+    #[test]
+    fn rebuild_task_guard_only_fails_the_matching_active_operation() {
+        let (service, _temp) = test_service();
+        let service = Arc::new(service);
+
+        // Dropping the guard without recording a terminal state must fail the
+        // interrupted operation and fill in its failure fields.
+        set_index_rebuild_status(&service, "interrupted-op", IndexRebuildState::Running);
+        {
+            let _guard = RebuildTaskGuard::new(service.clone(), "interrupted-op".to_string());
+        }
+        let interrupted = service
+            .get_index_rebuild_status("interrupted-op")
+            .expect("read rebuild status")
+            .expect("interrupted status should exist");
+        assert_eq!(interrupted.state, IndexRebuildState::Failed);
+        assert!(interrupted.completed_at_ms.is_some());
+        assert!(interrupted.error.is_some());
+
+        // A guard that already recorded its terminal state must not rewrite it.
+        set_index_rebuild_status(&service, "finalized-op", IndexRebuildState::Completed);
+        {
+            let mut finalized_guard =
+                RebuildTaskGuard::new(service.clone(), "finalized-op".to_string());
+            finalized_guard.mark_finalized();
+        }
+        let completed = service
+            .get_index_rebuild_status("finalized-op")
+            .expect("read rebuild status")
+            .expect("finalized status should exist");
+        assert_eq!(completed.state, IndexRebuildState::Completed);
+
+        // A guard belonging to a stale operation must not touch a newer one.
+        set_index_rebuild_status(&service, "current-op", IndexRebuildState::Running);
+        {
+            let _stale_guard = RebuildTaskGuard::new(service.clone(), "finalized-op".to_string());
+        }
+        let current = service
+            .get_index_rebuild_status("current-op")
+            .expect("read rebuild status")
+            .expect("current status should exist");
+        assert_eq!(current.state, IndexRebuildState::Running);
+    }
+
+    #[tokio::test]
+    async fn panicking_rebuild_task_marks_the_operation_failed_and_releases_the_gate() {
+        let (service, _temp) = test_service();
+        let service = Arc::new(service);
+        create_dataset_and_ingest_document(
+            &service,
+            "panic-doc",
+            "panic-task",
+            "panic.txt",
+            "panicrecoveryneedle guidance survives a panicking rebuild task",
+        )
+        .await;
+
+        // Simulate the spawned rebuild task panicking after claiming the
+        // operation: unwinding must drop the guard and fail the operation.
+        set_index_rebuild_status(&service, "panicked-op", IndexRebuildState::Running);
+        let task_guard = RebuildTaskGuard::new(service.clone(), "panicked-op".to_string());
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = task_guard;
+            panic!("simulated case index rebuild task panic");
+        }));
+        assert!(panic_result.is_err(), "the simulated task must panic");
+
+        let status = service
+            .get_index_rebuild_status("panicked-op")
+            .expect("read rebuild status")
+            .expect("panicked status should exist");
+        assert_eq!(status.state, IndexRebuildState::Failed);
+        assert!(status.completed_at_ms.is_some());
+        assert!(status.error.is_some());
+
+        // The gate must accept a new rebuild instead of returning 409 forever.
+        let restarted = service
+            .start_index_rebuild()
+            .expect("a rebuild must be accepted after the previous task panicked");
+        let completed = wait_for_rebuild_completion(&service, &restarted.operation_id).await;
+        assert_eq!(completed.state, IndexRebuildState::Completed);
+    }
+
+    #[tokio::test]
+    async fn failed_rebuild_removes_the_temporary_index_and_keeps_the_live_index() {
+        let (seed_service, temp) = test_service();
+        create_dataset_and_ingest_document(
+            &seed_service,
+            "cleanup-doc",
+            "cleanup-task",
+            "cleanup.txt",
+            "cleanupneedle guidance that must survive a failed rebuild",
+        )
+        .await;
+        let index_path = temp.path().join("memory-cases-index.sqlite");
+        let index_len_before = std::fs::metadata(&index_path)
+            .expect("live index metadata")
+            .len();
+
+        // The failing embedder forces an error after the temporary database has
+        // been initialized, so the failure cleanup path actually runs.
+        let failing_service =
+            service_with_embedding_provider(&temp, Arc::new(FailingEmbeddingProvider));
+        let error = failing_service
+            .rebuild_index("cleanup-operation")
+            .await
+            .expect_err("a rebuild with a failing embedding provider must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("temporary case index database"),
+            "unexpected error: {error:#}"
+        );
+
+        // The failure cleanup must delete the temporary database and sidecars.
+        let temp_path = index_rebuild_temp_path(&index_path);
+        assert!(
+            !temp_path.exists(),
+            "failed rebuild must remove the temporary index database"
+        );
+        for suffix in ["wal", "shm"] {
+            assert!(
+                !sqlite_sidecar_path(&temp_path, suffix).exists(),
+                "failed rebuild must remove the temporary index `-{suffix}` sidecar"
+            );
+        }
+        assert_no_rebuild_temp_files(&temp);
+
+        // The live index must stay intact and searchable.
+        assert_eq!(
+            std::fs::metadata(&index_path)
+                .expect("live index metadata after failure")
+                .len(),
+            index_len_before
+        );
+        assert!(!search_contents(&seed_service, "cleanupneedle")
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_rebuild_records_a_sanitized_error_and_releases_the_gate() {
+        let (seed_service, temp) = test_service();
+        create_dataset_and_ingest_document(
+            &seed_service,
+            "failure-doc",
+            "failure-task",
+            "failure.txt",
+            "failurerecoveryneedle guidance for the failed rebuild test",
+        )
+        .await;
+
+        let failing_service =
+            service_with_embedding_provider(&temp, Arc::new(FailingEmbeddingProvider));
+        set_index_rebuild_status(
+            &failing_service,
+            "failed-operation",
+            IndexRebuildState::Running,
+        );
+        failing_service
+            .clone()
+            .run_index_rebuild("failed-operation".to_string())
+            .await;
+
+        let status = failing_service
+            .get_index_rebuild_status("failed-operation")
+            .expect("read rebuild status")
+            .expect("failed status should exist");
+        assert_eq!(status.state, IndexRebuildState::Failed);
+        assert!(status.completed_at_ms.is_some());
+        let recorded_error = status.error.expect("failed rebuild must record an error");
+        assert_eq!(recorded_error, "case index rebuild failed");
+        assert!(
+            !recorded_error.contains(temp.path().to_str().expect("temp path is UTF-8")),
+            "recorded error must not leak filesystem paths: {recorded_error}"
+        );
+
+        assert_no_rebuild_temp_files(&temp);
+
+        // A recorded failure must release the concurrency gate.
+        let restarted = failing_service
+            .start_index_rebuild()
+            .expect("a failed rebuild must release the concurrency gate");
+        let restarted_status =
+            wait_for_rebuild_completion(&failing_service, &restarted.operation_id).await;
+        assert_eq!(restarted_status.state, IndexRebuildState::Failed);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_validation_rejects_a_record_count_mismatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("partial-index.sqlite");
+        let store = Arc::new(SqliteMemoryStore::new_existing(&path));
+        store.initialize().await.expect("initialize partial index");
+        let memory = MemoryManager::new(store, Arc::new(HashEmbedding::new(16)));
+        memory
+            .add_many(vec![AddMemoryRequest {
+                id: Some("record-1".to_string()),
+                text: "a single indexed record".to_string(),
+                metadata: serde_json::json!({}),
+            }])
+            .await
+            .expect("populate partial index");
+
+        let error = checkpoint_and_validate_index_database(&path, 2)
+            .await
+            .expect_err("record count mismatch must be rejected");
+        assert!(
+            error.to_string().contains("records; expected"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[tokio::test]

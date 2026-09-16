@@ -92,6 +92,13 @@ pub enum CaseServiceError {
     ConfirmationRequired,
     ConfirmationInvalid,
     ConfirmationExpired,
+    BusinessDatabaseMissing,
+    IndexDatabaseMissing,
+    /// The upstream service is running an administrator-requested index rebuild.
+    ///
+    /// This is a lifecycle state, not a transient outage: callers must wait for
+    /// the rebuild to complete instead of retrying immediately.
+    IndexRebuildInProgress,
     Unavailable,
     InvalidResponse,
     NotConfigured,
@@ -100,7 +107,7 @@ pub enum CaseServiceError {
 impl CaseServiceError {
     pub fn code(self) -> &'static str {
         match self {
-            Self::InvalidRequest => "CASE_INVALID_REQUEST",
+            Self::InvalidRequest => memory_cases::error::CASE_INVALID_REQUEST,
             Self::Forbidden => "CASE_FORBIDDEN",
             Self::LibraryNotFound => "CASE_LIBRARY_NOT_FOUND",
             Self::DocumentNotFound => "CASE_DOCUMENT_NOT_FOUND",
@@ -108,6 +115,9 @@ impl CaseServiceError {
             Self::ConfirmationRequired => "CASE_USER_CONFIRMATION_REQUIRED",
             Self::ConfirmationInvalid => "CASE_CONFIRMATION_INVALID",
             Self::ConfirmationExpired => "CASE_CONFIRMATION_EXPIRED",
+            Self::BusinessDatabaseMissing => memory_cases::error::CASE_BUSINESS_DATABASE_MISSING,
+            Self::IndexDatabaseMissing => memory_cases::error::CASE_INDEX_DATABASE_MISSING,
+            Self::IndexRebuildInProgress => memory_cases::error::CASE_INDEX_REBUILD_IN_PROGRESS,
             Self::Unavailable => "CASE_UNAVAILABLE",
             Self::InvalidResponse => "CASE_INVALID_RESPONSE",
             Self::NotConfigured => "CASE_NOT_CONFIGURED",
@@ -115,7 +125,10 @@ impl CaseServiceError {
     }
 
     pub fn retriable(self) -> bool {
-        matches!(self, Self::Unavailable)
+        matches!(
+            self,
+            Self::BusinessDatabaseMissing | Self::IndexDatabaseMissing | Self::Unavailable
+        )
     }
 }
 
@@ -130,6 +143,11 @@ impl fmt::Display for CaseServiceError {
             Self::ConfirmationRequired => "explicit user confirmation is required",
             Self::ConfirmationInvalid => "case mutation confirmation is invalid or already used",
             Self::ConfirmationExpired => "case mutation confirmation has expired",
+            Self::BusinessDatabaseMissing => "case business database is missing",
+            Self::IndexDatabaseMissing => "case index database is missing",
+            Self::IndexRebuildInProgress => {
+                "case index rebuild is in progress; wait for it to complete before retrying"
+            }
             Self::Unavailable => "case service is unavailable",
             Self::InvalidResponse => "case service returned an invalid response",
             Self::NotConfigured => "case service is not configured",
@@ -138,6 +156,16 @@ impl fmt::Display for CaseServiceError {
 }
 
 impl std::error::Error for CaseServiceError {}
+
+fn map_embedded_service_error(error: anyhow::Error) -> CaseServiceError {
+    if memory_cases::is_business_database_missing(&error) {
+        CaseServiceError::BusinessDatabaseMissing
+    } else if memory_cases::is_case_index_database_missing(&error) {
+        CaseServiceError::IndexDatabaseMissing
+    } else {
+        CaseServiceError::Unavailable
+    }
+}
 
 #[async_trait]
 pub trait CaseSearchProvider: Send + Sync {
@@ -340,7 +368,7 @@ impl EmbeddedCaseSearchProvider {
         let exists = self
             .service
             .list_datasets()
-            .map_err(|_| CaseServiceError::Unavailable)?
+            .map_err(map_embedded_service_error)?
             .datasets
             .iter()
             .any(|dataset| dataset.id == dataset_id);
@@ -361,7 +389,7 @@ impl EmbeddedCaseSearchProvider {
         let created_concurrently = self
             .service
             .list_datasets()
-            .map_err(|_| CaseServiceError::Unavailable)?
+            .map_err(map_embedded_service_error)?
             .datasets
             .iter()
             .any(|dataset| dataset.id == dataset_id);
@@ -376,7 +404,7 @@ impl EmbeddedCaseSearchProvider {
         Ok(self
             .service
             .list_datasets()
-            .map_err(|_| CaseServiceError::Unavailable)?
+            .map_err(map_embedded_service_error)?
             .datasets
             .iter()
             .any(|dataset| dataset.id == dataset_id))
@@ -399,7 +427,7 @@ impl EmbeddedCaseSearchProvider {
         Ok(self
             .service
             .list_documents(dataset_id)
-            .map_err(|_| CaseServiceError::Unavailable)?
+            .map_err(map_embedded_service_error)?
             .documents
             .iter()
             .any(|document| document.id == document_id))
@@ -413,7 +441,7 @@ impl EmbeddedCaseSearchProvider {
         self.require_existing_dataset(dataset_id)?;
         self.service
             .list_documents(dataset_id)
-            .map_err(|_| CaseServiceError::Unavailable)?
+            .map_err(map_embedded_service_error)?
             .documents
             .into_iter()
             .find(|document| document.id == document_id)
@@ -527,7 +555,14 @@ impl EmbeddedCaseSearchProvider {
             .pending_confirmations
             .lock()
             .map_err(|_| CaseServiceError::Unavailable)?;
-        if result == Err(CaseServiceError::Unavailable) {
+        if matches!(
+            result,
+            Err(
+                CaseServiceError::BusinessDatabaseMissing
+                    | CaseServiceError::IndexDatabaseMissing
+                    | CaseServiceError::Unavailable
+            )
+        ) {
             if let Some(mutation) = pending.get_mut(confirmation_token) {
                 mutation.executing = false;
             }
@@ -562,7 +597,7 @@ impl EmbeddedCaseSearchProvider {
         if let Some(task) = self
             .service
             .get_task(operation_id)
-            .map_err(|_| CaseServiceError::Unavailable)?
+            .map_err(map_embedded_service_error)?
         {
             return Ok(CaseDocumentMutationResponse {
                 library: library_name,
@@ -596,7 +631,7 @@ impl EmbeddedCaseSearchProvider {
                 },
             )
             .await
-            .map_err(|_| CaseServiceError::Unavailable)?;
+            .map_err(map_embedded_service_error)?;
 
         Ok(CaseDocumentMutationResponse {
             library: library_name,
@@ -620,7 +655,7 @@ impl EmbeddedCaseSearchProvider {
         if let Some(task) = self
             .service
             .get_task(operation_id)
-            .map_err(|_| CaseServiceError::Unavailable)?
+            .map_err(map_embedded_service_error)?
         {
             return Ok(CaseDocumentMutationResponse {
                 library: library_name,
@@ -648,7 +683,7 @@ impl EmbeddedCaseSearchProvider {
                 },
             )
             .await
-            .map_err(|_| CaseServiceError::Unavailable)?;
+            .map_err(map_embedded_service_error)?;
 
         Ok(CaseDocumentMutationResponse {
             library: library_name,
@@ -679,7 +714,7 @@ impl EmbeddedCaseSearchProvider {
             .service
             .delete_document(&dataset_id, &request.document_id)
             .await
-            .map_err(|_| CaseServiceError::Unavailable)?;
+            .map_err(map_embedded_service_error)?;
 
         Ok(CaseDocumentDeleteResponse {
             library: library_name,
@@ -713,7 +748,7 @@ impl CaseSearchProvider for EmbeddedCaseSearchProvider {
                 },
             )
             .await
-            .map_err(|_| CaseServiceError::Unavailable)?;
+            .map_err(map_embedded_service_error)?;
 
         let mut truncated = response.chunks.len() > request.top_k;
         let mut references = Vec::with_capacity(response.chunks.len().min(request.top_k));
@@ -1028,7 +1063,57 @@ struct UpstreamSearchResponse {
 
 #[derive(Deserialize)]
 struct UpstreamErrorResponse {
+    #[serde(default)]
+    code: Option<String>,
     error: String,
+}
+
+/// Maps an upstream case API error response to a client-facing [`CaseServiceError`].
+///
+/// Stable server error codes take precedence over message text. The codes are
+/// matched against the constants exported by the `memory-cases` server crate so
+/// a typo on either side fails at compile time or is caught by the
+/// `client_recognizes_every_mapped_upstream_error_code` test. The
+/// database-missing codes are only honored for HTTP 503 responses, matching the
+/// server contract, so an unrelated response that reuses a similar code is not
+/// mistaken for a storage outage. Codes without a template here fall back to
+/// [`CaseServiceError::Unavailable`], which keeps retry semantics for transient
+/// upstream failures.
+fn classify_upstream_error(
+    status: reqwest::StatusCode,
+    code: Option<&str>,
+    error_text: Option<&str>,
+) -> CaseServiceError {
+    match code {
+        Some(code)
+            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                && code == memory_cases::error::CASE_BUSINESS_DATABASE_MISSING =>
+        {
+            CaseServiceError::BusinessDatabaseMissing
+        }
+        Some(code)
+            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                && code == memory_cases::error::CASE_INDEX_DATABASE_MISSING =>
+        {
+            CaseServiceError::IndexDatabaseMissing
+        }
+        Some(code) if code == memory_cases::error::CASE_INDEX_REBUILD_IN_PROGRESS => {
+            CaseServiceError::IndexRebuildInProgress
+        }
+        Some(code) if code == memory_cases::error::CASE_NOT_FOUND => {
+            CaseServiceError::LibraryNotFound
+        }
+        Some(code) if code == memory_cases::error::CASE_INVALID_REQUEST => {
+            CaseServiceError::InvalidRequest
+        }
+        // Legacy fallback for servers that predate the stable `CASE_NOT_FOUND`
+        // code: match the historical dataset-not-found message text. Keep until
+        // the next release window, then remove it.
+        _ if status == reqwest::StatusCode::NOT_FOUND && error_text == Some("dataset not found") => {
+            CaseServiceError::LibraryNotFound
+        }
+        _ => CaseServiceError::Unavailable,
+    }
 }
 
 #[derive(Deserialize)]
@@ -1073,20 +1158,21 @@ impl CaseSearchProvider for CaseServiceClient {
             .map_err(|_| CaseServiceError::Unavailable)?;
         let status = response.status();
         if !status.is_success() {
-            let dataset_not_found = if status == reqwest::StatusCode::NOT_FOUND {
-                self.response_body(&mut response)
-                    .await
-                    .ok()
-                    .and_then(|body| serde_json::from_slice::<UpstreamErrorResponse>(&body).ok())
-                    .is_some_and(|body| body.error == "dataset not found")
-            } else {
-                false
-            };
-            let error = if dataset_not_found {
-                CaseServiceError::LibraryNotFound
-            } else {
-                CaseServiceError::Unavailable
-            };
+            let upstream_error = self
+                .response_body(&mut response)
+                .await
+                .ok()
+                .and_then(|body| serde_json::from_slice::<UpstreamErrorResponse>(&body).ok());
+            let error = upstream_error
+                .as_ref()
+                .map(|body| {
+                    classify_upstream_error(
+                        status,
+                        body.code.as_deref(),
+                        Some(body.error.as_str()),
+                    )
+                })
+                .unwrap_or(CaseServiceError::Unavailable);
             tracing::warn!(
                 event = "ram_a.case.upstream_search.failed",
                 url = %url,
@@ -1163,10 +1249,120 @@ impl CaseSearchProvider for DisabledCaseSearchProvider {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use memory_cases::{build_service, CaseServiceOptions, EmbeddingProviderKind};
     use tempfile::TempDir;
 
     use super::*;
+
+    /// Guards client/server error-code alignment: every upstream code the client
+    /// maps deliberately must reach its dedicated error instead of silently
+    /// falling back to the generic [`CaseServiceError::Unavailable`].
+    #[test]
+    fn client_recognizes_every_mapped_upstream_error_code() {
+        let upstream_codes = [
+            (
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                memory_cases::error::CASE_BUSINESS_DATABASE_MISSING,
+                CaseServiceError::BusinessDatabaseMissing,
+            ),
+            (
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                memory_cases::error::CASE_INDEX_DATABASE_MISSING,
+                CaseServiceError::IndexDatabaseMissing,
+            ),
+            (
+                reqwest::StatusCode::CONFLICT,
+                memory_cases::error::CASE_INDEX_REBUILD_IN_PROGRESS,
+                CaseServiceError::IndexRebuildInProgress,
+            ),
+            (
+                reqwest::StatusCode::NOT_FOUND,
+                memory_cases::error::CASE_NOT_FOUND,
+                CaseServiceError::LibraryNotFound,
+            ),
+            (
+                reqwest::StatusCode::BAD_REQUEST,
+                memory_cases::error::CASE_INVALID_REQUEST,
+                CaseServiceError::InvalidRequest,
+            ),
+        ];
+        for (status, code, expected) in upstream_codes {
+            let classified =
+                classify_upstream_error(status, Some(code), Some("upstream failure"));
+            assert_eq!(
+                classified, expected,
+                "client must recognize upstream error code {code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn database_missing_codes_require_a_service_unavailable_status() {
+        for status in [
+            reqwest::StatusCode::CONFLICT,
+            reqwest::StatusCode::BAD_REQUEST,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            for code in [
+                memory_cases::error::CASE_BUSINESS_DATABASE_MISSING,
+                memory_cases::error::CASE_INDEX_DATABASE_MISSING,
+            ] {
+                let classified =
+                    classify_upstream_error(status, Some(code), Some("upstream failure"));
+                assert_eq!(
+                    classified,
+                    CaseServiceError::Unavailable,
+                    "{code:?} must not be treated as a storage outage at {status}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rebuild_in_progress_conflict_is_not_retriable() {
+        let classified = classify_upstream_error(
+            reqwest::StatusCode::CONFLICT,
+            Some(memory_cases::error::CASE_INDEX_REBUILD_IN_PROGRESS),
+            Some("case index rebuild is already in progress: operation-1"),
+        );
+        assert_eq!(classified, CaseServiceError::IndexRebuildInProgress);
+        assert_eq!(
+            classified.code(),
+            memory_cases::error::CASE_INDEX_REBUILD_IN_PROGRESS
+        );
+        assert!(!classified.retriable());
+    }
+
+    #[test]
+    fn dataset_not_found_is_recognized_by_code_and_by_legacy_message() {
+        let by_code = classify_upstream_error(
+            reqwest::StatusCode::NOT_FOUND,
+            Some(memory_cases::error::CASE_NOT_FOUND),
+            Some("the dataset has been moved"),
+        );
+        assert_eq!(by_code, CaseServiceError::LibraryNotFound);
+        assert!(!by_code.retriable());
+
+        let legacy = classify_upstream_error(
+            reqwest::StatusCode::NOT_FOUND,
+            None,
+            Some("dataset not found"),
+        );
+        assert_eq!(legacy, CaseServiceError::LibraryNotFound);
+    }
+
+    #[test]
+    fn invalid_request_code_maps_to_a_non_retriable_error() {
+        let classified = classify_upstream_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            Some(memory_cases::error::CASE_INVALID_REQUEST),
+            Some("query must not be empty"),
+        );
+        assert_eq!(classified, CaseServiceError::InvalidRequest);
+        assert!(!classified.retriable());
+    }
 
     fn embedded_provider_without_dataset() -> (TempDir, EmbeddedCaseSearchProvider) {
         let temp = TempDir::new().unwrap();
@@ -1204,6 +1400,97 @@ mod tests {
             agent_id: "case-admin".to_owned(),
             permissions: vec!["cases:read".to_owned(), "cases:write".to_owned()],
         }
+    }
+
+    fn remove_sqlite_database(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        for suffix in ["wal", "shm"] {
+            let mut sidecar = path.as_os_str().to_os_string();
+            sidecar.push(format!("-{suffix}"));
+            let _ = std::fs::remove_file(sidecar);
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_provider_reports_a_missing_business_database() {
+        let (temp, provider) = embedded_provider_without_dataset();
+        let rag_store = temp.path().join("cases.sqlite");
+        let index_store = temp.path().join("case-index.sqlite");
+        assert!(index_store.exists());
+        remove_sqlite_database(&rag_store);
+        let principal = case_writer();
+
+        let search_error = provider
+            .search(
+                &principal,
+                CaseSearchRequest {
+                    query: "DNS failure".to_owned(),
+                    library: Some("ops".to_owned()),
+                    top_k: 5,
+                },
+            )
+            .await
+            .expect_err("search should report the missing business database");
+        assert_eq!(
+            search_error,
+            CaseServiceError::BusinessDatabaseMissing
+        );
+        assert_eq!(search_error.code(), memory_cases::error::CASE_BUSINESS_DATABASE_MISSING);
+        assert_eq!(
+            search_error.to_string(),
+            "case business database is missing"
+        );
+        assert!(search_error.retriable());
+
+        let update_error = provider
+            .execute_update(
+                &principal,
+                "update-operation",
+                CaseDocumentUpdateRequest {
+                    library: Some("ops".to_owned()),
+                    document_id: "dns-case".to_owned(),
+                    file_name: "dns-case.md".to_owned(),
+                    name: None,
+                    diagnosis_summary: "The resolver must be restarted.".to_owned(),
+                    content: "# Updated mitigation\n\nRestart the resolver.".to_owned(),
+                },
+            )
+            .await
+            .expect_err("update should report the missing business database");
+        assert_eq!(
+            update_error,
+            CaseServiceError::BusinessDatabaseMissing
+        );
+        assert!(!rag_store.exists());
+        assert!(index_store.exists());
+    }
+
+    #[tokio::test]
+    async fn embedded_provider_reports_a_missing_index_database() {
+        let (temp, provider) = embedded_provider_without_dataset();
+        provider
+            .ensure_dataset("ops", "ops-cases")
+            .expect("create configured dataset");
+        let index_path = temp.path().join("case-index.sqlite");
+        remove_sqlite_database(&index_path);
+
+        let error = provider
+            .search(
+                &case_writer(),
+                CaseSearchRequest {
+                    query: "DNS failure".to_owned(),
+                    library: Some("ops".to_owned()),
+                    top_k: 5,
+                },
+            )
+            .await
+            .expect_err("search should report the missing index database");
+
+        assert_eq!(error, CaseServiceError::IndexDatabaseMissing);
+        assert_eq!(error.code(), memory_cases::error::CASE_INDEX_DATABASE_MISSING);
+        assert_eq!(error.to_string(), "case index database is missing");
+        assert!(error.retriable());
+        assert!(!index_path.exists());
     }
 
     #[tokio::test]

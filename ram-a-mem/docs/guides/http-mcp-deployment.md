@@ -444,6 +444,41 @@ Keep these SQLite files separate:
   uploaded source files.
 - `case_library.index_store`: case-library retrieval index.
 
+`case_library.rag_store` and `case_library.index_store` must be ordinary filesystem paths.
+SQLite URI filenames beginning with `file:` are not supported. If the Business DB is removed
+while the daemon is running, case MCP operations return `CASE_BUSINESS_DATABASE_MISSING` and do
+not recreate it. The ingestion worker checks at the configured poll interval and rate-limits
+repeated logs. It tracks the Business DB and index DB independently, so each newly missing
+database is logged immediately with its own consecutive-failure count.
+
+Authenticated REST requests that encounter either missing database return HTTP 503 and emit a
+`ram_a.case.api.request.failed` storage event with the corresponding stable error code. The log
+uses a sanitized error summary and does not expose the configured database path.
+
+If only `case_library.index_store` is removed, searches, mutations, and ingestion return
+`CASE_INDEX_DATABASE_MISSING`; neither polling nor an ordinary request recreates it. At startup,
+an absent index is created automatically only when the Business DB has no canonical chunks.
+
+With `case_library.api_token_env` configured, an administrator can rebuild the index explicitly:
+
+```bash
+operation_id=$(
+  curl -fsS -X POST http://127.0.0.1:8080/api/v1/index/rebuilds \
+    -H "Authorization: Bearer ${RAM_A_CASES_ADMIN_TOKEN}" \
+  | jq -r .operation_id
+)
+
+curl -fsS http://127.0.0.1:8080/api/v1/index/rebuilds/${operation_id} \
+  -H "Authorization: Bearer ${RAM_A_CASES_ADMIN_TOKEN}"
+```
+
+The POST returns HTTP 202. Build status moves through `queued`, `running`, and either `completed`
+or `failed`; `phase` and record counters expose progress. The job builds and validates a sibling
+temporary SQLite database, then atomically replaces the live index, so requests never read a
+partially rebuilt database. Only one rebuild can run at a time; a concurrent POST returns
+`CASE_INDEX_REBUILD_IN_PROGRESS`. A rebuild that reaches `completed` or `failed` releases the
+gate, so later rebuild requests are accepted again.
+
 Do not point `case_library.index_store` at `storage.database_path`. Case-library reindexing
 and personal long-term memories must remain isolated even though both capabilities are
 served by the same `ram-a-mem` process and HTTP port.
@@ -454,10 +489,13 @@ dataset on startup. Existing documents with the same file name are skipped.
 
 If `case_library.api_token_env` is configured, the same `ram-a-mem` listener exposes the
 case-management REST API under `/api/v1`. The value of that environment variable is a
-dedicated administrator bearer token; it is intentionally separate from MCP user tokens.
-Document create and update requests enqueue ingestion tasks. The ingestion worker runs in
-the `ram-a-mem` Tokio runtime and polls according to `case_library.ingestion_poll_ms`, so no
-separate case API or ingestor process is required.
+dedicated administrator bearer token; it is intentionally separate from MCP user tokens and
+must never be handed to ordinary case callers. The whole management surface, including
+document mutations and full index rebuilds, trusts this single credential. Regular clients
+access the case library through the MCP tools instead. Document create and update requests
+enqueue ingestion tasks. The ingestion worker runs in the `ram-a-mem` Tokio runtime and polls
+according to `case_library.ingestion_poll_ms`, so no separate case API or ingestor process is
+required.
 
 ## Network boundary
 

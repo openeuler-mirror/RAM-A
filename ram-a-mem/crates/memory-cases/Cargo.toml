@@ -20,5 +20,6 @@ tokio-util.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 tempfile = "3.9"
 tower = { version = "0.5", features = ["util"] }

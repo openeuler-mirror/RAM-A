@@ -15,6 +15,9 @@ files by default so the ownership boundary is explicit.
 | `case_library.rag_store` | `data/memory-cases.sqlite` | Business DB for datasets, documents, tasks, and chunks |
 | `case_library.index_store` | `data/memory-cases-index.sqlite` | Retrieval index DB for memory text, FTS rows, and vectors |
 
+Both settings must be ordinary filesystem paths. SQLite URI filenames such as
+`file:data/memory-cases.sqlite?mode=rw` are not supported.
+
 `memory-cases` is a library embedded by `ram-a-mem`; it no longer owns a standalone API or
 ingestor process. The case-management API and ingestion worker share one in-process
 `RagService` and therefore always use the same configured store pair. There is no
@@ -69,9 +72,26 @@ vector spaces. Shared SQLite index deployment is not recommended for concurrent 
 
 The Business DB is the durable source for document state and chunk content. The memory
 index is maintained incrementally by ingestion, document update, and document delete flows.
-`memory-cases` intentionally does not expose a memory database rebuild command or API.
-When the index DB is deployed separately as recommended, operators can rebuild it by
-creating a fresh `--memory-store` and re-ingesting the case source set.
+Runtime operations never create a missing Business DB or index DB. A missing Business DB is
+reported to MCP callers as `CASE_BUSINESS_DATABASE_MISSING`; a missing index is reported as
+`CASE_INDEX_DATABASE_MISSING`. The ingestion worker keeps checking storage at the configured
+poll interval, tracks both database files independently, logs each newly missing database
+immediately, and rate-limits its repeated logs instead of starting an automatic rebuild.
+
+During daemon startup, an absent index is initialized only when the Business DB contains no
+canonical chunks. If canonical chunks already exist, the missing state is preserved so an empty
+replacement cannot hide data loss, including after a daemon restart.
+
+An administrator can explicitly start a rebuild with `POST /api/v1/index/rebuilds` and poll
+`GET /api/v1/index/rebuilds/{operation_id}` using the case-management administrator bearer token.
+The asynchronous job regenerates all chunk and document-summary records into the sibling
+`<index>.rebuild.tmp` database, checkpoints it, runs SQLite `quick_check`, and verifies both the
+memory and FTS record counts. Only then does it briefly exclude index readers and atomically
+rename the temporary database over the configured index. Case mutations and ingestion are paused
+while the business snapshot is rebuilt; searches continue against the previous complete index,
+or return `CASE_INDEX_DATABASE_MISSING` when no previous index exists. A failed or interrupted
+rebuild never exposes the temporary database as the live index. Starting a new rebuild cleans an
+orphaned temporary database left by an interrupted process.
 
 ## Why Split
 

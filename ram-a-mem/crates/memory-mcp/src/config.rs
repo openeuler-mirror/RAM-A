@@ -421,7 +421,10 @@ pub struct CaseLibraryServiceConfig {
     #[serde(default)]
     pub source_dir: Option<PathBuf>,
     /// Enables the case-management REST API when configured. The named
-    /// environment variable supplies its dedicated administrator bearer token.
+    /// environment variable supplies its dedicated administrator bearer token,
+    /// which guards the whole `/api/v1` management surface, including document
+    /// mutations and full index rebuilds. Never distribute it to ordinary case
+    /// callers; they access the case library through MCP tools instead.
     #[serde(default)]
     pub api_token_env: Option<String>,
     #[serde(default = "default_case_ingestion_poll_ms")]
@@ -768,6 +771,17 @@ impl CaseLibraryServiceConfig {
             || self.index_store == Path::new(":memory:")
         {
             anyhow::bail!("case library stores must use persistent SQLite files");
+        }
+        if [&self.rag_store, &self.index_store]
+            .into_iter()
+            .any(|path| {
+                path.to_str()
+                    .is_some_and(|value| value.starts_with("file:"))
+            })
+        {
+            anyhow::bail!(
+                "case library stores must use filesystem paths; SQLite URI filenames are not supported"
+            );
         }
         if self.rag_store == self.index_store {
             anyhow::bail!("case library rag_store and index_store must be different files");
@@ -1985,6 +1999,32 @@ mod tests {
     fn provider_base_url_allows_trusted_http_endpoints() {
         assert!(validate_provider_base_url("http://127.0.0.1:8080/v1", "provider").is_ok());
         assert!(validate_provider_base_url("https://example.com/v1", "provider").is_ok());
+    }
+
+    #[test]
+    fn case_library_stores_reject_sqlite_uri_filenames() {
+        for (rag_store, index_store) in [
+            ("file:cases.sqlite?mode=rwc", "cases-index.sqlite"),
+            ("cases.sqlite", "file:cases-index.sqlite?mode=rwc"),
+        ] {
+            let config: CaseLibraryServiceConfig =
+                serde_json::from_value(serde_json::json!({
+                    "rag_store": rag_store,
+                    "index_store": index_store,
+                    "default_library": "ops",
+                    "libraries": [{
+                        "name": "ops",
+                        "dataset_id": "ops-cases",
+                        "tenant_ids": ["tenant-a"]
+                    }]
+                }))
+                .expect("parse case library config");
+
+            let error = config
+                .validate(None)
+                .expect_err("SQLite URI filenames must be rejected");
+            assert!(error.to_string().contains("SQLite URI filenames"));
+        }
     }
 
     #[test]

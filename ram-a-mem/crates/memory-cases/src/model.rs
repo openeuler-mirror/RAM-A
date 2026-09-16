@@ -37,6 +37,50 @@ pub struct IngestionTask {
     pub completed_at_ms: Option<u64>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexRebuildState {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+}
+
+impl IndexRebuildState {
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::Queued | Self::Running)
+    }
+}
+
+/// Pipeline stage of an active index rebuild.
+///
+/// Terminal outcomes are expressed by [`IndexRebuildState`] alone; a rebuild
+/// that reaches `completed` or `failed` keeps the last stage it progressed
+/// through, so there is no way for the phase and the state to disagree.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexRebuildPhase {
+    Queued,
+    ScanningBusinessDatabase,
+    Embedding,
+    Validating,
+    Swapping,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct IndexRebuildStatus {
+    pub operation_id: String,
+    pub state: IndexRebuildState,
+    pub phase: IndexRebuildPhase,
+    pub document_count: usize,
+    pub chunk_count: usize,
+    pub record_count: usize,
+    pub processed_record_count: usize,
+    pub started_at_ms: u64,
+    pub completed_at_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Chunk {
     pub id: String,

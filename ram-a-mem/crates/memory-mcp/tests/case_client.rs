@@ -287,3 +287,127 @@ async fn client_maps_upstream_failure_to_retriable_tool_error() {
     assert_eq!(error.code(), "CASE_UNAVAILABLE");
     assert!(error.retriable());
 }
+
+#[tokio::test]
+async fn client_preserves_upstream_database_missing_error_codes() {
+    std::env::set_var(CASE_TOKEN_ENV, CASE_TOKEN);
+    for (code, expected) in [
+        (
+            memory_cases::error::CASE_BUSINESS_DATABASE_MISSING,
+            CaseServiceError::BusinessDatabaseMissing,
+        ),
+        (
+            memory_cases::error::CASE_INDEX_DATABASE_MISSING,
+            CaseServiceError::IndexDatabaseMissing,
+        ),
+    ] {
+        let app = Router::new().route(
+            "/api/v1/datasets/openeuler-ops-cases/search",
+            post(move || async move {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "code": code,
+                        "error": "case database is missing",
+                        "retriable": true
+                    })),
+                )
+            }),
+        );
+        let (base_url, server) = spawn_stub(app).await;
+        let client = CaseServiceClient::from_config(&config(base_url)).unwrap();
+
+        let error = client
+            .search(
+                &principal("tenant-a"),
+                CaseSearchRequest {
+                    query: "DNS failure".to_owned(),
+                    library: None,
+                    top_k: 3,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        server.abort();
+        assert_eq!(error, expected);
+        assert!(error.retriable());
+    }
+}
+
+#[tokio::test]
+async fn client_maps_rebuild_conflict_to_a_non_retriable_error() {
+    std::env::set_var(CASE_TOKEN_ENV, CASE_TOKEN);
+    let app = Router::new().route(
+        "/api/v1/datasets/openeuler-ops-cases/search",
+        post(|| async {
+            (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "code": memory_cases::error::CASE_INDEX_REBUILD_IN_PROGRESS,
+                    "error": "case index rebuild is already in progress: operation-1",
+                    "retriable": true
+                })),
+            )
+        }),
+    );
+    let (base_url, server) = spawn_stub(app).await;
+    let client = CaseServiceClient::from_config(&config(base_url)).unwrap();
+
+    let error = client
+        .search(
+            &principal("tenant-a"),
+            CaseSearchRequest {
+                query: "DNS failure".to_owned(),
+                library: None,
+                top_k: 3,
+            },
+        )
+        .await
+        .unwrap_err();
+
+    server.abort();
+    assert_eq!(error, CaseServiceError::IndexRebuildInProgress);
+    assert_eq!(
+        error.code(),
+        memory_cases::error::CASE_INDEX_REBUILD_IN_PROGRESS
+    );
+    assert!(!error.retriable());
+    assert!(error.to_string().contains("wait"));
+}
+
+#[tokio::test]
+async fn client_maps_upstream_invalid_request_to_a_non_retriable_error() {
+    std::env::set_var(CASE_TOKEN_ENV, CASE_TOKEN);
+    let app = Router::new().route(
+        "/api/v1/datasets/openeuler-ops-cases/search",
+        post(|| async {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "code": memory_cases::error::CASE_INVALID_REQUEST,
+                    "error": "query must not be empty",
+                    "retriable": false
+                })),
+            )
+        }),
+    );
+    let (base_url, server) = spawn_stub(app).await;
+    let client = CaseServiceClient::from_config(&config(base_url)).unwrap();
+
+    let error = client
+        .search(
+            &principal("tenant-a"),
+            CaseSearchRequest {
+                query: "DNS failure".to_owned(),
+                library: None,
+                top_k: 3,
+            },
+        )
+        .await
+        .unwrap_err();
+
+    server.abort();
+    assert_eq!(error, CaseServiceError::InvalidRequest);
+    assert!(!error.retriable());
+}

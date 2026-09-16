@@ -99,7 +99,7 @@ RAM-A 服务端不会主动判断用户意图或自动触发工具。xiaoO 建�
 }
 ```
 
-RAM-A 会移除内部 `dataset_id` 和原始 `source_path`，并将单个引用内容截断到4000 字符。请求的案例库不存在时返回非重试错误 `CASE_LIBRARY_NOT_FOUND`；案例库存在但没有匹配案例时成功返回 `references: []`。案例服务不可用时返回`CASE_UNAVAILABLE`（可重试）；未配置、越权或检索结果无效会返回对应的结构化工具错误。
+RAM-A 会移除内部 `dataset_id` 和原始 `source_path`，并将单个引用内容截断到4000 字符。请求的案例库不存在时返回非重试错误 `CASE_LIBRARY_NOT_FOUND`；案例库存在但没有匹配案例时成功返回 `references: []`。案例服务不可用时返回`CASE_UNAVAILABLE`（可重试）；远端案例服务正在执行全量索引重建时返回非重试错误 `CASE_INDEX_REBUILD_IN_PROGRESS`，调用方应等待重建完成后再查询而不是立即重试；未配置、越权或检索结果无效会返回对应的结构化工具错误。
 
 `CASE_LIBRARY_NOT_FOUND` 与 `CASE_FORBIDDEN` 的区分会使拥有 `cases:read` 权限的已认证调用者能够判断某个 library 别名是否已配置：未知别名返回`CASE_LIBRARY_NOT_FOUND`，已配置但当前 tenant 未获授权的别名返回 `CASE_FORBIDDEN`。这是为了准确区分配置缺失与跨租户访问而接受的设计权衡。
 
@@ -219,6 +219,29 @@ token 与 tenant、user、agent 和操作类型绑定，只能使用一次；`fa
 - `case_library.rag_store`：保存 dataset、document、task、chunk 和原文路径；
 - `case_library.index_store`：保存检索索引；
 - `storage.database_path`：保存个人长期记忆和幂等状态。
+
+`case_library.rag_store` 和 `case_library.index_store` 只支持普通文件系统路径，不支持
+以 `file:` 开头的 SQLite URI。daemon 运行期间如果业务库被删除，案例 MCP 操作会返回
+`CASE_BUSINESS_DATABASE_MISSING`，且不会创建空业务库。后台导入 worker 仍按配置的轮询
+间隔检查数据库，但会限制同类错误的日志频率。业务库和索引库的告警状态独立维护，因此
+无论删除顺序如何，新缺失的数据库都会立即记录，并使用独立的连续失败次数。
+
+如果仅删除案例索引库，查询、案例变更和后台导入均返回
+`CASE_INDEX_DATABASE_MISSING`，不会创建空库或自动启动全量恢复。daemon 启动时，只有业务库
+尚无任何 canonical chunk 才会初始化空索引；业务库已有 chunk 时继续保留缺失状态。
+
+管理员可以使用独立的案例管理 bearer token 调用 `POST /api/v1/index/rebuilds` 启动异步重建，
+再调用 `GET /api/v1/index/rebuilds/{operation_id}` 查询阶段、记录数和完成状态。重建写入同目录的
+`<index>.rebuild.tmp` 临时 SQLite，完成 checkpoint、`quick_check` 和记录数校验后才原子替换正式
+索引，因此查询不会看到半成品。进程中断或重建失败不会把临时库发布为正式索引；下一次管理员
+重建会先清理遗留临时库。同一时刻只允许运行一个重建任务：并发触发返回 HTTP 409 与
+`CASE_INDEX_REBUILD_IN_PROGRESS`；重建进入 `completed` 或 `failed` 后闸门释放，后续重建请求
+可以再次受理。
+
+`case_library.api_token_env` 指向的凭证是**管理凭证**：配置后 `ram-a-mem` 会托管整个
+`/api/v1/**` 管理端点（含 dataset/document 变更与全量索引重建），持有该凭证即可触发昂贵的
+重建操作。该凭证不得下发给普通调用方，普通客户端请通过 MCP 工具访问案例库（仅使用各自的
+MCP token）；未配置该环境变量时管理端点不会挂载。
 
 不要把 `case_library.index_store` 指向 `storage.database_path`。
 

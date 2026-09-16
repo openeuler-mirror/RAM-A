@@ -388,7 +388,9 @@ Change these fields before deployment:
 - `case_library.source_dir`: optional local directory of `.md`/`.txt` documents. When set,
   `ram-a-mem` imports new files into the default case-library dataset on startup.
 - `case_library.api_token_env`: optional environment variable containing the dedicated
-  administrator token for the case-management REST API. Omit it to keep that API disabled.
+  administrator token for the case-management REST API. It is an administrator credential:
+  never hand its value to ordinary case callers, who should use the MCP tools instead.
+  Omit it to keep that API disabled.
 - `case_library.ingestion_poll_ms`: polling interval for the ingestion worker embedded in
   `ram-a-mem`. The worker continuously processes document create/update tasks.
 - `case_library.embedding_provider`: case-library retrieval embedding provider. It can be
@@ -430,9 +432,21 @@ personal long-term memories must remain isolated even though both capabilities a
 from the same `ram-a-mem` process and HTTP port.
 
 When `case_library.api_token_env` is configured, `ram-a-mem` also serves the authenticated
-case-management API under `/api/v1`. Creating or updating a document enqueues an ingestion
-task; the background worker in the same process parses, chunks, and indexes it. Do not start
-a separate `memory-cases --api` or `memory-cases --ingestor` process.
+case-management API under `/api/v1`. That environment variable is the **administrator
+credential** for the whole management surface: anyone holding it can create or update case
+documents and trigger expensive full index rebuilds. Keep it separate from MCP caller tokens
+and never distribute it to ordinary case callers; they use the MCP tools instead. Creating or
+updating a document enqueues an ingestion task; the background worker in the same process
+parses, chunks, and indexes it. Do not start a separate `memory-cases --api` or
+`memory-cases --ingestor` process.
+
+Runtime access never recreates a missing case Business DB or retrieval index. MCP callers receive
+`CASE_BUSINESS_DATABASE_MISSING` or `CASE_INDEX_DATABASE_MISSING`, respectively. To rebuild the
+derived index, an administrator starts `POST /api/v1/index/rebuilds` with the dedicated case API
+bearer token and polls `GET /api/v1/index/rebuilds/{operation_id}`. The asynchronous job validates
+a same-directory temporary SQLite database before atomically replacing the live index. Only one
+rebuild runs at a time: a concurrent request is rejected with HTTP 409 and
+`CASE_INDEX_REBUILD_IN_PROGRESS`, and a finished rebuild releases the gate for the next request.
 
 ### MCP client config
 
