@@ -15,6 +15,7 @@ axum = "=0.7.9"
 chrono.workspace = true
 clap.workspace = true
 governor = "=0.6.3"
+http-body = "1.0"
 http-body-util = "0.1"
 memory-core = { path = "../memory-core" }
 memory-cases = { path = "../memory-cases" }

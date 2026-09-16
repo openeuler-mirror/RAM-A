@@ -1,8 +1,9 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::Duration;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde_json::Value;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -50,6 +51,15 @@ pub struct IdempotencyRepository {
     path: PathBuf,
 }
 
+/// Concurrent ingests write idempotency rows from several connections at
+/// once. SQLite only serializes writers when they take the write lock up
+/// front, so every write runs in an `Immediate` transaction and busy
+/// results are retried with backoff instead of failing the request.
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const SQLITE_BUSY_MAX_ATTEMPTS: usize = 3;
+const SQLITE_BUSY_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(50);
+const SQLITE_BUSY_RETRY_MAX_DELAY: Duration = Duration::from_millis(500);
+
 impl IdempotencyRepository {
     pub async fn open(path: impl Into<PathBuf>) -> Result<Self, IdempotencyError> {
         let repository = Self { path: path.into() };
@@ -70,7 +80,8 @@ impl IdempotencyRepository {
         let path = self.path.clone();
         let entries = entries.to_vec();
         let pipeline_run_id = pipeline_run_id.to_string();
-        run_sqlite(move || reserve_sync(&path, &entries, &pipeline_run_id)).await
+        run_sqlite(move || retry_sqlite_busy(|| reserve_sync(&path, &entries, &pipeline_run_id)))
+            .await
     }
 
     pub async fn complete(
@@ -83,7 +94,10 @@ impl IdempotencyRepository {
         let entries = entries.to_vec();
         let pipeline_run_id = pipeline_run_id.to_string();
         let result = serde_json::to_string(result).map_err(|_| IdempotencyError::Storage)?;
-        run_sqlite(move || complete_sync(&path, &entries, &pipeline_run_id, &result)).await
+        run_sqlite(move || {
+            retry_sqlite_busy(|| complete_sync(&path, &entries, &pipeline_run_id, &result))
+        })
+        .await
     }
 }
 
@@ -97,6 +111,31 @@ where
         .map_err(|_| IdempotencyError::Storage)?
 }
 
+fn retry_sqlite_busy<T, F>(mut operation: F) -> Result<T, IdempotencyError>
+where
+    F: FnMut() -> Result<T, IdempotencyError>,
+{
+    let mut delay = SQLITE_BUSY_RETRY_INITIAL_DELAY;
+    for attempt in 0..SQLITE_BUSY_MAX_ATTEMPTS {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error @ IdempotencyError::Busy) => {
+                if attempt + 1 == SQLITE_BUSY_MAX_ATTEMPTS {
+                    return Err(error);
+                }
+                thread::sleep(delay);
+                let next_delay_ms = delay
+                    .as_millis()
+                    .saturating_mul(2)
+                    .min(SQLITE_BUSY_RETRY_MAX_DELAY.as_millis());
+                delay = Duration::from_millis(next_delay_ms as u64);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("sqlite retry loop always returns");
+}
+
 fn open_connection(path: &Path) -> Result<Connection, IdempotencyError> {
     if path != Path::new(":memory:") {
         if let Some(parent) = path
@@ -108,7 +147,7 @@ fn open_connection(path: &Path) -> Result<Connection, IdempotencyError> {
     }
     let connection = Connection::open(path).map_err(map_sqlite_error)?;
     connection
-        .busy_timeout(Duration::from_millis(5_000))
+        .busy_timeout(SQLITE_BUSY_TIMEOUT)
         .map_err(map_sqlite_error)?;
     if path != Path::new(":memory:") {
         connection
@@ -142,7 +181,9 @@ fn reserve_sync(
     pipeline_run_id: &str,
 ) -> Result<Reservation, IdempotencyError> {
     let mut connection = open_connection(path)?;
-    let transaction = connection.transaction().map_err(map_sqlite_error)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(map_sqlite_error)?;
     let mut cached = Vec::new();
     let mut candidate_message_ids = Vec::new();
     let now = current_time_ms();
@@ -228,7 +269,9 @@ fn complete_sync(
     result_json: &str,
 ) -> Result<(), IdempotencyError> {
     let mut connection = open_connection(path)?;
-    let transaction = connection.transaction().map_err(map_sqlite_error)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(map_sqlite_error)?;
     let now = current_time_ms();
     for entry in entries {
         let updated = transaction
@@ -284,6 +327,8 @@ fn current_time_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use serde_json::json;
 
     use super::{IdempotencyEntry, IdempotencyError, IdempotencyRepository, Reservation};
@@ -299,6 +344,22 @@ mod tests {
                 rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(sqlite_code), None);
             assert_eq!(super::map_sqlite_error(error), expected);
         }
+    }
+
+    #[test]
+    fn busy_retry_attempt_count_matches_its_name() {
+        let attempts = AtomicUsize::new(0);
+        let error = super::retry_sqlite_busy(|| {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            Err::<(), _>(IdempotencyError::Busy)
+        })
+        .unwrap_err();
+
+        assert_eq!(error, IdempotencyError::Busy);
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            super::SQLITE_BUSY_MAX_ATTEMPTS
+        );
     }
 
     fn entry(hash: &str) -> IdempotencyEntry {

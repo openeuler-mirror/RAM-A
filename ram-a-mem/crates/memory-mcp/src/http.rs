@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -98,6 +99,7 @@ struct McpAuthState {
     initialize_rate_limiter: Arc<DefaultKeyedRateLimiter<PrincipalKey>>,
     session_admission: Arc<SessionAdmission>,
     session_manager: Arc<LocalSessionManager>,
+    in_flight_requests: Arc<InFlightRequests>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -295,6 +297,102 @@ enum SessionAccess {
     Expired,
 }
 
+/// JSON-RPC request ids currently in flight per session.
+///
+/// rmcp routes SSE responses by JSON-RPC id: when two concurrent requests on
+/// one session share an id, the second registration overwrites the first and
+/// every response but one is dropped on the floor — the losing HTTP streams
+/// never end. JSON-RPC forbids duplicate in-flight ids, so we reject the
+/// duplicate up front with a clear error instead of letting it hang.
+#[derive(Default)]
+struct InFlightRequests {
+    inner: Mutex<HashMap<SessionId, HashSet<String>>>,
+}
+
+impl InFlightRequests {
+    /// Registers `request_id` on `session_id`. Returns `None` when the same id
+    /// is already in flight for that session.
+    fn try_register(
+        self: &Arc<Self>,
+        session_id: &SessionId,
+        request_id: &str,
+    ) -> Option<InFlightRequestGuard> {
+        let mut inner = self.inner.lock().expect("in-flight request lock poisoned");
+        let inserted = inner
+            .entry(session_id.clone())
+            .or_default()
+            .insert(request_id.to_string());
+        inserted.then(|| InFlightRequestGuard {
+            in_flight: self.clone(),
+            session_id: session_id.clone(),
+            request_id: request_id.to_string(),
+        })
+    }
+
+    fn release(&self, session_id: &SessionId, request_id: &str) {
+        let mut inner = self.inner.lock().expect("in-flight request lock poisoned");
+        if let Some(requests) = inner.get_mut(session_id) {
+            requests.remove(request_id);
+            if requests.is_empty() {
+                inner.remove(session_id);
+            }
+        }
+    }
+
+    fn drop_session(&self, session_id: &SessionId) {
+        self.inner
+            .lock()
+            .expect("in-flight request lock poisoned")
+            .remove(session_id);
+    }
+}
+
+/// Cancellation-safe ownership of one in-flight registration. If the
+/// middleware future is dropped or unwinds before a response is constructed,
+/// this guard releases the id automatically.
+struct InFlightRequestGuard {
+    in_flight: Arc<InFlightRequests>,
+    session_id: SessionId,
+    request_id: String,
+}
+
+impl Drop for InFlightRequestGuard {
+    fn drop(&mut self) {
+        self.in_flight.release(&self.session_id, &self.request_id);
+    }
+}
+
+/// Response body that releases an in-flight JSON-RPC id registration exactly
+/// once — when the stream ends, errors, or is dropped without being polled to
+/// completion.
+struct ReleaseInFlightBody {
+    body: Body,
+    registration: Option<InFlightRequestGuard>,
+}
+
+impl ReleaseInFlightBody {
+    fn release_once(&mut self) {
+        drop(self.registration.take());
+    }
+}
+
+impl http_body::Body for ReleaseInFlightBody {
+    type Data = <Body as http_body::Body>::Data;
+    type Error = <Body as http_body::Body>::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.body).poll_frame(cx);
+        if matches!(poll, std::task::Poll::Ready(None | Some(Err(_)))) {
+            this.release_once();
+        }
+        poll
+    }
+}
+
 pub fn create_http_router(
     runtime: HttpRuntime,
     http: &HttpConfig,
@@ -364,6 +462,7 @@ pub fn create_http_router(
             session_idle_timeout,
         )),
         session_manager,
+        in_flight_requests: Arc::new(InFlightRequests::default()),
     };
     let mcp = Router::new()
         .route_service("/mcp", mcp_service)
@@ -455,16 +554,17 @@ async fn authorize_mcp(
     if client_agent_id.is_some_and(|agent_id| agent_id != principal.agent_id) {
         return error_response(StatusCode::FORBIDDEN, "forbidden", &request_id);
     }
-    let requested_operation = match requested_operation(&mut request, state.max_body_bytes).await {
-        Ok(operation) => operation,
-        Err(()) => {
-            return error_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "payload too large",
-                &request_id,
-            )
-        }
-    };
+    let (requested_operation, json_rpc_id) =
+        match requested_operation(&mut request, state.max_body_bytes).await {
+            Ok(operation) => operation,
+            Err(()) => {
+                return error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "payload too large",
+                    &request_id,
+                )
+            }
+        };
     if matches!(requested_operation, RequestedOperation::UnsupportedProtocol) {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -486,6 +586,7 @@ async fn authorize_mcp(
         close_sessions(
             &state.session_manager,
             &state.session_admission,
+            &state.in_flight_requests,
             attempt.expired,
         )
         .await;
@@ -514,6 +615,7 @@ async fn authorize_mcp(
                 close_sessions(
                     &state.session_manager,
                     &state.session_admission,
+                    &state.in_flight_requests,
                     vec![session_id.clone()],
                 )
                 .await;
@@ -540,6 +642,7 @@ async fn authorize_mcp(
     if method_is_delete {
         if let Some(session_id) = session_id.as_ref() {
             state.session_admission.mark_closing(session_id);
+            state.in_flight_requests.drop_session(session_id);
         }
     }
 
@@ -570,11 +673,44 @@ async fn authorize_mcp(
     if let Some(permit) = &concurrency_permit {
         request.extensions_mut().insert(permit.clone());
     }
+    // Register the JSON-RPC id only after every rejection path has passed, so
+    // refused requests never linger in the in-flight table. rmcp would route
+    // a concurrent duplicate's response to the wrong stream and hang it, so
+    // duplicates are rejected here with an explicit error instead.
+    let in_flight_registration = if let (Some(session_id), Some(json_rpc_id)) =
+        (session_id.as_ref(), json_rpc_id.as_deref())
+    {
+        let Some(registration) = state
+            .in_flight_requests
+            .try_register(session_id, json_rpc_id)
+        else {
+            return error_response(
+                StatusCode::CONFLICT,
+                "duplicate in-flight request id",
+                &request_id,
+            );
+        };
+        Some(registration)
+    } else {
+        None
+    };
     request.extensions_mut().insert(principal);
     request
         .extensions_mut()
         .insert(RequestId(request_id.clone()));
     let mut response = next.run(request).await;
+    if let Some(registration) = in_flight_registration {
+        // Successful responses stream the JSON-RPC reply as SSE; the
+        // registration is released when the stream finishes.
+        if response.status().is_success() {
+            let (parts, body) = response.into_parts();
+            let release_body = ReleaseInFlightBody {
+                body,
+                registration: Some(registration),
+            };
+            response = Response::from_parts(parts, Body::new(release_body));
+        }
+    }
     if let Some(pending) = reservation {
         let created_session_id = response_session_id(&response);
         match initialize_response_succeeded(&mut response, MAX_INITIALIZE_RESPONSE_BYTES).await {
@@ -636,9 +772,11 @@ fn response_session_id(response: &Response) -> Option<SessionId> {
 async fn close_sessions(
     manager: &LocalSessionManager,
     admission: &SessionAdmission,
+    in_flight_requests: &InFlightRequests,
     session_ids: Vec<SessionId>,
 ) {
     for session_id in session_ids {
+        in_flight_requests.drop_session(&session_id);
         let _ = manager.close_session(&session_id).await;
         admission.finish_closing(&session_id);
     }
@@ -720,9 +858,9 @@ impl RequestedTool {
 async fn requested_operation(
     request: &mut Request,
     max_body_bytes: usize,
-) -> Result<RequestedOperation, ()> {
+) -> Result<(RequestedOperation, Option<String>), ()> {
     if request.method() != axum::http::Method::POST {
-        return Ok(RequestedOperation::Other);
+        return Ok((RequestedOperation::Other, None));
     }
     if request
         .headers()
@@ -740,46 +878,61 @@ async fn requested_operation(
     Ok(operation)
 }
 
-fn parse_requested_operation(bytes: &[u8]) -> RequestedOperation {
+fn parse_requested_operation(bytes: &[u8]) -> (RequestedOperation, Option<String>) {
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-        return RequestedOperation::Other;
+        return (RequestedOperation::Other, None);
     };
     let method = value.get("method").and_then(serde_json::Value::as_str);
     if method == Some("initialize") {
-        return if value
-            .pointer("/params/protocolVersion")
-            .and_then(serde_json::Value::as_str)
-            == Some(MCP_PROTOCOL_VERSION)
-        {
-            RequestedOperation::Initialize
-        } else {
-            RequestedOperation::UnsupportedProtocol
-        };
+        return (
+            if value
+                .pointer("/params/protocolVersion")
+                .and_then(serde_json::Value::as_str)
+                == Some(MCP_PROTOCOL_VERSION)
+            {
+                RequestedOperation::Initialize
+            } else {
+                RequestedOperation::UnsupportedProtocol
+            },
+            None,
+        );
     }
+    // JSON-RPC ids are extracted for every request type, not just tool calls:
+    // rmcp routes responses by id, so duplicates of *any* in-flight request on
+    // one session would otherwise hang. Preserve the JSON value type in the
+    // registration key because numeric `1` and string `"1"` are distinct ids.
+    let json_rpc_id = match value.get("id") {
+        Some(serde_json::Value::String(id)) => Some(format!("s:{id}")),
+        Some(id @ serde_json::Value::Number(_)) => Some(format!("n:{id}")),
+        _ => None,
+    };
     if method != Some("tools/call") {
-        return RequestedOperation::Other;
+        return (RequestedOperation::Other, json_rpc_id);
     }
-    match value
-        .pointer("/params/name")
-        .and_then(serde_json::Value::as_str)
-    {
-        Some("memory_ingest") => RequestedOperation::Tool(RequestedTool::Ingest),
-        Some("memory_search") => RequestedOperation::Tool(RequestedTool::Search),
-        Some("memory_case_search") => RequestedOperation::Tool(RequestedTool::CaseSearch),
-        Some("memory_case_prepare_upload") => {
-            RequestedOperation::Tool(RequestedTool::CasePrepareUpload)
-        }
-        Some("memory_case_upload") => RequestedOperation::Tool(RequestedTool::CaseUpload),
-        Some("memory_case_prepare_update") => {
-            RequestedOperation::Tool(RequestedTool::CasePrepareUpdate)
-        }
-        Some("memory_case_update") => RequestedOperation::Tool(RequestedTool::CaseUpdate),
-        Some("memory_case_prepare_delete") => {
-            RequestedOperation::Tool(RequestedTool::CasePrepareDelete)
-        }
-        Some("memory_case_delete") => RequestedOperation::Tool(RequestedTool::CaseDelete),
-        _ => RequestedOperation::Other,
-    }
+    (
+        match value
+            .pointer("/params/name")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("memory_ingest") => RequestedOperation::Tool(RequestedTool::Ingest),
+            Some("memory_search") => RequestedOperation::Tool(RequestedTool::Search),
+            Some("memory_case_search") => RequestedOperation::Tool(RequestedTool::CaseSearch),
+            Some("memory_case_prepare_upload") => {
+                RequestedOperation::Tool(RequestedTool::CasePrepareUpload)
+            }
+            Some("memory_case_upload") => RequestedOperation::Tool(RequestedTool::CaseUpload),
+            Some("memory_case_prepare_update") => {
+                RequestedOperation::Tool(RequestedTool::CasePrepareUpdate)
+            }
+            Some("memory_case_update") => RequestedOperation::Tool(RequestedTool::CaseUpdate),
+            Some("memory_case_prepare_delete") => {
+                RequestedOperation::Tool(RequestedTool::CasePrepareDelete)
+            }
+            Some("memory_case_delete") => RequestedOperation::Tool(RequestedTool::CaseDelete),
+            _ => RequestedOperation::Other,
+        },
+        json_rpc_id,
+    )
 }
 
 async fn initialize_response_succeeded(
@@ -887,7 +1040,7 @@ mod tests {
 
         assert!(matches!(
             requested_operation(&mut request, 1).await,
-            Ok(RequestedOperation::Other)
+            Ok((RequestedOperation::Other, None))
         ));
         let body = to_bytes(request.into_body(), 1024).await.unwrap();
         assert_eq!(body.as_ref(), b"body-that-must-remain-untouched");
@@ -918,6 +1071,55 @@ mod tests {
                 body.as_bytes()
             );
         }
+    }
+
+    #[test]
+    fn in_flight_registration_releases_when_guard_is_dropped() {
+        let in_flight = Arc::new(InFlightRequests::default());
+        let session_id: SessionId = Arc::from("session-a");
+        let registration = in_flight.try_register(&session_id, "n:1").unwrap();
+
+        assert!(in_flight.try_register(&session_id, "n:1").is_none());
+        drop(registration);
+        assert!(in_flight.try_register(&session_id, "n:1").is_some());
+    }
+
+    #[test]
+    fn dropping_a_session_clears_its_in_flight_ids() {
+        let in_flight = Arc::new(InFlightRequests::default());
+        let session_id: SessionId = Arc::from("session-a");
+        let registration = in_flight.try_register(&session_id, "n:1").unwrap();
+
+        in_flight.drop_session(&session_id);
+        drop(registration);
+        assert!(in_flight.try_register(&session_id, "n:1").is_some());
+    }
+
+    #[tokio::test]
+    async fn numeric_and_string_json_rpc_ids_remain_distinct() {
+        async fn parsed_id(id: serde_json::Value) -> String {
+            let mut request = Request::builder()
+                .method("POST")
+                .body(Body::from(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "method": "tools/list"
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            requested_operation(&mut request, 1024)
+                .await
+                .unwrap()
+                .1
+                .unwrap()
+        }
+
+        assert_ne!(
+            parsed_id(serde_json::json!(1)).await,
+            parsed_id(serde_json::json!("1")).await
+        );
     }
 
     #[tokio::test(start_paused = true)]
