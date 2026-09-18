@@ -22,6 +22,9 @@ repository.
   dense/BM25/hybrid retrieval reference.
 - [design/memory-cases-storage-split.md](design/memory-cases-storage-split.md): `memory-cases`
   business DB and document/vector index split, table ownership, and index boundaries.
+- [guides/ram-a-mem-prerequisites.zh-CN.md](guides/ram-a-mem-prerequisites.zh-CN.md):
+  RAM-A-MEM 使用前置约束：最小可用的 Chat 模型服务、Embedding 要求、按功能叠加的
+  模型配置、MCP 客户端和网络部署边界。
 - [guides/locomo-evaluation.md](guides/locomo-evaluation.md): LoCoMo execution guide and
   output reference.
 - [guides/memory-cases-manual-quick-verify.md](guides/memory-cases-manual-quick-verify.md):
