@@ -61,14 +61,14 @@ curl -s -X POST http://127.0.0.1:6998/event \
 
 | type | 必填 | 可选 | 成功响应 data |
 |---|---|---|---|
-| `turn_start` | `session_id` | — | `{prefetch_sent, prefetch_count}` |
-| `turn_end` | `session_id`, `kv_transfer_params` | — | `{evicted_count, map_updated}` |
-| `snapshot_restore` | `session_id` | — | `{prefetch_sent, prefetch_count}` |
+| `turn_start` | `session_id` | — | `{prefetch_sent, prefetch_count, backend_degraded}` |
+| `turn_end` | `session_id`, `kv_transfer_params` | `debug_context` | `{evicted_count, map_updated, debug_written, backend_degraded, chunk_count}` |
+| `snapshot_restore` | `session_id` | — | `{prefetch_sent, prefetch_count, backend_degraded, evicted_count, pinned}` |
 | `session_map` | `session_id` | — | `{session_id, chunk_hashes}` |
-| `session_close` | `session_id` | — | `{evicted_count, closed}` |
-| `session_suspend` | `session_id` | — | `{evicted_count, suspended}` |
-| `session_fork` | `session_id` | — | `{forked}` |
-| `session_fork_end` | `session_id` | — | `{fork_end}` |
+| `session_close` | `session_id` | — | `{closed, pinned, evicted_count, backend_degraded}` |
+| `session_suspend` | `session_id` | — | `{suspended, pinned, evicted_count, backend_degraded}` |
+| `session_fork` | `session_id` | — | `{forked, fork_id}` |
+| `session_fork_end` | `session_id` | `fork_id` | `{fork_end, evicted_count, backend_degraded, matched}` |
 | `health` | — | — | `{status:"running", sessions_count}` |
 
 ### 事件使用场景
