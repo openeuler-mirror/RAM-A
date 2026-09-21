@@ -176,9 +176,22 @@ async fn main() {
     registry.register("session_fork_end", Arc::new(SessionForkEndHandler));
     registry.register("health", Arc::new(HealthHandler));
 
+    let acttrail_relay = match crate::handlers::acttrail_relay::ActtrailRelay::new(&config) {
+        Some(r) => {
+            tracing::info!(url = %config.acttrail_receiver_url.as_deref().unwrap_or(""),
+                           "actrail-kv relay enabled");
+            Some(Arc::new(r))
+        }
+        None => {
+            tracing::info!("actrail-kv relay disabled (no receiver_url configured)");
+            None
+        }
+    };
+
     let context = Arc::new(AppContext {
         manager: manager.clone(),
         session_store: session_store.clone(),
+        acttrail_relay,
     });
 
     let app_state = Arc::new(AppState {
