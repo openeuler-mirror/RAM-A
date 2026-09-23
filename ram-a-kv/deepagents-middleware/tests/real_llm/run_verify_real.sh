@@ -8,7 +8,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname -- "$0")" && pwd)
 
-S=/home/l00574157/ram-a-sdk-main
+S=/home/xxxxx/ram-a-sdk-main
 [ -x "$S/.venv/bin/python" ] || { echo "[FAIL] venv missing, run: cd $S && python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt && pip install '.[deepagents]'"; exit 1; }
 export MODEL_BASE_URL=http://127.0.0.1:8000/v1
 export RAM_A_URL=http://127.0.0.1:6990
@@ -29,4 +29,4 @@ else
     echo "[traffic-log] disabled"
 fi
 
-exec "$S/.venv/bin/python" /home/l00574157/verify_real_model.py "$@"
+exec "$S/.venv/bin/python" /home/xxxxxx/verify_real_model.py "$@"

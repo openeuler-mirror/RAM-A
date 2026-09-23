@@ -6,7 +6,7 @@ Usage (with ram-a-sdk-main venv activated, from any directory):
     export MODEL_BASE_URL=http://127.0.0.1:8000/v1
     export RAM_A_URL=http://127.0.0.1:6990
     export NO_PROXY=127.0.0.1,localhost
-    python /home/l00574157/verify_real_model.py
+    python /home/xxxx/verify_real_model.py
 """
 import json
 import os
