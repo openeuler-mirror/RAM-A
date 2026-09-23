@@ -23,6 +23,7 @@ pub enum EventResult {
 pub struct AppContext {
     pub manager: Arc<manager_core::KvCacheManager>,
     pub session_store: Arc<crate::session_store::SqliteSessionStore>,
+    pub acttrail_relay: Option<Arc<crate::handlers::acttrail_relay::ActtrailRelay>>,
 }
 
 #[async_trait]

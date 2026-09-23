@@ -70,6 +70,7 @@ impl RamAKvClient {
         session_id: &str,
         kv_transfer_params: Option<&Value>,
         debug_context: Option<&Value>,
+        acttrail_capture: Option<&Value>,
     ) {
         let mut p = serde_json::json!({"session_id": session_id});
         if let Some(v) = kv_transfer_params {
@@ -77,6 +78,9 @@ impl RamAKvClient {
         }
         if let Some(v) = debug_context {
             p["debug_context"] = v.clone();
+        }
+        if let Some(v) = acttrail_capture {
+            p["acttrail_capture"] = v.clone();
         }
         Self::emit("turn_end", p);
     }

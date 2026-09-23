@@ -32,6 +32,12 @@ pub struct DaemonConfig {
     // Required when listen_addr is not a loopback address.
     #[serde(default)]
     pub auth_token: String,
+    #[serde(default)]
+    pub acttrail_receiver_url: Option<String>,
+    #[serde(default)]
+    pub acttrail_model_deployment_key: Option<String>,
+    #[serde(default)]
+    pub acttrail_kv_namespace: Option<String>,
 }
 
 fn default_listen_addr() -> String {
@@ -69,6 +75,9 @@ impl Default for DaemonConfig {
             session_store_path: default_session_store_path(),
             turn_start_prefetch: default_turn_start_prefetch(),
             auth_token: String::new(),
+            acttrail_receiver_url: None,
+            acttrail_model_deployment_key: None,
+            acttrail_kv_namespace: None,
         }
     }
 }
