@@ -345,16 +345,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--daemon-bin', type=Path,
                         default=os.environ.get('RAM_A_KV_DAEMON_BIN') or None,
-                        help='Patched RAM-A binary (or set RAM_A_KV_DAEMON_BIN)')
+                        help='RAM-A daemon binary (or set RAM_A_KV_DAEMON_BIN)')
     parser.add_argument('--async', dest='async_mode', action='store_true', help='Run both turns with ainvoke')
     parser.add_argument('--output-dir', type=Path, help='New directory for retained logs and evidence')
     args = parser.parse_args()
     if args.daemon_bin is None:
         parser.error('provide --daemon-bin or RAM_A_KV_DAEMON_BIN; '
-                     'apply patches/ram-a-agent-event.patch to RAM-A and build it first')
+                     'build RAM-A first (cargo build in the ram-a-kv directory)')
     binary = args.daemon_bin.expanduser().resolve()
     if not binary.is_file() or not os.access(binary, os.X_OK):
-        parser.error(f'Daemon is missing or not executable: {binary}; see patches/README.md')
+        parser.error(f'Daemon is missing or not executable: {binary}')
     output = args.output_dir.expanduser().resolve() if args.output_dir else Path(tempfile.mkdtemp(prefix='ram-a-e2e-'))
     if args.output_dir:
         output.mkdir(parents=True, exist_ok=False)
