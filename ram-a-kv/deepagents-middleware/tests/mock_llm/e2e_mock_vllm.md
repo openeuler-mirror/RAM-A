@@ -4,7 +4,7 @@
 
 ## 运行
 
-先按[使用指南](../USE_GUIDE.md)安装依赖，并按[补丁说明](../patches/README.md)应用本版补丁和构建 RAM-A。
+先按[使用指南](../USE_GUIDE.md)安装依赖，并构建 RAM-A daemon（在 `ram-a-kv` 目录执行 `cargo build`）。当前版本 daemon 已默认支持 `agent_event` 事件。
 
 ```bash
 export RAM_A_KV_DAEMON_BIN=/absolute/path/to/RAM-A/ram-a-kv/target/debug/ram-a-kv
@@ -38,7 +38,7 @@ PYTHON_BIN=python bash tests/run_e2e_mock_vllm.sh --async
 | 主链路 | 两次真实模型 HTTP 请求，每次 agent/start → turn_start → turn_end；六次 ACK 与 daemon 日志一致 |
 | 预取与替换 | 第一轮预取 0；第二轮预取 28；替换映射后释放 1 个旧引用，session_map 读回一致 |
 
-服务端容量与 TTL 使用补丁内 Rust 单测验证，在 RAM-A 的 ram-a-kv 目录运行 `cargo test --locked --workspace`。主链路日志提取只筛选 `deepagents:mock-vllm-e2e`；额外 handler 探针使用 `contract-only`，不写入 KV 映射。
+服务端容量与 TTL 使用 RAM-A 的 Rust 单测验证，在 ram-a-kv 目录运行 `cargo test --locked --workspace`。主链路日志提取只筛选 `deepagents:mock-vllm-e2e`；额外 handler 探针使用 `contract-only`，不写入 KV 映射。
 
 ## 产物与范围
 
@@ -52,4 +52,4 @@ PYTHON_BIN=python bash tests/run_e2e_mock_vllm.sh --async
 
 模型请求 ID 对应 SDK model_request_id；completion ID 单独保留在响应 metadata，不混为同一字段。rank 仅为 metadata，不参与后端选择。
 
-脚本验证源码路径，不替代 wheel 安装验收。发行时还需构建 wheel、检查版本、从安装包运行使用指南示例，并在干净上游基线上验证补丁。真实 vLLM 集成、流式、Responses API、同一会话的并发写入、长时间故障恢复、数据库重启恢复不属于本套完整验证范围。应用应串行更新同一会话的缓存映射。
+脚本验证源码路径，不替代 wheel 安装验收。发行时还需构建 wheel、检查版本、从安装包运行使用指南示例。真实 vLLM 集成、流式、Responses API、同一会话的并发写入、长时间故障恢复、数据库重启恢复不属于本套完整验证范围。应用应串行更新同一会话的缓存映射。
