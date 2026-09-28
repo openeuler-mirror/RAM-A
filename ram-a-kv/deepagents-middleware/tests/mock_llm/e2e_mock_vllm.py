@@ -232,7 +232,11 @@ def check_regressions():
             'kv_transfer_params': {'ucm_block_ids': values}})])
         events.clear()
         require(middleware.wrap_model_call(request, lambda r: invalid) is invalid, 'invalid KV interrupted model')
-        require([e['type'] for e in events] == ['turn_start'], events)
+        # Contract: turn_end is still sent with chunk_hashes: null (see
+        # sdk/protocol.py turn_end null path), so the expected sequence is
+        # ['turn_start', 'turn_end'], not ['turn_start'].
+        require([e['type'] for e in events] == ['turn_start', 'turn_end'], events)
+        require(events[-1]['kv_transfer_params']['chunk_hashes'] is None, events[-1])
     def broken(*_args):
         raise RuntimeError('failure')
     middleware.cache_identity_provider = broken
