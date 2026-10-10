@@ -1,0 +1,612 @@
+diff --git a/ucm/integration/vllm/hma_connector.py b/ucm/integration/vllm/hma_connector.py
+index 1e09e2e..4ed7b6a 100644
+--- a/ucm/integration/vllm/hma_connector.py
++++ b/ucm/integration/vllm/hma_connector.py
+@@ -20,6 +20,7 @@ from ucm.integration.vllm.ucm_connector import (
+     UCMLiteConnector,
+     _check_shm_capacity,
+     _use_ucm_connector_cpu_affinity,
++    build_kv_block_info,
+ )
+ from ucm.logger import init_logger
+ from ucm.shared.metrics import ucmmetrics
+@@ -1627,8 +1628,13 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
+         request: "Request",
+         block_ids: tuple[list[int], ...],
+     ) -> tuple[bool, dict[str, object] | None]:
+-        # Scheduler side method
+-        return True, None
++        # Scheduler side method。
++        # 把本请求的 ucm_block_ids(预取句柄)随 response 返回,供 RAM-A 择机预取;
++        # 短请求(<load_tokens_threshold)未落盘,requests_meta 为空,返回 None。
++        # prefetch_rank = 承载本请求的 DP 副本索引,随句柄返回供上层校验落点。
++        req_meta = self.requests_meta.get(request.request_id)
++        prefetch_rank = int(self._vllm_config.parallel_config.data_parallel_index)
++        return True, build_kv_block_info(req_meta, prefetch_rank)
+ 
+ 
+ class UCMFAWALiteConnector(UCMLiteConnector):
+diff --git a/ucm/integration/vllm/prefetch_server.py b/ucm/integration/vllm/prefetch_server.py
+new file mode 100644
+index 0000000..ec72253
+--- /dev/null
++++ b/ucm/integration/vllm/prefetch_server.py
+@@ -0,0 +1,122 @@
++# SPDX-License-Identifier: Apache-2.0
++"""UCM 进程内 HTTP 端点:择机预取(调 UCM dispatcher 的 prefetch_data)。
++
++监听于 worker 进程,按 rank 绑定 base_port + local_rank,供 vllm-router 预取端点
++(/kv/prefetch)路由到对应 rank 后触发 CacheStore::Warm(Backend2Cache,SSD -> DDR)。
++仅依赖标准库,不反向依赖 vllm-ascend。
++"""
++import json
++import threading
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from typing import Callable, List, Optional
++
++from ucm.logger import init_logger
++
++logger = init_logger(__name__)
++
++# UCM BlockId 是 16 字节哈希(std::array<std::byte, 16>),hex 表示即 32 字符。
++# 长度不符会在 BufferArrayView 里被整除截断(num=0),导致 Warm 收到空任务;
++# 此处直接拒绝,避免下游空任务永久挂起。
++_UCM_BLOCK_ID_BYTES = 16
++
++
++class _PrefetchHandler(BaseHTTPRequestHandler):
++    server_version = "UcmPrefetchServer/1.0"
++
++    @property
++    def prefetch_fn(self) -> Callable[[List[bytes]], None]:
++        return self.server.prefetch_fn
++
++    @property
++    def token(self) -> Optional[str]:
++        return getattr(self.server, "token", None)
++
++    @property
++    def lock(self) -> threading.Lock:
++        return self.server.lock
++
++    def _authorized(self) -> bool:
++        if not self.token:
++            return True
++        return self.headers.get("Authorization", "") == f"Bearer {self.token}"
++
++    def _send_json(self, status: int, obj: dict) -> None:
++        body = json.dumps(obj).encode("utf-8")
++        self.send_response(status)
++        self.send_header("Content-Type", "application/json")
++        self.send_header("Content-Length", str(len(body)))
++        self.end_headers()
++        self.wfile.write(body)
++
++    def _read_body(self) -> dict:
++        length = int(self.headers.get("Content-Length", "0"))
++        if length <= 0:
++            return {}
++        return json.loads(self.rfile.read(length).decode("utf-8"))
++
++    @staticmethod
++    def _parse_block_ids(body: dict) -> List[bytes]:
++        raw = body.get("block_ids")
++        if not isinstance(raw, list):
++            raise ValueError("'block_ids' must be an array of hex strings")
++        block_ids: List[bytes] = []
++        for h in raw:
++            try:
++                bid = bytes.fromhex(str(h))
++            except ValueError:
++                raise ValueError(f"invalid hex block id: {h!r}")
++            if len(bid) != _UCM_BLOCK_ID_BYTES:
++                raise ValueError(
++                    f"block id must be {_UCM_BLOCK_ID_BYTES * 2} hex chars "
++                    f"({_UCM_BLOCK_ID_BYTES} bytes), got {h!r}"
++                )
++            block_ids.append(bid)
++        return block_ids
++
++    def do_GET(self) -> None:
++        if self.path == "/healthy":
++            self._send_json(200, {"ok": True})
++        else:
++            self._send_json(404, {"ok": False, "error": "not found"})
++
++    def do_POST(self) -> None:
++        if not self._authorized():
++            self._send_json(401, {"ok": False, "error": "unauthorized"})
++            return
++        try:
++            body = self._read_body()
++            if self.path == "/kv/prefetch":
++                block_ids = self._parse_block_ids(body)
++                with self.lock:
++                    self.prefetch_fn(block_ids)
++                self._send_json(200, {"ok": True, "count": len(block_ids)})
++            else:
++                self._send_json(404, {"ok": False, "error": "not found"})
++        except Exception as e:  # noqa: BLE001
++            logger.warning("UCM prefetch HTTP error: %s", e)
++            self._send_json(400, {"ok": False, "error": str(e)})
++
++    def log_message(self, fmt: str, *args) -> None:
++        logger.debug("ucm-prefetch-http: " + fmt, *args)
++
++
++class UcmPrefetchServer:
++    def __init__(self, prefetch_fn: Callable[[List[bytes]], None], host: str,
++                 port: int, token: Optional[str] = None) -> None:
++        self.lock = threading.Lock()
++        self._server = ThreadingHTTPServer((host, port), _PrefetchHandler)
++        self._server.prefetch_fn = prefetch_fn
++        self._server.token = token
++        self._server.lock = self.lock
++        self._thread = threading.Thread(
++            target=self._server.serve_forever, name="ucm-prefetch-http", daemon=True
++        )
++
++    def start(self) -> "UcmPrefetchServer":
++        self._thread.start()
++        logger.info("UCM prefetch HTTP started on %s", self._server.server_address)
++        return self
++
++    def stop(self) -> None:
++        self._server.shutdown()
++        self._server.server_close()
+diff --git a/ucm/integration/vllm/ucm_connector.py b/ucm/integration/vllm/ucm_connector.py
+index 53eb180..767aed7 100644
+--- a/ucm/integration/vllm/ucm_connector.py
++++ b/ucm/integration/vllm/ucm_connector.py
+@@ -1,5 +1,7 @@
+-﻿import copy
++import copy
+ import glob
++import hashlib
++import json
+ import math
+ import os
+ import re
+@@ -348,6 +350,24 @@ class RequestMeta:
+     token_processed: int = 0
+ 
+ 
++def build_kv_block_info(
++    req_meta: "RequestMeta | None", prefetch_rank: Optional[int] = None
++) -> dict[str, Any] | None:
++    """把请求的 UCM hash key 组装成随 response 返回的预取句柄。
++
++    prefetch_rank:承载该请求的 DP 副本索引(0-based),随句柄返回供上层校验落点;
++    缺省为 None 时不写入响应。
++    """
++    if req_meta is None or not req_meta.ucm_block_ids:
++        return None
++    info: dict[str, Any] = {
++        "ucm_block_ids": [b.hex() for b in req_meta.ucm_block_ids],
++    }
++    if prefetch_rank is not None:
++        info["prefetch_rank"] = prefetch_rank
++    return info
++
++
+ @dataclass
+ class RequestDispatchMeta:
+     load_block_ids: tuple[
+@@ -2491,10 +2511,12 @@ class UCMDirectConnector(KVConnectorBase_V1):
+         request: "Request",
+         block_ids: list[int],
+     ) -> tuple[bool, dict[str, Any] | None]:
++        req_meta = self.requests_meta.get(request.request_id)
++        kv_transfer_params = build_kv_block_info(req_meta)
+         if request.request_id in self._async_dump_req_ids:
+             self._async_dump_req_ids.discard(request.request_id)
+-            return True, None
+-        return False, None
++            return True, kv_transfer_params
++        return False, kv_transfer_params
+ 
+     def request_finished_all_groups(
+         self,
+@@ -3190,8 +3212,8 @@ class UCMLiteConnector(KVConnectorBase_V1):
+         request: "Request",
+         block_ids: list[int],
+     ) -> tuple[bool, dict[str, Any] | None]:
+-        self.requests_meta.pop(request.request_id, None)
+-        return False, None
++        req_meta = self.requests_meta.pop(request.request_id, None)
++        return False, build_kv_block_info(req_meta)
+ 
+     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
+         pass
+@@ -3401,6 +3423,46 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
+     def get_block_size(self) -> int:
+         return self.connector.get_block_size()
+ 
++    def prefetch_data(self, block_ids: List[bytes]) -> None:
++        """把块预读进 host DDR 缓冲(Backend2Cache),不做 H2D。
++
++        转发到内部 connector 的 store.prefetch_data(仅 worker 侧有 store)。
++        """
++        inner = getattr(self, "connector", None)
++        store = getattr(inner, "store", None)
++        if store is not None:
++            store.prefetch_data(block_ids)
++
++    def _maybe_start_prefetch_server(self) -> None:
++        """按 UCM YAML 的 prefetch_http 配置,在 worker 侧启动预取 HTTP 端口。
++
++        UCM store(含 Cache buffer)只在 worker 侧构建;scheduler 侧跳过。
++        DP x TP 下每 worker 端口须全局唯一:base_port + dp_rank * tp_size + tp_rank,
++        避免同一 TP rank 的多个 DP 副本抢占同一端口。
++        """
++        cfg = (self.launch_config or {}).get("prefetch_http") or {}
++        if not cfg.get("enable"):
++            return
++        if self._role != KVConnectorRole.WORKER:  # 只在 worker 侧(有 Cache buffer)开
++            return
++        host = cfg.get("host", "0.0.0.0")          # 监听地址;由 router 预取端点(/kv/prefetch)按节点 IP 访问
++        base_port = int(cfg.get("base_port", 6997))
++        token = cfg.get("token") or None
++        dp_rank = int(
++            self._vllm_config.parallel_config.data_parallel_index
++        )  # 0-based
++        tp_size = int(self._vllm_config.parallel_config.tensor_parallel_size)
++        tp_rank = max(get_world_group().local_rank, 0)
++        port = base_port + dp_rank * tp_size + tp_rank  # 全局唯一
++        try:
++            from ucm.integration.vllm.prefetch_server import UcmPrefetchServer
++
++            self._prefetch_server = UcmPrefetchServer(
++                self.prefetch_data, host, port, token
++            ).start()
++        except Exception as e:  # noqa: BLE001
++            logger.warning("UCM prefetch HTTP failed to start: %s", e)
++
+     def _setup_ucm_metrics(self, vllm_config: "VllmConfig", role: KVConnectorRole):
+         self._vllm_metrics_enabled = False
+         self._vllm_metric_definitions = []
+@@ -3564,6 +3626,7 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
+             dictionary of layer names, kv cache
+         """
+         self.connector.register_kv_caches(kv_caches)
++        self._maybe_start_prefetch_server()  # UCM 内部 store 已建,启动预取端口
+ 
+     @_record_connector_interface_duration
+     def build_connector_meta(
+diff --git a/ucm/store/cache/cc/cache_store.cc b/ucm/store/cache/cc/cache_store.cc
+index f4c22bd..783eba3 100644
+--- a/ucm/store/cache/cc/cache_store.cc
++++ b/ucm/store/cache/cc/cache_store.cc
+@@ -43,6 +43,7 @@ class CacheStore : public StoreV1 {
+     BufferManager bufferMgr_;
+     bool transEnable_{false};
+     TransManager transMgr_;
++    size_t nShardPerBlock_{0};
+     std::unique_ptr<Trans::GdrKVBufferConfig> gpuKvBufferRegistrations_{nullptr};
+ 
+ public:
+@@ -69,6 +70,7 @@ public:
+             return s;
+         }
+         transEnable_ = config.deviceId >= 0;
++        nShardPerBlock_ = config.blockSize / config.shardSize;
+         if (transEnable_) {
+             s = transMgr_.Setup(config, bufferMgr_.GetTransBuffer());
+             if (s.Failure()) [[unlikely]] { return s; }
+@@ -99,6 +101,21 @@ public:
+     {
+         bufferMgr_.Prefetch(blocks, num);
+     }
++    void Warm(const Detail::BlockId* blocks, size_t num) override
++    {
++        if (!transEnable_) { return; }  // scheduler 侧(无 device)跳过
++        if (num == 0) { return; }       // 空预取直接返回,避免提交空任务永久挂起
++        Detail::TaskDesc desc;
++        for (size_t i = 0; i < num; i++) {
++            for (size_t shard = 0; shard < nShardPerBlock_; shard++) {
++                desc.emplace_back(Detail::Shard{blocks[i], shard, {}});  // addrs 空, PREFETCH 不做 H2D
++            }
++        }
++        if (desc.empty()) { return; }  // 防御:nShardPerBlock_ 为 0 等异常配置
++        desc.brief = "Prefetch";
++        auto res = transMgr_.Submit({TransTask::Type::PREFETCH, std::move(desc)});
++        if (res) { transMgr_.Wait(res.Value()); }  // 同步等预取完成(HTTP 线程等待)
++    }
+     Expected<Detail::TaskHandle> Load(Detail::TaskDesc task) override
+     {
+         if (!transEnable_) { return Status::Error("transfer is not enable"); }
+diff --git a/ucm/store/cache/cc/load_queue.cc b/ucm/store/cache/cc/load_queue.cc
+index eaa704b..b079ba9 100644
+--- a/ucm/store/cache/cc/load_queue.cc
++++ b/ucm/store/cache/cc/load_queue.cc
+@@ -107,9 +107,15 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
+         waiter->Done();
+         return;
+     }
++    const auto nShard = task->desc.size();
++    if (nShard == 0) {
++        // 空任务(如 Warm 收到 0 个块)直接完成,避免 waiter 永不归零导致 Wait 永久挂起
++        UC_WARN("Cache task({}) dispatched with 0 shards, completing immediately.", task->id);
++        waiter->Done();
++        return;
++    }
+     auto tp = waiter->startTp;
+     auto tpWait = NowTime::Now();
+-    const auto nShard = task->desc.size();
+     size_t backendSubmitCount = 0;
+     size_t waitShardCount = 0;
+     const auto indexes = RearrangeIndex(nShard, deviceId_, localRankSize_);
+@@ -212,32 +218,37 @@ void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& task)
+         UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_shard_backend_wait_ms"),
+                                  (tpBackendReady - tpBackendWait) * 1e3);
+ 
+-        auto* host = cacheSdmaDirect_ ? task.bufferHandle.DeviceData() : task.bufferHandle.Data();
+-        s = HostToDeviceAsync(stream, host, task.shard.addrs.data());
+-        auto tpH2dSubmitted = NowTime::Now();
+-        if (s.Failure()) [[unlikely]] {
+-            UC_ERROR("Failed({}) to do H2D for task({}).", s, taskHandle);
+-            UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_h2d_errors_total"), 1.0);
+-            RecordShardResults(holder_, &task, false);
+-            break;
++        const bool isPrefetch = parentTask->type == TransTask::Type::PREFETCH;
++        if (!isPrefetch) {
++            auto* host = cacheSdmaDirect_ ? task.bufferHandle.DeviceData() : task.bufferHandle.Data();
++            s = HostToDeviceAsync(stream, host, task.shard.addrs.data());
++            auto tpH2dSubmitted = NowTime::Now();
++            if (s.Failure()) [[unlikely]] {
++                UC_ERROR("Failed({}) to do H2D for task({}).", s, taskHandle);
++                UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_h2d_errors_total"), 1.0);
++                RecordShardResults(holder_, &task, false);
++                break;
++            }
++            UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_h2d_submit_ms"),
++                                     (tpH2dSubmitted - tpBackendReady) * 1e3);
+         }
+-        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_h2d_submit_ms"),
+-                                 (tpH2dSubmitted - tpBackendReady) * 1e3);
+         if (!waiter) {
+             holder_.push_back(std::move(task));
+             return;
+         }
+-        auto tpH2dSyncStart = NowTime::Now();
+-        s = stream.Synchronize();
+-        auto h2dSyncMs = (NowTime::Now() - tpH2dSyncStart) * 1e3;
+-        RecordH2dSyncMetrics(h2dSyncMs);
++        if (!isPrefetch) {
++            auto tpH2dSyncStart = NowTime::Now();
++            s = stream.Synchronize();
++            auto h2dSyncMs = (NowTime::Now() - tpH2dSyncStart) * 1e3;
++            RecordH2dSyncMetrics(h2dSyncMs);
++            if (s.Failure()) [[unlikely]] {
++                UC_ERROR("Failed({}) to sync on stream for task({}).", s, taskHandle);
++                UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_h2d_errors_total"), 1.0);
++                break;
++            }
++        }
+         RecordShardResults(holder_, &task, s.Success());
+         holder_.clear();
+-        if (s.Failure()) [[unlikely]] {
+-            UC_ERROR("Failed({}) to sync on stream for task({}).", s, taskHandle);
+-            UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_h2d_errors_total"), 1.0);
+-            break;
+-        }
+     } while (0);
+     if (s.Failure()) [[unlikely]] {
+         parentTask->Fail(s);
+diff --git a/ucm/store/cache/cc/trans_buffer.cc b/ucm/store/cache/cc/trans_buffer.cc
+index a0f6676..284c809 100644
+--- a/ucm/store/cache/cc/trans_buffer.cc
++++ b/ucm/store/cache/cc/trans_buffer.cc
+@@ -334,6 +334,11 @@ protected:
+         if (!fs::exists(shmDir)) { return; }
+         const auto now = fs::file_time_type::clock::now();
+         const auto keepThreshold = std::chrono::minutes(10);
++        // 同一引擎实例的兄弟段(如 <hash>_fawa_fa / <hash>_fawa_wa)仅末缀不同,须互相豁免:
++        // 引擎启动期模型加载/CUDA graph 捕获可超过 keepThreshold,期间共享 buffer 无写入、
++        // mtime 停留在建段时刻,若不豁免,后 attach 的 watcher 会误删仍存活的本实例兄弟段,
++        // 导致后续 attach 报 ENOENT(errno 2)。foreign 陈旧段(实例 hash 不同)仍会被清理。
++        const auto meFamily = me.substr(0, me.rfind('_'));
+         for (const auto& entry : fs::directory_iterator(shmDir)) {
+             const auto& path = entry.path();
+             const auto& name = path.filename().string();
+@@ -341,6 +346,7 @@ protected:
+                 name == me) {
+                 continue;
+             }
++            if (name.substr(0, name.rfind('_')) == meFamily) { continue; }
+             try {
+                 const auto lwt = fs::last_write_time(path);
+                 if (now - lwt <= keepThreshold) { continue; }
+diff --git a/ucm/store/cache/cc/trans_manager.h b/ucm/store/cache/cc/trans_manager.h
+index 43d5b29..0d86718 100644
+--- a/ucm/store/cache/cc/trans_manager.h
++++ b/ucm/store/cache/cc/trans_manager.h
+@@ -57,7 +57,8 @@ protected:
+         const auto num = t->desc.size();
+         const auto size = shardSize_ * num;
+         const auto tp = w->startTp;
+-        const auto isLoad = t->type == TransTask::Type::LOAD;
++        const auto isLoad =
++            t->type == TransTask::Type::LOAD || t->type == TransTask::Type::PREFETCH;
+         UC_DEBUG("Cache task({},{},{},{}) dispatching.", id, brief, num, size);
+         w->SetEpilog([id, brief = std::move(brief), num, size, tp, isLoad] {
+             auto cost = NowTime::Now() - tp;
+@@ -79,7 +80,7 @@ protected:
+                                          static_cast<double>(size));
+             }
+         });
+-        if (t->type == TransTask::Type::LOAD) {
++        if (t->type == TransTask::Type::LOAD || t->type == TransTask::Type::PREFETCH) {
+             loadQ_.Submit(t, w);
+         } else {
+             dumpQ_.Submit(t, w);
+diff --git a/ucm/store/cache/cc/trans_task.h b/ucm/store/cache/cc/trans_task.h
+index 0c8b6c2..b0d9196 100644
+--- a/ucm/store/cache/cc/trans_task.h
++++ b/ucm/store/cache/cc/trans_task.h
+@@ -34,7 +34,7 @@ namespace UC::CacheStore {
+ 
+ class TransTask {
+ public:
+-    enum class Type : uint8_t { LOAD, DUMP };
++    enum class Type : uint8_t { LOAD, DUMP, PREFETCH };
+ 
+ public:
+     Detail::TaskHandle id{0};
+diff --git a/ucm/store/pipeline/cc/health_breaker_store.cc b/ucm/store/pipeline/cc/health_breaker_store.cc
+index 801e1f8..979242a 100644
+--- a/ucm/store/pipeline/cc/health_breaker_store.cc
++++ b/ucm/store/pipeline/cc/health_breaker_store.cc
+@@ -133,6 +133,11 @@ void HealthBreakerStore::Prefetch(const Detail::BlockId* blocks, size_t num)
+     if (Enabled()) { store_->Prefetch(blocks, num); }
+ }
+ 
++void HealthBreakerStore::Warm(const Detail::BlockId* blocks, size_t num)
++{
++    if (Enabled()) { store_->Warm(blocks, num); }
++}
++
+ Status HealthBreakerStore::CheckHealth()
+ {
+     if (!healthCheck_) { return Status::InvalidParam("health breaker store is not set up"); }
+diff --git a/ucm/store/pipeline/cc/health_breaker_store.h b/ucm/store/pipeline/cc/health_breaker_store.h
+index 3b61066..8100bf0 100644
+--- a/ucm/store/pipeline/cc/health_breaker_store.h
++++ b/ucm/store/pipeline/cc/health_breaker_store.h
+@@ -56,6 +56,7 @@ public:
+     Expected<ssize_t> LookupOnPrefix(const Detail::BlockId* blocks, size_t num) override;
+     Expected<ssize_t> LookupOnReverse(const Detail::BlockId* blocks, size_t num) override;
+     void Prefetch(const Detail::BlockId* blocks, size_t num) override;
++    void Warm(const Detail::BlockId* blocks, size_t num) override;
+     Status CheckHealth() override;
+     Expected<Detail::TaskHandle> Load(Detail::TaskDesc task) override;
+     Expected<Detail::TaskHandle> Dump(Detail::TaskDesc task) override;
+diff --git a/ucm/store/pipeline/connector.py b/ucm/store/pipeline/connector.py
+index 639d49d..d69325b 100644
+--- a/ucm/store/pipeline/connector.py
++++ b/ucm/store/pipeline/connector.py
+@@ -117,6 +117,10 @@ class UcmPipelineStore(UcmKVStoreBaseV1):
+         flat = np.frombuffer(b"".join(block_ids), dtype=np.uint8)
+         self.store_.Prefetch(flat)
+ 
++    def prefetch_data(self, block_ids: List[bytes]) -> None:
++        flat = np.frombuffer(b"".join(block_ids), dtype=np.uint8)
++        self.store_.Warm(flat)
++
+     def _tensor_normalize(self, tensors: List[List[torch.Tensor]]) -> np.ndarray:
+         n_rows = len(tensors)
+         n_cols = len(tensors[0])
+diff --git a/ucm/store/pipeline/cpy/pipeline_store.py.cc b/ucm/store/pipeline/cpy/pipeline_store.py.cc
+index 4706456..325f29d 100644
+--- a/ucm/store/pipeline/cpy/pipeline_store.py.cc
++++ b/ucm/store/pipeline/cpy/pipeline_store.py.cc
+@@ -207,6 +207,11 @@ public:
+         BufferArrayView<Detail::BlockId> idArr{ids};
+         StoreBack()->Prefetch(idArr.data, idArr.num);
+     }
++    void Warm(const pybind11::buffer& ids)
++    {
++        BufferArrayView<Detail::BlockId> idArr{ids};
++        StoreBack()->Warm(idArr.data, idArr.num);
++    }
+     Detail::TaskHandle Load(const pybind11::buffer& ids, const pybind11::buffer& indexes,
+                             const pybind11::buffer& addrs)
+     {
+@@ -268,6 +273,7 @@ PYBIND11_MODULE(ucmpipelinestore, m)
+     s.def("LookupOnPrefix", &PipelineStore::LookupOnPrefix, py::arg("ids").noconvert());
+     s.def("LookupOnReverse", &PipelineStore::LookupOnReverse, py::arg("ids").noconvert());
+     s.def("Prefetch", &PipelineStore::Prefetch, py::arg("ids").noconvert());
++    s.def("Warm", &PipelineStore::Warm, py::arg("ids").noconvert());
+     s.def("Load", &PipelineStore::Load, py::arg("ids").noconvert(), py::arg("indexes").noconvert(),
+           py::arg("addrs").noconvert());
+     s.def("Dump", &PipelineStore::Dump, py::arg("ids").noconvert(), py::arg("indexes").noconvert(),
+diff --git a/ucm/store/test/case/cache/cache_load_queue_test.cc b/ucm/store/test/case/cache/cache_load_queue_test.cc
+index ba1664a..0a9389b 100644
+--- a/ucm/store/test/case/cache/cache_load_queue_test.cc
++++ b/ucm/store/test/case/cache/cache_load_queue_test.cc
+@@ -38,6 +38,37 @@ public:
+     }
+ };
+ 
++TEST_F(UCCacheLoadQueueTest, EmptyDescTaskCompletesImmediately)
++{
++    using namespace UC::CacheStore;
++    UC::Test::Detail::MockStore backend;
++    EXPECT_CALL(backend, Load).Times(0);
++    UC::HashSet<UC::Detail::TaskHandle> failureSet;
++    Config config;
++    config.storeBackend = &backend;
++    size_t tensorSize = 32768;
++    config.tensorSizes = {tensorSize};
++    config.shardSize = tensorSize;
++    config.blockSize = config.shardSize;
++    config.deviceId = 0;
++    config.bufferCapacity = config.shardSize * 1024;
++    config.uniqueId = rd.RandomString(10);
++    config.shareBufferEnable = true;
++    TransBuffer buffer;
++    LoadQueue loadQ;
++    auto s = buffer.Setup(config);
++    ASSERT_EQ(s, UC::Status::OK());
++    s = loadQ.Setup(config, &failureSet, &buffer);
++    ASSERT_EQ(s, UC::Status::OK());
++    // 空任务(Warm 收到 0 个块时可能出现)必须立即完成,不能永久挂起 Wait。
++    UC::Detail::TaskDesc desc{};
++    auto task = std::make_shared<TransTask>(TransTask::Type::PREFETCH, desc);
++    auto waiter = std::make_shared<UC::Latch>();
++    loadQ.Submit(task, waiter);
++    ASSERT_TRUE(waiter->WaitForDuration(1000));
++    ASSERT_FALSE(failureSet.Contains(task->id));
++}
++
+ TEST_F(UCCacheLoadQueueTest, LoadSameBlockTwice)
+ {
+     using namespace UC::CacheStore;
+diff --git a/ucm/store/ucmstore_v1.h b/ucm/store/ucmstore_v1.h
+index 6d71b31..1b6682f 100644
+--- a/ucm/store/ucmstore_v1.h
++++ b/ucm/store/ucmstore_v1.h
+@@ -176,6 +176,25 @@ public:
+      */
+     virtual Status Wait(Detail::TaskHandle taskId) = 0;
+ 
++    /**
++     * @brief Synchronously warm the given blocks into host DDR buffer.
++     *
++     * Unlike Prefetch, this call is **synchronous** and **blocking**; it
++     * waits until the blocks are read from the slow backend (e.g. SSD) into
++     * the cache store's DDR buffer (Backend2Cache) and marked ready. No H2D
++     * transfer is performed.
++     *
++     * @param blocks Array of block identifiers to be warmed.
++     * @param num Number of block identifiers to be warmed.
++     *
++     * @note Thread-safe; may be called concurrently with other operations.
++     * @note Default implementation does nothing.
++     * @note MUST be appended at the END of the vtable: existing store shared
++     *       libraries are compiled against the old layout and rely on the
++     *       virtual slots of ~StoreV1..Wait staying unchanged.
++     */
++    virtual void Warm(const Detail::BlockId* blocks, size_t num) {}
++
+ protected:
+     /**
+      * @brief Protected default constructor.
+diff --git a/ucm/store/ucmstore_v1.py b/ucm/store/ucmstore_v1.py
+index c9660d4..ccc99b1 100644
+--- a/ucm/store/ucmstore_v1.py
++++ b/ucm/store/ucmstore_v1.py
+@@ -127,6 +127,13 @@ class UcmKVStoreBaseV1(ABC):
+         """
+         pass
+ 
++    def prefetch_data(self, block_ids: List[bytes]) -> None:
++        """把块预读进 host DDR 缓冲(Backend2Cache),不做 H2D。
++
++        默认 no-op;UcmPipelineStore 覆写。
++        """
++        pass
++
+     @abstractmethod
+     def load(
+         self,

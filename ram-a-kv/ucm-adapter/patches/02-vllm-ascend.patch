@@ -1,0 +1,85 @@
+diff --git a/vllm_ascend/distributed/kv_transfer/ascend_multi_connector.py b/vllm_ascend/distributed/kv_transfer/ascend_multi_connector.py
+index d26b5ef25..29cedb6d0 100644
+--- a/vllm_ascend/distributed/kv_transfer/ascend_multi_connector.py
++++ b/vllm_ascend/distributed/kv_transfer/ascend_multi_connector.py
+@@ -92,8 +92,15 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
+                 async_saves += 1
+             if txfer_params is not None:
+                 if kv_txfer_params is not None:
+-                    raise RuntimeError("Only one connector can produce KV transfer params")
+-                kv_txfer_params = txfer_params
++                    clashes = set(kv_txfer_params) & set(txfer_params)
++                    if clashes:
++                        raise RuntimeError(
++                            "Key clash in kv_transfer_params from multiple "
++                            f"connectors: {clashes}"
++                        )
++                    kv_txfer_params.update(txfer_params)
++                else:
++                    kv_txfer_params = txfer_params
+         if async_saves > 1:
+             self._extra_async_saves[request.request_id] = async_saves - 1
+ 
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
+index 5101fb18d..8285ba7e8 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
+@@ -1843,6 +1843,12 @@ class MooncakeConnectorScheduler:
+             or not params.get("do_remote_decode")
+             or request.status != RequestStatus.FINISHED_LENGTH_CAPPED
+         ):
++            # D 节点侧透传 UCM hash key 到最终 response(供 RAM-A 择机预取)。
++            # 注意:v0.25.1rc 中 do_remote_prefill 已在 update_state_after_alloc
++            # 被置为 False,因此用 ucm_block_ids 字段是否存在来识别 P 节点
++            # 通过代理透传的 remote prefill 请求;其余分支保持原样。
++            if params is not None and params.get("ucm_block_ids"):
++                return False, {"ucm_block_ids": params.get("ucm_block_ids")}
+             return False, None
+ 
+         num_prompt_blocks = math.ceil(len(request.prompt_token_ids) / self.block_size)
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ucm_connector.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ucm_connector.py
+index de25ae934..c542c249d 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ucm_connector.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ucm_connector.py
+@@ -16,6 +16,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+ )
+ from vllm.v1.core.sched.output import SchedulerOutput
+ from vllm.v1.outputs import KVConnectorOutput
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
+ 
+ # isort: off
+ if TYPE_CHECKING:
+@@ -90,6 +93,31 @@ class UCMConnectorV1(KVConnectorBase_V1, SupportsHMA):
+             kv_caches: A dictionary mapping layer names to KV cache tensors.
+         """
+         self._ucm_engine.register_kv_caches(kv_caches)
++        self._maybe_start_prefetch_server()  # UCM 内部 store 已建,启动端口
++
++    def prefetch(self, block_ids: list[bytes]) -> None:
++        """转发到 UCM 的 prefetch_data(dispatcher 到内部 connector store)。"""
++        self._ucm_engine.prefetch_data(block_ids)
++
++    def _maybe_start_prefetch_server(self) -> None:
++        cfg = getattr(self._ucm_engine, "launch_config", None) or {}
++        cfg = cfg.get("prefetch_http") or {}
++        if not cfg.get("enable"):
++            return
++        if self._role != KVConnectorRole.WORKER:  # 只在 worker 侧(有 Cache buffer)开
++            return
++        host = cfg.get("host", "0.0.0.0")          # 监听地址;由 vllm-router 预取端点按节点 IP 访问
++        base_port = int(cfg.get("base_port", 6997))
++        token = cfg.get("token") or None
++        inner = getattr(self._ucm_engine, "connector", None)
++        local_rank = getattr(inner, "local_rank", 0)
++        port = base_port + max(local_rank, 0)       # 每 rank 一个端口,避免冲突
++        try:
++            from ucm.integration.vllm.prefetch_server import UcmPrefetchServer
++
++            self._prefetch_server = UcmPrefetchServer(self.prefetch, host, port, token).start()
++        except Exception as e:  # noqa: BLE001
++            logger.warning("UCM prefetch HTTP failed to start: %s", e)
+ 
+     def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp) -> None:
+         self._call_ucm_reserved_hook("set_host_xfer_buffer_ops", copy_operation)
