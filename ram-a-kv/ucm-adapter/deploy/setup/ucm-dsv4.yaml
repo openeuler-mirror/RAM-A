@@ -1,0 +1,36 @@
+ucm_connectors:
+  - ucm_connector_name: "UcmPipelineStore"
+    ucm_connector_config:
+      store_pipeline: "Cache|Posix"
+      storage_backends: "/mnt/sdb/ucm/dsv4-kv"
+      io_direct: true
+      posix_io_engine: "psync"
+      # DDR Cache store 容量(GB)。本栈(FAWA/MLA)语义: **节点级共享一份**(/dev/shm 只有
+      # 一个 uc_shm_cache_*_fawa_fa,4 个 DP 共用,各 DP rank 的 ucm_uniqueid_* 内容相同),
+      # 且 hma_connector 会对半切给 FA/WA,故 64 => FA 32GiB / WA 32GiB(不是每 DP 容量)。
+      # 下限: WA 侧 shard=6889472B,要求 bufferCapacity >= 14GiB,故本项须 >= 28;
+      # 写 16(=> FA/WA 各 8GiB)会导致启动失败:
+      #   too small buffer(8589934592) on shard(6889472),please set >= 14GB
+      cache_buffer_capacity_gb: 64
+      posix_capacity_gb: 1024
+      # 关闭 Posix GC:GC 按文件数阈值(avgFiles/shard)触发,回收"未访问"的低热度
+      # 文件,会误删刚 dump 且尚未 load 过的预取池数据(曾观测大量丢块)。
+      # 代价:磁盘只增不减,需定期手动清理。
+      store_health:
+        health_check_interval_s: 30
+        health_check_timeout_s: 10
+        failure_threshold: 4
+
+enable_event_sync: true
+use_layerwise: true
+enable_record_traces: false
+use_lite: false
+persist_token_threshold: 0
+
+# UCM KV 预取 HTTP 服务(Backend2Cache): worker 侧按全局唯一 rank 监听
+#   base_port + dp_rank * tp_size + tp_rank (DP x TP 下端口不冲突)
+prefetch_http:
+  enable: true
+  host: 0.0.0.0
+  base_port: 6997
+
