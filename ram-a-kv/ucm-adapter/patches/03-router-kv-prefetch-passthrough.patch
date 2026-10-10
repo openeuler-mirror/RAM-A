@@ -1,0 +1,225 @@
+diff --git a/src/server.rs b/src/server.rs
+index cb2d5f4..7baf26e 100644
+--- a/src/server.rs
++++ b/src/server.rs
+@@ -1,11 +1,11 @@
+ use crate::{
+     config::{HistoryBackend, RouterConfig, TraceConfig},
+-    core::{WorkerRegistry, WorkerType},
++    core::{Worker, WorkerRegistry, WorkerType},
+     data_connector::{MemoryResponseStorage, NoOpResponseStorage, SharedResponseStorage},
+     logging::{self, LoggingConfig},
+     metrics::{self, PrometheusConfig},
+     middleware::{self, QueuedRequest, TokenBucket},
+-    policies::PolicyRegistry,
++    policies::{PolicyRegistry, RequestHeaders},
+     protocols::{
+         spec::{
+             ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
+@@ -14,6 +14,7 @@ use crate::{
+         worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
+     },
+     routers::{
++        http::dp_utils,
+         router_manager::{RouterId, RouterManager},
+         RouterFactory, RouterTrait,
+     },
+@@ -100,6 +101,187 @@ async fn sink_handler() -> Response {
+     StatusCode::NOT_FOUND.into_response()
+ }
+ 
++// ===== UCM KV prefetch passthrough =====
++// 预取流量与推理流量共享同一份 policy 实例(consistent_hash)与 worker 集合,
++// 构造性保证"预取落点 == 推理落点":
++//   - 路由键: 与推理一致的 x-session-id header(hash_key 优先级最高)
++//   - 选路:   同一个 PolicyRegistry -> select_worker_with_headers
++//   - 落点:   选中 DP 虚拟后端 "http://host:port@R" 的 R,即推理请求的 X-data-parallel-rank
++// 然后并发转发到该 rank 的全部 TP rank 预取端口(base_port + R*tp_size + tp),
++// 聚合返回(ok/mode=router/dp_rank/prefetch_count/rank_results)。
++async fn kv_prefetch(
++    State(state): State<Arc<AppState>>,
++    headers: http::HeaderMap,
++    Json(body): Json<serde_json::Value>,
++) -> Response {
++    let block_ids = match body.get("block_ids").and_then(|v| v.as_array()) {
++        Some(ids) if !ids.is_empty() => ids.clone(),
++        _ => {
++            return (
++                StatusCode::BAD_REQUEST,
++                "missing or empty 'block_ids'",
++            )
++                .into_response()
++        }
++    };
++
++    // 与推理一致的 header 键提取(小写化)
++    let request_headers: RequestHeaders = headers
++        .iter()
++        .filter_map(|(name, value)| {
++            value
++                .to_str()
++                .ok()
++                .map(|v| (name.as_str().to_lowercase(), v.to_string()))
++        })
++        .collect();
++
++    // 预取请求必须带 session 头,避免空哈希键恒落同一副本的静默退化
++    if !request_headers.contains_key("x-session-id") {
++        return (
++            StatusCode::BAD_REQUEST,
++            "'x-session-id' header is required for KV prefetch routing",
++        )
++            .into_response();
++    }
++
++    // 与推理同一份 worker 集合 + policy 实例选路
++    let workers: Vec<Arc<dyn Worker>> = state
++        .context
++        .worker_registry
++        .get_all()
++        .into_iter()
++        .filter(|w| w.is_available())
++        .collect();
++    if workers.is_empty() {
++        return (StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response();
++    }
++    let policy = state.context.policy_registry.get_default_policy();
++    let idx = match policy.select_worker_with_headers(&workers, None, Some(&request_headers)) {
++        Some(i) => i,
++        None => {
++            return (
++                StatusCode::SERVICE_UNAVAILABLE,
++                "Policy selected no worker",
++            )
++                .into_response()
++        }
++    };
++    let worker_url = workers[idx].url().to_string();
++
++    // 提取 DP 虚拟后端的 rank(即推理请求将落到的 dp_rank)。
++    // DP=1 时 worker URL 没有 "@rank" 后缀(单实例),推理全部落 dp_rank 0;
++    // 此时预取也必须扇出到 dp_rank 0 的 TP 端口段
++    // (base_port .. base_port + tp_size - 1),而不是直接 501。
++    let (base_url, dp_rank) = match dp_utils::extract_dp_rank(&worker_url) {
++        Ok((b, r)) => (b.to_string(), r),
++        Err(_) => (worker_url.clone(), 0usize),
++    };
++
++    // 预取端口与 vllm 同机:从 base_url 提取 host
++    let host = extract_host_from_base_url(&base_url);
++
++    // 端口参数与 UCM 侧 yaml 的 prefetch_http.base_port / tp_size 对齐,可用环境变量覆盖
++    let base_port: u32 = std::env::var("UCM_PREFETCH_BASE_PORT")
++        .ok()
++        .and_then(|v| v.parse().ok())
++        .unwrap_or(6997);
++    let tp_size: u32 = std::env::var("UCM_PREFETCH_TP_SIZE")
++        .ok()
++        .and_then(|v| v.parse().ok())
++        .unwrap_or(4);
++
++    // 并发转发到该 DP rank 的全部 TP rank 预取端口
++    let payload = json!({"block_ids": block_ids});
++    let mut tasks = Vec::new();
++    for tp_rank in 0..tp_size {
++        let port = base_port + dp_rank as u32 * tp_size + tp_rank;
++        let url = format!("http://{}:{}/kv/prefetch", host, port);
++        let client = state.context.client.clone();
++        let body = payload.clone();
++        tasks.push(spawn(async move {
++            let resp = client.post(&url).json(&body).send().await;
++            (url, tp_rank, resp)
++        }));
++    }
++
++    let mut rank_results = Vec::new();
++    let mut ok_any = false;
++    let mut prefetch_count = 0u64;
++    for t in tasks {
++        let (url, tp_rank, resp) = match t.await {
++            Ok(r) => r,
++            Err(e) => {
++                rank_results.push(json!({
++                    "tp_rank": -1, "url": "?", "ok": false, "count": 0,
++                    "error": e.to_string(),
++                }));
++                continue;
++            }
++        };
++        let entry = match resp {
++            Ok(r) => {
++                let status = r.status();
++                match r.json::<serde_json::Value>().await {
++                    Ok(v) => {
++                        let ok = status.is_success()
++                            && v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
++                        let count = v.get("count").and_then(|x| x.as_u64()).unwrap_or(0);
++                        if ok {
++                            ok_any = true;
++                            prefetch_count += count;
++                        }
++                        json!({"tp_rank": tp_rank, "url": url, "ok": ok, "count": count})
++                    }
++                    Err(e) => {
++                        json!({"tp_rank": tp_rank, "url": url, "ok": false, "count": 0,
++                               "error": e.to_string()})
++                    }
++                }
++            }
++            Err(e) => {
++                json!({"tp_rank": tp_rank, "url": url, "ok": false, "count": 0,
++                       "error": e.to_string()})
++            }
++        };
++        rank_results.push(entry);
++    }
++
++    let count = block_ids.len() as u64;
++    let resp = json!({
++        "ok": ok_any,
++        "count": count,
++        "mode": "router",
++        "dp_rank": dp_rank,
++        "worker_url": worker_url,
++        "prefetch_count": prefetch_count,
++        "rank_results": rank_results,
++    });
++    let status = if ok_any {
++        StatusCode::OK
++    } else {
++        StatusCode::BAD_GATEWAY
++    };
++    (status, Json(resp)).into_response()
++}
++
++/// Extract host from a base worker URL like "http://127.0.0.1:8000"
++/// (handles plain and [ipv6] hosts; prefetch ports live on the same machine as vllm)
++fn extract_host_from_base_url(base_url: &str) -> String {
++    let no_scheme = base_url
++        .trim_start_matches("http://")
++        .trim_start_matches("https://");
++    if let Some(rest) = no_scheme.strip_prefix('[') {
++        if let Some(end) = rest.find(']') {
++            return format!("[{}]", &rest[..end]);
++        }
++    }
++    no_scheme
++        .rsplit_once(':')
++        .map(|(h, _)| h.to_string())
++        .unwrap_or_else(|| no_scheme.to_string())
++}
++
+ /// Transparent proxy handler for unmatched routes
+ /// Routes requests through the router's route_transparent method
+ async fn transparent_proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> Response {
+@@ -786,7 +968,9 @@ pub fn build_app_with_wasm_middleware(
+         .route("/health_generate", get(health_generate))
+         .route("/v1/models", get(v1_models))
+         .route("/get_model_info", get(get_model_info))
+-        .route("/get_server_info", get(get_server_info));
++        .route("/get_server_info", get(get_server_info))
++        // UCM KV prefetch passthrough: 与推理共享 policy 选路(旁路,不占推理并发额度)
++        .route("/kv/prefetch", post(kv_prefetch));
+ 
+     let admin_routes = Router::new()
+         .route("/add_worker", post(add_worker))
