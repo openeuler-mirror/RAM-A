@@ -12,6 +12,13 @@ pub struct DaemonConfig {
     pub noop_backend: bool,
     #[serde(default = "default_lmcache_url")]
     pub lmcache_url: String,
+    // Use the UCM backend (routing prefetch through vllm-router) when true.
+    // Takes effect only when `noop_backend` is false.
+    #[serde(default)]
+    pub ucm_backend: bool,
+    // UCM vllm-router base URL; prefetch goes to {ucm_url}/kv/prefetch.
+    #[serde(default = "default_ucm_url")]
+    pub ucm_url: String,
     #[serde(default)]
     pub debug_enabled: bool,
 
@@ -51,6 +58,11 @@ fn default_lmcache_url() -> String {
     "http://localhost:6999".to_string()
 }
 
+fn default_ucm_url() -> String {
+    // vllm-router base URL for the UCM prefetch chain (/kv/prefetch).
+    "http://127.0.0.1:9003".to_string()
+}
+
 fn default_debug_dir() -> String {
     "kvcache_debug".to_string()
 }
@@ -69,6 +81,8 @@ impl Default for DaemonConfig {
             listen_addr: default_listen_addr(),
             noop_backend: false,
             lmcache_url: default_lmcache_url(),
+            ucm_backend: false,
+            ucm_url: default_ucm_url(),
             debug_enabled: false,
             trace_events: false,
             debug_dir: default_debug_dir(),

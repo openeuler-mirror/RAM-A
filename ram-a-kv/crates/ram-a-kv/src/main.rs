@@ -16,6 +16,7 @@ use manager_core::config::KvCacheConfig;
 use manager_core::KvCacheManager;
 
 use crate::backend::lmcache_ascend::LMCacheAscendBackend;
+use crate::backend::ucm::UCMBackend;
 use crate::daemon_config::DaemonConfig;
 use crate::event_registry::AppContext;
 use crate::event_registry::EventRegistry;
@@ -122,13 +123,23 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // Pick backend: NoopBackend for tests (no LMCache traffic) vs. LMCacheAscendBackend for production.
-    let backend: Arc<dyn KvCacheBackend> = if config.noop_backend {
+    // Pick backend: NoopBackend for tests, UCM (vllm-router /kv/prefetch) or
+    // LMCache-Ascend (/memory/*) for production.
+    let (backend, backend_url): (Arc<dyn KvCacheBackend>, String) = if config.noop_backend {
         tracing::info!("using noop backend (no LMCache calls)");
-        Arc::new(NoopBackend)
+        (Arc::new(NoopBackend), config.lmcache_url.clone())
+    } else if config.ucm_backend {
+        tracing::info!(url = %config.ucm_url, "using UCM backend");
+        (
+            Arc::new(UCMBackend::new(config.ucm_url.clone())),
+            config.ucm_url.clone(),
+        )
     } else {
         tracing::info!(url = %config.lmcache_url, "using LMCache-Ascend backend");
-        Arc::new(LMCacheAscendBackend::new(config.lmcache_url.clone()))
+        (
+            Arc::new(LMCacheAscendBackend::new(config.lmcache_url.clone())),
+            config.lmcache_url.clone(),
+        )
     };
 
     let core_config = KvCacheConfig {
@@ -136,7 +147,7 @@ async fn main() {
         debug_enabled: config.debug_enabled,
         trace_events: config.trace_events,
         debug_dir: config.debug_dir.clone(),
-        backend_url: config.lmcache_url.clone(),
+        backend_url,
         turn_start_prefetch: config.turn_start_prefetch,
     };
     let manager = Arc::new(KvCacheManager::new(core_config, backend));

@@ -83,7 +83,7 @@ impl LMCacheAscendBackend {
 
 #[async_trait]
 impl KvCacheBackend for LMCacheAscendBackend {
-    async fn prefetch(&self, hashes: Vec<String>, lookup_id: String) -> BackendResult {
+    async fn prefetch(&self, hashes: Vec<String>, lookup_id: String, _session_id: String) -> BackendResult {
         let payload = serde_json::json!({
             "chunk_hashes": hashes,
             "lookup_id": lookup_id,

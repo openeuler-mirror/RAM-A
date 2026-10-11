@@ -2,5 +2,9 @@
 
 listen_addr = "127.0.0.1:6998"
 lmcache_url = "http://localhost:6999"
+# Set ucm_backend = true to route prefetch through the UCM vllm-router
+# (POST {ucm_url}/kv/prefetch) instead of LMCache. Ignored when noop_backend = true.
+ucm_backend = false
+ucm_url = "http://127.0.0.1:9003"
 debug_enabled = false
 debug_dir = "kvcache_debug"
