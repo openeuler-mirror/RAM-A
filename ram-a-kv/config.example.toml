@@ -6,5 +6,10 @@ lmcache_url = "http://localhost:6999"
 # (POST {ucm_url}/kv/prefetch) instead of LMCache. Ignored when noop_backend = true.
 ucm_backend = false
 ucm_url = "http://127.0.0.1:9003"
+# turn_start prefetch: true runs it inline (blocks the caller on the router
+# fan-out); turn_start_prefetch_async = true makes it fire-and-forget so the
+# fan-out overlaps the caller's next work (e.g. the model call).
+turn_start_prefetch = true
+turn_start_prefetch_async = false
 debug_enabled = false
 debug_dir = "kvcache_debug"

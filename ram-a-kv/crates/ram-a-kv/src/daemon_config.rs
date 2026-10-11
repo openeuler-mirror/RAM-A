@@ -34,6 +34,12 @@ pub struct DaemonConfig {
     #[serde(default = "default_turn_start_prefetch")]
     pub turn_start_prefetch: bool,
 
+    // Dispatch the turn_start prefetch in the background (fire-and-forget) so the
+    // router fan-out overlaps the caller's next work instead of blocking it.
+    // Only meaningful when turn_start_prefetch is true.
+    #[serde(default)]
+    pub turn_start_prefetch_async: bool,
+
     // Optional bearer token for authenticating POST /event requests.
     // When non-empty, requests must carry `Authorization: Bearer <token>`.
     // Required when listen_addr is not a loopback address.
@@ -88,6 +94,7 @@ impl Default for DaemonConfig {
             debug_dir: default_debug_dir(),
             session_store_path: default_session_store_path(),
             turn_start_prefetch: default_turn_start_prefetch(),
+            turn_start_prefetch_async: false,
             auth_token: String::new(),
             acttrail_receiver_url: None,
             acttrail_model_deployment_key: None,

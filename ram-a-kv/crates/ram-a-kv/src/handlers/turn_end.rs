@@ -8,11 +8,13 @@ use crate::event_registry::{AppContext, EventHandler, EventResult, EventSpec};
 use crate::handlers::acttrail_relay::ActtrailCapture;
 
 // Hard-coded input limits for turn_end chunk_hashes.
-// Each chunk hash is at most 100 bytes; a single request carries at most 1000
-// chunks. Oversized payloads are rejected before reaching the manager so a
-// hostile or buggy client cannot blow up memory or stall eviction.
+// Each chunk hash is at most 100 bytes; a single request carries at most 4096
+// chunks (was 1000; raised so that very long sessions can map their KV -- the
+// engine's block size is 128 tokens, so a ~256k-token context needs ~2000
+// chunks). Oversized payloads are still rejected before reaching the manager so
+// a hostile or buggy client cannot blow up memory or stall eviction.
 const MAX_CHUNK_HASH_LEN: usize = 100;
-const MAX_CHUNK_COUNT: usize = 1000;
+const MAX_CHUNK_COUNT: usize = 4096;
 
 pub struct TurnEndHandler;
 

@@ -20,6 +20,7 @@ use crate::backend::ucm::UCMBackend;
 use crate::daemon_config::DaemonConfig;
 use crate::event_registry::AppContext;
 use crate::event_registry::EventRegistry;
+use crate::handlers::agent_event::AgentEventHandler;
 use crate::handlers::health::HealthHandler;
 use crate::handlers::session_close::SessionCloseHandler;
 use crate::handlers::session_fork::SessionForkHandler;
@@ -186,6 +187,7 @@ async fn main() {
     registry.register("session_fork", Arc::new(SessionForkHandler));
     registry.register("session_fork_end", Arc::new(SessionForkEndHandler));
     registry.register("health", Arc::new(HealthHandler));
+    registry.register("agent_event", Arc::new(AgentEventHandler));
 
     let acttrail_relay = match crate::handlers::acttrail_relay::ActtrailRelay::new(&config) {
         Some(r) => {
@@ -203,6 +205,7 @@ async fn main() {
         manager: manager.clone(),
         session_store: session_store.clone(),
         acttrail_relay,
+        turn_start_prefetch_async: config.turn_start_prefetch_async,
     });
 
     let app_state = Arc::new(AppState {

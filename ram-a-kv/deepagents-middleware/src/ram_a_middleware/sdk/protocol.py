@@ -13,7 +13,7 @@ from . import traffic_log
 
 def _valid_hashes(value: Any) -> bool:
     try:
-        return isinstance(value, (list, tuple)) and 0 < len(value) <= 1000 and all(
+        return isinstance(value, (list, tuple)) and 0 < len(value) <= 4096 and all(
             isinstance(item, str) and item.strip() and len(item.encode("utf-8")) <= 100
             for item in value
         )
@@ -127,7 +127,7 @@ class _Protocol:
                 fields["kv_transfer_params"] = {"chunk_hashes": None}
             else:
                 if not _valid_hashes(result.cache_hashes):
-                    raise ValueError("requires 1 to 1000 cache identifiers, each at most 100 UTF-8 bytes")
+                    raise ValueError("requires 1 to 4096 cache identifiers, each at most 100 UTF-8 bytes")
                 if result.status != "success":
                     raise ValueError("cannot update cache mapping for an unsuccessful model result")
                 fields["kv_transfer_params"] = {"chunk_hashes": list(result.cache_hashes)}
