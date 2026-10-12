@@ -150,6 +150,11 @@ class ModelCallTimer:
 
     This isolates the model call (where prefetch actually helps) from the rest
     of the agent turn (graph dispatch, middleware POSTs, message bookkeeping).
+
+    It also records, for each model call, the wall-clock (epoch seconds) start
+    and end plus the engine-issued request id, so the client-side stage can be
+    aligned with the daemon (``turn_start`` / prefetch fan-out) and the engine
+    (``FAWA request_id``) timestamps in a single end-to-end timeline.
     """
 
     def __init__(self):
@@ -160,18 +165,25 @@ class ModelCallTimer:
         class _Handler(BaseCallbackHandler):
             def on_chat_model_start(self, serialized, messages, *, run_id, **kwargs):
                 outer._starts[run_id] = time.perf_counter()
+                outer.start_epochs.append(time.time())
 
             def on_llm_end(self, response, *, run_id, **kwargs):
                 started = outer._starts.pop(run_id, None)
                 if started is not None:
                     outer.total += time.perf_counter() - started
                     outer.calls += 1
-                # Capture the engine-reported token usage (authoritative x-axis).
+                outer.end_epochs.append(time.time())
+                # Capture the engine-reported token usage (authoritative x-axis)
+                # and the engine-issued request id (aligns with the FAWA log line).
                 try:
                     msg = response.generations[0][0].message
                     usage = getattr(msg, "usage_metadata", None) or {}
                     outer.prompt_tokens += int(usage.get("input_tokens") or 0)
                     outer.completion_tokens += int(usage.get("output_tokens") or 0)
+                    rid = (getattr(msg, "response_metadata", None) or {}).get("id") \
+                        or getattr(msg, "id", None)
+                    if rid:
+                        outer.request_ids.append(str(rid))
                 except Exception:
                     pass
 
@@ -180,6 +192,9 @@ class ModelCallTimer:
         self.calls = 0
         self.prompt_tokens = 0
         self.completion_tokens = 0
+        self.start_epochs: list = []
+        self.end_epochs: list = []
+        self.request_ids: list = []
         self.handler = _Handler()
 
 
@@ -241,9 +256,11 @@ def phase_measure(args) -> int:
     timer = ModelCallTimer()
     try:
         config = {"configurable": {"thread_id": args.thread_id}, "callbacks": [timer.handler]}
+        measure_start_epoch = time.time()
         started = time.perf_counter()
         result = agent.invoke({"messages": messages}, config=config)
         latency = time.perf_counter() - started
+        measure_end_epoch = time.time()
         reply = _last_content(result["messages"])
     finally:
         model.root_client.close()
@@ -262,6 +279,15 @@ def phase_measure(args) -> int:
         "completion_tokens": timer.completion_tokens,
         "context_messages": len(context),
         "reply": reply[:120],
+        # Wall-clock anchors (epoch seconds) for the end-to-end stage timeline:
+        #   measure_*_epoch       : agent.invoke start/end (whole turn)
+        #   model_*_epoch         : earliest chat-model start / latest chat-model end
+        #   engine_request_ids    : engine chatcmpl ids (join key with the FAWA log)
+        "measure_start_epoch": round(measure_start_epoch, 6),
+        "measure_end_epoch": round(measure_end_epoch, 6),
+        "model_start_epoch": round(min(timer.start_epochs), 6) if timer.start_epochs else None,
+        "model_end_epoch": round(max(timer.end_epochs), 6) if timer.end_epochs else None,
+        "engine_request_ids": timer.request_ids,
         "ts": time.time(),
     }
     Path(args.results).parent.mkdir(parents=True, exist_ok=True)
