@@ -128,7 +128,11 @@ impl KvCacheManager {
         outcome.prefetch_count = hashes.len();
         let result = self
             .backend
-            .prefetch(hashes, format!("turn_prefetch_{}", session_id))
+            .prefetch(
+                hashes,
+                format!("turn_prefetch_{}", session_id),
+                session_id.to_string(),
+            )
             .await;
         if !backend_ok(&result) {
             tracing::warn!(
@@ -313,7 +317,11 @@ impl KvCacheManager {
             outcome.prefetch_count = hashes.len();
             let result = self
                 .backend
-                .prefetch(hashes, format!("snapshot_prefetch_{}", session_id))
+                .prefetch(
+                    hashes,
+                    format!("snapshot_prefetch_{}", session_id),
+                    session_id.to_string(),
+                )
                 .await;
             if !backend_ok(&result) {
                 tracing::warn!(

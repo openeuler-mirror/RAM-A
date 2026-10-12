@@ -12,6 +12,13 @@ pub struct DaemonConfig {
     pub noop_backend: bool,
     #[serde(default = "default_lmcache_url")]
     pub lmcache_url: String,
+    // Use the UCM backend (routing prefetch through vllm-router) when true.
+    // Takes effect only when `noop_backend` is false.
+    #[serde(default)]
+    pub ucm_backend: bool,
+    // UCM vllm-router base URL; prefetch goes to {ucm_url}/kv/prefetch.
+    #[serde(default = "default_ucm_url")]
+    pub ucm_url: String,
     #[serde(default)]
     pub debug_enabled: bool,
 
@@ -26,6 +33,12 @@ pub struct DaemonConfig {
     // Run prefetch during turn_start when true.
     #[serde(default = "default_turn_start_prefetch")]
     pub turn_start_prefetch: bool,
+
+    // Dispatch the turn_start prefetch in the background (fire-and-forget) so the
+    // router fan-out overlaps the caller's next work instead of blocking it.
+    // Only meaningful when turn_start_prefetch is true.
+    #[serde(default)]
+    pub turn_start_prefetch_async: bool,
 
     // Optional bearer token for authenticating POST /event requests.
     // When non-empty, requests must carry `Authorization: Bearer <token>`.
@@ -51,6 +64,11 @@ fn default_lmcache_url() -> String {
     "http://localhost:6999".to_string()
 }
 
+fn default_ucm_url() -> String {
+    // vllm-router base URL for the UCM prefetch chain (/kv/prefetch).
+    "http://127.0.0.1:9003".to_string()
+}
+
 fn default_debug_dir() -> String {
     "kvcache_debug".to_string()
 }
@@ -69,11 +87,14 @@ impl Default for DaemonConfig {
             listen_addr: default_listen_addr(),
             noop_backend: false,
             lmcache_url: default_lmcache_url(),
+            ucm_backend: false,
+            ucm_url: default_ucm_url(),
             debug_enabled: false,
             trace_events: false,
             debug_dir: default_debug_dir(),
             session_store_path: default_session_store_path(),
             turn_start_prefetch: default_turn_start_prefetch(),
+            turn_start_prefetch_async: false,
             auth_token: String::new(),
             acttrail_receiver_url: None,
             acttrail_model_deployment_key: None,

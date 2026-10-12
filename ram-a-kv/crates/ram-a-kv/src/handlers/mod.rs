@@ -1,5 +1,6 @@
 // Event handler module declarations
 pub mod acttrail_relay;
+pub mod agent_event;
 pub mod health;
 pub mod session_close;
 pub mod session_fork;

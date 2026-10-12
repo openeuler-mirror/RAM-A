@@ -12,7 +12,12 @@ pub struct NoopBackend;
 #[async_trait]
 impl KvCacheBackend for NoopBackend {
     // Prefetch: return 204 (success, no content) without a real request.
-    async fn prefetch(&self, _hashes: Vec<String>, _lookup_id: String) -> BackendResult {
+    async fn prefetch(
+        &self,
+        _hashes: Vec<String>,
+        _lookup_id: String,
+        _session_id: String,
+    ) -> BackendResult {
         BackendResult {
             status: 204,
             responded: true,

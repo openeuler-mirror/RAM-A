@@ -16,9 +16,11 @@ use manager_core::config::KvCacheConfig;
 use manager_core::KvCacheManager;
 
 use crate::backend::lmcache_ascend::LMCacheAscendBackend;
+use crate::backend::ucm::UCMBackend;
 use crate::daemon_config::DaemonConfig;
 use crate::event_registry::AppContext;
 use crate::event_registry::EventRegistry;
+use crate::handlers::agent_event::AgentEventHandler;
 use crate::handlers::health::HealthHandler;
 use crate::handlers::session_close::SessionCloseHandler;
 use crate::handlers::session_fork::SessionForkHandler;
@@ -122,13 +124,23 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // Pick backend: NoopBackend for tests (no LMCache traffic) vs. LMCacheAscendBackend for production.
-    let backend: Arc<dyn KvCacheBackend> = if config.noop_backend {
+    // Pick backend: NoopBackend for tests, UCM (vllm-router /kv/prefetch) or
+    // LMCache-Ascend (/memory/*) for production.
+    let (backend, backend_url): (Arc<dyn KvCacheBackend>, String) = if config.noop_backend {
         tracing::info!("using noop backend (no LMCache calls)");
-        Arc::new(NoopBackend)
+        (Arc::new(NoopBackend), config.lmcache_url.clone())
+    } else if config.ucm_backend {
+        tracing::info!(url = %config.ucm_url, "using UCM backend");
+        (
+            Arc::new(UCMBackend::new(config.ucm_url.clone())),
+            config.ucm_url.clone(),
+        )
     } else {
         tracing::info!(url = %config.lmcache_url, "using LMCache-Ascend backend");
-        Arc::new(LMCacheAscendBackend::new(config.lmcache_url.clone()))
+        (
+            Arc::new(LMCacheAscendBackend::new(config.lmcache_url.clone())),
+            config.lmcache_url.clone(),
+        )
     };
 
     let core_config = KvCacheConfig {
@@ -136,7 +148,7 @@ async fn main() {
         debug_enabled: config.debug_enabled,
         trace_events: config.trace_events,
         debug_dir: config.debug_dir.clone(),
-        backend_url: config.lmcache_url.clone(),
+        backend_url,
         turn_start_prefetch: config.turn_start_prefetch,
     };
     let manager = Arc::new(KvCacheManager::new(core_config, backend));
@@ -175,6 +187,7 @@ async fn main() {
     registry.register("session_fork", Arc::new(SessionForkHandler));
     registry.register("session_fork_end", Arc::new(SessionForkEndHandler));
     registry.register("health", Arc::new(HealthHandler));
+    registry.register("agent_event", Arc::new(AgentEventHandler));
 
     let acttrail_relay = match crate::handlers::acttrail_relay::ActtrailRelay::new(&config) {
         Some(r) => {
@@ -192,6 +205,7 @@ async fn main() {
         manager: manager.clone(),
         session_store: session_store.clone(),
         acttrail_relay,
+        turn_start_prefetch_async: config.turn_start_prefetch_async,
     });
 
     let app_state = Arc::new(AppState {

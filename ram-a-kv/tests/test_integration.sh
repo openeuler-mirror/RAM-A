@@ -18,6 +18,10 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 DAEMON_BIN="${DAEMON_BIN:-$REPO_ROOT/target/release/ram-a-kv}"
 TEST_DIR="${TEST_DIR:-/tmp/ram-a-kv-test}"
 DAEMON_URL="${DAEMON_URL:-http://127.0.0.1:6998}"
+# The generated config and the readiness check follow DAEMON_URL's host:port, so a
+# busy 6998 (e.g. a UCM worker port) can be dodged with DAEMON_URL=http://127.0.0.1:7998.
+DAEMON_HOSTPORT="${DAEMON_URL#*://}"; DAEMON_HOSTPORT="${DAEMON_HOSTPORT%%/*}"
+DAEMON_PORT="${DAEMON_HOSTPORT##*:}"
 
 # ─────────────────────────────────────────────────────────────
 # xiaoO integration guide mode
@@ -162,12 +166,12 @@ if [ ! -x "$DAEMON_BIN" ]; then
 fi
 
 echo "=== write test config (noop_backend=true, no LMCache needed) ==="
-cat > "$TEST_DIR/config.toml" <<'EOF'
-listen_addr = "127.0.0.1:6998"
+cat > "$TEST_DIR/config.toml" <<EOF
+listen_addr = "$DAEMON_HOSTPORT"
 noop_backend = true
 debug_enabled = true
-debug_dir = "/tmp/ram-a-kv-test/debug"
-session_store_path = "/tmp/ram-a-kv-test/sessions.db"
+debug_dir = "$TEST_DIR/debug"
+session_store_path = "$TEST_DIR/sessions.db"
 turn_start_prefetch = true
 EOF
 
@@ -177,8 +181,8 @@ DAEMON_PID=$!
 sleep 1
 
 # verify daemon started successfully
-if ! ss -tlnp 2>/dev/null | grep -q ":6998"; then
-    echo "ERROR: daemon did not start (port 6998 not listening)"
+if ! ss -tlnp 2>/dev/null | grep -q ":${DAEMON_PORT}"; then
+    echo "ERROR: daemon did not start (port ${DAEMON_PORT} not listening)"
     cat "$TEST_DIR/daemon.log"
     exit 1
 fi
@@ -203,11 +207,18 @@ list_resp=$(curl -s -X POST "$DAEMON_URL/event" \
     -d '{"type":"list_events"}')
 event_count=$(echo "$list_resp" | jq -r '.data.events | length' 2>/dev/null)
 echo "  event count: $event_count"
-if [ "$event_count" = "9" ]; then
-    echo "  [PASS] 9 events registered"
+if [ "$event_count" = "10" ]; then
+    echo "  [PASS] 10 events registered"
     PASS=$((PASS + 1))
 else
-    echo "  [FAIL] expected 9 events, got $event_count"
+    echo "  [FAIL] expected 10 events, got $event_count"
+    FAIL=$((FAIL + 1))
+fi
+if echo "$list_resp" | jq -e '.data.events.agent_event' >/dev/null 2>&1; then
+    echo "  [PASS] agent_event is registered"
+    PASS=$((PASS + 1))
+else
+    echo "  [FAIL] agent_event not registered"
     FAIL=$((FAIL + 1))
 fi
 echo "$list_resp" | jq -c '.data.events | keys' | sed 's/^/        /'
@@ -347,11 +358,11 @@ emit "turn_end chunk_hashes contains non-string (rejected)" "false" \
     '{"type":"turn_end","session_id":"edge-s1","kv_transfer_params":{"chunk_hashes":["ok",123]}}'
 emit "turn_end with explicit empty chunk_hashes (allowed, clears session)" "true" \
     '{"type":"turn_end","session_id":"edge-clear","kv_transfer_params":{"chunk_hashes":[]}}'
-# chunk_hash length and count limits (hard-coded: 100 bytes per hash, 1000 hashes per request)
-emit "turn_end chunk_hashes with 1001 entries (rejected by count limit)" "false" \
-    "$(jq -ncM '{type:"turn_end",session_id:"edge-count-overflow",kv_transfer_params:{chunk_hashes:[range(1001)|"h"+tostring]}}')"
-emit "turn_end chunk_hashes with exactly 1000 entries (allowed at boundary)" "true" \
-    "$(jq -ncM '{type:"turn_end",session_id:"edge-count-1000",kv_transfer_params:{chunk_hashes:[range(1000)|"h"+tostring]}}')"
+# chunk_hash length and count limits (hard-coded: 100 bytes per hash, 4096 hashes per request)
+emit "turn_end chunk_hashes with 4097 entries (rejected by count limit)" "false" \
+    "$(jq -ncM '{type:"turn_end",session_id:"edge-count-overflow",kv_transfer_params:{chunk_hashes:[range(4097)|"h"+tostring]}}')"
+emit "turn_end chunk_hashes with exactly 4096 entries (allowed at boundary)" "true" \
+    "$(jq -ncM '{type:"turn_end",session_id:"edge-count-4096",kv_transfer_params:{chunk_hashes:[range(4096)|"h"+tostring]}}')"
 emit "turn_end chunk_hash of 101 bytes (rejected by length limit)" "false" \
     "$(jq -ncM '{type:"turn_end",session_id:"edge-len-overflow",kv_transfer_params:{chunk_hashes:[("x"*101)]}}')"
 emit "turn_end chunk_hash of exactly 100 bytes (allowed at boundary)" "true" \
@@ -368,7 +379,7 @@ curl -s -X POST "$DAEMON_URL/event" -H "Content-Type: application/json" \
 curl -s -X POST "$DAEMON_URL/event" -H "Content-Type: application/json" \
     -d '{"type":"session_close","session_id":"edge-clear"}' > /dev/null
 curl -s -X POST "$DAEMON_URL/event" -H "Content-Type: application/json" \
-    -d '{"type":"session_close","session_id":"edge-count-1000"}' > /dev/null
+    -d '{"type":"session_close","session_id":"edge-count-4096"}' > /dev/null
 curl -s -X POST "$DAEMON_URL/event" -H "Content-Type: application/json" \
     -d '{"type":"session_close","session_id":"edge-len-100"}' > /dev/null
 
