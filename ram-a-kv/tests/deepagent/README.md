@@ -168,12 +168,14 @@ cd ram-a-kv/tests/deepagent
 SWEEP=32768,65536,131072,262144 REPS=3 MIN_SIZE=32768 HUMAN_TOKEN_LIMIT=1000000 ./run_deepagent_gain.sh
 ```
 
+上面这条以及下文的 (A)–(D) 均为**非流式**(`streaming=false`,即默认)Chat Completions;如需**流式(SSE)**,加 `STREAMING=1`(见变体 (E))。
+
 常用变体:
 
 ```bash
 cd ram-a-kv/tests/deepagent
 
-# (A) 四档扫描(推荐,主结果)
+# (A) 四档扫描(推荐,主结果;非流式)
 SWEEP=32768,65536,131072,262144 REPS=3 MIN_SIZE=32768 HUMAN_TOKEN_LIMIT=1000000 ./run_deepagent_gain.sh
 
 # (B) 单尺寸、自定义长 prompt(文件传入,避免 argv 长度上限)
@@ -184,6 +186,10 @@ PROMPT_FILE=/path/to/prompt.txt REPS=3 ./run_deepagent_gain.sh
 
 # (D) 不做冷 flush(更快;但近端仍热,两档差异被抹平)
 FLUSH=0 SWEEP=65536 ./run_deepagent_gain.sh
+
+# (E) 流式(SSE)Chat Completions:引擎把 kv_transfer_params 附在最后一个 chunk,
+#     中间件模型适配层会保留该字段,故预取在流式下同样生效(见 §8.4)
+STREAMING=1 SWEEP=131072 REPS=3 MIN_SIZE=131072 HUMAN_TOKEN_LIMIT=1000000 ./run_deepagent_gain.sh
 ```
 
 > 测 >45k token 的上下文需放开单条消息上限:`HUMAN_TOKEN_LIMIT=1000000`(见 §7)。
@@ -230,6 +236,7 @@ FLUSH=0 SWEEP=65536 ./run_deepagent_gain.sh
 | `THREAD_ID`         | `deepagent-gain`                   | 单尺寸模式的会话 id                                   |
 | `REPS`              | `3`                                | `{cold, prefetch}` 的重复次数(报告取中位)               |
 | `TURN_START_ASYNC`  | `1`                                | turn\_start 预取异步派发(扇出与模型调用重叠);置 0 为同步等待,仅诊断用  |
+| `STREAMING`         | `0`                                | 置 1 使用流式(SSE)Chat Completions;引擎在最后一个 chunk 回传 `kv_transfer_params`,中间件保留之,预取同样生效(见 §8.4) |
 | `FLUSH`             | `1`                                | 每次 measure 前是否 flush 近端为冷                     |
 | `FLUSH_POOL`        | `/mnt/sdb/ucm/flush_pool_64g.json` | UCM 预放池                                       |
 | `FLUSH_ENTRIES`     | `16`                               | 每次 flush 重放的池条目数(须 > \~1.2×FA,见 §4.5)         |
@@ -246,7 +253,7 @@ FLUSH=0 SWEEP=65536 ./run_deepagent_gain.sh
 
 ## 8 实验结果
 
-> **统一条件**:单条 human 起始 prompt、`max_tokens=32`、`temperature=0`、异步 turn\_start 预取、daemon 走 `ucm_backend`;每次 `cold` / `prefetch` 前 flush 16 条池条目(§4.5)。`REPS=3`、`HUMAN_TOKEN_LIMIT=1000000`。原始数据在 `data/`。
+> **统一条件**:单条 human 起始 prompt、`max_tokens=32`、`temperature=0`、异步 turn\_start 预取、daemon 走 `ucm_backend`;**非流式**(`streaming=false`,默认)Chat Completions;每次 `cold` / `prefetch` 前 flush 16 条池条目(§4.5)。`REPS=3`、`HUMAN_TOKEN_LIMIT=1000000`。原始数据在 `data/`(§8.4 流式复测在 `data/streaming/`)。
 
 ### 8.1 主结果:上下文 32k / 64k / 128k / 256k(RQ1)
 
@@ -363,6 +370,20 @@ FLUSH=0 SWEEP=65536 ./run_deepagent_gain.sh
 按 blocks 比例折算到 128k:`1269 ms × 1024/2047 ≈ 635 ms`,恰好落在 (A) 段(≈653 ms)内、并在 FAWA(+652.7 ms)前完成——这正是 (A) 段两档耗时相同、(C) 段省下 ≈406 ms 的原因。
 
 **一句话**:预取耗时 ≈ **635 ms** 被完全隐藏在模型调用 **1379.7 ms** 之内(准确地讲,藏在 FAWA 之前的 (A) 段里),故整轮收益 ≈ `Δ ≈ 0.42 s`,与 §8.1 实测一致。
+
+### 8.4 流式(SSE)下的一致性(128k,交叉验证)
+
+§8.1–§8.3 为非流式(默认)。流式下引擎把 `kv_transfer_params` 附在**最后一个 SSE chunk**,而 LangChain 的 chunk 转换默认丢弃该顶层字段;中间件模型适配层(`_KvResponseChatOpenAI`)在 chunk 转换时予以保留,故 `turn_end` 仍能上报 `chunk_hashes`、预取照常生效。以 128k 复测(`STREAMING=1 SWEEP=131072 REPS=3 FLUSH=1`,原始数据 `data/streaming/`):
+
+| 档位 | 整轮 mean(s) | 模型 mean(s) | n |
+| --- | --- | --- | --- |
+| `cold` | 1.879 | 1.835 | 3 |
+| `prefetch` | 1.463 | 1.419 | 3 |
+
+- 整轮收益 **1.284×**(+22.1%),模型收益 1.293×(+22.7%,省 416 ms);与本文件 128k 非流式结果(1.287× / +22.3%)在噪声内一致。
+- warm 阶段记录 `chunk_hashes=1024`,实测 `prompt_tokens=131092`,证明流式下 KV 上报与 token 口径均完整。
+
+**结论**:是否流式不影响预取收益——收益来自预填充阶段的 `T_kv_load`,与响应以 SSE 还是整体返回无关。
 
 ***
 
