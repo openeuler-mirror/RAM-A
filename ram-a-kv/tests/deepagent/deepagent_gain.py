@@ -109,7 +109,7 @@ def flush_near_tier(pool_path: str, router_base: str, model_name: str, entries: 
 # Agent construction (imported lazily so --help works without the venv)
 # --------------------------------------------------------------------------- #
 def make_agent(model_base_url: str, daemon_url: str, model_name: str, max_tokens: int,
-               human_token_limit: int = 0):
+               human_token_limit: int = 0, streaming: bool = False):
     from deepagents import create_deep_agent
     from langchain_openai import ChatOpenAI
     from ram_a_middleware.sdk import RamAClient
@@ -119,8 +119,12 @@ def make_agent(model_base_url: str, daemon_url: str, model_name: str, max_tokens
         model=model_name,
         base_url=model_base_url,
         api_key="local-test",
-        use_responses_api=False,   # KV transfer needs non-streaming Chat Completions
-        streaming=False,
+        use_responses_api=False,   # KV transfer rides on Chat Completions responses
+        streaming=streaming,
+        # Streaming only reports token usage when asked; without it the timer
+        # loses prompt_tokens. The KV field is preserved on the final chunk by
+        # the middleware's model adapter regardless.
+        stream_usage=streaming,
         temperature=0,
         max_tokens=max_tokens,
         timeout=600,
@@ -207,7 +211,7 @@ def phase_warm(args) -> int:
     prompt = Path(args.prompt_file).read_text(encoding="utf-8")
     model_name = resolve_model_name(args.model_base_url)
     agent, model = make_agent(args.model_base_url, args.daemon_url, model_name, args.max_tokens,
-                              args.human_token_limit)
+                              args.human_token_limit, args.streaming)
     try:
         config = {"configurable": {"thread_id": args.thread_id}}
         result = agent.invoke(
@@ -252,7 +256,7 @@ def phase_measure(args) -> int:
     messages = list(context) + [HumanMessage(content=args.probe)]
 
     agent, model = make_agent(args.model_base_url, args.daemon_url, model_name, args.max_tokens,
-                              args.human_token_limit)
+                              args.human_token_limit, args.streaming)
     timer = ModelCallTimer()
     try:
         config = {"configurable": {"thread_id": args.thread_id}, "callbacks": [timer.handler]}
@@ -532,6 +536,8 @@ def main() -> int:
     ap.add_argument("--flush", action="store_true", help="measure phase: flush near tier before running")
     ap.add_argument("--pool", default="")
     ap.add_argument("--flush-entries", type=int, default=12)
+    ap.add_argument("--streaming", action="store_true",
+                    help="use streaming Chat Completions (KV field is preserved on the final chunk)")
     args = ap.parse_args()
 
     if args.phase == "warm":

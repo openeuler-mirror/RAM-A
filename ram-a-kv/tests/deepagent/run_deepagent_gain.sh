@@ -36,6 +36,7 @@
 #   THREAD_ID        session id (single mode)                       (deepagent-gain)
 #   REPS             repetitions of {cold, prefetch}                (3)
 #   TURN_START_ASYNC 1 = async turn_start prefetch (recommended)    (1)
+#   STREAMING        1 = streaming Chat Completions (SSE)           (0)
 #   FLUSH            1 = flush near tier cold before each run        (1)
 #   FLUSH_POOL       UCM flush pool json                            (/mnt/sdb/ucm/flush_pool_64g.json)
 #   FLUSH_ENTRIES    pool entries replayed per flush                (16; must exceed ~1.2x FA size)
@@ -96,6 +97,12 @@ ASYNC_FLAG="false"
 # model call and is what makes the prefetch benefit visible at the turn level.
 [ "${TURN_START_ASYNC:-1}" = "1" ] && ASYNC_FLAG="true"
 
+# Streaming Chat Completions (SSE). The engine emits kv_transfer_params on the
+# final chunk and the middleware's model adapter preserves it, so the prefetch
+# handle still reaches the daemon.
+STREAM_FLAG=""
+[ "${STREAMING:-0}" = "1" ] && STREAM_FLAG="--streaming"
+
 DATA_DIR="${DATA_DIR:-$SCRIPT_DIR/data}"
 mkdir -p "$DATA_DIR"
 RESULTS="$DATA_DIR/results.jsonl"
@@ -147,7 +154,7 @@ if ! curl -sf -m5 -o /dev/null "$MODEL_BASE_URL/models"; then
     echo "ERROR: model endpoint not reachable: $MODEL_BASE_URL/models" >&2; exit 1
 fi
 echo "[setup] python=$PY"
-echo "[setup] model_base_url=$MODEL_BASE_URL  ucm_url=$UCM_URL  daemon=$DAEMON_URL  async=$ASYNC_FLAG  reps=$REPS"
+echo "[setup] model_base_url=$MODEL_BASE_URL  ucm_url=$UCM_URL  daemon=$DAEMON_URL  async=$ASYNC_FLAG  streaming=${STREAMING:-0}  reps=$REPS"
 
 # ── daemon lifecycle ───────────────────────────────────────────────────────────
 DAEMON_PID=""
@@ -217,7 +224,8 @@ py() { "$PY" "$SCRIPT_DIR/deepagent_gain.py" \
         --model-base-url "$MODEL_BASE_URL" --daemon-url "$DAEMON_URL" --router-base "$ROUTER_BASE" \
         --size "$CUR_SIZE" --rep "$CUR_REP" \
         --human-token-limit "$HUMAN_TOKEN_LIMIT" \
-        --pool "$FLUSH_POOL" --flush-entries "$FLUSH_ENTRIES" "$@"; }
+        --pool "$FLUSH_POOL" --flush-entries "$FLUSH_ENTRIES" \
+        $STREAM_FLAG "$@"; }
 
 gen_prompt() {  # $1 = tokens, $2 = outfile
     "$PY" "$SCRIPT_DIR/gen_prompt.py" --tokens "$1" --out "$2" \
@@ -279,6 +287,7 @@ write_env() {  # immutable snapshot of what produced the numbers (for the report
   "sizes_tokens": "$SWEEP",
   "scaffold_tokens": "$SCAFFOLD_TOKENS",
   "max_tokens": "32",
+  "streaming": "${STREAMING:-0}",
   "human_token_limit": "$HUMAN_TOKEN_LIMIT",
   "probe": "$PROBE"
 }
