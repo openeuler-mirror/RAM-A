@@ -1,7 +1,9 @@
 """DeepAgents hooks for RAM-A; model request IDs and KV values are borrowed."""
 from __future__ import annotations
 
+import json
 import logging
+import os
 import time
 from collections.abc import Mapping
 from typing import Annotated, Any, Callable
@@ -13,7 +15,8 @@ from ram_a_middleware.sdk import traffic_log
 from ram_a_middleware.sdk.events import AgentEvent, CallContext, CallResult, EventResult
 from ram_a_middleware.sdk.protocol import _valid_hashes
 from .identity import IdentityContext, normalize_session_id
-from .model import cache_hashes_from_response, model_request_id, preserve_kv_response
+from .model import (cache_hashes_from_response, model_request_id, preserve_kv_response,
+                    stream_timing_from_response, stream_usage_from_response)
 from .serialization import json_safe
 
 logger = logging.getLogger(__name__)
@@ -36,7 +39,9 @@ class RamAKvMiddleware(AgentMiddleware):
                  identity: IdentityContext | None = None, response_max_bytes: int = 4096,
                  capture_debug: bool = False,
                  context_provider: Callable | None = None,
-                 cache_identity_provider: Callable | None = None):
+                 cache_identity_provider: Callable | None = None,
+                 actrail_enabled: bool = False, actrail_endpoint_key: str | None = None,
+                 actrail_agent_key: str | None = None):
         if type(response_max_bytes) is not int or response_max_bytes < 2:
             raise ValueError("response_max_bytes must be an integer of at least 2")
         self.client = client
@@ -48,6 +53,13 @@ class RamAKvMiddleware(AgentMiddleware):
         self.capture_debug = capture_debug
         self.context_provider = context_provider
         self.cache_identity_provider = cache_identity_provider or cache_hashes_from_response
+        # actrail-kv capture: opt-in via parameter or RAM_A_ACTRAIL_* env.
+        self.actrail_enabled = actrail_enabled or os.getenv("RAM_A_ACTRAIL_ENABLED") in (
+            "1", "true", "True", "yes")
+        self.actrail_endpoint_key = actrail_endpoint_key \
+            or os.getenv("RAM_A_ACTRAIL_ENDPOINT_KEY") or "chat"
+        self.actrail_agent_key = actrail_agent_key \
+            if actrail_agent_key is not None else os.getenv("RAM_A_ACTRAIL_AGENT_KEY")
 
     async def aclose(self):
         """Close the async client created internally; supplied clients are borrowed."""
@@ -143,6 +155,81 @@ class RamAKvMiddleware(AgentMiddleware):
                           response_metadata=json_safe({"messages": metadata}, max_bytes=self.response_max_bytes),
                           debug_max_bytes=self.response_max_bytes)
 
+    @staticmethod
+    def _actrail_bytes(payload: Mapping) -> int:
+        return len(json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8"))
+
+    def _actrail_oversized(self, payload: Mapping) -> bool:
+        # Mirrors the actrail-kv receiver default body limit (8 MiB).
+        return self._actrail_bytes(payload) > 8 * 1024 * 1024
+
+    def _build_openai_payload(self, request, model_name: str) -> dict:
+        payload = {"model": model_name, "messages": []}
+        try:
+            for message in request.messages:
+                content = message.content if isinstance(message.content, str) \
+                    else json_safe(message.content, max_bytes=2048)
+                payload["messages"].append({"role": getattr(message, "type", type(message).__name__),
+                                            "content": content})
+        except Exception:
+            pass
+        tools = getattr(request, "tools", None) or []
+        if tools:
+            payload["tools"] = json_safe(tools, max_bytes=8192)
+        return payload
+
+    def _build_actrail_capture(self, request, session, ctx, result,
+                               usage: Mapping | None = None,
+                               timing: tuple | None = None) -> dict | None:
+        """Build the turn_end actrail_capture (best-effort, never blocks).
+
+        The payload mirrors the OpenAI request and carries the runtime metrics
+        inside ``payload._actrail_response_usage`` (design doc): prompt_tokens /
+        completion_tokens from the engine usage, ttft_ms / total_ms measured on
+        the streaming path. actrail-kv consumes prompt_tokens / cached_tokens /
+        completion_tokens for the reported hit rate; ttft_ms / total_ms are
+        stored verbatim for later dashboard display. An oversized or
+        unserializable capture is discarded with a warning; KV turn_end is
+        never affected.
+        """
+        if not self.actrail_enabled:
+            return None
+        if not self.actrail_endpoint_key:
+            logger.warning("RAM-A actrail capture skipped, endpoint_key missing: session=%s", session)
+            return None
+        try:
+            model_name = ctx.model or getattr(request.model, "model_name",
+                                              type(request.model).__name__)
+            payload = self._build_openai_payload(request, model_name)
+            response_usage: dict[str, int] = {}
+            if usage is not None:
+                if usage.get("input_tokens") is not None:
+                    response_usage["prompt_tokens"] = usage["input_tokens"]
+                if usage.get("output_tokens") is not None:
+                    response_usage["completion_tokens"] = usage["output_tokens"]
+            if timing is not None:
+                ttft_ms, total_ms = timing
+                if ttft_ms is not None:
+                    response_usage["ttft_ms"] = ttft_ms
+                if total_ms is not None:
+                    response_usage["total_ms"] = total_ms
+            if response_usage:
+                payload["_actrail_response_usage"] = response_usage
+            if self._actrail_oversized(payload):
+                logger.warning("RAM-A actrail capture skipped, payload too large: session=%s request_id=%s",
+                               session, ctx.model_request_id)
+                return None
+            # Kept verbatim: the payload is already JSON-safe (plain str/int/
+            # list/dict) and json_safe would redact values under "token" keys,
+            # corrupting prompt_tokens/completion_tokens.
+            return {"endpoint_key": self.actrail_endpoint_key,
+                    "agent_key": self.actrail_agent_key,
+                    "payload": payload}
+        except Exception:
+            logger.warning("RAM-A actrail capture failed: session=%s request_id=%s",
+                           session, ctx.model_request_id)
+            return None
+
     def _log_model_request(self, session, ctx, request) -> None:
         """Log the deepagents-side model request body (opt-in via RAM_A_TRAFFIC_LOG)."""
         if not traffic_log.enabled():
@@ -187,7 +274,11 @@ class RamAKvMiddleware(AgentMiddleware):
         self._log_model_response(session, ctx, response)
         result = self._result(ctx, response, started)
         if result is not None:
-            self._observe(self.client.end_model_call(ctx, result), session, ctx.model_request_id)
+            capture = self._build_actrail_capture(request, session, ctx, result,
+                                                  usage=stream_usage_from_response(response),
+                                                  timing=stream_timing_from_response(response))
+            self._observe(self.client.end_model_call(ctx, result, actrail_capture=capture),
+                          session, ctx.model_request_id)
         return response
 
     async def awrap_model_call(self, request: ModelRequest, handler: Callable) -> ModelResponse:
@@ -202,7 +293,11 @@ class RamAKvMiddleware(AgentMiddleware):
         self._log_model_response(session, ctx, response)
         result = self._result(ctx, response, started)
         if result is not None:
-            self._observe(await self.async_client.end_model_call(ctx, result), session, ctx.model_request_id)
+            capture = self._build_actrail_capture(request, session, ctx, result,
+                                                  usage=stream_usage_from_response(response),
+                                                  timing=stream_timing_from_response(response))
+            self._observe(await self.async_client.end_model_call(ctx, result, actrail_capture=capture),
+                          session, ctx.model_request_id)
         return response
 
 

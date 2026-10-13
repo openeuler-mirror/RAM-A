@@ -1,6 +1,7 @@
 """Three-event HTTP clients with explicit connection ownership."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 from uuid import uuid4
 
@@ -96,7 +97,7 @@ class _Protocol:
                            error_code="daemon_error" if response.is_success else f"http_{response.status_code}",
                            error=payload.get("error"))
 
-    def _fields(self, kind, value, result=None):
+    def _fields(self, kind, value, result=None, actrail_capture=None):
         """Validation returns an EventResult instead of leaking input errors."""
         try:
             if kind == "agent_event":
@@ -121,10 +122,10 @@ class _Protocol:
             if not isinstance(result, CallResult):
                 raise ValueError("a CallResult is required for turn_end")
             if result.cache_hashes is None:
-                # The model did not return kv_transfer_params: still send the
-                # turn_end with chunk_hashes null (middleware-side contract;
-                # the daemon applies its own validation to what it receives).
-                fields["kv_transfer_params"] = {"chunk_hashes": None}
+                # No KV identifiers: omit kv_transfer_params entirely (the
+                # daemon rejects null chunk_hashes). Actrail forwarding stays
+                # independent of KV.
+                pass
             else:
                 if not _valid_hashes(result.cache_hashes):
                     raise ValueError("requires 1 to 4096 cache identifiers, each at most 100 UTF-8 bytes")
@@ -137,6 +138,18 @@ class _Protocol:
                 if item is not None:
                     debug[key] = item
             fields["debug_context"] = json_safe(debug, max_bytes=result.debug_max_bytes)
+            if actrail_capture is not None:
+                # Kept verbatim (not json_safe): json_safe redacts values under
+                # "token" keys, which would corrupt prompt_tokens/completion_tokens.
+                if not isinstance(actrail_capture, Mapping):
+                    raise ValueError("actrail_capture must be an object")
+                endpoint_key = actrail_capture.get("endpoint_key")
+                payload = actrail_capture.get("payload")
+                if not isinstance(endpoint_key, str) or not endpoint_key.strip():
+                    raise ValueError("actrail_capture.endpoint_key must be a non-empty string")
+                if not isinstance(payload, dict):
+                    raise ValueError("actrail_capture.payload must be an object")
+                fields["actrail_capture"] = dict(actrail_capture)
             return fields
         except Exception as exc:
             return self._invalid(kind, str(exc))
@@ -188,8 +201,9 @@ class RamAProtocolClient(_Protocol):
     def begin_model_call(self, ctx: CallContext) -> EventResult:
         return self._post("turn_start", self._fields("turn_start", ctx))
 
-    def end_model_call(self, ctx: CallContext, result: CallResult) -> EventResult:
-        return self._post("turn_end", self._fields("turn_end", ctx, result))
+    def end_model_call(self, ctx: CallContext, result: CallResult,
+                       actrail_capture: Mapping | None = None) -> EventResult:
+        return self._post("turn_end", self._fields("turn_end", ctx, result, actrail_capture))
 
     def agent_event(self, event: AgentEvent) -> EventResult:
         return self._post("agent_event", self._fields("agent_event", event), retryable=True)
@@ -238,8 +252,9 @@ class AsyncRamAProtocolClient(_Protocol):
     async def begin_model_call(self, ctx: CallContext) -> EventResult:
         return await self._post("turn_start", self._fields("turn_start", ctx))
 
-    async def end_model_call(self, ctx: CallContext, result: CallResult) -> EventResult:
-        return await self._post("turn_end", self._fields("turn_end", ctx, result))
+    async def end_model_call(self, ctx: CallContext, result: CallResult,
+                             actrail_capture: Mapping | None = None) -> EventResult:
+        return await self._post("turn_end", self._fields("turn_end", ctx, result, actrail_capture))
 
     async def agent_event(self, event: AgentEvent) -> EventResult:
         return await self._post("agent_event", self._fields("agent_event", event), retryable=True)
