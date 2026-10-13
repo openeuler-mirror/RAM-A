@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::event_registry::{AppContext, EventHandler, EventResult, EventSpec};
-use crate::handlers::acttrail_relay::ActtrailCapture;
+use crate::handlers::actrail_relay::ActrailCapture;
 
 // Hard-coded input limits for turn_end chunk_hashes.
 // Each chunk hash is at most 100 bytes; a single request carries at most 4096
@@ -37,7 +37,7 @@ struct TurnEndPayload {
     #[serde(default)]
     debug_context: Option<Value>,
     #[serde(default)]
-    acttrail_capture: Option<ActtrailCapture>,
+    actrail_capture: Option<ActrailCapture>,
 }
 
 #[async_trait]
@@ -46,7 +46,7 @@ impl EventHandler for TurnEndHandler {
         EventSpec {
             description: "Post-inference safe eviction + update: decrement refcount, evict only when refcount == 0".into(),
             required: vec!["session_id".into()],
-            optional: vec!["kv_transfer_params".into(), "debug_context".into(), "acttrail_capture".into()],
+            optional: vec!["kv_transfer_params".into(), "debug_context".into(), "actrail_capture".into()],
         }
     }
 
@@ -117,7 +117,7 @@ impl EventHandler for TurnEndHandler {
             Err(e) => return EventResult::Err(e.to_string()),
         };
 
-        if let (Some(relay), Some(capture)) = (&ctx.acttrail_relay, parsed.acttrail_capture.clone()) {
+        if let (Some(relay), Some(capture)) = (&ctx.actrail_relay, parsed.actrail_capture.clone()) {
             let session_id = parsed.session_id.clone();
             let relay = relay.clone();
             tokio::spawn(async move {

@@ -23,7 +23,7 @@ pub enum EventResult {
 pub struct AppContext {
     pub manager: Arc<manager_core::KvCacheManager>,
     pub session_store: Arc<crate::session_store::SqliteSessionStore>,
-    pub acttrail_relay: Option<Arc<crate::handlers::acttrail_relay::ActtrailRelay>>,
+    pub actrail_relay: Option<Arc<crate::handlers::actrail_relay::ActrailRelay>>,
     // When true, turn_start dispatches the prefetch in the background and returns
     // immediately, so the router fan-out overlaps the caller's next work (model call)
     // instead of blocking it.
