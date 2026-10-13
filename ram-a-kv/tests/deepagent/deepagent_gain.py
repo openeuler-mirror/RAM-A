@@ -402,10 +402,11 @@ def _report_markdown(summary: dict) -> str:
                 continue
             turn, model = st.get("latency_s", {}), st.get("model_latency_s", {})
             rows.append([size, mode, turn.get("n", "-"),
+                         st.get("prompt_tokens", {}).get("mean", "-"),
                          turn.get("median", "-"), turn.get("stdev", "-"),
                          model.get("median", "-"), model.get("stdev", "-")])
-    out += [_md_table(["context(tok)", "mode", "n", "turn med(s)", "turn sd",
-                       "model med(s)", "model sd"], rows), "",
+    out += [_md_table(["context(tok)", "mode", "n", "prompt tok",
+                       "turn med(s)", "turn sd", "model med(s)", "model sd"], rows), "",
             "## Comparison vs baseline", ""]
     rows = []
     for size, entry in summary["sizes"].items():
@@ -460,15 +461,19 @@ def _result_markdown(summary: dict, ts: str) -> str:
         imp = (cold - pf) / cold * 100 if (cold and pf) else None
         if imp is not None:
             turn_imps.append(imp)
+        # Engine-reported prompt tokens (authoritative) prove the context really
+        # is the labeled size; cold/prefetch share the same context so either works.
+        measured = _mean(entry, base, "prompt_tokens") or _mean(entry, "prefetch", "prompt_tokens")
         rows.append([
             size,
+            f"{measured:.0f}" if measured else "-",
             f"{cold:.3f}" if cold else "-",
             f"{pf:.3f}" if pf else "-",
             f"{cold / pf:.3f}×" if (cold and pf) else "-",
             f"{imp:+.1f}%" if imp is not None else "-",
         ])
     out.append(_md_table(
-        ["上下文(tok)", "冷态 cold(s)", "预取 prefetch(s)", "加速比", "提升"], rows))
+        ["目标tok", "实测tok", "冷态 cold(s)", "预取 prefetch(s)", "加速比", "提升"], rows))
     if turn_imps:
         out += ["", f"**整轮:在 {len(turn_imps)} 个尺寸上平均降低 "
                     f"{statistics.fmean(turn_imps):.1f}%(单尺寸 {min(turn_imps):+.1f}% ~ {max(turn_imps):+.1f}%)。**"]
@@ -488,7 +493,7 @@ def _result_markdown(summary: dict, ts: str) -> str:
             f"{imp:+.1f}%" if imp is not None else "-",
         ])
     out.append(_md_table(
-        ["上下文(tok)", "冷态 cold(s)", "预取 prefetch(s)", "省时(ms)", "提升"], rows))
+        ["目标tok", "冷态 cold(s)", "预取 prefetch(s)", "省时(ms)", "提升"], rows))
     if model_imps:
         out += ["", f"**模型调用:在 {len(model_imps)} 个尺寸上平均降低 {statistics.fmean(model_imps):.1f}%。**"]
     out += ["", "> 提升 =(冷态 − 预取)/ 冷态;加速比 = 冷态 / 预取;均为各尺寸内的样本均值(mean)。"]

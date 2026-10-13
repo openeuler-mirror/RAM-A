@@ -30,6 +30,8 @@
 #   PROMPT_FILE      starting prompt file (single mode)
 #   MODEL_BASE_URL   OpenAI-compatible endpoint the agent talks to  (router http://127.0.0.1:9003/v1)
 #   UCM_URL          UCM vllm-router base (daemon ucm_url)          (http://127.0.0.1:9003)
+#   TOKENIZE_URL     base exposing /tokenize to calibrate prompts   (= UCM_URL)
+#   SCAFFOLD_TOKENS  agent scaffold tokens subtracted from each size  (2817; 0=material)
 #   RAM_A_PORT       ram-a-kv daemon port                           (7098; avoid 6997-7004)
 #   THREAD_ID        session id (single mode)                       (deepagent-gain)
 #   REPS             repetitions of {cold, prefetch}                (3)
@@ -61,6 +63,14 @@ PROBE="${PROBE:-请用一句话复述上文的核心要点。}"
 MODEL_BASE_URL="${MODEL_BASE_URL:-http://127.0.0.1:9003/v1}"
 UCM_URL="${UCM_URL:-http://127.0.0.1:9003}"
 ROUTER_BASE="${ROUTER_BASE:-$UCM_URL}"
+# Base URL exposing the engine's real tokenizer (/tokenize). Used to calibrate
+# generated prompts so their actual token count matches the target (~32k...).
+TOKENIZE_URL="${TOKENIZE_URL:-$UCM_URL}"
+# Fixed agent scaffold (DeepAgents system prompt + warm reply + probe + chat
+# template) the engine counts on top of the generated material. Subtracted from
+# each target so the engine-reported prompt_tokens lands on 32k/64k/128k/256k;
+# set 0 to size the material itself. Measured from a real run (~2.8k).
+SCAFFOLD_TOKENS="${SCAFFOLD_TOKENS:-2817}"
 RAM_A_PORT="${RAM_A_PORT:-7098}"
 DAEMON_URL="http://127.0.0.1:${RAM_A_PORT}"
 REPS="${REPS:-3}"
@@ -210,7 +220,8 @@ py() { "$PY" "$SCRIPT_DIR/deepagent_gain.py" \
         --pool "$FLUSH_POOL" --flush-entries "$FLUSH_ENTRIES" "$@"; }
 
 gen_prompt() {  # $1 = tokens, $2 = outfile
-    "$PY" "$SCRIPT_DIR/gen_prompt.py" --tokens "$1" --out "$2"
+    "$PY" "$SCRIPT_DIR/gen_prompt.py" --tokens "$1" --out "$2" \
+        --tokenize-url "$TOKENIZE_URL" --overhead-tokens "$SCAFFOLD_TOKENS"
 }
 
 run_one() {  # $1 mode  $2 turn_start_prefetch  $3 async  $4 flush(0|1)
@@ -266,6 +277,7 @@ write_env() {  # immutable snapshot of what produced the numbers (for the report
   "flush_entries": "$FLUSH_ENTRIES",
   "reps": "$REPS",
   "sizes_tokens": "$SWEEP",
+  "scaffold_tokens": "$SCAFFOLD_TOKENS",
   "max_tokens": "32",
   "human_token_limit": "$HUMAN_TOKEN_LIMIT",
   "probe": "$PROBE"
@@ -296,8 +308,14 @@ else
     PROMPT_PATH="$DATA_DIR/prompt_${THREAD_ID}.txt"
     printf '%s' "$PROMPT" > "$PROMPT_PATH"
     CUR_SIZE="${SIZE:-0}"
-    # crude token estimate so the report can still group the single-size run
-    [ "$CUR_SIZE" = "0" ] && CUR_SIZE=$(python3 -c "import sys;print(round(len(open(sys.argv[1]).read())/4.4))" "$PROMPT_PATH")
+    # real token count (engine tokenizer) so the report groups the single-size run
+    if [ "$CUR_SIZE" = "0" ]; then
+        CUR_SIZE="$("$PY" "$SCRIPT_DIR/gen_prompt.py" --count-file "$PROMPT_PATH" \
+                    --tokenize-url "$TOKENIZE_URL" 2>/dev/null || true)"
+        if ! [ "${CUR_SIZE:-0}" -gt 0 ] 2>/dev/null; then
+            CUR_SIZE=$(python3 -c "import sys;print(round(len(open(sys.argv[1]).read())/5.6))" "$PROMPT_PATH")
+        fi
+    fi
     SWEEP="$CUR_SIZE"
     write_env
     run_size "$CUR_SIZE" "$PROMPT_PATH" "$THREAD_ID" "$CONTEXT"
