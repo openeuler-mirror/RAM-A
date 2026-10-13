@@ -116,6 +116,38 @@ class StreamMetricsTests(unittest.TestCase):
                 {"input_tokens": 5, "output_tokens": 2}, message.response_metadata)
         require("ram_a_timing" in message.response_metadata, message.response_metadata)
 
+    def test_actrail_model_deployment_key_fills_empty_model(self):
+        from types import SimpleNamespace
+
+        from langchain.agents.middleware.types import ModelRequest
+        from langgraph.runtime import Runtime
+
+        from ram_a_middleware.deepagents.middleware import RamAKvMiddleware
+        from ram_a_middleware.sdk import RamAClient
+
+        class NoNameModel:
+            model_name = None
+
+        client = RamAClient("http://127.0.0.1:9", timeout=0.5, retries=1)
+        ctx = SimpleNamespace(model=None, model_request_id="r1")
+        request = ModelRequest(
+            model=NoNameModel(),
+            messages=[HumanMessage(content="hi")],
+            system_message=None,
+            tools=[],
+            state={"_ram_a_session_id": "s1", "_ram_a_turn_id": "t1"},
+            runtime=Runtime(context={}),
+        )
+
+        mw = RamAKvMiddleware(client, actrail_enabled=True, actrail_endpoint_key="chat",
+                              actrail_model_deployment_key="glm-5.2-bj")
+        capture = mw._build_actrail_capture(request, "s1", ctx, None)
+        require(capture["payload"]["model"] == "glm-5.2-bj", capture)
+
+        mw2 = RamAKvMiddleware(client, actrail_enabled=True, actrail_endpoint_key="chat")
+        capture2 = mw2._build_actrail_capture(request, "s1", ctx, None)
+        require(capture2["payload"]["model"] == "NoNameModel", capture2)
+
     @unittest.skipUnless(resolve_daemon_binary(), "ram-a-kv daemon binary not found")
     def test_capture_carries_metrics_e2e(self):
         binary = resolve_daemon_binary()

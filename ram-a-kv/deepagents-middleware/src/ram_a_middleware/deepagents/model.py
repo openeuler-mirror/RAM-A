@@ -9,13 +9,76 @@ from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResu
 from langchain_openai import ChatOpenAI
 
 
-def _usage_from_message(message):
-    """Extract ``{"input_tokens", "output_tokens"}`` from a message.
+_CACHED_TOKEN_KEYS = ("cache_read", "cached_tokens")
 
-    Accepts both langchain's ``usage_metadata`` and the legacy
-    ``prompt_tokens``/``completion_tokens`` shapes.
+
+def _deep_cached_tokens(source):
+    """Depth-first search for a cache-read token count under arbitrary nesting."""
+    if isinstance(source, Mapping):
+        for key, raw in source.items():
+            if key in _CACHED_TOKEN_KEYS and isinstance(raw, (int, float)):
+                return int(raw)
+        values = list(source.values())
+    elif isinstance(source, (list, tuple)):
+        values = list(source)
+    else:
+        return None
+    for value in values:
+        found = _deep_cached_tokens(value)
+        if found is not None:
+            return found
+    return None
+
+
+def _cached_tokens_from_message(message):
+    """Extract cached (hit) input tokens from the engine usage.
+
+    Shape-agnostic: depth-first searches ``usage_metadata`` first, then the
+    engine's raw ``response_metadata.usage``, for a ``cache_read`` or
+    ``cached_tokens`` count regardless of nesting (langchain's flat
+    ``input_token_details.cache_read``, a nested ``cached_token_details``,
+    or OpenAI/vLLM ``prompt_tokens_details.cached_tokens``). Returns None
+    when the engine did not report cache hits, keeping "missing" distinct
+    from a measured 0 (actrail-kv contract).
+    """
+    found = _deep_cached_tokens(getattr(message, "usage_metadata", None))
+    if found is not None:
+        return found
+    response_metadata = getattr(message, "response_metadata", None) or {}
+    return _deep_cached_tokens(response_metadata.get("usage"))
+
+
+def _extract_reasoning(content):
+    """Extract reasoning-block text from an AIMessage content list, e.g.
+    ``[{'type': 'reasoning', 'reasoning': '...'}]`` (DeepSeek-style thinking)
+    or plain text. Returns None when no reasoning content is present.
+    """
+    if isinstance(content, str):
+        return None
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, Mapping) and block.get("type") == "reasoning":
+                text = block.get("reasoning") or block.get("text") or ""
+                if text:
+                    parts.append(text)
+        return "\n".join(parts) if parts else None
+    return None
+
+
+def _usage_from_message(message):
+    """Extract input/output/cached token counts from a response message.
+
+    Accepts langchain's ``usage_metadata``, falling back to the engine's raw
+    ``response_metadata.usage`` when a model only mirrors the latter, plus the
+    legacy ``prompt_tokens``/``completion_tokens`` aliases.
     """
     usage_metadata = getattr(message, "usage_metadata", None)
+    if not isinstance(usage_metadata, Mapping):
+        # 只镜像引擎原始 usage、不填 usage_metadata 的模型：回退原始形态。
+        metadata = getattr(message, "response_metadata", None)
+        engine_usage = metadata.get("usage") if isinstance(metadata, Mapping) else None
+        usage_metadata = engine_usage if isinstance(engine_usage, Mapping) else None
     if isinstance(usage_metadata, Mapping):
         input_tokens = usage_metadata.get(
             "input_tokens", usage_metadata.get("prompt_tokens")
@@ -24,7 +87,11 @@ def _usage_from_message(message):
             "output_tokens", usage_metadata.get("completion_tokens")
         )
         if input_tokens is not None and output_tokens is not None:
-            return {"input_tokens": input_tokens, "output_tokens": output_tokens}
+            usage = {"input_tokens": input_tokens, "output_tokens": output_tokens}
+            cached_tokens = _cached_tokens_from_message(message)
+            if cached_tokens is not None:
+                usage["cached_tokens"] = cached_tokens
+            return usage
     return None
 
 
@@ -311,6 +378,10 @@ def preserve_kv_response(request):
     model = timed_cls.model_construct(
         _fields_set=model.model_fields_set, **model.__dict__
     )
+    # 声明了 stream_usage 的模型（如 ChatAnthropic）也强制开启，让引擎在流式
+    # 末 chunk 回传 usage；未声明该字段的 pydantic 子类赋值会抛 ValueError。
+    if "stream_usage" in type(model).model_fields:
+        model.stream_usage = True
     return request.override(model=model)
 
 
@@ -353,10 +424,17 @@ def stream_timing_from_response(response):
 
 
 def stream_usage_from_response(response):
-    """Read ``ram_a_usage`` attached by ``_KvResponseChatOpenAI``.
+    """Read usage from a model response, preferring our ``ram_a_usage`` stamp.
 
-    Returns ``{"input_tokens", "output_tokens"}`` or ``None`` when the engine
-    did not report usage; the actrail capture then omits the fields.
+    Returns ``{"input_tokens", "output_tokens", "cached_tokens"?}`` or ``None``
+    when the engine did not report usage; the actrail capture then omits the
+    fields. ``cached_tokens`` is present only when the engine reported cache
+    hits (missing kept distinct from 0).
+
+    The stamp is only attached on the wrapped (timed) streaming path; a model
+    that aggregates streaming internally carries usage in
+    ``message.usage_metadata`` instead, so we fall back to
+    ``_usage_from_message`` to keep the raw response analyzable.
     """
     for message in response.result:
         usage = message.response_metadata.get("ram_a_usage")
@@ -364,5 +442,12 @@ def stream_usage_from_response(response):
             input_tokens = usage.get("input_tokens")
             output_tokens = usage.get("output_tokens")
             if isinstance(input_tokens, (int, float)) and isinstance(output_tokens, (int, float)):
-                return {"input_tokens": int(input_tokens), "output_tokens": int(output_tokens)}
+                result = {"input_tokens": int(input_tokens), "output_tokens": int(output_tokens)}
+                cached = usage.get("cached_tokens")
+                if isinstance(cached, (int, float)):
+                    result["cached_tokens"] = int(cached)
+                return result
+        raw = _usage_from_message(message)
+        if raw is not None:
+            return raw
     return None
