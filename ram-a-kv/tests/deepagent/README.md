@@ -291,6 +291,79 @@ FLUSH=0 SWEEP=65536 ./run_deepagent_gain.sh
 
 绝对省时(ms)始终 ∝ KV 体积、随上下文增长(97 → 874 ms),此即大上下文收益更高的根源。
 
+### 8.3 各阶段时间轴:预取如何被模型调用「掩盖」(以 128k 为例)
+
+把一次真实 turn 的四层(客户端 → 网关 → 引擎各阶段 → SSD 加载 → 预取)放在**同一墙钟轴**上。四层日志时钟均为 UTC,可直接对齐。
+
+> **口径**(重要):
+> - **实测**:客户端 `results.jsonl` 的 `measure_start/model_start/model_end_epoch`;引擎 FAWA 行(墙钟 + `chatcmpl` id);daemon `daemon.log` 的 `turn_start` / `UCM prefetch response`。
+> - **聚合均值**:`/metrics` 的 `vllm:request_*`、`ucm:cache_load_duration_ms`、`vllm_router_generate_duration_seconds` —— 引擎/网关**自启动以来**的全局直方图(**非单请求**),此处仅作量级参考。
+> - **估计**:128k 的 daemon 逐请求预取窗口未留存(见 §8.3.4),按 256k 实测窗口 × blocks 比例折算。
+
+#### 8.3.1 单次 128k turn 的四层锚点(实测)
+
+以 `prefetch` 档 rep1 为例(引擎 request `chatcmpl-a6e8d14e28a1ccfb…`,`prompt_tokens=131092`):
+
+| 层 | 锚点事件 | UTC 墙钟 | 相对 `model_start` | 来源 |
+| --- | --- | --- | --- | --- |
+| client | `measure_start`(turn 起点) | 10:44:03.586699 | −33.8 ms | results.jsonl |
+| daemon | 收到 `turn_start` → 异步派发预取 | ≈ 10:44:03.616 | ≈ −4 ms | daemon 机制(§8.3.4) |
+| client | `model_start`(`POST /v1/chat/completions` → 网关) | 10:44:03.620538 | 0.0 ms | results.jsonl |
+| engine | FAWA:命中外部 KV(connector lookup) | 10:44:04.273211 | **+652.7 ms** | 引擎日志 |
+| client | `model_end`(32 tok 解码完毕返回) | 10:44:05.000258 | **+1379.7 ms** | results.jsonl |
+
+整轮 `measure_start → model_end` = **1413.6 ms**;其中模型调用 `model_start → model_end` = **1379.7 ms**(= `model_latency_s`)。
+
+#### 8.3.2 时序图(相对 `model_start`)
+
+```text
+ 相对 model_start(ms)   0                     652.7                            1379.7
+                        |                       |                                 |
+ [client] model 调用     +---------- 模型调用 1379.7 ms -------------------------+
+                        |                       |                                 |
+ [engine] (A) + (C)      +- (A) 网关路由+在途+调度+lookup ≈653ms -+- (C) KVload+预填充+解码32tok ≈727ms -+
+                        |                       ^ FAWA:外部 KV 命中 131072
+ [daemon] 预取(后台)     +== SSD→DDR 1024 blocks ≈635 ms ==+     <- 完全落在模型窗口内 => 被掩盖
+                        |                       |
+ [UCM]     近端/远端      SSD ====> DDR(1024 blocks)  =>  近端就绪,预填充免于 SSD 回源
+```
+
+#### 8.3.3 冷 / 预取两档的分段耗时(128k,rep=3 均值)
+
+| 分段 | cold | prefetch | 差 |
+| --- | --- | --- | --- |
+| (A) `model_start → FAWA`(网关路由+在途+调度+lookup) | 709 ms | 692 ms | ≈0 |
+| (C) `FAWA → model_end`(KV load + 预填充 + 解码 32 tok) | **1139 ms** | **733 ms** | **−406 ms** |
+| 模型调用 `model_start → model_end` | 1848 ms | 1425 ms | −423 ms |
+| 整轮 `latency_s` | 1889 ms | 1468 ms | −421 ms |
+
+关键点:
+
+- 两档 **(A) 段几乎相同**(709 vs 692 ms):网关路由、引擎在途、调度、UCM lookup 与是否预取无关。
+- 差异**全部落在 (C) 段**(−406 ms ≈ Δ):预取把 `T_kv_load` 从「SSD 读」变成「DDR 命中」。
+- (C) 段差(−406 ms)与模型调用差(−423 ms)在噪声内一致 ⇒ 预取收益即 `Δ = T_ssd − T_ddr`,无其它副作用。
+
+补充(**聚合均值,非单请求**):UCM 单次加载 `ucm:cache_load_duration_ms`(worker_rank0,count=1999)均值 ≈ **575 ms**;网关 `vllm_router_generate_duration_seconds` 均值 ≈ **2.73 s**(全量 981 请求,含 32k–256k 混合)。网关自身为 `consistent_hash` **查表路由**(亚毫秒),其「占时」主要是**透传引擎流式推理**,对 128k 单请求 ≈ 模型调用 1379.7 ms。
+
+#### 8.3.4 预取窗口为何「被掩盖」
+
+`daemon.log` 每次运行被覆盖,当前仅保留**最后一次 256k** 的**逐请求**预取窗口;128k 的 daemon 窗口未留存,但机制相同。以 256k 实测窗口佐证:
+
+| 量(256k,`prefetch`,`deepagent-gain-262144`) | 值 |
+| --- | --- |
+| `turn_start` 收到 | 10:52:51.784876 |
+| `UCM prefetch response`(8×worker 扇出完成) | 10:52:53.054112 |
+| **预取窗口** | **1269 ms**(2047 blocks/rank) |
+| `model_start` | 10:52:51.786548 |
+| FAWA(外部 KV 命中) | 10:52:53.292072(+1506 ms) |
+| `model_end` | 10:52:54.252785(+2466 ms) |
+
+预取窗口 `[0, 1268 ms] ⊂ 模型窗口 [0, 2466 ms]`,且比 FAWA(+1506 ms)**早 238 ms** 完成——**预取全程与「网关+在途+调度」重叠,不占关键路径**。
+
+按 blocks 比例折算到 128k:`1269 ms × 1024/2047 ≈ 635 ms`,恰好落在 (A) 段(≈653 ms)内、并在 FAWA(+652.7 ms)前完成——这正是 (A) 段两档耗时相同、(C) 段省下 ≈406 ms 的原因。
+
+**一句话**:预取耗时 ≈ **635 ms** 被完全隐藏在模型调用 **1379.7 ms** 之内(准确地讲,藏在 FAWA 之前的 (A) 段里),故整轮收益 ≈ `Δ ≈ 0.42 s`,与 §8.1 实测一致。
+
 ***
 
 ## 9 验收准则
