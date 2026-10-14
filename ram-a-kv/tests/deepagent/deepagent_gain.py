@@ -109,7 +109,7 @@ def flush_near_tier(pool_path: str, router_base: str, model_name: str, entries: 
 # Agent construction (imported lazily so --help works without the venv)
 # --------------------------------------------------------------------------- #
 def make_agent(model_base_url: str, daemon_url: str, model_name: str, max_tokens: int,
-               human_token_limit: int = 0):
+               human_token_limit: int = 0, streaming: bool = False):
     from deepagents import create_deep_agent
     from langchain_openai import ChatOpenAI
     from ram_a_middleware.sdk import RamAClient
@@ -119,8 +119,12 @@ def make_agent(model_base_url: str, daemon_url: str, model_name: str, max_tokens
         model=model_name,
         base_url=model_base_url,
         api_key="local-test",
-        use_responses_api=False,   # KV transfer needs non-streaming Chat Completions
-        streaming=False,
+        use_responses_api=False,   # KV transfer rides on Chat Completions responses
+        streaming=streaming,
+        # Streaming only reports token usage when asked; without it the timer
+        # loses prompt_tokens. The KV field is preserved on the final chunk by
+        # the middleware's model adapter regardless.
+        stream_usage=streaming,
         temperature=0,
         max_tokens=max_tokens,
         timeout=600,
@@ -150,6 +154,11 @@ class ModelCallTimer:
 
     This isolates the model call (where prefetch actually helps) from the rest
     of the agent turn (graph dispatch, middleware POSTs, message bookkeeping).
+
+    It also records, for each model call, the wall-clock (epoch seconds) start
+    and end plus the engine-issued request id, so the client-side stage can be
+    aligned with the daemon (``turn_start`` / prefetch fan-out) and the engine
+    (``FAWA request_id``) timestamps in a single end-to-end timeline.
     """
 
     def __init__(self):
@@ -160,18 +169,25 @@ class ModelCallTimer:
         class _Handler(BaseCallbackHandler):
             def on_chat_model_start(self, serialized, messages, *, run_id, **kwargs):
                 outer._starts[run_id] = time.perf_counter()
+                outer.start_epochs.append(time.time())
 
             def on_llm_end(self, response, *, run_id, **kwargs):
                 started = outer._starts.pop(run_id, None)
                 if started is not None:
                     outer.total += time.perf_counter() - started
                     outer.calls += 1
-                # Capture the engine-reported token usage (authoritative x-axis).
+                outer.end_epochs.append(time.time())
+                # Capture the engine-reported token usage (authoritative x-axis)
+                # and the engine-issued request id (aligns with the FAWA log line).
                 try:
                     msg = response.generations[0][0].message
                     usage = getattr(msg, "usage_metadata", None) or {}
                     outer.prompt_tokens += int(usage.get("input_tokens") or 0)
                     outer.completion_tokens += int(usage.get("output_tokens") or 0)
+                    rid = (getattr(msg, "response_metadata", None) or {}).get("id") \
+                        or getattr(msg, "id", None)
+                    if rid:
+                        outer.request_ids.append(str(rid))
                 except Exception:
                     pass
 
@@ -180,6 +196,9 @@ class ModelCallTimer:
         self.calls = 0
         self.prompt_tokens = 0
         self.completion_tokens = 0
+        self.start_epochs: list = []
+        self.end_epochs: list = []
+        self.request_ids: list = []
         self.handler = _Handler()
 
 
@@ -192,7 +211,7 @@ def phase_warm(args) -> int:
     prompt = Path(args.prompt_file).read_text(encoding="utf-8")
     model_name = resolve_model_name(args.model_base_url)
     agent, model = make_agent(args.model_base_url, args.daemon_url, model_name, args.max_tokens,
-                              args.human_token_limit)
+                              args.human_token_limit, args.streaming)
     try:
         config = {"configurable": {"thread_id": args.thread_id}}
         result = agent.invoke(
@@ -237,13 +256,15 @@ def phase_measure(args) -> int:
     messages = list(context) + [HumanMessage(content=args.probe)]
 
     agent, model = make_agent(args.model_base_url, args.daemon_url, model_name, args.max_tokens,
-                              args.human_token_limit)
+                              args.human_token_limit, args.streaming)
     timer = ModelCallTimer()
     try:
         config = {"configurable": {"thread_id": args.thread_id}, "callbacks": [timer.handler]}
+        measure_start_epoch = time.time()
         started = time.perf_counter()
         result = agent.invoke({"messages": messages}, config=config)
         latency = time.perf_counter() - started
+        measure_end_epoch = time.time()
         reply = _last_content(result["messages"])
     finally:
         model.root_client.close()
@@ -262,6 +283,15 @@ def phase_measure(args) -> int:
         "completion_tokens": timer.completion_tokens,
         "context_messages": len(context),
         "reply": reply[:120],
+        # Wall-clock anchors (epoch seconds) for the end-to-end stage timeline:
+        #   measure_*_epoch       : agent.invoke start/end (whole turn)
+        #   model_*_epoch         : earliest chat-model start / latest chat-model end
+        #   engine_request_ids    : engine chatcmpl ids (join key with the FAWA log)
+        "measure_start_epoch": round(measure_start_epoch, 6),
+        "measure_end_epoch": round(measure_end_epoch, 6),
+        "model_start_epoch": round(min(timer.start_epochs), 6) if timer.start_epochs else None,
+        "model_end_epoch": round(max(timer.end_epochs), 6) if timer.end_epochs else None,
+        "engine_request_ids": timer.request_ids,
         "ts": time.time(),
     }
     Path(args.results).parent.mkdir(parents=True, exist_ok=True)
@@ -376,10 +406,11 @@ def _report_markdown(summary: dict) -> str:
                 continue
             turn, model = st.get("latency_s", {}), st.get("model_latency_s", {})
             rows.append([size, mode, turn.get("n", "-"),
+                         st.get("prompt_tokens", {}).get("mean", "-"),
                          turn.get("median", "-"), turn.get("stdev", "-"),
                          model.get("median", "-"), model.get("stdev", "-")])
-    out += [_md_table(["context(tok)", "mode", "n", "turn med(s)", "turn sd",
-                       "model med(s)", "model sd"], rows), "",
+    out += [_md_table(["context(tok)", "mode", "n", "prompt tok",
+                       "turn med(s)", "turn sd", "model med(s)", "model sd"], rows), "",
             "## Comparison vs baseline", ""]
     rows = []
     for size, entry in summary["sizes"].items():
@@ -434,15 +465,19 @@ def _result_markdown(summary: dict, ts: str) -> str:
         imp = (cold - pf) / cold * 100 if (cold and pf) else None
         if imp is not None:
             turn_imps.append(imp)
+        # Engine-reported prompt tokens (authoritative) prove the context really
+        # is the labeled size; cold/prefetch share the same context so either works.
+        measured = _mean(entry, base, "prompt_tokens") or _mean(entry, "prefetch", "prompt_tokens")
         rows.append([
             size,
+            f"{measured:.0f}" if measured else "-",
             f"{cold:.3f}" if cold else "-",
             f"{pf:.3f}" if pf else "-",
             f"{cold / pf:.3f}×" if (cold and pf) else "-",
             f"{imp:+.1f}%" if imp is not None else "-",
         ])
     out.append(_md_table(
-        ["上下文(tok)", "冷态 cold(s)", "预取 prefetch(s)", "加速比", "提升"], rows))
+        ["目标tok", "实测tok", "冷态 cold(s)", "预取 prefetch(s)", "加速比", "提升"], rows))
     if turn_imps:
         out += ["", f"**整轮:在 {len(turn_imps)} 个尺寸上平均降低 "
                     f"{statistics.fmean(turn_imps):.1f}%(单尺寸 {min(turn_imps):+.1f}% ~ {max(turn_imps):+.1f}%)。**"]
@@ -462,7 +497,7 @@ def _result_markdown(summary: dict, ts: str) -> str:
             f"{imp:+.1f}%" if imp is not None else "-",
         ])
     out.append(_md_table(
-        ["上下文(tok)", "冷态 cold(s)", "预取 prefetch(s)", "省时(ms)", "提升"], rows))
+        ["目标tok", "冷态 cold(s)", "预取 prefetch(s)", "省时(ms)", "提升"], rows))
     if model_imps:
         out += ["", f"**模型调用:在 {len(model_imps)} 个尺寸上平均降低 {statistics.fmean(model_imps):.1f}%。**"]
     out += ["", "> 提升 =(冷态 − 预取)/ 冷态;加速比 = 冷态 / 预取;均为各尺寸内的样本均值(mean)。"]
@@ -501,6 +536,8 @@ def main() -> int:
     ap.add_argument("--flush", action="store_true", help="measure phase: flush near tier before running")
     ap.add_argument("--pool", default="")
     ap.add_argument("--flush-entries", type=int, default=12)
+    ap.add_argument("--streaming", action="store_true",
+                    help="use streaming Chat Completions (KV field is preserved on the final chunk)")
     args = ap.parse_args()
 
     if args.phase == "warm":

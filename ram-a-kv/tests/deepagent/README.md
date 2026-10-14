@@ -1,6 +1,6 @@
 # DeepAgents × RAM-A:KV 预取收益实验
 
-**摘要** — 本实验以真实的 [DeepAgents](https://docs.langchain.com/oss/python/deepagents) agent 会话为负载,量化 **ram-a-kv 预取**在「模型调用」与「整轮 agent 交互」两个口径上的时延收益。实验采用**两档对照**:近端(FA/DDR)容量小且被所有请求共享,一个会话的 KV 在其它请求持续写入下会被驱逐到 SSD,因此**默认(不预取)即为冷态**——预填充须从 SSD 回源;`prefetch` 则在 `turn_start` 把该会话 KV 拉回近端。在 **32k / 64k / 128k / 256k** token 四个上下文上,整轮加速比为 **1.05× → 1.28×**
+**摘要** — 本实验以真实的 [DeepAgents](https://docs.langchain.com/oss/python/deepagents) agent 会话为负载,量化 **ram-a-kv 预取**在「模型调用」与「整轮 agent 交互」两个口径上的时延收益。实验采用**两档对照**:近端(FA/DDR)容量小且被所有请求共享,一个会话的 KV 在其它请求持续写入下会被驱逐到 SSD,因此**默认(不预取)即为冷态**——预填充须从 SSD 回源;`prefetch` 则在 `turn_start` 把该会话 KV 拉回近端。在 **32k / 64k / 128k / 256k** token 四个上下文上,整轮加速比为 **1.10× → 1.36×**（token 数由引擎 `/tokenize` 真实校准，并经引擎回传 `prompt_tokens` 复核）。
 
 ***
 
@@ -98,6 +98,7 @@ prefetch:  T_kv_load = T_ddr,  代价是一次额外的扇出开销 C_fanout
 
 - **自变量**:预取开关(开 / 关)。
 - **控制变量**:上下文规模(32k / 64k / 128k / 256k token)、`max_tokens`、`temperature`、探针 prompt、会话隔离、近端初始状态。
+  - token 口径为**引擎回传的 `prompt_tokens`**(整条 prompt,含 DeepAgents 系统提示/探针/模板等固定脚手架)。生成器用引擎 `/tokenize` 真实校准材料长度,并按 `SCAFFOLD_TOKENS`(默认 2817)从目标中扣除该固定开销,使实测 `prompt_tokens` ≈ 目标(实测偏差 < 0.1%)。
 - **响应指标**:
 
 | 指标                | 定义                                            | 采集方式                                                       |
@@ -167,12 +168,14 @@ cd ram-a-kv/tests/deepagent
 SWEEP=32768,65536,131072,262144 REPS=3 MIN_SIZE=32768 HUMAN_TOKEN_LIMIT=1000000 ./run_deepagent_gain.sh
 ```
 
+上面这条以及下文的 (A)–(D) 均为**非流式**(`streaming=false`,即默认)Chat Completions;如需**流式(SSE)**,加 `STREAMING=1`(见变体 (E))。
+
 常用变体:
 
 ```bash
 cd ram-a-kv/tests/deepagent
 
-# (A) 四档扫描(推荐,主结果)
+# (A) 四档扫描(推荐,主结果;非流式)
 SWEEP=32768,65536,131072,262144 REPS=3 MIN_SIZE=32768 HUMAN_TOKEN_LIMIT=1000000 ./run_deepagent_gain.sh
 
 # (B) 单尺寸、自定义长 prompt(文件传入,避免 argv 长度上限)
@@ -183,6 +186,10 @@ PROMPT_FILE=/path/to/prompt.txt REPS=3 ./run_deepagent_gain.sh
 
 # (D) 不做冷 flush(更快;但近端仍热,两档差异被抹平)
 FLUSH=0 SWEEP=65536 ./run_deepagent_gain.sh
+
+# (E) 流式(SSE)Chat Completions:引擎把 kv_transfer_params 附在最后一个 chunk,
+#     中间件模型适配层会保留该字段,故预取在流式下同样生效(见 §8.4)
+STREAMING=1 SWEEP=131072 REPS=3 MIN_SIZE=131072 HUMAN_TOKEN_LIMIT=1000000 ./run_deepagent_gain.sh
 ```
 
 > 测 >45k token 的上下文需放开单条消息上限:`HUMAN_TOKEN_LIMIT=1000000`(见 §7)。
@@ -223,10 +230,13 @@ FLUSH=0 SWEEP=65536 ./run_deepagent_gain.sh
 | `PROMPT_FILE`       | 空                                  | 单尺寸模式的起始 prompt 文件                            |
 | `MODEL_BASE_URL`    | `http://127.0.0.1:9003/v1`         | agent 访问的 OpenAI 兼容端点(建议指向 vLLM-router)       |
 | `UCM_URL`           | `http://127.0.0.1:9003`            | daemon `ucm_url`,`/kv/prefetch` 目标            |
+| `TOKENIZE_URL`      | `= UCM_URL`                        | 暴露引擎 `/tokenize` 的基址,用于真实校准 prompt token 数       |
+| `SCAFFOLD_TOKENS`   | `2817`                             | 固定脚手架 token(system+探针+模板),从每个目标尺寸扣除;置 0 则直接按材料长度 |
 | `RAM_A_PORT`        | `7098`                             | daemon 端口,**勿用 6997–7004**(UCM worker 预取口)    |
 | `THREAD_ID`         | `deepagent-gain`                   | 单尺寸模式的会话 id                                   |
 | `REPS`              | `3`                                | `{cold, prefetch}` 的重复次数(报告取中位)               |
 | `TURN_START_ASYNC`  | `1`                                | turn\_start 预取异步派发(扇出与模型调用重叠);置 0 为同步等待,仅诊断用  |
+| `STREAMING`         | `0`                                | 置 1 使用流式(SSE)Chat Completions;引擎在最后一个 chunk 回传 `kv_transfer_params`,中间件保留之,预取同样生效(见 §8.4) |
 | `FLUSH`             | `1`                                | 每次 measure 前是否 flush 近端为冷                     |
 | `FLUSH_POOL`        | `/mnt/sdb/ucm/flush_pool_64g.json` | UCM 预放池                                       |
 | `FLUSH_ENTRIES`     | `16`                               | 每次 flush 重放的池条目数(须 > \~1.2×FA,见 §4.5)         |
@@ -243,50 +253,137 @@ FLUSH=0 SWEEP=65536 ./run_deepagent_gain.sh
 
 ## 8 实验结果
 
-> **统一条件**:单条 human 起始 prompt、`max_tokens=32`、`temperature=0`、异步 turn\_start 预取、daemon 走 `ucm_backend`;每次 `cold` / `prefetch` 前 flush 16 条池条目(§4.5)。`REPS=3`、`HUMAN_TOKEN_LIMIT=1000000`。原始数据在 `data/`。
+> **统一条件**:单条 human 起始 prompt、`max_tokens=32`、`temperature=0`、异步 turn\_start 预取、daemon 走 `ucm_backend`;**非流式**(`streaming=false`,默认)Chat Completions;每次 `cold` / `prefetch` 前 flush 16 条池条目(§4.5)。`REPS=3`、`HUMAN_TOKEN_LIMIT=1000000`。原始数据在 `data/`(§8.4 流式复测在 `data/streaming/`)。
 
 ### 8.1 主结果:上下文 32k / 64k / 128k / 256k(RQ1)
 
-命令 `SWEEP=32768,65536,131072,262144 REPS=3 HUMAN_TOKEN_LIMIT=1000000 ./run_deepagent_gain.sh`。下表 `上下文(tok)` 为配置的目标 token 数。
+命令 `SWEEP=32768,65536,131072,262144 REPS=3 MIN_SIZE=32768 HUMAN_TOKEN_LIMIT=1000000 ./run_deepagent_gain.sh`。下表 `目标tok` 为配置目标;`实测tok` 为引擎回传的 `prompt_tokens`(整条 prompt,含固定脚手架),两者偏差 < 0.1%。
 
 **两档平均时延(mean,s;每格 n=3)**
 
-| 上下文(tok) | cold 整轮 | prefetch 整轮 | cold 模型 | prefetch 模型 |
-| -------- | ------- | ----------- | ------- | ----------- |
-| 32768    | 1.142   | 1.093       | 1.102   | 1.053       |
-| 65536    | 1.373   | 1.225       | 1.333   | 1.183       |
-| 131072   | 1.633   | 1.354       | 1.592   | 1.313       |
-| 262144   | 2.723   | 2.133       | 2.677   | 2.087       |
+| 目标tok  | 实测tok  | cold 整轮 | prefetch 整轮 | cold 模型 | prefetch 模型 |
+| ------ | ------ | ------- | ----------- | ------- | ----------- |
+| 32768  | 32764  | 1.149   | 1.049       | 1.108   | 1.011       |
+| 65536  | 65557  | 1.520   | 1.307       | 1.478   | 1.265       |
+| 131072 | 131092 | 1.889   | 1.468       | 1.848   | 1.425       |
+| 262144 | 262109 | 3.324   | 2.447       | 3.278   | 2.404       |
 
 **收益(相对** **`cold`** **基准)**
 
-| 上下文(tok) | 整轮收益      | 模型收益      | 模型省时(ms) |
-| -------- | --------- | --------- | -------- |
-| 32768    | 1.045     | 1.047     | 49       |
-| 65536    | 1.121     | 1.127     | 150      |
-| 131072   | 1.206     | 1.213     | 279      |
-| 262144   | **1.276** | **1.283** | **590**  |
+| 目标tok  | 整轮收益      | 模型收益      | 模型省时(ms) |
+| ------ | --------- | --------- | -------- |
+| 32768  | 1.096     | 1.096     | 97       |
+| 65536  | 1.163     | 1.168     | 213      |
+| 131072 | 1.287     | 1.297     | 423      |
+| 262144 | **1.358** | **1.363** | **874**  |
 
 **判读**:
 
 - **两档在四个尺寸上稳定分离**:`prefetch` 一致快于 `cold`,整轮与模型两层口径高度一致。
-- **上下文越大收益越大**:32k → 4.3%,64k → 10.8%,128k → 17.1%,256k → **21.7%**。
-- **256k 最显著**:`cold`(2.723 s)比 `prefetch`(2.133 s)慢 0.59 s,SSD 回源在冷态总时长中的占比随 KV 体积增大而上升。
+- **上下文越大收益越大**:32k → 8.7%,64k → 14.0%,128k → 22.3%,256k → **26.4%**。
+- **256k 最显著**:`cold`(3.324 s)比 `prefetch`(2.447 s)慢 0.88 s,SSD 回源在冷态总时长中的占比随 KV 体积增大而上升。
 
 ### 8.2 收益随上下文的变化
 
-| 上下文(tok) | 整轮收益      | 模型收益      |
-| :------- | :-------- | :-------- |
-| 32768    | 1.045     | 1.047     |
-| 65536    | 1.121     | 1.127     |
-| 131072   | 1.206     | 1.213     |
-| 262144   | **1.276** | **1.283** |
+| 目标tok  | 整轮收益      | 模型收益      |
+| :----- | :-------- | :-------- |
+| 32768  | 1.096     | 1.096     |
+| 65536  | 1.163     | 1.168     |
+| 131072 | 1.287     | 1.297     |
+| 262144 | **1.358** | **1.363** |
 
-- 收益随上下文**单调上升**(+4.3% → +21.7%),绝对省时随 KV 体积增长(49 → 590 ms)。
+- 收益随上下文**单调上升**(+8.7% → +26.4%),绝对省时随 KV 体积增长(97 → 874 ms)。
 
 **机制**:`speedup = 1/(1 − Δ/T_cold)`,分子为省下的 SSD 读取 `Δ ∝ KV 体积`;`T_cold` 中的**预填充计算**随 token 同阶增长,稀释了比值,故收益比不会无限放大,而是随上下文增大**稳步上升**。
 
-绝对省时(ms)始终 ∝ KV 体积、随上下文增长(49 → 590 ms),此即大上下文收益更高的根源。
+绝对省时(ms)始终 ∝ KV 体积、随上下文增长(97 → 874 ms),此即大上下文收益更高的根源。
+
+### 8.3 各阶段时间轴:预取如何被模型调用「掩盖」(以 128k 为例)
+
+把一次真实 turn 的四层(客户端 → 网关 → 引擎各阶段 → SSD 加载 → 预取)放在**同一墙钟轴**上。四层日志时钟均为 UTC,可直接对齐。
+
+> **口径**(重要):
+> - **实测**:客户端 `results.jsonl` 的 `measure_start/model_start/model_end_epoch`;引擎 FAWA 行(墙钟 + `chatcmpl` id);daemon `daemon.log` 的 `turn_start` / `UCM prefetch response`。
+> - **聚合均值**:`/metrics` 的 `vllm:request_*`、`ucm:cache_load_duration_ms`、`vllm_router_generate_duration_seconds` —— 引擎/网关**自启动以来**的全局直方图(**非单请求**),此处仅作量级参考。
+> - **估计**:128k 的 daemon 逐请求预取窗口未留存(见 §8.3.4),按 256k 实测窗口 × blocks 比例折算。
+
+#### 8.3.1 单次 128k turn 的四层锚点(实测)
+
+以 `prefetch` 档 rep1 为例(引擎 request `chatcmpl-a6e8d14e28a1ccfb…`,`prompt_tokens=131092`):
+
+| 层 | 锚点事件 | UTC 墙钟 | 相对 `model_start` | 来源 |
+| --- | --- | --- | --- | --- |
+| client | `measure_start`(turn 起点) | 10:44:03.586699 | −33.8 ms | results.jsonl |
+| daemon | 收到 `turn_start` → 异步派发预取 | ≈ 10:44:03.616 | ≈ −4 ms | daemon 机制(§8.3.4) |
+| client | `model_start`(`POST /v1/chat/completions` → 网关) | 10:44:03.620538 | 0.0 ms | results.jsonl |
+| engine | FAWA:命中外部 KV(connector lookup) | 10:44:04.273211 | **+652.7 ms** | 引擎日志 |
+| client | `model_end`(32 tok 解码完毕返回) | 10:44:05.000258 | **+1379.7 ms** | results.jsonl |
+
+整轮 `measure_start → model_end` = **1413.6 ms**;其中模型调用 `model_start → model_end` = **1379.7 ms**(= `model_latency_s`)。
+
+#### 8.3.2 时序图(相对 `model_start`)
+
+```text
+ 相对 model_start(ms)   0                     652.7                            1379.7
+                        |                       |                                 |
+ [client] model 调用     +---------- 模型调用 1379.7 ms -------------------------+
+                        |                       |                                 |
+ [engine] (A) + (C)      +- (A) 网关路由+在途+调度+lookup ≈653ms -+- (C) KVload+预填充+解码32tok ≈727ms -+
+                        |                       ^ FAWA:外部 KV 命中 131072
+ [daemon] 预取(后台)     +== SSD→DDR 1024 blocks ≈635 ms ==+     <- 完全落在模型窗口内 => 被掩盖
+                        |                       |
+ [UCM]     近端/远端      SSD ====> DDR(1024 blocks)  =>  近端就绪,预填充免于 SSD 回源
+```
+
+#### 8.3.3 冷 / 预取两档的分段耗时(128k,rep=3 均值)
+
+| 分段 | cold | prefetch | 差 |
+| --- | --- | --- | --- |
+| (A) `model_start → FAWA`(网关路由+在途+调度+lookup) | 709 ms | 692 ms | ≈0 |
+| (C) `FAWA → model_end`(KV load + 预填充 + 解码 32 tok) | **1139 ms** | **733 ms** | **−406 ms** |
+| 模型调用 `model_start → model_end` | 1848 ms | 1425 ms | −423 ms |
+| 整轮 `latency_s` | 1889 ms | 1468 ms | −421 ms |
+
+关键点:
+
+- 两档 **(A) 段几乎相同**(709 vs 692 ms):网关路由、引擎在途、调度、UCM lookup 与是否预取无关。
+- 差异**全部落在 (C) 段**(−406 ms ≈ Δ):预取把 `T_kv_load` 从「SSD 读」变成「DDR 命中」。
+- (C) 段差(−406 ms)与模型调用差(−423 ms)在噪声内一致 ⇒ 预取收益即 `Δ = T_ssd − T_ddr`,无其它副作用。
+
+补充(**聚合均值,非单请求**):UCM 单次加载 `ucm:cache_load_duration_ms`(worker_rank0,count=1999)均值 ≈ **575 ms**;网关 `vllm_router_generate_duration_seconds` 均值 ≈ **2.73 s**(全量 981 请求,含 32k–256k 混合)。网关自身为 `consistent_hash` **查表路由**(亚毫秒),其「占时」主要是**透传引擎流式推理**,对 128k 单请求 ≈ 模型调用 1379.7 ms。
+
+#### 8.3.4 预取窗口为何「被掩盖」
+
+`daemon.log` 每次运行被覆盖,当前仅保留**最后一次 256k** 的**逐请求**预取窗口;128k 的 daemon 窗口未留存,但机制相同。以 256k 实测窗口佐证:
+
+| 量(256k,`prefetch`,`deepagent-gain-262144`) | 值 |
+| --- | --- |
+| `turn_start` 收到 | 10:52:51.784876 |
+| `UCM prefetch response`(8×worker 扇出完成) | 10:52:53.054112 |
+| **预取窗口** | **1269 ms**(2047 blocks/rank) |
+| `model_start` | 10:52:51.786548 |
+| FAWA(外部 KV 命中) | 10:52:53.292072(+1506 ms) |
+| `model_end` | 10:52:54.252785(+2466 ms) |
+
+预取窗口 `[0, 1268 ms] ⊂ 模型窗口 [0, 2466 ms]`,且比 FAWA(+1506 ms)**早 238 ms** 完成——**预取全程与「网关+在途+调度」重叠,不占关键路径**。
+
+按 blocks 比例折算到 128k:`1269 ms × 1024/2047 ≈ 635 ms`,恰好落在 (A) 段(≈653 ms)内、并在 FAWA(+652.7 ms)前完成——这正是 (A) 段两档耗时相同、(C) 段省下 ≈406 ms 的原因。
+
+**一句话**:预取耗时 ≈ **635 ms** 被完全隐藏在模型调用 **1379.7 ms** 之内(准确地讲,藏在 FAWA 之前的 (A) 段里),故整轮收益 ≈ `Δ ≈ 0.42 s`,与 §8.1 实测一致。
+
+### 8.4 流式(SSE)下的一致性(128k,交叉验证)
+
+§8.1–§8.3 为非流式(默认)。流式下引擎把 `kv_transfer_params` 附在**最后一个 SSE chunk**,而 LangChain 的 chunk 转换默认丢弃该顶层字段;中间件模型适配层(`_KvResponseChatOpenAI`)在 chunk 转换时予以保留,故 `turn_end` 仍能上报 `chunk_hashes`、预取照常生效。以 128k 复测(`STREAMING=1 SWEEP=131072 REPS=3 FLUSH=1`,原始数据 `data/streaming/`):
+
+| 档位 | 整轮 mean(s) | 模型 mean(s) | n |
+| --- | --- | --- | --- |
+| `cold` | 1.879 | 1.835 | 3 |
+| `prefetch` | 1.463 | 1.419 | 3 |
+
+- 整轮收益 **1.284×**(+22.1%),模型收益 1.293×(+22.7%,省 416 ms);与本文件 128k 非流式结果(1.287× / +22.3%)在噪声内一致。
+- warm 阶段记录 `chunk_hashes=1024`,实测 `prompt_tokens=131092`,证明流式下 KV 上报与 token 口径均完整。
+
+**结论**:是否流式不影响预取收益——收益来自预填充阶段的 `T_kv_load`,与响应以 SSE 还是整体返回无关。
 
 ***
 
@@ -298,7 +395,7 @@ FLUSH=0 SWEEP=65536 ./run_deepagent_gain.sh
 2. **口径一致**:模型调用与整轮的收益比接近(差异 < 0.1×)。
 3. **可复现**:多次重复(`REPS≥3`)收益方向一致、量级稳定。
 
-> 实测:32k / 64k / 128k / 256k 四个尺寸整轮收益 1.045× → **1.276×**,随上下文单调上升。32k 档收益 1.045×,接近门限;如需 ≤32k 的结论,须将 `REPS` 提到 ≥5。
+> 实测:32k / 64k / 128k / 256k 四个尺寸整轮收益 1.096× → **1.358×**,随上下文单调上升。32k 档收益 1.096×,高于门限;如需 ≤32k 的结论,须将 `REPS` 提到 ≥5。
 
 ***
 
