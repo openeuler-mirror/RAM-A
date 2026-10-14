@@ -43,3 +43,6 @@ tests/deepagent/data/
 tests/deepagent/.venv/
 tests/deepagent/__pycache__/
 tests/deepagent/*.pyc
+
+# tests/server -- local-only experiment scripts/artifacts, not tracked
+tests/server/
