@@ -46,11 +46,11 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub auth_token: String,
     #[serde(default)]
-    pub acttrail_receiver_url: Option<String>,
+    pub actrail_receiver_url: Option<String>,
     #[serde(default)]
-    pub acttrail_model_deployment_key: Option<String>,
+    pub actrail_model_deployment_key: Option<String>,
     #[serde(default)]
-    pub acttrail_kv_namespace: Option<String>,
+    pub actrail_kv_namespace: Option<String>,
 }
 
 fn default_listen_addr() -> String {
@@ -96,9 +96,9 @@ impl Default for DaemonConfig {
             turn_start_prefetch: default_turn_start_prefetch(),
             turn_start_prefetch_async: false,
             auth_token: String::new(),
-            acttrail_receiver_url: None,
-            acttrail_model_deployment_key: None,
-            acttrail_kv_namespace: None,
+            actrail_receiver_url: None,
+            actrail_model_deployment_key: None,
+            actrail_kv_namespace: None,
         }
     }
 }

@@ -189,9 +189,9 @@ async fn main() {
     registry.register("health", Arc::new(HealthHandler));
     registry.register("agent_event", Arc::new(AgentEventHandler));
 
-    let acttrail_relay = match crate::handlers::acttrail_relay::ActtrailRelay::new(&config) {
+    let actrail_relay = match crate::handlers::actrail_relay::ActrailRelay::new(&config) {
         Some(r) => {
-            tracing::info!(url = %config.acttrail_receiver_url.as_deref().unwrap_or(""),
+            tracing::info!(url = %config.actrail_receiver_url.as_deref().unwrap_or(""),
                            "actrail-kv relay enabled");
             Some(Arc::new(r))
         }
@@ -204,7 +204,7 @@ async fn main() {
     let context = Arc::new(AppContext {
         manager: manager.clone(),
         session_store: session_store.clone(),
-        acttrail_relay,
+        actrail_relay,
         turn_start_prefetch_async: config.turn_start_prefetch_async,
     });
 
