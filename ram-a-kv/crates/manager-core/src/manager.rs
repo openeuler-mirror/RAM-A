@@ -150,6 +150,10 @@ impl KvCacheManager {
     // Post-inference update: apply the new chunk-hash set, adjust refcounts, and evict
     // chunks that are no longer referenced by any session.
     //
+    // `new_hashes` is `None` when the caller sent no kv_transfer_params (i.e. it
+    // has no KV data this turn): the session map is left untouched. `Some(vec![])`
+    // is an explicit clear; any other `Some` replaces the map as before.
+    //
     // Algorithm:
     // 1. Auto-create an empty session if it does not exist.
     // 2. Compute unique old/new hash sets. Duplicate hashes inside one session do
@@ -161,12 +165,12 @@ impl KvCacheManager {
     pub async fn on_turn_end(
         &self,
         session_id: &str,
-        new_hashes: Vec<String>,
+        new_hashes: Option<Vec<String>>,
         debug_context: Option<DebugContext>,
     ) -> ManagerResult<OperationOutcome> {
         let mut outcome = OperationOutcome::default();
 
-        let (to_evict, turn_count) = {
+        let (to_evict, turn_count, map_hashes) = {
             let mut sessions = self.sessions.lock().await;
             if !sessions.contains_key(session_id) {
                 sessions.insert(
@@ -182,34 +186,44 @@ impl KvCacheManager {
                 .ok_or(KvCacheError::SessionNotFound {
                     session_id: session_id.to_string(),
                 })?;
-
-            let old_hashes = state.map.chunk_hashes();
-            let old_unique = unique_hashes(&old_hashes);
-            let new_unique = unique_hashes(&new_hashes);
-            let old_set: HashSet<&String> = old_unique.iter().collect();
-            let new_set: HashSet<&String> = new_unique.iter().collect();
-
-            let to_decrement: Vec<String> = old_unique
-                .iter()
-                .filter(|h| !new_set.contains(h))
-                .cloned()
-                .collect();
-            let to_increment: Vec<String> = new_unique
-                .iter()
-                .filter(|h| !old_set.contains(h))
-                .cloned()
-                .collect();
-
-            let mut refcounts = self.refcounts.lock().await;
-            let to_evict = decrement_refcounts(&mut refcounts, &to_decrement);
-            for hash in &to_increment {
-                *refcounts.entry(hash.clone()).or_insert(0) += 1;
-            }
-            drop(refcounts);
-
-            state.map.replace(&new_hashes);
             state.turn_count += 1;
-            (to_evict, state.turn_count)
+
+            match new_hashes {
+                // No KV transfer data this turn: leave the map and refcounts as-is
+                // so a request that carried no cache identifiers cannot silently
+                // clear the session.
+                None => (Vec::new(), state.turn_count, state.map.chunk_hashes()),
+                // Explicit hashes drive the normal diff. An explicit empty array
+                // clears the session (every old hash drops to refcount 0).
+                Some(new_hashes) => {
+                    let old_hashes = state.map.chunk_hashes();
+                    let old_unique = unique_hashes(&old_hashes);
+                    let new_unique = unique_hashes(&new_hashes);
+                    let old_set: HashSet<&String> = old_unique.iter().collect();
+                    let new_set: HashSet<&String> = new_unique.iter().collect();
+
+                    let to_decrement: Vec<String> = old_unique
+                        .iter()
+                        .filter(|h| !new_set.contains(h))
+                        .cloned()
+                        .collect();
+                    let to_increment: Vec<String> = new_unique
+                        .iter()
+                        .filter(|h| !old_set.contains(h))
+                        .cloned()
+                        .collect();
+
+                    let mut refcounts = self.refcounts.lock().await;
+                    let to_evict = decrement_refcounts(&mut refcounts, &to_decrement);
+                    for hash in &to_increment {
+                        *refcounts.entry(hash.clone()).or_insert(0) += 1;
+                    }
+                    drop(refcounts);
+
+                    state.map.replace(&new_hashes);
+                    (to_evict, state.turn_count, new_hashes)
+                }
+            }
         };
 
         if !to_evict.is_empty() {
@@ -229,10 +243,10 @@ impl KvCacheManager {
 
         if self.config.debug_enabled {
             // Always write a debug file when debug_enabled, even if the request
-            // carried no chunk_hashes or no debug_context. Missing fields are
-            // filled with empty defaults so the file shape stays consistent.
+            // carried no kv_transfer_params or no debug_context. On a no-op turn
+            // we record the session's surviving map so the file reflects reality.
             let ctx = debug_context.unwrap_or_default();
-            match write_debug_file(&self.config, session_id, turn_count, &new_hashes, &ctx) {
+            match write_debug_file(&self.config, session_id, turn_count, &map_hashes, &ctx) {
                 Ok(()) => outcome.debug_written = true,
                 Err(e) => {
                     tracing::warn!(error = %e, "debug file write failed");
@@ -617,10 +631,14 @@ mod tests {
         // closing session 2 would over-decrement and evict A while session 1 still uses it.
         let mgr = KvCacheManager::new_noop(test_config());
 
-        mgr.on_turn_end("s1", vec!["A".into()], None).await.unwrap();
-        mgr.on_turn_end("s2", vec!["A".into()], None).await.unwrap();
+        mgr.on_turn_end("s1", Some(vec!["A".into()]), None)
+            .await
+            .unwrap();
+        mgr.on_turn_end("s2", Some(vec!["A".into()]), None)
+            .await
+            .unwrap();
         // s2 update [A] -> [A, A]: refcount for A must remain 2 (s1+s2 once each).
-        mgr.on_turn_end("s2", vec!["A".into(), "A".into()], None)
+        mgr.on_turn_end("s2", Some(vec!["A".into(), "A".into()]), None)
             .await
             .unwrap();
 
@@ -676,7 +694,7 @@ mod tests {
         // Parent starts with [A]. Fork captures [A]. Parent's map changes to [B].
         // fork_end must release the snapshot's [A], not the parent's current [B].
         let mgr = KvCacheManager::new_noop(test_config());
-        mgr.on_turn_end("parent", vec!["A".into()], None)
+        mgr.on_turn_end("parent", Some(vec!["A".into()]), None)
             .await
             .unwrap();
         let fork = mgr.on_session_fork("parent").await.unwrap();
@@ -687,7 +705,7 @@ mod tests {
         }
         // Parent's turn_end changes map to [B]. Parent's reference to A is dropped
         // (refcount goes 2→1, only the fork snapshot holds A now); B is added.
-        mgr.on_turn_end("parent", vec!["B".into()], None)
+        mgr.on_turn_end("parent", Some(vec!["B".into()]), None)
             .await
             .unwrap();
         {
@@ -722,7 +740,7 @@ mod tests {
     async fn duplicate_fork_end_is_idempotent() {
         // A second fork_end with the same fork_id must NOT decrement again.
         let mgr = KvCacheManager::new_noop(test_config());
-        mgr.on_turn_end("parent", vec!["A".into()], None)
+        mgr.on_turn_end("parent", Some(vec!["A".into()]), None)
             .await
             .unwrap();
         let fork = mgr.on_session_fork("parent").await.unwrap();
@@ -815,12 +833,61 @@ mod tests {
         // turn_count must be queryable for persistence so it is not hard-coded to 0.
         let mgr = KvCacheManager::new_noop(test_config());
         assert!(mgr.session_turn_count("s1").await.is_none());
-        mgr.on_turn_end("s1", vec!["A".into()], None).await.unwrap();
+        mgr.on_turn_end("s1", Some(vec!["A".into()]), None)
+            .await
+            .unwrap();
         assert_eq!(mgr.session_turn_count("s1").await, Some(1));
-        mgr.on_turn_end("s1", vec!["A".into(), "B".into()], None)
+        mgr.on_turn_end("s1", Some(vec!["A".into(), "B".into()]), None)
             .await
             .unwrap();
         assert_eq!(mgr.session_turn_count("s1").await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn turn_end_without_kv_params_is_a_noop_for_the_session_map() {
+        // A request that carries no kv_transfer_params (None) must NOT clear the
+        // session map: this is what protects the deepagents path, whose middleware
+        // omits the field when a response yields no ucm_block_ids.
+        let mgr = KvCacheManager::new_noop(test_config());
+        mgr.on_turn_end("s1", Some(vec!["A".into(), "B".into()]), None)
+            .await
+            .unwrap();
+
+        let outcome = mgr.on_turn_end("s1", None, None).await.unwrap();
+        assert_eq!(outcome.evicted_count, 0, "no-op must not evict");
+
+        let map = mgr.session_map("s1").await.expect("s1 must still exist");
+        assert_eq!(
+            map.chunk_hashes(),
+            vec!["A".to_string(), "B".to_string()],
+            "absent kv_transfer_params must leave the map untouched"
+        );
+        // turn_count still advances: the turn happened, it just carried no KV data.
+        assert_eq!(mgr.session_turn_count("s1").await, Some(2));
+        {
+            let refcounts = mgr.refcounts.lock().await;
+            assert_eq!(refcounts.get("A"), Some(&1), "refcounts untouched");
+            assert_eq!(refcounts.get("B"), Some(&1), "refcounts untouched");
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_end_with_explicit_empty_hashes_clears_the_session() {
+        // An explicit [] is the only way to clear: every old hash drops to refcount 0
+        // and is evicted.
+        let mgr = KvCacheManager::new_noop(test_config());
+        mgr.on_turn_end("s1", Some(vec!["A".into(), "B".into()]), None)
+            .await
+            .unwrap();
+
+        let outcome = mgr.on_turn_end("s1", Some(vec![]), None).await.unwrap();
+        assert_eq!(outcome.evicted_count, 2, "A and B must be evicted");
+
+        let map = mgr.session_map("s1").await.expect("s1 must still exist");
+        assert!(map.chunk_hashes().is_empty(), "map must be cleared");
+        let refcounts = mgr.refcounts.lock().await;
+        assert!(refcounts.get("A").is_none(), "A evicted");
+        assert!(refcounts.get("B").is_none(), "B evicted");
     }
 
     #[tokio::test]
@@ -829,8 +896,12 @@ mod tests {
         // fork snapshot by passing B's fork_id — the ownership check must reject it.
         let mgr = KvCacheManager::new_noop(test_config());
 
-        mgr.on_turn_end("A", vec!["X".into()], None).await.unwrap();
-        mgr.on_turn_end("B", vec!["Y".into()], None).await.unwrap();
+        mgr.on_turn_end("A", Some(vec!["X".into()]), None)
+            .await
+            .unwrap();
+        mgr.on_turn_end("B", Some(vec!["Y".into()]), None)
+            .await
+            .unwrap();
         let fork_a = mgr.on_session_fork("A").await.unwrap();
         let fork_b = mgr.on_session_fork("B").await.unwrap();
 
