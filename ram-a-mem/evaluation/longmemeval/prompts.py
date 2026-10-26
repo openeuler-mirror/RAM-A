@@ -1,3 +1,21 @@
+# Copyright (c) 2026 Huawei Technologies Co.,Ltd. All rights reserved.
+#
+# RAM-A original contributions to this file are licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan
+# PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#         http://license.coscl.org.cn/MulanPSL2
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY
+# KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# NON-INFRINGEMENT, MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+#
+# Portions of the judge prompts in get_judge_prompt
+# are adapted from LongMemEval and retain the MIT license.
+# Copyright (c) 2024 Di Wu
+# Source: https://github.com/xiaowu0162/longmemeval/blob/main/src/evaluation/evaluate_qa.py
+# Full MIT license: ram-a-mem/LICENSES/LongMemEval-MIT.txt
+
 """Prompt and retrieved-memory formatting helpers for LongMemEval QA."""
 
 from __future__ import annotations
