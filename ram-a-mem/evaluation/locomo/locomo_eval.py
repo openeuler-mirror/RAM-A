@@ -1,3 +1,21 @@
+# Copyright (c) 2026 Huawei Technologies Co.,Ltd. All rights reserved.
+#
+# RAM-A original contributions to this file are licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan
+# PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#         http://license.coscl.org.cn/MulanPSL2
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY
+# KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# NON-INFRINGEMENT, MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+#
+# Portions of the metric helpers simple_tokenize, calculate_bleu_score and calculate_f1_score
+# are adapted from AgenticMemory and retain the MIT license.
+# Copyright (c) 2025 Wujiang Xu, Zujie Liang, Kai Mei, Hang Gao, Juntao Tan, Yongfeng Zhang
+# Source: https://github.com/WujiangXu/AgenticMemory/blob/main/utils.py
+# Full MIT license: ram-a-mem/LICENSES/AgenticMemory-MIT.txt
+
 import argparse
 import concurrent.futures
 import json

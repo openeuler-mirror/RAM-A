@@ -1,4 +1,16 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Huawei Technologies Co.,Ltd. All rights reserved.
+#
+# RAM-A is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan
+# PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#         http://license.coscl.org.cn/MulanPSL2
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY
+# KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# NON-INFRINGEMENT, MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+
 # 启动 vllm serve（UCM 预取链路,容器 + 本仓库代码）。
 # 必须在容器内执行；cd / 是必需的，否则 cwd 下的 vllm/ 目录会被解析为命名空间包。
 set -uo pipefail

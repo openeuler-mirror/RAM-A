@@ -2,14 +2,15 @@
 
 This file records the third-party open source software notice for RAM-A.
 
-RAM-A itself is licensed under Mulan PSL v2. See [LICENSE](./LICENSE) for the
-project license text.
+RAM-A original contributions are licensed under Mulan PSL v2. See
+[LICENSE](./LICENSE) for the project license text. The adapted evaluation
+portions listed below retain their upstream MIT licenses.
 
 ## Scope
 
-This is an initial notice generated from the current Cargo workspace dependency
-set. It is intended to make the third-party dependency notice explicit for
-review and future maintenance.
+This notice covers the adapted evaluation portions listed below and an initial
+dependency inventory generated from the Cargo workspace. The Cargo inventory
+is retained for review and future maintenance.
 
 The current workspace uses Rust crates managed by Cargo. Direct third-party
 dependencies are listed below. Transitive dependencies are resolved through
@@ -20,6 +21,23 @@ When dependencies change, or before producing a release package or binary
 distribution, this notice should be regenerated or expanded from `Cargo.lock`.
 Release-oriented notices may also need exact copyright notices and full license
 texts for every third-party component.
+
+## Adapted Evaluation Code and Prompts
+
+The following attributions apply to the identified adapted portions, rather
+than to all RAM-A code in the containing files. Existing source attributions
+are retained. RAM-A original contributions remain under Mulan PSL v2.
+
+| Upstream project | Local adapted portions | Upstream source | Copyright | License text |
+| --- | --- | --- | --- | --- |
+| AgenticMemory | [evaluation/locomo/locomo_eval.py](evaluation/locomo/locomo_eval.py): metric helpers simple_tokenize, calculate_bleu_score and calculate_f1_score | [Source](https://github.com/WujiangXu/AgenticMemory/blob/main/utils.py) | Copyright (c) 2025 Wujiang Xu, Zujie Liang, Kai Mei, Hang Gao, Juntao Tan, Yongfeng Zhang | [MIT](LICENSES/AgenticMemory-MIT.txt) |
+| LongMemEval | [evaluation/longmemeval/prompts.py](evaluation/longmemeval/prompts.py): judge prompts in get_judge_prompt | [Source](https://github.com/xiaowu0162/longmemeval/blob/main/src/evaluation/evaluate_qa.py) | Copyright (c) 2024 Di Wu | [MIT](LICENSES/LongMemEval-MIT.txt) |
+
+The linked license files preserve the upstream copyright notices, MIT
+permission terms and disclaimers. Include them when redistributing the
+corresponding adapted portions. The source links identify the upstream
+implementations inspected for this notice; they do not establish the exact
+historical revision originally used by RAM-A.
 
 ## Direct Third-Party Dependencies
 
