@@ -2,7 +2,7 @@ diff --git a/vllm_ascend/patch/__init__.py b/vllm_ascend/patch/__init__.py
 index d5a7038a7..44fa9701c 100644
 --- a/vllm_ascend/patch/__init__.py
 +++ b/vllm_ascend/patch/__init__.py
-@@ -675,2 +675,21 @@
+@@ -675,4 +675,23 @@
  #
 +# ** 24. File: platform/patch_kv_transfer_params_streaming.py**
 +# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
