@@ -151,7 +151,7 @@ prefetch:  T_kv_load = T_ddr,  代价是一次额外的扇出开销 C_fanout
 ## 5 运行环境与前置条件
 
 1. **推理栈在运行**:vLLM-Ascend 引擎 `:8000`(启用 UCM)+ vLLM-router `:9003`,且 TP worker 预取口 `6997–7004` 已监听。
-2. **ram-a-kv 已构建**:`cargo build --release`,`target/release/ram-a-kv` 存在。
+2. **ram-a-kv 已构建**:`cargo build --release`,`target/release/ram-a-kv` 存在。默认构建即可(会话状态存内存,本脚本不校验 `sessions.db`);若要落盘会话表,用 `cargo build --release --features sqlite`。
 3. **预放池存在**:`/mnt/sdb/ucm/flush_pool_64g.json`。
 4. **Python 环境**:一个能 `import deepagents, langchain_openai, ram_a_middleware` 的解释器。脚本会自动探测,亦可用 `VENV_PY=` 显式指定。
 
@@ -207,7 +207,7 @@ STREAMING=1 SWEEP=131072 REPS=3 MIN_SIZE=131072 HUMAN_TOKEN_LIMIT=1000000 ./run_
 | `data/run_env.json`                         | 本次运行的环境指纹                                    |
 | `data/daemon.log`                           | daemon 日志                                    |
 | `data/context_*.json` / `data/prompt_*.txt` | 各尺寸复用的上下文与 prompt                            |
-| `data/sessions.db`                          | daemon 会话表                                   |
+| `data/sessions.db`                          | daemon 会话表(仅 `--features sqlite` 构建时生成)        |
 
 ### 6.3 故障排查
 
@@ -406,7 +406,7 @@ STREAMING=1 SWEEP=131072 REPS=3 MIN_SIZE=131072 HUMAN_TOKEN_LIMIT=1000000 ./run_
 | `run_deepagent_gain.sh` | 入口:单尺寸 / 多尺寸扫描,两档 A/B 循环,管理 daemon 生命周期,写环境指纹                                                                                                                                           |
 | `deepagent_gain.py`     | 驱动:`warm` / `measure` / `report` 三阶段,含模型调用独立计时与收益汇总                                                                                                                                     |
 | `gen_prompt.py`         | 确定性、高熵 prompt 生成器(`(size, seed)` → 文本)                                                                                                                                                  |
-| `data/`                 | **单一输出目录**(已被 git 忽略):`RESULT.md`、`report.md`、`results.jsonl`、`summary.json`、`run_env.json`、context、prompt、`daemon.log`、`sessions.db`;历史归档放子目录 `data/small/`、`data/large/`、`data/logs/` |
+| `data/`                 | **单一输出目录**(已被 git 忽略):`RESULT.md`、`report.md`、`results.jsonl`、`summary.json`、`run_env.json`、context、prompt、`daemon.log`、`sessions.db`(仅 SQLite 构建);历史归档放子目录 `data/small/`、`data/large/`、`data/logs/` |
 
 ## 附录 B daemon 侧配置
 

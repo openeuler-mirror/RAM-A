@@ -56,7 +56,7 @@ impl EventResponse {
 pub struct AppState {
     pub manager: Arc<manager_core::KvCacheManager>,
     pub registry: Arc<EventRegistry>,
-    pub session_store: Arc<crate::session_store::SqliteSessionStore>,
+    pub session_store: Arc<dyn crate::session_store::SessionStore>,
     pub context: Arc<AppContext>,
     pub auth_token: String,
 }

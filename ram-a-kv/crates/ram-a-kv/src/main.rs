@@ -165,14 +165,11 @@ async fn main() {
     };
     let manager = Arc::new(KvCacheManager::new(core_config, backend));
 
-    let session_store = Arc::new(
-        crate::session_store::SqliteSessionStore::new(&config.session_store_path).unwrap_or_else(
-            |e| {
-                tracing::error!(error = %e, "session store init failed");
-                panic!("cannot initialize session store")
-            },
-        ),
-    );
+    let session_store = crate::session_store::new_session_store(&config.session_store_path)
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "session store init failed");
+            panic!("cannot initialize session store")
+        });
 
     // Rehydrate every persisted session so state survives daemon restarts.
     for session_id in session_store.list_all() {

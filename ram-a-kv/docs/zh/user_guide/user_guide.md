@@ -73,6 +73,8 @@ curl -s -X POST http://127.0.0.1:6998/event \
 
 ### 事件使用场景
 
+> 下文中涉及 SQLite 的持久化行为只在用 `--features sqlite` 构建的 daemon 上生效；默认构建的会话状态存放在内存中，进程退出即清空。
+
 - **`turn_start`**：每一轮推理开始时上报。daemon 根据会话当前 chunk map 向后端发起 prefetch，将所需 KV cache 块预载入加速卡，降低本轮推理的 TTFT。
 - **`turn_end`**：每一轮推理结束后上报，携带本轮实际产生的 `chunk_hashes`。daemon 据此更新会话的 chunk map，对新旧引用做差集计算，驱逐不再被任何会话引用的块。
 - **`snapshot_restore`**：会话从挂起状态恢复或 daemon 重启后恢复时上报。daemon 从内存或 SQLite 加载该会话的 chunk map，重新注册引用并发起 prefetch，使会话状态得以延续。

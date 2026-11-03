@@ -22,6 +22,12 @@
 #   TEST_DIR      — custom test directory (default /tmp/ram-a-kv-test)
 #   DAEMON_URL    — custom daemon URL (default http://127.0.0.1:6998)
 #   KEEP_DAEMON   — when set to 1, do not kill daemon after tests (default 0)
+#
+# Build requirement: SQLite session persistence is an opt-in cargo feature. The
+# default `cargo build --release` produces a daemon with an in-memory session
+# store, so the SQLite-only assertions (pins table, restart recovery) are
+# skipped automatically. Build with `cargo build --release --features sqlite`
+# to run the full suite.
 
 set -e
 
@@ -101,10 +107,19 @@ fi
 # ─────────────────────────────────────────────────────────────
 PASS=0
 FAIL=0
+SKIPPED=0
+
+# Count a skipped assertion group (used for the SQLite-only checks).
+skip_section() {
+    echo "  [SKIP] $1 (daemon built without the 'sqlite' feature)"
+    SKIPPED=$((SKIPPED + 1))
+}
 
 # Check for required external tools so the script fails fast with a clear
-# message instead of emitting confusing INVALID_JSON output.
-for dep in jq sqlite3 curl ss; do
+# message instead of emitting confusing INVALID_JSON output. `sqlite3` is only
+# needed for the SQLite assertions, so it is checked after daemon startup once
+# the build flavour is known.
+for dep in jq curl ss; do
     if ! command -v "$dep" >/dev/null 2>&1; then
         echo "ERROR: required tool '$dep' is not installed"
         echo "       install it before running the integration tests"
@@ -174,6 +189,7 @@ echo "=== check daemon binary ==="
 if [ ! -x "$DAEMON_BIN" ]; then
     echo "ERROR: daemon binary not found at $DAEMON_BIN"
     echo "       run 'cargo build --release' first, or set DAEMON_BIN env var"
+    echo "       (add --features sqlite to also exercise the SQLite assertions)"
     exit 1
 fi
 
@@ -199,6 +215,24 @@ if ! ss -tlnp 2>/dev/null | grep -q ":${DAEMON_PORT}"; then
     exit 1
 fi
 echo "daemon pid=$DAEMON_PID"
+echo ""
+
+# Detect the build flavour: the no-SQLite build logs a warning at startup. Keep
+# the SQLite assertions out of the run when that warning is present instead of
+# letting them fail against an in-memory store.
+if grep -q "without the 'sqlite' feature" "$TEST_DIR/daemon.log"; then
+    SQLITE_ENABLED=0
+    echo "NOTE: daemon was built without the 'sqlite' feature (default build);"
+    echo "      sessions live in memory and SQLite assertions will be skipped."
+    echo "      Rebuild with 'cargo build --release --features sqlite' to run them."
+else
+    SQLITE_ENABLED=1
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        echo "ERROR: required tool 'sqlite3' is not installed"
+        echo "       install it, or use a daemon built without '--features sqlite'"
+        exit 1
+    fi
+fi
 echo ""
 
 # ─────────────────────────────────────────────────────────────
@@ -305,11 +339,12 @@ emit "duplicate session_fork_end with same fork_id (idempotent)" "true" \
 # L1.6 session_suspend (pin + kept in SQLite)
 # ─────────────────────────────────────────────────────────────
 echo ""
-echo "=== L1.6 session_suspend (pin + kept in SQLite) ==="
+echo "=== L1.6 session_suspend (pin + kept in store) ==="
 suspend_resp=$(curl -s -X POST "$DAEMON_URL/event" -H "Content-Type: application/json" \
     -d '{"type":"session_suspend","session_id":"basic-s1"}')
 echo "$suspend_resp" | jq -c '.' | sed 's/^/        /'
 assert_field "session_suspend reports pinned=true" "$suspend_resp" '.data.pinned' 'true'
+if [ "$SQLITE_ENABLED" = "1" ]; then
 echo "        basic-s1 should be pinned and still in SQLite:"
 sqlite3 "$TEST_DIR/sessions.db" \
     "SELECT session_id FROM sessions WHERE session_id='basic-s1';" \
@@ -323,12 +358,16 @@ else
     echo "  [FAIL] basic-s1 not found in pins table"
     FAIL=$((FAIL + 1))
 fi
-# Close while pinned: the SQLite row must survive for snapshot_restore.
+else
+    skip_section "L1.6 pins table row"
+fi
+# Close while pinned: the persisted row must survive for snapshot_restore.
 emit "session_close basic-s1 while pinned (row must survive)" "true" \
     '{"type":"session_close","session_id":"basic-s1"}'
 close_resp=$(curl -s -X POST "$DAEMON_URL/event" -H "Content-Type: application/json" \
     -d '{"type":"session_close","session_id":"basic-s1"}')
 assert_field "session_close while pinned reports pinned=true" "$close_resp" '.data.pinned' 'true'
+if [ "$SQLITE_ENABLED" = "1" ]; then
 surviving_row=$(sqlite3 "$TEST_DIR/sessions.db" \
     "SELECT session_id FROM sessions WHERE session_id='basic-s1';")
 if [ -n "$surviving_row" ]; then
@@ -338,7 +377,10 @@ else
     echo "  [FAIL] basic-s1 SQLite row was deleted despite pin"
     FAIL=$((FAIL + 1))
 fi
-# A pinned session no longer in memory must still restore from SQLite.
+else
+    skip_section "L1.6 pinned row survival"
+fi
+# A pinned session no longer in memory must still restore from the session store.
 restore_resp=$(curl -s -X POST "$DAEMON_URL/event" -H "Content-Type: application/json" \
     -d '{"type":"snapshot_restore","session_id":"basic-s1"}')
 echo "$restore_resp" | jq -c '.' | sed 's/^/        /'
@@ -455,6 +497,7 @@ curl -s -X POST "$DAEMON_URL/event" -H "Content-Type: application/json" \
 # ─────────────────────────────────────────────────────────────
 echo ""
 echo "=== L1.7e restart rebuild refcount regression ==="
+if [ "$SQLITE_ENABLED" = "1" ]; then
 emit "shared-s1 turn_end [shared-A, B]" "true" \
     '{"type":"turn_end","session_id":"shared-s1","kv_transfer_params":{"chunk_hashes":["shared-A","shared-B"]}}'
 emit "shared-s2 turn_end [shared-A, C]" "true" \
@@ -474,12 +517,16 @@ assert_field "shared-s2 still has shared-A after s1 closed (post-restart)" \
     "$map_after" '.data.chunk_hashes | tostring' '["shared-A","shared-C"]'
 curl -s -X POST "$DAEMON_URL/event" -H "Content-Type: application/json" \
     -d '{"type":"session_close","session_id":"shared-s2"}' > /dev/null
+else
+    skip_section "L1.7e restart refcount rebuild"
+fi
 
 # ─────────────────────────────────────────────────────────────
 # L1.8 persistence and restart recovery
 # ─────────────────────────────────────────────────────────────
 echo ""
 echo "=== L1.8 persistence and restart recovery ==="
+if [ "$SQLITE_ENABLED" = "1" ]; then
 # use a separate session to avoid side effects from earlier cases
 emit "turn_end persist-s1 before restart" "true" \
     '{"type":"turn_end","session_id":"persist-s1","kv_transfer_params":{"chunk_hashes":["persist-h1","persist-h2"]}}'
@@ -511,6 +558,9 @@ assert_field "snapshot_restore prefetch_count=2" \
     "$snap_resp" '.data.prefetch_count' '2'
 assert_field "snapshot_restore prefetch_sent=true" \
     "$snap_resp" '.data.prefetch_sent' 'true'
+else
+    skip_section "L1.8 persistence and restart recovery"
+fi
 
 # ─────────────────────────────────────────────────────────────
 # L1.9 debug file persistence (debug_enabled generates file even when
@@ -571,6 +621,7 @@ emit "session_close debug-empty" "true" \
 
 # Pinned sessions keep their SQLite row across session_close by design:
 #   basic-s1, dup-restore-s1, persist-s1. Every unpinned session must be gone.
+if [ "$SQLITE_ENABLED" = "1" ]; then
 echo "        SQLite sessions table after cleanup (pinned rows remain by design):"
 sqlite3 "$TEST_DIR/sessions.db" "SELECT session_id FROM sessions ORDER BY session_id;" \
     | sed 's/^/        /'
@@ -583,6 +634,9 @@ else
     echo "  [FAIL] unexpected remaining rows: $remaining"
     echo "        expected: basic-s1,dup-restore-s1,persist-s1"
     FAIL=$((FAIL + 1))
+fi
+else
+    skip_section "L1.10 remaining SQLite rows"
 fi
 
 # ─────────────────────────────────────────────────────────────
@@ -600,7 +654,10 @@ assert_field "final sessions_count=0" "$final" '.data.sessions_count' '0'
 # ─────────────────────────────────────────────────────────────
 echo ""
 echo "=============================================="
-echo "  L1 test results: PASS=$PASS  FAIL=$FAIL"
+echo "  L1 test results: PASS=$PASS  FAIL=$FAIL  SKIP=$SKIPPED"
+if [ "$SKIPPED" -gt 0 ]; then
+    echo "  ($SKIPPED SQLite group(s) skipped: daemon built without '--features sqlite')"
+fi
 echo "=============================================="
 if [ "$FAIL" -gt 0 ]; then
     echo "check daemon logs: $TEST_DIR/daemon.log / $TEST_DIR/daemon-restart.log"
