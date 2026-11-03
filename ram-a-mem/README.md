@@ -386,7 +386,9 @@ Change these fields before deployment:
 - `case_library.index_store`: case-library retrieval index SQLite path. Keep it separate
   from `storage.database_path`.
 - `case_library.source_dir`: optional local directory of `.md`/`.txt` documents. When set,
-  `ram-a-mem` imports new files into the default case-library dataset on startup.
+  `ram-a-mem` recursively imports new files into the default case-library dataset on startup,
+  using source-relative paths as document names. Unreadable or disappearing subdirectories
+  are logged and skipped; failure to read the source directory itself still fails the import.
 - `case_library.api_token_env`: optional environment variable containing the dedicated
   administrator token for the case-management REST API. It is an administrator credential:
   never hand its value to ordinary case callers, who should use the MCP tools instead.

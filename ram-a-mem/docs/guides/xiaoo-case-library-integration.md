@@ -210,9 +210,11 @@ token 与 tenant、user、agent 和操作类型绑定，只能使用一次；`fa
 }
 ```
 
-`ram-a-mem` 启动时会读取 `source_dir`，把新出现的 `.md`/`.txt` 文档导入
-`default_library` 对应的 dataset。已经导入过的同名文件会跳过。若不配置
-`source_dir`，服务只读取已有持久化案例库 SQLite。
+`ram-a-mem` 启动时会递归读取 `source_dir`，把新出现的 `.md`/`.txt` 文档导入
+`default_library` 对应的 dataset。文档名使用相对于 `source_dir` 的路径，已经导入过的
+相同相对路径会跳过。子目录读取或条目枚举失败时，记录警告并跳过该目录，继续扫描其他
+目录；检查条目类型失败时，记录警告并跳过该条目。`source_dir` 本身不可读取时仍报告
+导入失败。若不配置 `source_dir`，服务只读取已有持久化案例库 SQLite。
 
 案例库仍然使用独立 SQLite 文件：
 
