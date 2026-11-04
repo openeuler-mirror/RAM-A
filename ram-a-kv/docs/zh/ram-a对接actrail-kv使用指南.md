@@ -67,7 +67,8 @@ cd ..
 
 ```bash
 cd RAM-A/ram-a-kv
-cargo build --release
+cargo build --release                    # 默认：会话状态存内存，不依赖 SQLite
+# cargo build --release --features sqlite  # 需要 SQLite 持久化时改用这条
 # 产物：target/release/ram-a-kv
 cd ../..
 ```
@@ -77,11 +78,13 @@ cd ../..
 ```toml
 listen_addr = "127.0.0.1:6998"
 noop_backend = true
-session_store_path = "./sessions.db"
+session_store_path = "./sessions.db"   # 仅 --features sqlite 构建生效
 actrail_receiver_url = "http://127.0.0.1:8087"
 actrail_model_deployment_key = "deepseek-v4-flash"
 actrail_kv_namespace = "default"
 ```
+
+> `session_store_path` 只在用 `--features sqlite` 构建的 daemon 上生效。默认构建（内存存储）会忽略它，不创建 `sessions.db`，daemon 重启后会话状态不恢复；本指南的 actrail 联调不依赖持久化，默认构建即可。
 
 启动 daemon：
 

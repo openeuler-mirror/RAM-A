@@ -12,7 +12,7 @@ ram-a-kv 是一个 **KV 缓存（KV cache）协调守护进程（daemon）**，�
 
 | 组件 | 说明 |
 |---|---|
-| **ram-a-kv（daemon）** | HTTP 服务、事件分发、SQLite 持久化、启动恢复。二进制名 `ram-a-kv`。 |
+| **ram-a-kv（daemon）** | HTTP 服务、事件分发、会话状态持久化（默认内存，可选 SQLite）、启动恢复。二进制名 `ram-a-kv`。 |
 | **manager-core** | 纯业务逻辑库：会话状态、引用计数、驱逐策略、后端 trait。无 HTTP / SQLite / CLI。 |
 | **backend** | `NoopBackend` / `LMCacheAscendBackend`，实现 `KvCacheBackend`（prefetch / evict / query）。 |
 | **ram-a-kv-sdk** | 给宿主应用（如 xiaoo）用的客户端库，封装事件上报。 |
@@ -24,10 +24,16 @@ ram-a-kv 是一个 **KV 缓存（KV cache）协调守护进程（daemon）**，�
 
 ```bash
 cd ram-a-kv
-cargo build --release
+cargo build --release                  # 默认：会话状态存内存，不依赖 SQLite
+cargo build --release --features sqlite  # 可选：SQLite 持久化（编译 `bundled` 版 SQLite，需要 C 编译器）
 ```
 
 产物：`ram-a-kv/target/release/ram-a-kv`（即可执行 daemon 二进制）。
+
+SQLite 支持是**编译期**开关（cargo feature `sqlite`，默认关闭）：
+
+- 默认构建不编译 `rusqlite` / `libsqlite3-sys`，产物不含 SQLite，运行时用内存存储，不创建 `.db` 文件，daemon 重启后会话状态不恢复。
+- 需要持久化时用 `--features sqlite` 构建；同一份源码两个构建产物行为不同，不能用配置在运行时切换。
 
 ## 4. 配置
 
@@ -41,6 +47,7 @@ daemon 通过环境变量 `RAM_A_KV_CONFIG` 指定配置文件路径；未设置
 | `lmcache_url` | `http://localhost:6999` | LMCache-Ascend 后端地址 |
 | `debug_enabled` | `false` | 是否写 debug 文件 |
 | `debug_dir` | `kvcache_debug` | debug 文件输出目录 |
+| `session_store_path` | `/var/lib/ram-a-kv/sessions.db` | 会话状态持久化路径（仅 `--features sqlite` 构建生效） |
 
 最小示例（参考 `config.example.toml`）：
 
@@ -156,7 +163,7 @@ curl -s -X POST $URL -H 'Content-Type: application/json' \
 
 ### 7.3 snapshot_restore
 
-`snapshot_restore` 先查内存，内存没有则从 SQLite 加载该 session 的 map，取 `chunk_hashes` 后向 manager 注册引用并发 prefetch。适合在 daemon 重启后、或 suspend 后恢复时调用。
+`snapshot_restore` 先查内存，内存没有则从会话存储加载该 session 的 map（`--features sqlite` 构建时为 SQLite），取 `chunk_hashes` 后向 manager 注册引用并发 prefetch。适合在 suspend 后恢复时调用；daemon 重启后的恢复只在 SQLite 构建下有效。
 
 ## 8. 引用计数与驱逐语义（重要）
 
@@ -169,6 +176,8 @@ ram-a-kv 的核心安全不变式：
 - **`snapshot_restore`**：按唯一 hash 计数（局部去重，避免重复输入导致多计），并按客户端传入的**原始顺序**透传给后端 prefetch，保持与手动 curl 一致的顺序。
 
 ## 9. 持久化与重启恢复
+
+> 本节只适用于用 `cargo build --release --features sqlite` 构建的 daemon。默认构建使用内存存储：不读写 SQLite，`session_store_path` 被忽略，daemon 重启后会话状态清空（启动时会打一条 `built without the 'sqlite' feature` 的 warn 日志）。
 
 - 持久化用 SQLite，schema：
   ```sql
@@ -262,4 +271,4 @@ RamAKvClient::session_close("s1");
 ./tests/test_integration.sh xiaoo    # 打印 xiaoo 联调步骤指南
 ```
 
-脚本会先 `cargo build --release` 出 daemon，再起 daemon、发事件、断言 `ok` / 字段、验证持久化与重启恢复。支持环境变量：`DAEMON_BIN` / `TEST_DIR` / `DAEMON_URL` / `KEEP_DAEMON`。
+脚本不负责编译：先自行构建 daemon（`cargo build --release`），再按 `DAEMON_BIN`（默认 `target/release/ram-a-kv`）找到二进制；之后起 daemon、发事件、断言 `ok` / 字段。SQLite 持久化与重启恢复相关的断言只在 daemon 用 `--features sqlite` 构建时执行，默认（内存存储）构建会自动跳过并在结果里计入 `SKIP=`。支持环境变量：`DAEMON_BIN` / `TEST_DIR` / `DAEMON_URL` / `KEEP_DAEMON`。

@@ -162,7 +162,7 @@ impl EventHandler for TurnEndHandler {
 mod tests {
     use super::*;
     use crate::handlers::turn_start::TurnStartHandler;
-    use crate::session_store::SqliteSessionStore;
+    use crate::session_store::MemorySessionStore;
     use async_trait::async_trait;
     use manager_core::{BackendQueryResult, BackendResult, KvCacheBackend, KvCacheConfig, KvCacheManager};
     use std::collections::HashMap;
@@ -210,7 +210,7 @@ mod tests {
         };
         AppContext {
             manager: Arc::new(KvCacheManager::new(config, backend)),
-            session_store: Arc::new(SqliteSessionStore::new(":memory:").unwrap()),
+            session_store: Arc::new(MemorySessionStore::new()),
             actrail_relay: None,
             turn_start_prefetch_async: false,
         }

@@ -1,10 +1,10 @@
 # 端到端与交付回归测试
 
-统一入口验证真实 DeepAgents → mock vLLM → Python SDK → 真实 RAM-A daemon → SQLite。模型服务和缓存后端为 mock / noop；不验证实际 GPU KV 数据搬运、命中率或性能。
+统一入口验证真实 DeepAgents → mock vLLM → Python SDK → 真实 RAM-A daemon（默认内存存储，可选 SQLite）。模型服务和缓存后端为 mock / noop；不验证实际 GPU KV 数据搬运、命中率或性能。
 
 ## 运行
 
-先按[使用指南](../USE_GUIDE.md)安装依赖，并构建 RAM-A daemon（在 `ram-a-kv` 目录执行 `cargo build`）。当前版本 daemon 已默认支持 `agent_event` 事件。
+先按[使用指南](../USE_GUIDE.md)安装依赖，并构建 RAM-A daemon（在 `ram-a-kv` 目录执行 `cargo build`；默认构建即可，SQLite 持久化不是本用例的验证项）。当前版本 daemon 已默认支持 `agent_event` 事件。
 
 ```bash
 export RAM_A_KV_DAEMON_BIN=/absolute/path/to/RAM-A/ram-a-kv/target/debug/ram-a-kv
@@ -48,7 +48,7 @@ PYTHON_BIN=python bash tests/run_e2e_mock_vllm.sh --async
 | mock-vllm.jsonl | 模型请求和原始回复 |
 | events.json | 主链路 SDK 请求与 ACK |
 | evidence.json | 校验通过后提取的六条主链路事件 |
-| ram-a.toml / sessions.db | 临时配置与数据库 |
+| ram-a.toml / sessions.db | 临时配置与数据库（`sessions.db` 仅在 `--features sqlite` 构建下生成） |
 
 模型请求 ID 对应 SDK model_request_id；completion ID 单独保留在响应 metadata，不混为同一字段。rank 仅为 metadata，不参与后端选择。
 

@@ -21,7 +21,7 @@ ram-a-kv 以守护进程形式运行，通过 HTTP API 接收推理生命周期�
 | 层次 | 说明 |
 |---|---|
 | **事件接入** | 宿主 Agent 在推理轮次的关键节点向 daemon 上报事件 |
-| **状态管理** | daemon 维护每个会话的 chunk map 与全局引用计数，持久化到 SQLite |
+| **状态管理** | daemon 维护每个会话的 chunk map 与全局引用计数；默认存内存，可选 SQLite 持久化 |
 | **后端编排** | daemon 根据事件与引用计数，向 LMCache-Ascend 后端发送 prefetch / evict / query 请求 |
 
 无论哪种宿主 Agent，事件契约、状态模型与后端编排逻辑都保持一致。
@@ -30,5 +30,5 @@ ram-a-kv 以守护进程形式运行，通过 HTTP API 接收推理生命周期�
 
 - **事件驱动**：9 个事件覆盖推理轮次的完整生命周期（`turn_start` / `turn_end` / `snapshot_restore` / `session_map` / `session_close` / `session_suspend` / `session_fork` / `session_fork_end` / `health`）
 - **引用计数安全**：跨会话共享的 chunk 通过全局引用计数（refcount）保护，杜绝被某个会话提前驱逐
-- **持久化与重启恢复**：SQLite 存储 session map，daemon 重启后自动遍历恢复所有会话状态与引用计数
+- **持久化与重启恢复（可选）**：用 `--features sqlite` 构建时，SQLite 存储 session map，daemon 重启后自动遍历恢复所有会话状态与引用计数；默认构建会话状态仅存内存，重启后清空
 - **安全认证**：非回环地址监听时强制要求 Bearer 令牌认证，防止未授权访问

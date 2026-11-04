@@ -4,7 +4,7 @@
 
 - **操作系统**：openEuler 26.09 LTS 或更高版本（x86\_64 / aarch64）
 - **内存**：建议至少 8GB RAM
-- **存储**：建议至少 10GB 可用磁盘空间（含 SQLite 持久化）
+- **存储**：建议至少 10GB 可用磁盘空间（启用 SQLite 持久化的 `--features sqlite` 构建需要；默认内存存储不落盘）
 - **KV cache 后端服务**：
     - 需部署 LMCache-Ascend 服务（HTTP 端点 `/memory/prefetch`、`/memory/evict`、`/memory/query`），配套昇腾 NPU 与 CANN 驱动
     - 具体安装与配置见 LMCache-Ascend 官方文档
