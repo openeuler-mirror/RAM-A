@@ -10,7 +10,7 @@ ram-a-kv 作为**语义大脑**，将 Agent 上下文映射到 KV cache 块（ch
 
 ## 支持平台
 
-- **操作系统**：openEuler 26.09 LTS 或更高版本（x86\_64 / aarch64）
+- **操作系统**：openEuler 26.09 或更高版本（x86\_64 / aarch64）
 - **运行依赖**：LMCache-Ascend 服务（作为 KV cache 后端，提供 HTTP 端点）
 - **算力底座**：昇腾 NPU（配套 CANN 驱动）
 
