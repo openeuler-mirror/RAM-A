@@ -386,6 +386,38 @@ restore_resp=$(curl -s -X POST "$DAEMON_URL/event" -H "Content-Type: application
 echo "$restore_resp" | jq -c '.' | sed 's/^/        /'
 assert_field "snapshot_restore after pinned close still works" \
     "$restore_resp" '.data.prefetch_count' '1'
+assert_field "snapshot_restore keeps pin (pinned=true)" \
+    "$restore_resp" '.data.pinned' 'true'
+
+# ─────────────────────────────────────────────────────────────
+# L1.6b suspended session must NOT reappear after daemon restart
+# ─────────────────────────────────────────────────────────────
+echo ""
+echo "=== L1.6b suspended session survives restart as dormant ==="
+emit "seed suspend-restart-s1 via turn_end" "true" \
+    '{"type":"turn_end","session_id":"suspend-restart-s1","kv_transfer_params":{"chunk_hashes":["sr-h1","sr-h2"]}}'
+emit "suspend suspend-restart-s1 (pin + release memory)" "true" \
+    '{"type":"session_suspend","session_id":"suspend-restart-s1"}'
+emit "session_map before restart must be empty (session is dormant)" "false" \
+    '{"type":"session_map","session_id":"suspend-restart-s1"}'
+echo "        --- restart daemon ---"
+kill "$DAEMON_PID" 2>/dev/null || true
+wait "$DAEMON_PID" 2>/dev/null || true
+sleep 0.5
+RAM_A_KV_CONFIG="$TEST_DIR/config.toml" "$DAEMON_BIN" > "$TEST_DIR/daemon-restart-suspend.log" 2>&1 &
+DAEMON_PID=$!
+sleep 1
+emit "session_map after restart must still be empty (dormant not rehydrated)" "false" \
+    '{"type":"session_map","session_id":"suspend-restart-s1"}'
+sr_restore_resp=$(curl -s -X POST "$DAEMON_URL/event" -H "Content-Type: application/json" \
+    -d '{"type":"snapshot_restore","session_id":"suspend-restart-s1"}')
+echo "$sr_restore_resp" | jq -c '.' | sed 's/^/        /'
+assert_field "snapshot_restore after restart prefetch_count=2" \
+    "$sr_restore_resp" '.data.prefetch_count' '2'
+assert_field "snapshot_restore keeps pin after restart (pinned=true)" \
+    "$sr_restore_resp" '.data.pinned' 'true'
+emit "session_map after restore must now be present" "true" \
+    '{"type":"session_map","session_id":"suspend-restart-s1"}'
 
 # ─────────────────────────────────────────────────────────────
 # L1.7 edge cases and error handling (cases isolated: each uses its own session_id)
@@ -604,12 +636,11 @@ fi
 # ─────────────────────────────────────────────────────────────
 echo ""
 echo "=== L1.10 cleanup ==="
-emit "session_close basic-s1 (suspended+pinned in L1.6)" "true" \
+emit "session_close basic-s1 (pinned in L1.6; row will survive close)" "true" \
     '{"type":"session_close","session_id":"basic-s1"}'
 emit "session_close persist-s1" "true" \
     '{"type":"session_close","session_id":"persist-s1"}'
-# dup-restore-s1 was pinned in L1.7c; its row survived the L1.7e restart and was
-# re-loaded into memory, so close it here.
+# dup-restore-s1 was never suspended, so it is not pinned; close deletes its row.
 emit "session_close dup-restore-s1" "true" \
     '{"type":"session_close","session_id":"dup-restore-s1"}'
 emit "session_close refcount-s2" "true" \
@@ -618,21 +649,24 @@ emit "session_close debug-s1" "true" \
     '{"type":"session_close","session_id":"debug-s1"}'
 emit "session_close debug-empty" "true" \
     '{"type":"session_close","session_id":"debug-empty"}'
+emit "session_close suspend-restart-s1 (restored in L1.6b, still pinned)" "true" \
+    '{"type":"session_close","session_id":"suspend-restart-s1"}'
 
-# Pinned sessions keep their SQLite row across session_close by design:
-#   basic-s1, dup-restore-s1, persist-s1. Every unpinned session must be gone.
+# After cleanup, pinned sessions keep their SQLite row (basic-s1 pinned in
+# L1.6, suspend-restart-s1 pinned in L1.6b; snapshot_restore does NOT unpin so
+# the pin survives and close keeps the row). Every unpinned session is gone.
 if [ "$SQLITE_ENABLED" = "1" ]; then
-echo "        SQLite sessions table after cleanup (pinned rows remain by design):"
+echo "        SQLite sessions table after cleanup (only pinned rows remain):"
 sqlite3 "$TEST_DIR/sessions.db" "SELECT session_id FROM sessions ORDER BY session_id;" \
     | sed 's/^/        /'
 remaining=$(sqlite3 "$TEST_DIR/sessions.db" \
     "SELECT group_concat(session_id, ',') FROM (SELECT session_id FROM sessions ORDER BY session_id);")
-if [ "$remaining" = "basic-s1,dup-restore-s1,persist-s1" ]; then
+if [ "$remaining" = "basic-s1,suspend-restart-s1" ]; then
     echo "  [PASS] only pinned sessions remain in SQLite"
     PASS=$((PASS + 1))
 else
     echo "  [FAIL] unexpected remaining rows: $remaining"
-    echo "        expected: basic-s1,dup-restore-s1,persist-s1"
+    echo "        expected: basic-s1,suspend-restart-s1"
     FAIL=$((FAIL + 1))
 fi
 else
