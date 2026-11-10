@@ -402,7 +402,7 @@ def cache_hashes_from_response(_context, response):
         if transfer is not None:
             if not isinstance(transfer, Mapping):
                 raise ValueError("kv_transfer_params must be an object")
-            return transfer.get("ucm_block_ids")
+            return transfer.get("hash_keys")
     return None
 
 
