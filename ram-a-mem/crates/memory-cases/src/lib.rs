@@ -139,50 +139,166 @@ pub async fn import_documents_from_dir(
         .map(|document| document.name)
         .collect::<std::collections::HashSet<_>>();
     let mut imported = 0usize;
-    let mut entries = std::fs::read_dir(source_dir)
-        .with_context(|| {
-            format!(
-                "failed to read case library source_dir {}",
-                source_dir.display()
-            )
-        })?
-        .collect::<Result<Vec<_>, std::io::Error>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
-
-    for entry in entries {
-        let path = entry.path();
-        if !path.is_file() || !is_supported_document(&path) {
+    for source_document in source_documents_from_dir(source_dir)? {
+        if existing_names.contains(&source_document.name) {
             continue;
         }
-        let file_name = path
+        let file_name = source_document
+            .path
             .file_name()
             .and_then(|name| name.to_str())
-            .with_context(|| format!("case document path is not valid UTF-8: {}", path.display()))?
+            .with_context(|| {
+                format!(
+                    "case document path is not valid UTF-8: {}",
+                    source_document.path.display()
+                )
+            })?
             .to_string();
-        if existing_names.contains(&file_name) {
-            continue;
-        }
-        let bytes = tokio::fs::read(&path)
+        let bytes = tokio::fs::read(&source_document.path)
             .await
-            .with_context(|| format!("failed to read case document {}", path.display()))?;
+            .with_context(|| {
+                format!(
+                    "failed to read case document {}",
+                    source_document.path.display()
+                )
+            })?;
         service
             .create_document(
                 dataset_id,
                 CreateDocumentFileRequest {
                     id: None,
                     task_id: None,
-                    name: file_name.clone(),
-                    file_name: file_name.clone(),
-                    mime_type: mime_type_for_file(&path).map(str::to_string),
+                    name: source_document.name,
+                    file_name,
+                    mime_type: mime_type_for_file(&source_document.path).map(str::to_string),
                     bytes,
                 },
             )
             .await
-            .with_context(|| format!("failed to create case document {}", path.display()))?;
+            .with_context(|| {
+                format!(
+                    "failed to create case document {}",
+                    source_document.path.display()
+                )
+            })?;
         imported = imported.saturating_add(1);
     }
 
     Ok(imported)
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SourceDocument {
+    path: PathBuf,
+    name: String,
+}
+
+fn source_documents_from_dir(source_dir: &Path) -> Result<Vec<SourceDocument>> {
+    source_documents_from_dir_with_reader(source_dir, |directory| std::fs::read_dir(directory))
+}
+
+fn source_documents_from_dir_with_reader<I>(
+    source_dir: &Path,
+    mut read_dir: impl FnMut(&Path) -> std::io::Result<I>,
+) -> Result<Vec<SourceDocument>>
+where
+    I: Iterator<Item = std::io::Result<std::fs::DirEntry>>,
+{
+    let mut documents = Vec::new();
+    let mut pending_directories = vec![source_dir.to_path_buf()];
+
+    while let Some(directory) = pending_directories.pop() {
+        let entries = match read_dir(&directory)
+            .and_then(|entries| entries.collect::<std::io::Result<Vec<_>>>())
+        {
+            Ok(entries) => entries,
+            Err(error) if directory == source_dir => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to read case library directory {}",
+                        directory.display()
+                    )
+                });
+            }
+            Err(error) => {
+                tracing::warn!(
+                    event = "ram_a.case.ingestion.degraded",
+                    stage = "source_scan",
+                    action = "skip_directory",
+                    directory = %directory.display(),
+                    error_kind = ?error.kind(),
+                    error = %error
+                );
+                continue;
+            }
+        };
+
+        for entry in entries {
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    tracing::warn!(
+                        event = "ram_a.case.ingestion.degraded",
+                        stage = "source_scan",
+                        action = "skip_entry",
+                        path = %path.display(),
+                        error_kind = ?error.kind(),
+                        error = %error
+                    );
+                    continue;
+                }
+            };
+            if file_type.is_dir() {
+                pending_directories.push(path);
+                continue;
+            }
+            if !file_type.is_file() || !is_supported_document(&path) {
+                continue;
+            }
+
+            let relative_path = path.strip_prefix(source_dir).with_context(|| {
+                format!(
+                    "case document {} is outside source_dir {}",
+                    path.display(),
+                    source_dir.display()
+                )
+            })?;
+            let name = relative_document_name(relative_path)?;
+            documents.push(SourceDocument { path, name });
+        }
+    }
+
+    documents.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(documents)
+}
+
+fn relative_document_name(relative_path: &Path) -> Result<String> {
+    let mut components = Vec::new();
+    for component in relative_path.components() {
+        let std::path::Component::Normal(component) = component else {
+            anyhow::bail!(
+                "case document relative path contains an unsupported component: {}",
+                relative_path.display()
+            );
+        };
+        components.push(
+            component
+                .to_str()
+                .with_context(|| {
+                    format!(
+                        "case document relative path is not valid UTF-8: {}",
+                        relative_path.display()
+                    )
+                })?
+                .to_string(),
+        );
+    }
+    anyhow::ensure!(
+        !components.is_empty(),
+        "case document relative path must not be empty"
+    );
+    Ok(components.join("/"))
 }
 
 fn ensure_dataset(service: &RagService, dataset_id: &str) -> Result<()> {
@@ -284,5 +400,227 @@ fn mime_type_for_file(path: &Path) -> Option<&'static str> {
         "md" | "markdown" | "mdx" => Some("text/markdown"),
         "txt" | "text" | "log" => Some("text/plain"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::fs;
+    use std::io;
+    use std::path::Path;
+
+    use tempfile::TempDir;
+
+    use super::{
+        build_service, import_documents_from_dir, source_documents_from_dir,
+        source_documents_from_dir_with_reader, CaseServiceOptions, EmbeddingProviderKind,
+    };
+
+    fn write_source_file(source_dir: &Path, relative_path: &str, contents: &str) {
+        let path = source_dir.join(relative_path);
+        fs::create_dir_all(path.parent().expect("source file parent"))
+            .expect("create source directory");
+        fs::write(path, contents).expect("write source file");
+    }
+
+    fn source_document_names(source_dir: &Path) -> Vec<String> {
+        source_documents_from_dir(source_dir)
+            .expect("scan source documents")
+            .into_iter()
+            .map(|document| document.name)
+            .collect()
+    }
+
+    fn test_service(temp: &TempDir) -> std::sync::Arc<crate::service::RagService> {
+        build_service(&CaseServiceOptions {
+            rag_store: temp.path().join("cases.sqlite"),
+            memory_store: temp.path().join("case-index.sqlite"),
+            embedding_provider: EmbeddingProviderKind::Hash,
+            embedding_api_key_env: "UNUSED_CASE_EMBEDDING_KEY".to_string(),
+            embedding_base_url: "http://127.0.0.1:1/v1".to_string(),
+            embedding_model: "hash".to_string(),
+            embedding_dimensions: 32,
+            chunk_size: 32,
+            summary_llm_model: None,
+            summary_llm_api_key_env: "UNUSED_CASE_SUMMARY_KEY".to_string(),
+            summary_llm_base_url: "http://127.0.0.1:1/v1".to_string(),
+            summary_llm_timeout_ms: 1_000,
+        })
+        .expect("build case service")
+    }
+
+    #[test]
+    fn source_scan_keeps_same_file_names_from_different_directories() {
+        let temp = TempDir::new().expect("create temp directory");
+        let source_dir = temp.path().join("cases");
+        write_source_file(&source_dir, "network/incident.md", "network incident");
+        write_source_file(&source_dir, "storage/incident.md", "storage incident");
+
+        assert_eq!(
+            source_document_names(&source_dir),
+            vec!["network/incident.md", "storage/incident.md"]
+        );
+    }
+
+    #[test]
+    fn source_scan_recurses_into_nested_directories() {
+        let temp = TempDir::new().expect("create temp directory");
+        let source_dir = temp.path().join("cases");
+        write_source_file(
+            &source_dir,
+            "security/authentication/mfa/timeout.txt",
+            "nested case",
+        );
+
+        assert_eq!(
+            source_document_names(&source_dir),
+            vec!["security/authentication/mfa/timeout.txt"]
+        );
+    }
+
+    #[test]
+    fn source_scan_skips_unsupported_file_types() {
+        let temp = TempDir::new().expect("create temp directory");
+        let source_dir = temp.path().join("cases");
+        write_source_file(&source_dir, "supported/case.log", "supported case");
+        write_source_file(&source_dir, "unsupported/case.json", "{}");
+        write_source_file(&source_dir, "unsupported/screenshot.png", "not an image");
+
+        assert_eq!(
+            source_document_names(&source_dir),
+            vec!["supported/case.log"]
+        );
+    }
+
+    #[test]
+    fn source_scan_skips_unreadable_or_disappearing_subdirectories() {
+        for error_kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::NotFound] {
+            let temp = TempDir::new().expect("create temp directory");
+            let source_dir = temp.path().join("cases");
+            write_source_file(&source_dir, "root.md", "root case");
+            write_source_file(&source_dir, "readable/nested/case.txt", "readable case");
+            let unavailable_dir = source_dir.join("unavailable");
+            fs::create_dir(&unavailable_dir).expect("create unavailable directory");
+            let mut encountered_failure = false;
+
+            let documents = source_documents_from_dir_with_reader(&source_dir, |directory| {
+                if directory == unavailable_dir {
+                    encountered_failure = true;
+                    if error_kind == io::ErrorKind::NotFound {
+                        fs::remove_dir(directory).expect("remove directory during scan");
+                    } else {
+                        // chmod(000) is still readable by root, so inject EACCES directly.
+                        return Err(io::Error::from(error_kind));
+                    }
+                }
+                fs::read_dir(directory)
+            })
+            .expect("skip the unavailable subtree and continue scanning");
+
+            assert!(encountered_failure, "the failing directory must be visited");
+            let names = documents
+                .into_iter()
+                .map(|document| document.name)
+                .collect::<Vec<_>>();
+            assert_eq!(names, vec!["readable/nested/case.txt", "root.md"]);
+        }
+    }
+
+    #[test]
+    fn source_scan_skips_subdirectories_with_entry_enumeration_errors() {
+        let temp = TempDir::new().expect("create temp directory");
+        let source_dir = temp.path().join("cases");
+        write_source_file(&source_dir, "readable/case.md", "readable case");
+        write_source_file(&source_dir, "interrupted/partial.md", "partial case");
+        let interrupted_dir = source_dir.join("interrupted");
+        let mut encountered_failure = false;
+
+        let documents = source_documents_from_dir_with_reader(&source_dir, |directory| {
+            let mut entries = fs::read_dir(directory)?.collect::<Vec<_>>();
+            if directory == interrupted_dir {
+                encountered_failure = true;
+                entries.push(Err(io::Error::from(io::ErrorKind::PermissionDenied)));
+            }
+            Ok(entries.into_iter())
+        })
+        .expect("skip a partially enumerated subtree and continue scanning");
+
+        assert!(encountered_failure, "the failing directory must be visited");
+        let names = documents
+            .into_iter()
+            .map(|document| document.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["readable/case.md"]);
+    }
+
+    #[test]
+    fn source_scan_preserves_root_directory_errors() {
+        let temp = TempDir::new().expect("create temp directory");
+        let missing_dir = temp.path().join("missing");
+        let error = source_documents_from_dir(&missing_dir).expect_err("root must be readable");
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(error.to_string().contains(&missing_dir.display().to_string()));
+
+        let source_dir = temp.path().join("cases");
+        write_source_file(&source_dir, "case.md", "root case");
+        let error = source_documents_from_dir_with_reader(&source_dir, |_| {
+            Err::<fs::ReadDir, _>(io::Error::from(io::ErrorKind::PermissionDenied))
+        })
+        .expect_err("root open errors must not become successful empty scans");
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        let error = source_documents_from_dir_with_reader(&source_dir, |directory| {
+            let mut entries = fs::read_dir(directory)?.collect::<Vec<_>>();
+            entries.push(Err(io::Error::from(io::ErrorKind::PermissionDenied)));
+            Ok(entries.into_iter())
+        })
+        .expect_err("root enumeration errors must not become successful empty scans");
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_import_uses_relative_names_and_is_idempotent() {
+        let temp = TempDir::new().expect("create temp directory");
+        let source_dir = temp.path().join("cases");
+        write_source_file(&source_dir, "network/incident.md", "network incident");
+        write_source_file(&source_dir, "storage/incident.md", "storage incident");
+        let service = test_service(&temp);
+
+        assert_eq!(
+            import_documents_from_dir(&service, "dataset-1", &source_dir)
+                .await
+                .expect("import source documents"),
+            2
+        );
+        let names = service
+            .list_documents("dataset-1")
+            .expect("list imported documents")
+            .documents
+            .into_iter()
+            .map(|document| document.name)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            names,
+            HashSet::from([
+                "network/incident.md".to_string(),
+                "storage/incident.md".to_string(),
+            ])
+        );
+        assert_eq!(
+            import_documents_from_dir(&service, "dataset-1", &source_dir)
+                .await
+                .expect("repeat source import"),
+            0
+        );
     }
 }
