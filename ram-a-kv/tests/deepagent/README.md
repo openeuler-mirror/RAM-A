@@ -371,6 +371,255 @@ STREAMING=1 SWEEP=131072 REPS=3 MIN_SIZE=131072 HUMAN_TOKEN_LIMIT=1000000 ./run_
 
 **一句话**:预取耗时 ≈ **635 ms** 被完全隐藏在模型调用 **1379.7 ms** 之内(准确地讲,藏在 FAWA 之前的 (A) 段里),故整轮收益 ≈ `Δ ≈ 0.42 s`,与 §8.1 实测一致。
 
+> 上面的窗口与「按 blocks 折算」均属推断;§8.3.5 改用引擎侧细粒度打点直接实测,实测预取窗口 ≈ 376–382 ms,结论方向一致、余量更大。
+
+#### 8.3.5 流程时延细粒度拆解(实测,n=3)
+
+§8.3.1–8.3.4 的分解建立在**四个锚点**(client / daemon / FAWA 日志 / UCM 聚合直方图)与**按 blocks 比例折算**之上:daemon 只记录 `turn_start` 与 `prefetch response` 两个时刻,引擎侧只有一条 `logger.info_once` 的 `FAWA` 日志,既没有逐请求、也没有逐 rank 的分段。为把「谁占了多少毫秒」从推断变为实测,在 UCM 侧加了可开关的阶段打点:设置 `UCM_STAGE_TRACE_FILE=<path>.jsonl` 即开启,未设置时**零开销**;引擎 9 个进程(1 个 EngineCore + 8 个 TP worker)各自 `O_APPEND` 写同一份 JSONL。
+
+**事件字典**
+
+| 事件 | 产生位置 | 关键字段 | 含义 |
+| --- | --- | --- | --- |
+| `prefetch_recv` | 各 TP worker 的预取 HTTP 服务 | `ts` / `rank` / `blocks` | 该 rank 收到 daemon 发来的 `/kv/prefetch` |
+| `prefetch_warm` | 同上 | `warm_ms` / `lock_wait_ms` | 该 rank 的 SSD→DDR 预热耗时,以及在 rank 内的排队等待 |
+| `prefetch_resp` | 同上 | `total_ms` | 该 rank 从 recv 到返回响应 |
+| `lookup` | 引擎 rank0(connector) | `age_ms` / `lookup_ms` / `ext_hit_blocks` / `hbm_hit_blocks` / `tokens` | `age_ms` = 请求**到达引擎**→connector 查表完成(含网关在途、排队与调度);`lookup_ms` 为查表本身 |
+| `load_submit` / `load_done` | 各 TP worker | `label`(FA/WA) / `blocks` / `wait_ms` / `ok` | DDR→HBM 的提交与等待 |
+| `req_finished` | 引擎 rank0 | `age_ms` / `tokens` | 请求结束;`age_ms` 为到达→结束总时长 |
+
+**口径**(容易踩的两个坑):
+
+- 8 个 TP rank **各自**上报 `load_done`,FA/WA 的加载在 rank 间**并行**,关键路径取各 rank 的**最大值**而非求和(求和会得到 8 倍的假象);
+- `lookup` 只由 rank0 产生(其余 rank 拿广播结果),故它不代表 8 rank 之和。
+
+**实测:128k 逐请求分段(三对 cold / prefetch,中位数 ms)**
+
+| 分段 | cold | prefetch | 差 |
+| --- | --- | --- | --- |
+| 整轮 `latency_s` | 1997.0 | 1594.1 | **−402.9**(1.253×) |
+| 模型调用 | 1953.2 | 1555.7 | **−397.5** |
+| 网关 + 在途(0 → 到达引擎) | 23.9 | 24.4 | +0.5 |
+| 到达 → lookup 完成 | 686.5 | 722.3 | +35.8 |
+| lookup 本身 | 11.5 | 9.7 | −1.8 |
+| **KV load(FA,8 rank 最大)** | **445.4** | **55.9** | **−389.5** |
+| KV load(WA) | 0.04 | 0.03 | ≈0 |
+| 尾段(预填充计算 + 解码 32 tok) | 795.3 | 728.0 | −67.3 |
+
+> 逐列为各自中位数,`尾段` 由每次 `模型调用 − 到达→lookup − lookup − load` 逐条算出后再取中位,故各列相加与整轮有 ~10 ms 级舍入差;`load` 取 8 rank 最大值。
+
+**一次 turn 的时间轴(取各档中位时延的那次,相对 `model_start`)**
+
+```text
+相对 model_start(ms)   0        24                         747  845              1556
+                       |         |                           |    |                 |
+[client] 模型调用       +----------- 1555.7 ms ------------------------------------+
+[engine] 到达引擎                  +                           |                    |
+         lookup 完成(722.3)                                    +                    |
+         KV load 55.9ms(DDR)                                        +               |
+         req_finished                                                       +1545.9 |
+[daemon] 预取 fanout    +== 381.5 ms (8 rank 并行, 1024 blocks/rank) ==>          |
+[UCM]    SSD ===> DDR   ^ 在 +384.7 ms 完成,比 lookup 完成早 362 ms                |
+```
+
+同一次对照的 `cold` 档:到达 +23.9 ms、lookup 完成 +710.4 ms、`KV load 427.1 ms` 结束于 +1175.6 ms、`req_finished` +1944.4 ms。两档在「到达 → lookup」段基本重合(710.4 vs 746.7 ms),差别集中在 `KV load` 之后的 +430 ms。
+
+**并行时间轴:推理请求 与 预取 fanout 怎么重叠(同一次 turn 实测)**
+
+先明确一点:预取**不是另一次推理请求**,而是 daemon 向 8 个 TP worker 的预取服务发起的 HTTP fanout,只做 **SSD→DDR**(`warm`),既不进调度队列、也不搬 HBM。推理请求此刻还在 `frontend` 进程里做 **chat 模板渲染 + 131k prompt 分词**(vLLM 的 `arrival_time` 打在渲染/分词**之前**,见 `vllm/renderers/base.py`)。两者的并行是**进程级**的:
+
+```text
+t (ms, 相对 model_start)   0     2        24                          747  781  845          1546
+                           |     |        |                            |    |    |             |
+client/middleware  ────────● 发模型请求
+daemon             ────────●─┐ 异步 fanout(不等响应)
+worker×8 (SSD→DDR) ──────────┴══ warm 381.1~381.7 ms ══╡ resp 383.9~384.5
+frontend (CPU)     ────────●(24)════ chat 模板 + 分词 131k ≈ 690 ms ════●(747)
+engine core        ───────────────────────────────────────────────────●(747)─●(781)─●(845)
+                                                                     lookup 9.7  submit  FA load 61.5
+engine core        ─────────────────────────────────────────────────────────────[ prefill 845→ + decode ]→1546
+                     ↑ 预取结束(384.5)到 lookup(746.8)之间有 362 ms 空窗:已预热完,纯排队
+```
+
+| 时间窗(ms) | 推理侧在做什么 | 预取侧在做什么 | 是否相互影响 |
+| --- | --- | --- | --- |
+| 0 – 24 | client → router → frontend,`arrival_time` 打点 | daemon 异步派发;8 个 rank 在 **1.9–2.4 ms** 内全部收到 | 否(不同进程) |
+| 24 – 385 | 模板渲染 + 分词 + 入 EngineCore 队列 | 8 rank 并行 `warm` 1024 blocks/rank,384.5 全部返回 | 否:`warm` 只占 **CPU + SSD 读 + /dev/shm 写**,此时 8 个 worker 无 batch |
+| 385 – 747 | 排队 / 首次调度(362 ms 空窗) | 已结束,DDR 中已有副本 | 否 |
+| 747 – 845 | `lookup` 9.7 ms → 提交 load → `FA load` 61.5 ms(DDR→HBM) | 已结束 | 是:`load` 直接读刚才预热好的 DDR 副本 |
+| 845 – 1546 | 分块预填充计算 + 解码 32 tok | — | — |
+
+8 个 rank 的预取时序(同一次 turn):
+
+| rank | recv(ms) | warm(ms) | resp(ms) |
+| --- | --- | --- | --- |
+| 0 | 1.87 | 381.7 | 384.1 |
+| 1 | 2.24 | 381.7 | 384.5 |
+| 2 | 2.32 | 381.7 | 384.5 |
+| 3 | 2.20 | 381.7 | 384.5 |
+| 4 | 2.17 | 381.2 | 383.9 |
+| 5 | 2.41 | 381.1 | 384.1 |
+| 6 | 2.36 | 381.2 | 384.1 |
+| 7 | 2.25 | 381.4 | 384.1 |
+
+与之对照,`cold` 档同一请求:`lookup` 结束于 +710.4 ms,`FA load`(427.1 ms,SSD)结束于 +1175.6 ms —— 也就是说两档**唯一错开的就是 385→1176 ms 这一段**:预取档在这里只花 61.5 ms(DDR),冷档花 427.1 ms(SSD)。
+
+**为什么能藏住**:① daemon 异步派发,客户端不等 `turn_start` 的响应;② `warm` 与推理此时用的资源不重叠(SSD/DDR 写 vs CPU 分词);③ 真正需要 HBM 的 `load` 被排在 `lookup` 之后,而那时 `warm` 早已结束(362 ms 余量),不存在「边加载边等预热」。
+
+**代价与边界**:能藏住的前提是「到达 → lookup」窗口(本例 690 ms)长于 `warm`(≈382 ms)。若 prompt 更短、或引擎几乎不排队,该窗口可能缩到 100–200 ms,`warm` 就会露头,收益退化为 `Δ_load − 未隐藏部分`;若 8 个 worker 此刻正有 batch 在跑,`warm` 还会与推理抢 SSD/DDR 带宽。因此 §8.3.5 的 402.9 ms 是**长 prompt、近空载**下的最好情况。
+
+**预取 fanout(每次 turn_start 一次,8 个 rank 全部到达)**
+
+| 次 | blocks/rank | 到达 rank 数 | recv → 最晚 resp(ms) | warm min / med / max(ms) | lock_wait max(ms) |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 1024 | 8 | 377.3 | 375.2 / 376.1 / 376.9 | 0.005 |
+| 2 | 1024 | 8 | 382.6 | 381.2 / 381.5 / 381.9 | 0.005 |
+| 3 | 1024 | 8 | 382.7 | 381.1 / 381.5 / 381.7 | 0.005 |
+| 4 | 1024 | 8 | 372.3 | 371.0 / 371.3 / 371.6 | 0.004 |
+
+- 8 个 rank 的 `prefetch_recv` 在 **0.5 ms** 内齐到(说明 router 扇出本身近乎无耗时),`warm` 各 rank 差异 < 7 ms,`lock_wait` ≈ **0**(rank 内无排队);
+- `warm ≈ 376 ms` 对应 1024 blocks/rank(≈0.8 GB/rank),折算单 rank 带宽 ≈ 2.2 GB/s,8 rank 合计 ≈ 17.5 GB/s。
+
+**结论修正(相对 §8.3.4)**
+
+1. **预取窗口实测 ≈ 376–382 ms**,而不是按 blocks 折算的 635 ms;§8.3.4 里「635 ms 恰在 (A) 段内」的估算是**保守的**,实际余量更大。
+2. 预取在 **+384.7 ms** 完成,比 lookup 完成(**+746.7 ms**)早 **362 ms**,完全落在「前端模板渲染 / 分词 + 入队调度」窗口内(该窗口不含任何 KV 搬运);两档该段实测 686.5 vs 722.3 ms(diff 36 ms,与引擎抖动同量级),**证实预取不占关键路径**。
+3. **收益主体是 `KV load`**:FA 从 **445.4 ms(SSD)降到 55.9 ms(DDR)**,Δ ≈ **390 ms**,占模型调用省时(397.5 ms)的 **98%**。WA 只加载每个前缀边界的 tail(实测 **1 个 block**、0.03 ms),预取未覆盖 WA 也**无实质影响**——这也印证了 §8.3.4 对 FA/WA 的判断。
+4. **尾段差不稳定**(三次配对分别为 −94 / −68 / +5 ms):说明冷档除了在 `wait_load` 里等 SSD 之外,预填充流水线上只残留零到几十毫秒的抖动,不构成机制性差异;其余差额应计入引擎抖动而非预取副作用。
+5. 由 2、3 得单轮净收益 ≈ `Δ_KV_load − 0` ≈ **390 ms**,与整轮实测 **402.9 ms**(含 ~13 ms 客户端/middleware 抖动)一致。
+
+**复现**
+
+```bash
+# 1) 起引擎(容器内):UCM 指向打了点的副本,并打开 trace
+export PYTHONPATH=/home/xtc/ucm/unified-cache-management-analyze:$PYTHONPATH
+export UCM_STAGE_TRACE_FILE=/mnt/sdb/ucm/<dir>/ucm-stage-trace.jsonl
+UCM_CACHE_BUFFER_CAPACITY_GB=32 VLLM_MAX_MODEL_LEN=262144 ./start-tp8.sh up
+
+# 2) 128k 冷 / 预取各 3 次
+SWEEP=131072 REPS=3 MIN_SIZE=131072 HUMAN_TOKEN_LIMIT=1000000 FLUSH=1 \
+  VENV_PY=/opt/miniconda3/envs/ram-a-agent/bin/python \
+  DATA_DIR=$PWD/data/trace-131k ./run_deepagent_gain.sh
+
+# 3) 汇总:两档分段中位数 + 每次 fanout 的 8 rank 明细 + 逐请求表
+python3 benchmarks/stage_trace_report.py \
+  --trace /mnt/sdb/ucm/<dir>/ucm-stage-trace.jsonl \
+  --client data/trace-131k/results.jsonl
+```
+
+- 打点只改 Python(connector / 预取服务 / 报告脚本),重启引擎即生效,无需重编译 UCM;关闭只需不再导出 `UCM_STAGE_TRACE_FILE`。
+- 本例数据:`data/trace-131k/`(客户端 `results.jsonl`、`daemon.log`);JSONL 与汇总报告在 `/mnt/sdb/ucm/deepagent-trace-20261028-191059/`(`ucm-stage-trace.jsonl`、`report.md`)。trace 里还包含 flush 用的 16 条 250k 级请求(1959 blocks/rank),可作为「大 KV 量」的对照。
+- **局限**:n=3、单会话、单卡视角(TP8 全卡);`REPS` 越大越稳。分段中位为逐次配对后取中位,样本量小,毫秒级差异不宜过度解读。
+
+#### 8.3.6 引擎内实测:从 `t=0` 起的两条路径(前端/哈希/查表全打点)
+
+§8.3.5 给的是**中位数**和「拼图」;§8.3.6 的上一版只能把「chat 编码 / 分词 / 哈希 / IPC」标成**同机离线实测**,并把最后 ≈240 ms 记为「由总时长反推的残差」。本节把这几段也做成**引擎内打点**,用真实 TP8 引擎的一轮推理把离线值与残差全部替换掉。
+
+**打点装置**(三处,全部默认零开销,只有导出 `UCM_STAGE_TRACE_FILE` 才落盘)
+
+| 事件 | 位置 | 语义 |
+| --- | --- | --- |
+| `render_txt` / `render_done` | `vllm/vllm/renderers/base.py` 的 `render_chat` / `render_chat_async` | `arrival_time` 起点、chat 编码 + 分词结束(带 `tokens`) |
+| `hash_start` / `hash_done` | `vllm/vllm/v1/engine/core.py` 的 `preprocess_add_request` | `Request.__init__` + block 链式哈希 前后 |
+| `lookup` / `load_submit` / `load_done` / `req_finished` / `prefetch_*` | `ucm/integration/vllm/stage_trace.py`(analyze 副本) | 连接器查表 / KV 加载 / 预取 |
+
+- 引擎:`归档/real-test/start-tp8.sh`,TP8/DP1,dies 4–11,`--block-size 32`,`--max-model-len 262144`,UCM DDR 32 GB,`--max-num-batched-tokens 10240`;
+- 模型 `DeepSeek-V4-Flash-0731-w8a8`,prompt 固定 **131092 token**(`SWEEP=131072` + 2817 token scaffold);
+- 打点原始文件:`/mnt/sdb/ucm/deepagent-trace-live2/stage-trace.jsonl`;客户端锚点:`data/trace-live5/results.jsonl`(n=3)与 `data/trace-live4/results.jsonl`(单 turn 表取自这一轮);
+- `t=0` 一律取**该档自己的客户端 `model_start_epoch`**,所以 `arrival` ≈ +25 ms(含网关与在途);
+- 下文「单 turn」列:同一行的分项相加**严格等于** `age_ms`,用于自洽展示;「n=3 中位」列:3 次重复各自取中位,列内**不同行相加不等于 `age`**(各差几 ms),用于看稳健性。
+
+**A. 预取路径(daemon → router → 8 个 TP worker 的预取服务)**
+
+请求 `chatcmpl-b922126858962eb3-9ace824c` 所属 turn 的预取侧事件,`t0 = 1793222602.750203`(比 `model_start` 晚 **+1.8 ms**:中间件先异步派发 turn_start,再去调模型)。
+
+| 阶段 | 单 turn t(ms) | n=3 中位(ms) | 打点 |
+| --- | --- | --- | --- |
+| 8 个 rank 收到预取请求 | 0.0(t0 = model_start +1.8) | t0 = +1.5 ~ +2.0 | `prefetch_recv` ×8 |
+| 各 rank 完成 SSD→DDR | **+374.9** | warm 结束 **+371.4**(warm_ms 中位 **371.8**,区间 370.7–373.7) | `prefetch_warm` ×8 |
+| 8 个 rank 返回响应 | **+375.3** | resp 结束 **+371.7** | `prefetch_resp` ×8 |
+
+预取整条路径 **≈375 ms**,其中 99.9% 是 8 rank 并行的 `warm`(1024 blocks/rank ≈ 0.79 GB/rank),扇出与回包各 <1 ms,`lock_wait` ≤0.005 ms(rank 内无排队)。与上一版(383 ms)一致。
+
+**B. 推理路径(单 turn,cold / prefetch 并列,t=0 为各自 `model_start`)**
+
+| 阶段 | prefetch t(ms) | cold t(ms) | 打点 |
+| --- | --- | --- | --- |
+| 到达引擎(`arrival_time`) | **+25.2** | **+23.6** | `render_txt` |
+| chat 编码 + 分词完成 | **+544.1** | **+503.3** | `render_done` |
+| 进入 EngineCore(开始构造 `Request` + 哈希) | +558.1 | +518.4 | `hash_start` |
+| 4096 块哈希完成 | +726.9 | +689.0 | `hash_done` |
+| `lookup` 完成(connector 查表返回) | **+747.9** | **+713.1** | `lookup` |
+| `load_submit`(8 rank 首个) | +784.8 | +753.6 | `load_submit` |
+| `FA load_done`(8 rank 最早) | **+867.3** | **+1169.7** | `load_done` |
+| `req_finished` | +1586.4 | +1960.6 | `req_finished` |
+| 客户端收到响应(`model_end`) | +1607.9 | +1984.5 | `results.jsonl` |
+
+**C. 「到达 → lookup」窗口拆解(替换上一版的离线值与 240 ms 残差)**
+
+| 子阶段 | cold 单 turn | prefetch 单 turn | n=3 中位 cold / prefetch | 口径 |
+| --- | --- | --- | --- | --- |
+| 到达 → `render_done`:chat 编码 + 分词(131092 tok) | **479.7 ms** | **518.9 ms** | **506.5 / 553.4 ms** | 引擎内 |
+| `render_done` → `hash_start`:前端序列化 + ZMQ `ipc://` + 输入线程入队 | 15.1 ms | 14.0 ms | 14.6 / 14.0 ms | 引擎内 |
+| `hash_start` → `hash_done`:`Request.__init__` + 4096 块链式 `tuple+pickle+sha256` | **170.6 ms** | **168.8 ms** | **168.7 / 167.8 ms** | 引擎内 |
+| `hash_done` → `lookup`:本地前缀查找 + 调度步进 + UCM 查表 | 24.1 ms | 21.1 ms | 21.4 / 18.9 ms | 引擎内 |
+| 其中 UCM 外部查表 `lookup_ms` | 13.0 ms | 11.6 ms | 13.1 / 12.0 ms | 引擎内 |
+| **合计 到达 → `lookup`(`age_ms`)** | **689.4 ms** | **722.7 ms** | **711.5 / 756.0 ms** | 引擎内 |
+
+旧版的「≈240 ms 反推残差」到这里被拆成两段实测量:**哈希 168.7 ms + 入队/查表 21.4 ms**。同时暴露出一个反直觉事实:同机离线基准测的「4096 块哈希 = 11.0 ms」**低了 15 倍** —— 离线基准是空载独立进程,引擎内该线程要跟引擎步进线程、8 个 worker 抢 CPU,单块成本从 2.7 µs 涨到 41 µs。这也印证了「离线基准只能量级参考,不能用于线上定量」。
+
+**D. `lookup` 之后的阶段**
+
+| 区间 | cold 单 turn | prefetch 单 turn | n=3 中位 cold / prefetch |
+| --- | --- | --- | --- |
+| `lookup` → `load_submit` | 40.6 ms | 36.9 ms | 35.6 / 37.0 ms |
+| `load_submit` → FA 完成(8 rank 最早) | **416.1 ms** | **82.5 ms** | **417.5 / 81.8 ms** |
+| FA 完成 → `req_finished`(prefill 131k + decode 32) | 790.9 ms | 719.1 ms | 725.0 / 716.0 ms |
+| 模型全程(`model_latency`) | **1972.5 ms** | **1596.1 ms** | **1923.1 / 1626.9 ms** |
+| 整轮(`turn`) | 2016.8 ms | 1645.6 ms | 1968.2 / 1673.5 ms |
+
+**E. 合并时间轴(t=0 起;`cold / prefetch` 并列)**
+
+```text
+t(ms)     0      25        503/544     689/727   713/748  754/785     867/1170        1586/1961 1608/1985
+          |       |            |           |         |        |            |                |        |
+client    ●──────────────────────────────────────────────────────────────────────────────────────────────●
+daemon    ●─┐ turn_start 异步派发(+1.8)
+worker×8    └══ warm 370.7~373.7 ══╡ resp 375.3       ← 预取在 +375 就干完了,后面全被藏住
+engine    ──● 到达(+25)─ 分词(480/519) ─ 入队(15/14) ─ hash(171/169) ─ 查表(24/21) ─●(713/748)─●(754/785)
+                                                                                        │
+cold      ───────────────────────────────────────────────────── FA 416 ← SSD ──────────●(1170)── prefill+decode 791 ──●(1961)
+prefetch  ───────────────────────────────────────────────────── FA  82 ← DDR ──────────●( 867)── prefill+decode 719 ──●(1586)
+                                                                      ↑
+                                                        两档唯一实质差异:416 → 82 ms(Δ334)
+```
+
+**关键读数**
+
+1. **分词仍是第一大户**:n=3 中位 506.5 ms(cold),占「到达 → lookup」窗口 711.5 ms 的 **71%**;哈希第二 168.7 ms(**24%**);两者合计 **95%**,UCM 查表只有 12–13 ms(1.7%)。
+2. **旧版的「240 ms 残差」实测就是 block 哈希**:引擎内 `Request.__init__` + 4096 块链式哈希 **168.7 ms**,另有入队/IPC 14.6 ms、查表与调度 21.4 ms。
+3. **预取会轻微拖慢分词**:同一次运行里 prefetch 档分词中位 553.4 ms,比 cold 档 506.5 ms 长 **46.9 ms(+9.3%)**;3 轮区间(cold 486–568、prefetch 549–565)有重叠,只能定性为「疑似 CPU/内存带宽争抢」,量级 ≤50 ms。
+4. **收益口径要对齐到端到端**:FA 加载 `417.5 → 81.8 ms`(Δ **335.7 ms**),但端到端 `model` 只省 `1923.1 → 1626.9 = 296.2 ms`;差的 ≈40 ms 正好被第 3 条的分词变慢吃掉。**只看 FA 段会高估 13%。**
+5. **预取依旧完全被隐藏**:预取在 +375 ms 完成,引擎 +748 ms 才查完表、+785 ms 才发起 KV 加载,**余量 410 ms**,一次都没被等过。
+6. 两档窗口差 44.5 ms(711.5 vs 756.0),几乎全部来自分词抖动(506.5 vs 553.4),与 KV 冷热无关 —— 与上一版结论一致。
+7. **踩坑提醒**:`HUMAN_TOKEN_LIMIT` 默认 0(中间件按 50000 淘汰),131k 的 human 消息会被替换成文件引用,实测请求只剩 **3156 token**,跑出来「收益 1.003×」。测 >45k 必须显式 `HUMAN_TOKEN_LIMIT=200000`。
+
+**局限**
+
+- 两档是**不同 turn**,不是同一请求的 A/B;每档重复 3 次取中位,单 turn 表只用于「分项相加 = age」的自洽展示。
+- 打点是每次一条 `os.write`(实测 <0.1 ms/事件),对结论无影响;`render_*` 与 `hash_*` 两处新增打点目前只在本机 vllm 源码与 UCM analyze 副本里,未进主干,复现时需带上这两处改动。
+- 宿主机 dies 0–3 被其他租户占用(本次只用 4–11),绝对时延会随邻居负载波动,但**同一次运行内**的 A/B 对比不受影响。
+- 复现命令(容器内):
+
+```bash
+UCM_STAGE_TRACE_FILE=/mnt/sdb/ucm/trace/stage-trace.jsonl \
+PYTHONPATH=/home/xtc/ucm/unified-cache-management-analyze \
+ASCEND_VISIBLE_CARDS=4,5,6,7,8,9,10,11 VLLM_GPU_MEM_UTIL=0.9 VLLM_MAX_MODEL_LEN=262144 \
+UCM_CACHE_BUFFER_CAPACITY_GB=32 ./start-tp8.sh up && ./start-tp8.sh ready
+
+HUMAN_TOKEN_LIMIT=200000 SWEEP=131072 REPS=3 ./run_deepagent_gain.sh
+```
+
 ### 8.4 流式(SSE)下的一致性(128k,交叉验证)
 
 §8.1–§8.3 为非流式(默认)。流式下引擎把 `kv_transfer_params` 附在**最后一个 SSE chunk**,而 LangChain 的 chunk 转换默认丢弃该顶层字段;中间件模型适配层(`_KvResponseChatOpenAI`)在 chunk 转换时予以保留,故 `turn_end` 仍能上报 `chunk_hashes`、预取照常生效。以 128k 复测(`STREAMING=1 SWEEP=131072 REPS=3 FLUSH=1`,原始数据 `data/streaming/`):
