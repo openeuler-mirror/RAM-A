@@ -66,16 +66,12 @@ impl EventHandler for SnapshotRestoreHandler {
             Err(e) => return EventResult::Err(e.to_string()),
         };
 
-        // Fallback pin: covers the case where the daemon was offline while the
-        // snapshot was saved and the suspend-time pin never landed.
-        ctx.session_store.pin_session(&session_id);
-
         EventResult::Ok(json!({
             "prefetch_sent": outcome.prefetch_sent,
             "prefetch_count": chunk_count,
             "backend_degraded": outcome.backend_degraded,
             "evicted_count": outcome.evicted_count,
-            "pinned": true,
+            "pinned": ctx.session_store.is_pinned(&session_id),
         }))
     }
 }

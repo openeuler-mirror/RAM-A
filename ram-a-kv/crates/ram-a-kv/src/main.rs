@@ -172,7 +172,14 @@ async fn main() {
         });
 
     // Rehydrate every persisted session so state survives daemon restarts.
+    // Skip pinned sessions: a pin means the session was suspended (released
+    // from memory on purpose) and must stay dormant until snapshot_restore
+    // explicitly reactivates it.
     for session_id in session_store.list_all() {
+        if session_store.is_pinned(&session_id) {
+            tracing::info!(session_id = %session_id, "skipping pinned session on restart (dormant)");
+            continue;
+        }
         if let Some((map, turn_count)) = session_store.load(&session_id) {
             manager
                 .restore_session(
