@@ -1,0 +1,44 @@
+[package]
+name = "actrail-kv-analyzer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+actrail-kv-artifacts.workspace = true
+anyhow.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+same-file.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[[test]]
+name = "acceptance"
+path = "../../tests/integration/analyzer/acceptance/main.rs"
+
+[[test]]
+name = "case_fixtures"
+path = "../../tests/integration/analyzer/case_fixtures.rs"
+
+[[test]]
+name = "files"
+path = "../../tests/integration/analyzer/files.rs"
+
+[[test]]
+name = "properties"
+path = "../../tests/integration/analyzer/properties.rs"
+
+[[test]]
+name = "scale"
+path = "../../tests/integration/analyzer/scale.rs"
+
+[lints]
+workspace = true

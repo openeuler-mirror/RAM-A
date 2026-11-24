@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/artifacts",
+    "crates/storage",
+    "crates/receiver",
+    "crates/analyzer",
+    "crates/reporter",
+    "crates/cmd/receiver",
+    "crates/cmd/analyze",
+    "crates/cmd/export",
+    "crates/cmd/report",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MulanPSL-2.0"
+
+[workspace.dependencies]
+actrail-kv-artifacts = { path = "crates/artifacts" }
+actrail-kv-storage = { path = "crates/storage" }
+actrail-kv-receiver = { path = "crates/receiver" }
+actrail-kv-analyzer = { path = "crates/analyzer" }
+actrail-kv-reporter = { path = "crates/reporter" }
+anyhow = "1.0"
+axum = "0.8"
+clap = { version = "4.5", features = ["derive"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+hex = "0.4"
+proptest = "1.7"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+same-file = "1.0"
+sha2 = "0.10"
+tempfile = "3.20"
+thiserror = "2.0"
+time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde"] }
+tokio = { version = "1.47", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tower = { version = "0.5", features = ["util"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+rust_2018_idioms = { level = "deny", priority = -1 }
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"

@@ -56,6 +56,7 @@ ram-a-kv/                      # KV cache coordination workspace (semantic brain
     manager-core/              # backend manager abstraction (LMCache-Ascend adapter)
     ram-a-kv-sdk/              # Rust SDK
   openclaw-plugin/             # OpenClaw TypeScript plugin
+  actrail-kv/                  # Independent Cargo workspace for KV capture and analysis
   docs/                        # design docs and guides
 ```
 

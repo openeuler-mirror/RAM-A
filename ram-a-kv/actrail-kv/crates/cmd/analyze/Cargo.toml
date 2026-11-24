@@ -1,0 +1,19 @@
+[package]
+name = "actrail-kv-analyze"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "actrail-kv-analyze"
+path = "src/main.rs"
+
+[dependencies]
+actrail-kv-analyzer.workspace = true
+actrail-kv-storage.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

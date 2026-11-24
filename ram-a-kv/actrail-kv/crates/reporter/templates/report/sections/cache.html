@@ -1,0 +1,49 @@
+<h2>{{ cache.title }}</h2>
+<p class="muted">{{ cache.intro }}</p>
+<div class="pt-summary">
+  <div class="pt-metric"><b>{{ cache.request_count }}</b>{{ cache.requests_label }}</div>
+  <div class="pt-metric"><b>{{ cache.average }}</b>{{ cache.average_label }}</div>
+  <div class="pt-metric"><b>{{ cache.reported }}</b>{{ cache.reported_label }}</div>
+  <div class="pt-metric"><b>{{ cache.estimated }}</b>{{ cache.estimated_label }}</div>
+</div>
+<table class="pt-table">
+  <thead>
+    <tr>
+      <th>{{ cache.session_header }}</th>
+      <th>{{ cache.sequence_header }}</th>
+      <th>{{ cache.request_header }}</th>
+      <th>{{ cache.prompt_header }}</th>
+      <th>{{ cache.cached_header }}</th>
+      <th>{{ cache.miss_header }}</th>
+      <th>{{ cache.output_header }}</th>
+      <th>{{ cache.ttft_header }}</th>
+      <th>{{ cache.total_header }}</th>
+      <th>{{ cache.hit_rate_header }}</th>
+      <th>{{ cache.delta_header }}</th>
+      <th>{{ cache.basis_header }}</th>
+      <th>{{ cache.detail_header }}</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for group in cache.groups %}
+      <tr><td colspan="13" style="background:#f8f9f9"><strong>{{ cache.session_header }} {{ group.label }}</strong></td></tr>
+      {% for row in group.rows %}
+        <tr>
+          <td></td>
+          <td>{{ row.sequence }}</td>
+          <td><code>{{ row.request_id }}</code></td>
+          <td>{{ row.prompt }}</td>
+          <td>{{ row.cached }}</td>
+          <td>{{ row.miss }}</td>
+          <td>{{ row.output }}</td>
+          <td>{{ row.ttft }}</td>
+          <td>{{ row.total }}</td>
+          <td>{{ row.hit_rate }}</td>
+          <td>{{ row.delta }}</td>
+          <td>{{ row.basis }}</td>
+          <td>{{ row.detail }}</td>
+        </tr>
+      {% endfor %}
+    {% endfor %}
+  </tbody>
+</table>
