@@ -1,0 +1,85 @@
+<section id="prefix-tree">
+  <h2>{{ prefix_tree.title }}</h2>
+  <div class="pt-legend">
+    <div>{{ prefix_tree.stable_legend }}</div>
+    <div>{{ prefix_tree.dynamic_legend }}</div>
+    <div>{{ prefix_tree.defect_legend }}</div>
+    <div>{{ prefix_tree.support_legend }}</div>
+    <div>{{ prefix_tree.overview }}</div>
+  </div>
+  {% if prefix_tree.show_toc %}
+    <table class="pt-toc">
+      <thead>
+        <tr>
+          <th>{{ prefix_tree.template_header }}</th>
+          <th>{{ prefix_tree.members_header }}</th>
+          <th>{{ prefix_tree.stable_bytes_header }}</th>
+          <th>{{ prefix_tree.dynamic_nodes_header }}</th>
+          <th>{{ prefix_tree.defect_nodes_header }}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for summary in prefix_tree.toc %}
+          <tr>
+            <td><a href="#pt-{{ summary.id }}"><code>{{ summary.short_id }}…</code></a></td>
+            <td>{{ summary.members }}</td>
+            <td>{{ summary.stable_bytes }}</td>
+            <td>{{ summary.dynamic_nodes }}</td>
+            <td>{{ summary.defect_nodes }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+  {% for template in prefix_tree.templates %}
+    <div class="pt-section" id="pt-{{ template.anchor }}">
+      <div class="pt-head">
+        <h3>{{ prefix_tree.template_header }} {{ template.short_id }}…</h3>
+        <p class="pt-sub">{{ prefix_tree.full_id_label }} <code>{{ template.id }}</code></p>
+        <p class="pt-sub">{{ template.members_summary }}</p>
+      </div>
+      <div class="pt-stats">
+        {% for stat in template.stats %}
+          <div class="pt-stat"><span class="pt-stat-k">{{ stat.label }}</span><span class="pt-stat-v">{{ stat.value }}</span></div>
+        {% endfor %}
+      </div>
+      <h4 class="pt-h">{{ prefix_tree.distribution_title }}</h4>
+      <div class="pt-bar">
+        <i style="width:{{ template.stable_width }}%;background:#2c6fb0"></i>
+        <i style="width:{{ template.dynamic_width }}%;background:#e67e22"></i>
+      </div>
+      <p class="pt-note">{{ prefix_tree.stable_region_label }} <b>{{ template.stable_bytes }} B</b> ({{ template.stable_percent }}%) · {{ prefix_tree.dynamic_region_label }} <b>{{ template.dynamic_bytes }} B</b> ({{ template.dynamic_percent }}%) · {{ template.first_prefix }}</p>
+      {% if let Some(message) = template.first_divergence %}
+        <p class="pt-note">{{ message }}</p>
+      {% endif %}
+      {% if let Some(decay) = template.decay %}
+        <h4 class="pt-h">{{ prefix_tree.decay_title }}</h4>
+        <svg viewBox="0 0 640 190" style="width:100%;max-height:220px;background:#fff;border:1px solid #e0e3e5;border-radius:4px">
+          {% for line in decay.grid_lines %}
+            <line x1="24" y1="{{ line.y }}" x2="616" y2="{{ line.y }}" stroke="#eceff1"></line>
+            <text x="20" y="{{ line.label_y }}" text-anchor="end" font-size="9" fill="#95a5a6">{{ line.label }}</text>
+          {% endfor %}
+          {% for point in decay.points %}
+            <circle cx="{{ point.x }}" cy="{{ point.y }}" r="2.5" fill="{{ point.color }}"></circle>
+          {% endfor %}
+          <polyline points="{{ decay.polyline }}" fill="none" stroke="#5d6d7e" stroke-width="1.5"></polyline>
+          {% for tick in decay.ticks %}
+            <line x1="{{ tick.x }}" y1="{{ tick.y }}" x2="{{ tick.x }}" y2="150" stroke="#d5d8dc" stroke-dasharray="2 3"></line>
+            <text x="{{ tick.x }}" y="172" text-anchor="middle" font-size="9" fill="#626567">{{ tick.index }}</text>
+          {% endfor %}
+        </svg>
+        <p class="pt-note">{{ prefix_tree.decay_note }}</p>
+      {% endif %}
+      <h4 class="pt-h">{{ prefix_tree.structure_title }}</h4>
+      <p class="pt-note">{{ prefix_tree.overview }}</p>
+      <ol class="pt-nodes">
+        {% for node in template.nodes %}
+          {% include "report/sections/prefix-node.html" %}
+        {% endfor %}
+      </ol>
+      {% if let Some(message) = template.truncated %}
+        <p class="pt-note">{{ message }}</p>
+      {% endif %}
+    </div>
+  {% endfor %}
+</section>

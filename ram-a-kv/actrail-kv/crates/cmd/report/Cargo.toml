@@ -1,0 +1,17 @@
+[package]
+name = "actrail-kv-report"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "actrail-kv-report"
+path = "src/main.rs"
+
+[dependencies]
+actrail-kv-reporter.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+
+[lints]
+workspace = true

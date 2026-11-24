@@ -1,6 +1,6 @@
 # ram-a 对接 actrail-kv 使用指南
 
-> 适用：deepagents-middleware + actrail-kv（分支 `feat/kv-cache-metrics`）；版本以仓库最新为准
+> 适用：deepagents-middleware + actrail-kv
 > 功能：middleware 采集每次 LLM 调用的 **prompt_tokens / completion_tokens / ttft_ms / total_ms**，经 RAM-A daemon relay 转发到 actrail-kv，落盘后由 analyze/report 生成命中率看板（含 TTFT、总耗时列）。
 > 本文档所有命令块均可直接复制执行。
 
@@ -37,28 +37,26 @@ actrail-kv report ──▶ report.html（命中率看板）
 ## 2. 拉取代码
 
 ```bash
-# actrail-kv（分析 + 看板）
-git clone https://gitcode.com/yaozhenhe/actrail-kv.git
-cd actrail-kv
-git checkout feat/kv-cache-metrics
-cd ..
-
 # RAM-A（daemon relay + deepagents-middleware）
 git clone https://gitcode.com/openeuler/RAM-A.git
 ```
 
 ---
 
-## 3. 构建 actrail-kv（receiver / analyze / report）
+## 3. 安装 actrail-kv（receiver / analyze / report）
+
+这三个命令已在 `PATH` 上时，可跳过本节。从源码安装时，在 RAM-A 仓库根目录运行下面的命令。
 
 ```bash
-cd actrail-kv
-cargo build --release
-# 产物：
-#   target/release/actrail-kv-receiver
-#   target/release/actrail-kv-analyze
-#   target/release/actrail-kv-report
-cd ..
+cargo install --locked --path ram-a-kv/actrail-kv/crates/cmd/receiver
+cargo install --locked --path ram-a-kv/actrail-kv/crates/cmd/analyze
+cargo install --locked --path ram-a-kv/actrail-kv/crates/cmd/report
+```
+
+如果 Cargo 安装成功后仍找不到命令，可将 Cargo 默认的二进制目录加入 `PATH`。
+
+```bash
+export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
 ```
 
 ---
@@ -97,7 +95,7 @@ RAM_A_KV_CONFIG=daemon.toml ./RAM-A/ram-a-kv/target/release/ram-a-kv
 ## 5. 启动 actrail-kv receiver
 
 ```bash
-./actrail-kv/target/release/actrail-kv-receiver \
+actrail-kv-receiver \
   --listen 127.0.0.1:8087 \
   --output requests.ndjson
 ```
@@ -163,12 +161,12 @@ agent = create_deep_agent(...)        # 之后的每个模型调用自动被采�
 ## 7. 生成看板
 
 ```bash
-./actrail-kv/target/release/actrail-kv-analyze \
+actrail-kv-analyze \
   --input requests.ndjson \
   --output analysis.json \
   --top-k 20
 
-./actrail-kv/target/release/actrail-kv-report \
+actrail-kv-report \
   --input analysis.json \
   --output report.html
 ```
@@ -258,9 +256,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # 亦可单独覆盖 AKV_OUT_DIR；下方默认值仅示意，<checkout-root> 请按本机实际检出位置替换
 AKV_ROOT = os.environ.get("AKV_ROOT", "<checkout-root>")
 OUT_DIR = os.environ.get("AKV_OUT_DIR", os.path.join(AKV_ROOT, "actrail/ttft-total-e2e-verify"))
-RECEIVER = os.path.join(AKV_ROOT, "actrail-kv/target/release/actrail-kv-receiver")
-ANALYZE = os.path.join(AKV_ROOT, "actrail-kv/target/release/actrail-kv-analyze")
-REPORT = os.path.join(AKV_ROOT, "actrail-kv/target/release/actrail-kv-report")
+RECEIVER = "actrail-kv-receiver"
+ANALYZE = "actrail-kv-analyze"
+REPORT = "actrail-kv-report"
 DAEMON = os.path.join(AKV_ROOT, "RAM-A/ram-a-kv/target/release/ram-a-kv")
 
 MW_SRC = os.path.join(AKV_ROOT, "RAM-A/ram-a-kv/deepagents-middleware/src")

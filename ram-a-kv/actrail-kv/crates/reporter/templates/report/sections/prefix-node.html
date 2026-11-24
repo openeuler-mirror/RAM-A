@@ -1,0 +1,64 @@
+<li class="{{ node.class }}">
+  <details{% if node.open %} open{% endif %}>
+    <summary>
+      <span class="{{ node.badge_class }}">{{ node.kind_label }}</span>
+      <span class="pt-idx">#{{ node.index }}</span>
+      <span class="pt-excerpt">{{ node.excerpt }}</span>
+      <span class="pt-size">{{ node.bytes }} B</span>
+      <span class="pt-sup"><span class="pt-sup-bar"><i style="width:{{ node.percent }}%"></i></span>{{ node.support }}/{{ node.members }}</span>
+      {% if node.warning %}<span class="pt-warn">{{ prefix_tree.warning_badge }}</span>{% endif %}
+    </summary>
+    <div class="pt-body">
+      <table class="pt-fields">
+        <tr>
+          <th>{{ prefix_tree.source_label }}</th>
+          <td><code>{{ node.source_path }}</code>{% if let Some(role) = node.role %}<span class="pt-tag">{{ prefix_tree.role_label }}={{ role }}</span>{% endif %}</td>
+        </tr>
+        <tr>
+          <th>{{ prefix_tree.position_label }}</th>
+          <td><code>{{ node.position }}</code>{% if let Some(unit) = node.unit %}<span class="pt-tag">{{ prefix_tree.unit_label }} #{{ unit }}</span>{% endif %}</td>
+        </tr>
+        <tr><th>{{ prefix_tree.support_label }}</th><td>{{ node.support_value }}</td></tr>
+        <tr><th>{{ prefix_tree.summary_label }}</th><td><code>{{ node.summary }}</code></td></tr>
+        {% if !node.variants.is_empty() %}
+          <tr>
+            <th>{{ prefix_tree.variants_label }}</th>
+            <td>
+              <ul class="pt-varlist">
+                {% for variant in node.variants %}
+                  <li class="{{ variant.class }}"><code>{{ variant.label }}</code><em>{{ variant.count }}{% if let Some(zero) = variant.zero_label %}{{ zero }}{% endif %}</em></li>
+                {% endfor %}
+              </ul>
+            </td>
+          </tr>
+        {% endif %}
+        {% if !node.defect_ids.is_empty() %}
+          <tr>
+            <th>{{ prefix_tree.associated_defects_label }}</th>
+            <td>
+              {% for id in node.defect_ids %}<a href="#defect-{{ id }}"><code>{{ id }}</code></a>{% if !loop.last %}　{% endif %}{% endfor %}
+            </td>
+          </tr>
+        {% endif %}
+        {% if let Some(sample) = node.content_sample %}
+          <tr><th>{{ prefix_tree.content_sample_label }}</th><td><pre class="pt-sec">{{ sample }}</pre></td></tr>
+        {% endif %}
+        {% if node.show_members %}
+          <tr>
+            <th>{{ prefix_tree.member_label }}</th>
+            <td class="pt-members">
+              {{ prefix_tree.alive_label }} {{ node.alive_count }} / {{ node.all_count }}:
+              {% if node.alive_members.is_empty() %}—{% else %}
+                {% for id in node.alive_members %}<code>{{ id }}</code>{% if !loop.last %}{{ prefix_tree.member_separator }}{% endif %}{% endfor %}{% if node.alive_truncated %}…{% endif %}
+              {% endif %}
+              {% if !node.lost_members.is_empty() %}
+                <br>{{ prefix_tree.lost_label }} {{ node.lost_members.len() }}:
+                {% for id in node.lost_members %}<code>{{ id }}</code>{% if !loop.last %}{{ prefix_tree.member_separator }}{% endif %}{% endfor %}{% if node.lost_truncated %}…{% endif %}
+              {% endif %}
+            </td>
+          </tr>
+        {% endif %}
+      </table>
+    </div>
+  </details>
+</li>

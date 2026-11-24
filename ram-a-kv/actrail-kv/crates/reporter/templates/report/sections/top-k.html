@@ -1,0 +1,34 @@
+<section id="top-k">
+  <h2>{{ report.top_k.title }}</h2>
+  <p class="muted">{{ report.top_k.intro_before }}<code>top_k[]</code>{{ report.top_k.intro_after }}</p>
+  {% if let Some(empty) = report.top_k.empty %}
+    <p class="muted">{{ empty }}</p>
+  {% else %}
+    <table class="pt-table">
+      <thead>
+        <tr>
+          <th>{{ report.top_k.rank_header }}</th>
+          <th>{{ report.top_k.location_header }}</th>
+          <th>{{ report.top_k.blocked_header }}</th>
+          <th>{{ report.top_k.affected_header }}</th>
+          <th>{{ report.top_k.score_header }}</th>
+          <th>{{ report.top_k.advice_header }}</th>
+          <th>{{ report.top_k.defect_header }}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in report.top_k.rows %}
+          <tr>
+            <td>{{ row.rank }}</td>
+            <td><code>{{ row.location }}</code></td>
+            <td>{{ row.blocked }}</td>
+            <td>{{ row.affected }}</td>
+            <td>{{ row.score }}</td>
+            <td>{{ row.advice }}</td>
+            <td><a href="#defect-{{ row.defect_id }}"><code>{{ row.defect_id }}</code></a></td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</section>

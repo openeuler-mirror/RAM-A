@@ -1,0 +1,55 @@
+<section id="prefix-reuse">
+  <h2>{{ prefix_reuse.title }}</h2>
+  <p class="muted">{{ prefix_reuse.scope }}</p>
+  <div class="pr-scale">
+    <i class="pr-now" style="width:{{ prefix_reuse.current_width }}%"></i>
+    <i class="pr-gain" style="left:{{ prefix_reuse.gain_left }}%;width:{{ prefix_reuse.gain_width }}%"></i>
+    <i class="pr-new" style="left:{{ prefix_reuse.new_left }}%;width:{{ prefix_reuse.new_width }}%"></i>
+    <span class="pr-target" style="left:{{ prefix_reuse.target_left }}%"></span>
+  </div>
+  <div class="pr-legend">
+    <span><b>{{ prefix_reuse.current_label }}</b> {{ prefix_reuse.current_percent }}%</span>
+    <span><b>{{ prefix_reuse.upper_label }}</b> {{ prefix_reuse.upper_percent }}% ({{ prefix_reuse.known_recoverable_label }} {{ prefix_reuse.known_recoverable_kb }} KB)</span>
+    <span><b>{{ prefix_reuse.target_label }}</b> {{ prefix_reuse.target_percent }}%</span>
+  </div>
+  <p class="pr-note">{{ prefix_reuse.composition_title }}: {{ prefix_reuse.reusable_label }} {{ prefix_reuse.reusable_value }} · {{ prefix_reuse.recoverable_label }} {{ prefix_reuse.recoverable_value }} · {{ prefix_reuse.new_content_label }} {{ prefix_reuse.new_content_value }}</p>
+  <p class="pr-note">{{ prefix_reuse.composition_note }}</p>
+  <p class="pr-note">{{ prefix_reuse.status_note }}</p>
+  {% if let Some(cross_check) = prefix_reuse.cross_check %}
+    <h3>{{ cross_check.title }}</h3>
+    <p class="muted">{{ cross_check.intro }}</p>
+    {% if let Some(message) = cross_check.estimated_only %}
+      <p class="muted">{{ message }}</p>
+    {% endif %}
+    {% if let Some(message) = cross_check.other_estimated %}
+      <p class="muted">{{ message }}</p>
+    {% endif %}
+    {% if let Some(message) = cross_check.truncated %}
+      <p class="muted">{{ message }}</p>
+    {% endif %}
+    {% if !cross_check.rows.is_empty() %}
+      <table class="pt-table">
+        <thead>
+          <tr>
+            <th>{{ cross_check.session_header }}</th>
+            <th>{{ cross_check.structural_header }}</th>
+            <th>{{ cross_check.real_header }}</th>
+            <th>{{ cross_check.delta_header }}</th>
+            <th>{{ cross_check.coverage_header }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in cross_check.rows %}
+            <tr>
+              <td><code>{{ row.session }}</code></td>
+              <td>{{ row.structural }}</td>
+              <td>{{ row.real }}</td>
+              <td>{{ row.delta }}</td>
+              <td>{{ row.coverage }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% endif %}
+  {% endif %}
+</section>

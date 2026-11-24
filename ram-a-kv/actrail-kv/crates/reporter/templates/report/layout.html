@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="{{ report.lang }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+  <title>{{ report.title }}</title>
+  <style>
+{% include "report/styles.css" %}
+  </style>
+</head>
+<body>
+  <h1>{{ report.document_title }}</h1>
+  <p>{{ report.summary }}</p>
+  <p class="muted">{{ report.limitations }}</p>
+  {% if let Some(prefix_reuse) = report.prefix_reuse %}
+    {% include "report/sections/prefix-reuse.html" %}
+  {% endif %}
+  {% include "report/sections/top-k.html" %}
+  <h2>{{ report.defects.title }}</h2>
+  {% for defect in report.defects.items %}
+    {% include "report/sections/defect.html" %}
+  {% endfor %}
+  {% if let Some(session) = report.sessions %}
+    {% include "report/sections/session.html" %}
+  {% endif %}
+  {% if let Some(cache) = report.cache %}
+    {% include "report/sections/cache.html" %}
+  {% endif %}
+  {% if let Some(prefix_tree) = report.prefix_tree %}
+    {% include "report/sections/prefix-tree.html" %}
+  {% endif %}
+</body>
+</html>

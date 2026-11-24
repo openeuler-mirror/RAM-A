@@ -1,0 +1,191 @@
+<h2>{{ session.title }}</h2>
+<p class="muted">{{ session.intro }}</p>
+<div class="pt-summary">
+  {% for metric in session.metrics %}
+    <div class="pt-metric"><b>{{ metric.value }}</b>{{ metric.label }}</div>
+  {% endfor %}
+</div>
+<p class="muted">{{ session.note }}</p>
+<p class="muted">{{ session.endpoints_label }} <code>{{ session.endpoints }}</code> · {{ session.models_label }} <code>{{ session.models }}</code>{% if let Some(message) = session.common_prefix_note %} · {{ message }}{% endif %}</p>
+{% if let Some(message) = session.no_refresh %}
+  <p class="muted">{{ message }}</p>
+{% endif %}
+{% if let Some(table) = session.attention %}
+  <h3>{{ table.heading }}</h3>
+  <table class="pt-table">
+    <thead>
+      <tr>
+        <th>{{ session.labels.table_session }}</th>
+        <th>{{ session.labels.table_requests }}</th>
+        <th>{{ session.labels.table_refreshes }}</th>
+        <th>{{ session.labels.table_first_refresh }}</th>
+        <th>{{ session.labels.table_events }}</th>
+        <th>{{ session.labels.table_min_reuse }}</th>
+        <th>{{ session.labels.table_abandoned }}</th>
+        <th>{{ session.labels.table_current_ratio }}</th>
+        <th>{{ session.labels.table_trend }}</th>
+        {% if table.include_detail %}<th>{{ session.labels.detail }}</th>{% endif %}
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in table.rows %}
+        <tr class="{{ row.class }}">
+          <td><code>{{ row.session }}</code></td>
+          <td>{{ row.requests }}</td>
+          <td>{{ row.refreshes }}</td>
+          <td>{{ row.first_refresh }}</td>
+          <td>
+            {% if row.tags.is_empty() %}—{% else %}
+              {% for tag in row.tags %}<span class="sx-tag {{ tag.class }}">{{ tag.label }}×{{ tag.count }}</span>{% endfor %}
+            {% endif %}
+          </td>
+          <td>{{ row.minimum_reuse }}</td>
+          <td>{{ row.abandoned }} B</td>
+          <td><span class="sx-bar"><i style="width:{{ row.current_ratio }}%"></i></span>{{ row.current_ratio }}%</td>
+          <td>
+            {% if let Some(spark) = row.spark %}
+              <span class="sx-spark">{% for bar in spark.bars %}<i class="{{ bar.class }}" style="height:{{ bar.height }}%"></i>{% endfor %}</span><span class="sx-range">{{ spark.range }}</span>
+            {% else %}—{% endif %}
+          </td>
+          {% if table.include_detail %}
+            <td>
+              <details>
+                <summary>{{ session.labels.table_events }}</summary>
+                <table class="pt-table">
+                  <thead>
+                    <tr>
+                      <th>{{ session.labels.event_round }}</th>
+                      <th>{{ session.labels.event_type }}</th>
+                      <th>{{ session.labels.event_risk }}</th>
+                      <th>{{ session.labels.event_previous }}</th>
+                      <th>{{ session.labels.event_next }}</th>
+                      <th>{{ session.labels.event_structural_prefix }}</th>
+                      <th>{{ session.labels.event_retained_prefix }}</th>
+                      <th>{{ session.labels.event_reuse_ratio }}</th>
+                      <th>{{ session.labels.event_abandoned }}</th>
+                      <th>{{ session.labels.event_recomputed }}</th>
+                      <th>{{ session.labels.event_recoverable }}</th>
+                      <th>{{ session.labels.event_domain }}</th>
+                      <th>{{ session.labels.event_blocks }}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {% for event in row.events %}
+                      <tr>
+                        <td>{{ event.round }}</td>
+                        <td>{{ event.event_type }}</td>
+                        <td>{% if let Some(risk) = event.risk %}<span class="sx-tag sx-reset">{{ risk }}</span>{% else %}—{% endif %}</td>
+                        <td><code>{{ event.previous_request }}</code></td>
+                        <td><code>{{ event.next_request }}</code></td>
+                        <td>{{ event.structural_prefix }}</td>
+                        <td>{{ event.retained_prefix }}</td>
+                        <td>{{ event.reuse_ratio }}</td>
+                        <td>{{ event.abandoned }} B</td>
+                        <td>{{ event.recomputed }} B</td>
+                        <td>{{ event.recoverable }} B</td>
+                        <td>{{ event.domain }}</td>
+                        <td><code>{{ event.blocks }}</code></td>
+                      </tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </details>
+            </td>
+          {% endif %}
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+{% if let Some(table) = session.normal %}
+  {% if table.collapsed %}
+    <details class="sx-detail"><summary>{{ table.heading }}</summary>
+  {% else %}
+    <h3>{{ table.heading }}</h3>
+  {% endif %}
+  <table class="pt-table">
+    <thead>
+      <tr>
+        <th>{{ session.labels.table_session }}</th>
+        <th>{{ session.labels.table_requests }}</th>
+        <th>{{ session.labels.table_refreshes }}</th>
+        <th>{{ session.labels.table_first_refresh }}</th>
+        <th>{{ session.labels.table_events }}</th>
+        <th>{{ session.labels.table_min_reuse }}</th>
+        <th>{{ session.labels.table_abandoned }}</th>
+        <th>{{ session.labels.table_current_ratio }}</th>
+        <th>{{ session.labels.table_trend }}</th>
+        {% if table.include_detail %}<th>{{ session.labels.detail }}</th>{% endif %}
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in table.rows %}
+        <tr class="{{ row.class }}">
+          <td><code>{{ row.session }}</code></td>
+          <td>{{ row.requests }}</td>
+          <td>{{ row.refreshes }}</td>
+          <td>{{ row.first_refresh }}</td>
+          <td>
+            {% if row.tags.is_empty() %}—{% else %}
+              {% for tag in row.tags %}<span class="sx-tag {{ tag.class }}">{{ tag.label }}×{{ tag.count }}</span>{% endfor %}
+            {% endif %}
+          </td>
+          <td>{{ row.minimum_reuse }}</td>
+          <td>{{ row.abandoned }} B</td>
+          <td><span class="sx-bar"><i style="width:{{ row.current_ratio }}%"></i></span>{{ row.current_ratio }}%</td>
+          <td>
+            {% if let Some(spark) = row.spark %}
+              <span class="sx-spark">{% for bar in spark.bars %}<i class="{{ bar.class }}" style="height:{{ bar.height }}%"></i>{% endfor %}</span><span class="sx-range">{{ spark.range }}</span>
+            {% else %}—{% endif %}
+          </td>
+          {% if table.include_detail %}
+            <td>
+              <details>
+                <summary>{{ session.labels.table_events }}</summary>
+                <table class="pt-table">
+                  <thead>
+                    <tr>
+                      <th>{{ session.labels.event_round }}</th>
+                      <th>{{ session.labels.event_type }}</th>
+                      <th>{{ session.labels.event_risk }}</th>
+                      <th>{{ session.labels.event_previous }}</th>
+                      <th>{{ session.labels.event_next }}</th>
+                      <th>{{ session.labels.event_structural_prefix }}</th>
+                      <th>{{ session.labels.event_retained_prefix }}</th>
+                      <th>{{ session.labels.event_reuse_ratio }}</th>
+                      <th>{{ session.labels.event_abandoned }}</th>
+                      <th>{{ session.labels.event_recomputed }}</th>
+                      <th>{{ session.labels.event_recoverable }}</th>
+                      <th>{{ session.labels.event_domain }}</th>
+                      <th>{{ session.labels.event_blocks }}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {% for event in row.events %}
+                      <tr>
+                        <td>{{ event.round }}</td>
+                        <td>{{ event.event_type }}</td>
+                        <td>{% if let Some(risk) = event.risk %}<span class="sx-tag sx-reset">{{ risk }}</span>{% else %}—{% endif %}</td>
+                        <td><code>{{ event.previous_request }}</code></td>
+                        <td><code>{{ event.next_request }}</code></td>
+                        <td>{{ event.structural_prefix }}</td>
+                        <td>{{ event.retained_prefix }}</td>
+                        <td>{{ event.reuse_ratio }}</td>
+                        <td>{{ event.abandoned }} B</td>
+                        <td>{{ event.recomputed }} B</td>
+                        <td>{{ event.recoverable }} B</td>
+                        <td>{{ event.domain }}</td>
+                        <td><code>{{ event.blocks }}</code></td>
+                      </tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </details>
+            </td>
+          {% endif %}
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% if table.collapsed %}</details>{% endif %}
+{% endif %}

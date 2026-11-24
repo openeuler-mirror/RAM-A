@@ -1,0 +1,18 @@
+# 采集记录导出命令的构建和依赖配置。
+[package]
+name = "actrail-kv-export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+actrail-kv-storage.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,52 @@
+<section class="defect" id="defect-{{ defect.id }}">
+  <h3>{{ defect.id }}</h3>
+  <p class="muted"><a href="#top-k">{{ report.defects.labels.back_to_top_k }}</a></p>
+  <p><strong>{{ report.defects.labels.comparison_group }}</strong><code>window={{ defect.comparison.time_window }} endpoint={{ defect.comparison.endpoint }} model={{ defect.comparison.model }} schema={{ defect.comparison.schema }}</code></p>
+  {% for extra in defect.extras %}
+    <p><strong>{{ extra.label }}:</strong> <code>{{ extra.value }}</code></p>
+  {% endfor %}
+  <p class="sequence">{{ defect.p1_summary }}</p>
+  <h4>{{ report.defects.labels.variants_title }}</h4>
+  {% for variant in defect.variants %}
+    <div class="variant">
+      <strong>{{ variant.request_count }}</strong>; {{ variant.representative_label }} <code>{{ variant.request_id }}</code>; {{ variant.bytes }}
+      {% if !variant.locations.is_empty() %}
+        ; {{ report.defects.labels.location }}
+        {% for location in variant.locations %}
+          <code>{{ location }}</code>{% if !loop.last %}, {% endif %}
+        {% endfor %}
+      {% endif %}
+      {% match variant.excerpt %}
+        {% when Some with (excerpt) %}
+          <br><code>{{ excerpt }}</code>
+        {% when None %}
+          <br><em>{{ report.defects.labels.missing_variant }}</em>
+      {% endmatch %}
+    </div>
+  {% endfor %}
+  {% if !defect.facts.is_empty() %}
+    <h4>{{ report.defects.labels.facts_title }}</h4>
+    <ul>
+      {% for fact in defect.facts %}
+        <li>{{ fact.label }}{% if let Some(detail) = fact.detail %}：{{ detail }}{% endif %}</li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+  <h4>{{ report.defects.labels.p2_title }}</h4>
+  <p><code>{{ defect.p2_excerpt }}</code></p>
+  <table class="pt-table">
+    <tbody>
+      {% for row in defect.p2_rows %}
+        <tr><th>{{ row.label }}</th><td>{{ row.value }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% if !defect.insights.is_empty() %}
+    <h4>{{ report.defects.labels.insights_title }}</h4>
+    <ul>
+      {% for insight in defect.insights %}
+        <li><strong>{{ insight.summary }}</strong>{% if let Some(detail) = insight.detail %}：{{ detail }}{% endif %}</li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+</section>
