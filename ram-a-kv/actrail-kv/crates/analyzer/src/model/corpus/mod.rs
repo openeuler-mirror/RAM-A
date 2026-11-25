@@ -4,7 +4,7 @@ mod loader;
 mod selection;
 mod types;
 
-pub use loader::{CorpusLoadLimits, CorpusLoader, CorpusReadError};
+pub use loader::{CorpusConfig, CorpusLoader, CorpusReadError};
 pub use selection::{CaptureTimeRange, ReportSelection};
 pub use types::{
     AnalysisCorpus, CaptureComparison, CorpusLoadResult, CorpusRecord, CorpusSkip,

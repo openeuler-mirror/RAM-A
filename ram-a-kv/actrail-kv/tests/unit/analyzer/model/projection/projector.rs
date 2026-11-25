@@ -97,13 +97,11 @@ fn isolates_models_and_ignores_non_context_fields() {
 
 #[test]
 fn rejects_at_text_budget_plus_one_without_truncation() {
-    let projector = RequestProjector::new(
-        ProjectionLimits {
-            max_units: 512,
-            max_text_unit_bytes: 4,
-        },
-        3_600,
-    );
+    let projector = RequestProjector::new(ProjectionConfig {
+        max_units: 512,
+        max_text_unit_bytes: 4,
+        comparison_window_seconds: 3_600,
+    });
     let failure = projector
         .project(&record(
             json!({"model":"m", "messages":[{"role":"user", "content":"12345"}]}),
@@ -117,13 +115,11 @@ fn rejects_at_text_budget_plus_one_without_truncation() {
 
 #[test]
 fn rejects_unit_budget_during_projection() {
-    let projector = RequestProjector::new(
-        ProjectionLimits {
-            max_units: 3,
-            max_text_unit_bytes: 1_024,
-        },
-        3_600,
-    );
+    let projector = RequestProjector::new(ProjectionConfig {
+        max_units: 3,
+        max_text_unit_bytes: 1_024,
+        comparison_window_seconds: 3_600,
+    });
     let failure = projector
         .project(&record(json!({
             "model": "m",

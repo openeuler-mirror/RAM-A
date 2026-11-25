@@ -1,0 +1,23 @@
+[package]
+name = "actrail-kv-sdk-analyzer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "actrail_analyzer"
+crate-type = ["cdylib"]
+
+[dependencies]
+actrail-kv-sdk-runtime = { path = "../runtime" }
+actrail-kv-sdk-contracts = { path = "../contracts" }
+actrail-kv-analyzer.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+actrail-kv-storage.workspace = true
+analysis-contract.workspace = true
+config-contract.workspace = true
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

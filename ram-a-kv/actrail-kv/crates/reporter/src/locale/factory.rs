@@ -35,6 +35,12 @@ impl LocaleFactory {
             .map_err(|_| anyhow::anyhow!("locale registry lock is poisoned"))
     }
 
+    /// 创建实例级快照，不读写进程全局语言设置。
+    pub fn snapshot_for(locale: Locale) -> Result<LocaleSnapshot> {
+        super::registry::validate_catalogs()?;
+        Ok(LocaleSnapshot::new(locale))
+    }
+
     pub fn snapshot() -> Result<LocaleSnapshot> {
         Ok(LocaleSnapshot::new(Self::current()?))
     }

@@ -1,0 +1,5 @@
+[receiver]
+# HTTP 监听地址
+listen = "127.0.0.1:8080"
+# 单次请求体字节上限
+max_payload_bytes = 8388608

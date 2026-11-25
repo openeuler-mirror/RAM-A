@@ -1,8 +1,14 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/contracts/analysis",
+    "crates/contracts/report",
+    "crates/contracts/config",
+    "crates/contracts/config/derive",
+    "crates/contracts/storage",
     "crates/artifacts",
     "crates/storage",
+    "crates/settings",
     "crates/receiver",
     "crates/analyzer",
     "crates/reporter",
@@ -10,16 +16,27 @@ members = [
     "crates/cmd/analyze",
     "crates/cmd/export",
     "crates/cmd/report",
+    "crates/sdk/native/contracts",
+    "crates/sdk/native/runtime",
+    "crates/sdk/native/receiver",
+    "crates/sdk/native/analyzer",
+    "crates/sdk/native/reporter",
+    "crates/sdk/rust",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.1"
 edition = "2021"
 license = "MulanPSL-2.0"
 
 [workspace.dependencies]
+storage-contract = { path = "crates/contracts/storage" }
+report-contract = { path = "crates/contracts/report" }
+analysis-contract = { path = "crates/contracts/analysis" }
+config-contract = { path = "crates/contracts/config" }
 actrail-kv-artifacts = { path = "crates/artifacts" }
 actrail-kv-storage = { path = "crates/storage" }
+actrail-kv-settings = { path = "crates/settings" }
 actrail-kv-receiver = { path = "crates/receiver" }
 actrail-kv-analyzer = { path = "crates/analyzer" }
 actrail-kv-reporter = { path = "crates/reporter" }

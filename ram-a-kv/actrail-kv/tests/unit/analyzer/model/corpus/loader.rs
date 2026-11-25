@@ -148,7 +148,7 @@ fn rejects_empty_or_non_string_comparison_keys() {
 #[test]
 fn enforces_record_size_and_count_boundaries() {
     let at_limit = "{\"comparison\":{\"endpoint_key\":\"x\"},\"payload\":{}}";
-    let limits = CorpusLoadLimits {
+    let limits = CorpusConfig {
         max_record_bytes: at_limit.len(),
         max_records: 1,
     };

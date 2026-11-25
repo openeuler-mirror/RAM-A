@@ -15,8 +15,15 @@ use anyhow::{bail, Context, Result};
 pub fn load_result(path: &Path) -> Result<AnalysisResult> {
     let file = File::open(path)
         .with_context(|| format!("failed to open analysis result {}", path.display()))?;
-    let result: AnalysisResult = serde_json::from_reader(BufReader::new(file))
+    let result = serde_json::from_reader(BufReader::new(file))
         .with_context(|| format!("invalid analysis result {}", path.display()))?;
+    validate(&result)?;
+    Ok(result)
+}
+
+/// 对内存和文件输入应用相同的分析产物契约。
+pub fn read_result(reader: impl std::io::Read) -> Result<AnalysisResult> {
+    let result: AnalysisResult = serde_json::from_reader(reader)?;
     validate(&result)?;
     Ok(result)
 }

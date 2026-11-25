@@ -1,6 +1,6 @@
 //! 本文件验证 main 模块的行为。
 
-use super::{Cli, FormatArg};
+use super::{Cli, ReportFormat};
 use clap::Parser;
 
 fn base() -> Vec<&'static str> {
@@ -23,14 +23,14 @@ fn format_is_optional_and_accepts_html_or_md() {
     html.extend(["--format", "html"]);
     assert_eq!(
         Cli::try_parse_from(html).expect("html").format,
-        Some(FormatArg::Html)
+        Some(ReportFormat::Html)
     );
 
     let mut markdown = base();
     markdown.extend(["--format", "md"]);
     assert_eq!(
         Cli::try_parse_from(markdown).expect("markdown").format,
-        Some(FormatArg::Md)
+        Some(ReportFormat::Markdown)
     );
 
     let mut invalid = base();

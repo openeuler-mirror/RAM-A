@@ -1,11 +1,10 @@
-//! 本模块提供可验证、原子输出的离线分析运行入口与配置。
+//! 本模块提供内存分析、CLI 原子输出与公共运行配置。
 
-mod options;
 mod pipeline;
 
+pub use crate::config::AnalyzeConfig;
 pub use crate::model::corpus::{CaptureTimeRange, ReportSelection};
-pub use options::AnalysisOptions;
 pub use pipeline::{
-    analyze_captures, analyze_captures_with_selection, analyze_file, analyze_file_with_selection,
-    analyze_reader,
+    analyze_capture_stream_with_selection, analyze_captures, analyze_captures_with_selection,
+    analyze_file, analyze_file_with_selection, analyze_reader, analyze_reader_with_selection,
 };

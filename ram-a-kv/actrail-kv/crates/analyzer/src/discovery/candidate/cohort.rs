@@ -8,24 +8,7 @@ use crate::model::projection::{CacheSequence, ComparisonDomain};
 
 use super::{pair_metrics, PairMetrics, StructureSignature};
 
-#[derive(Clone, Debug)]
-pub struct CandidateOptions {
-    pub compatibility_threshold: f64,
-    pub max_dynamic_coverage_ratio: f64,
-    pub min_members: usize,
-    pub max_candidates_per_request: usize,
-}
-
-impl Default for CandidateOptions {
-    fn default() -> Self {
-        Self {
-            compatibility_threshold: 0.68,
-            max_dynamic_coverage_ratio: 0.35,
-            min_members: 3,
-            max_candidates_per_request: 128,
-        }
-    }
-}
+pub use analysis_contract::config::CandidateConfig;
 
 #[derive(Clone, Debug)]
 pub struct CandidateCohort {
@@ -52,11 +35,11 @@ pub struct CandidateBuildResult {
 
 #[derive(Clone, Debug, Default)]
 pub struct CandidateBuilder {
-    options: CandidateOptions,
+    options: CandidateConfig,
 }
 
 impl CandidateBuilder {
-    pub fn new(options: CandidateOptions) -> Self {
+    pub fn new(options: CandidateConfig) -> Self {
         Self { options }
     }
 

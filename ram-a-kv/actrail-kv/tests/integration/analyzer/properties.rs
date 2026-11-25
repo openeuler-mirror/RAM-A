@@ -2,7 +2,7 @@
 
 use std::io::Cursor;
 
-use actrail_kv_analyzer::run::{analyze_reader, AnalysisOptions};
+use actrail_kv_analyzer::run::{analyze_reader, AnalyzeConfig};
 use actrail_kv_artifacts::DefectFactKind;
 use proptest::prelude::*;
 use serde_json::{json, Value};
@@ -20,7 +20,7 @@ fn analyze(payloads: Vec<Value>) -> actrail_kv_artifacts::AnalysisResult {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    analyze_reader(Cursor::new(input), AnalysisOptions::default()).expect("analysis")
+    analyze_reader(Cursor::new(input), AnalyzeConfig::default()).expect("analysis")
 }
 
 fn request(first: String, tail: String) -> Value {

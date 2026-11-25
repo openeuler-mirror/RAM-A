@@ -4,12 +4,12 @@ mod analysis_result;
 mod captured_request;
 
 pub use analysis_result::{
-    AnalysisOptionsSnapshot, AnalysisResult, AnalysisRunSummary, CacheMetricBasis, ComparisonGroup,
-    ContextDefect, DefectFact, DefectFactKind, KvCacheMetric, MismatchPattern, MismatchRegion,
-    MismatchVariant, OptimizationInsight, PrefixNode, PrefixNodeKind, PrefixReuseComposition,
-    PrefixReuseRequest, PrefixReuseSession, PrefixReuseSummary, PrefixVariant, RecoveredStable,
-    RequestTemplate, ScoreBreakdown, SessionEventType, SessionReport, SessionSwitchEvent,
-    SkipRecord, SourceLocation, StableSpan, TemplatePrefixView, TemplateSlot, VariantEvidence,
+    AnalysisResult, AnalysisRunSummary, CacheMetricBasis, ComparisonGroup, ContextDefect,
+    DefectFact, DefectFactKind, KvCacheMetric, MismatchPattern, MismatchRegion, MismatchVariant,
+    OptimizationInsight, PrefixNode, PrefixNodeKind, PrefixReuseComposition, PrefixReuseRequest,
+    PrefixReuseSession, PrefixReuseSummary, PrefixVariant, RecoveredStable, RequestTemplate,
+    ScoreBreakdown, SessionEventType, SessionReport, SessionSwitchEvent, SkipRecord,
+    SourceLocation, StableSpan, TemplatePrefixView, TemplateSlot, VariantEvidence,
     ANALYSIS_SCHEMA_VERSION,
 };
 pub use captured_request::{CapturedRequest, ComparisonMetadata};

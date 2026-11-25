@@ -1,0 +1,18 @@
+# Defines the procedural macro for typed TOML configuration.
+[package]
+name = "config-contract-derive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+serde_derive_internals = "0.30"
+syn = "3"
+
+[lints]
+workspace = true

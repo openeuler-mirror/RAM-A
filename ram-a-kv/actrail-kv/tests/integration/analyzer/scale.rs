@@ -2,7 +2,7 @@
 
 use std::io::Cursor;
 
-use actrail_kv_analyzer::run::{analyze_reader, AnalysisOptions};
+use actrail_kv_analyzer::run::{analyze_reader, AnalyzeConfig};
 use serde_json::json;
 
 #[test]
@@ -23,7 +23,7 @@ fn ten_thousand_homogeneous_requests_form_one_cohort() {
         input.push('\n');
     }
 
-    let result = analyze_reader(Cursor::new(input), AnalysisOptions::default()).expect("analysis");
+    let result = analyze_reader(Cursor::new(input), AnalyzeConfig::default()).expect("analysis");
     assert_eq!(result.run.analyzed_records, RECORDS);
     assert_eq!(result.templates.len(), 1);
     assert_eq!(result.templates[0].member_request_ids.len(), RECORDS);

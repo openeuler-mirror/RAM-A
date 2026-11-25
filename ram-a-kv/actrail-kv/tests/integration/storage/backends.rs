@@ -16,7 +16,7 @@ use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 #[test]
 fn switches_backend_and_retention_by_changing_only_the_selector() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("storage.json");
+    let path = directory.path().join("storage.toml");
     let mut document = json!({
         "storage": {
             "backend": "sqlite",
@@ -33,42 +33,128 @@ fn switches_backend_and_retention_by_changing_only_the_selector() {
             }
         }
     });
-    fs::write(&path, document.to_string()).unwrap();
-    let StorageConfig::Sqlite(sqlite) = StorageConfig::from_file(&path).unwrap() else {
-        panic!("expected SQLite");
-    };
+    fs::write(&path, toml_document(&document)).unwrap();
+    let config = StorageConfig::from_file(&path).unwrap();
+    let sqlite = config.backends.sqlite.unwrap();
     assert_eq!(sqlite.path, directory.path().join("captures.sqlite"));
-    assert_eq!(sqlite.retention.unwrap().max_age_seconds.get(), 86400);
-    assert_eq!(sqlite.delete_batch_size.get(), 128);
+    assert_eq!(
+        sqlite.retention.as_ref().unwrap().max_age_seconds,
+        Some(86400)
+    );
+    assert_eq!(
+        sqlite.retention.unwrap().delete_batch_size.unwrap().get(),
+        128
+    );
 
     document["storage"]["backend"] = json!("ndjson");
-    fs::write(&path, document.to_string()).unwrap();
-    let StorageConfig::Ndjson(ndjson) = StorageConfig::from_file(&path).unwrap() else {
-        panic!("expected NDJSON");
-    };
+    fs::write(&path, toml_document(&document)).unwrap();
+    let config = StorageConfig::from_file(&path).unwrap();
+    assert_eq!(config.retention.unwrap().max_age_seconds, 604800);
+    let ndjson = config.backends.ndjson.unwrap();
     assert_eq!(ndjson.directory, directory.path().join("segments"));
-    assert_eq!(ndjson.retention.unwrap().max_age_seconds.get(), 604800);
-    assert_eq!(ndjson.retention.unwrap().cleanup_interval_seconds.get(), 30);
-    assert_eq!(ndjson.max_segments_per_cleanup.unwrap().get(), 3);
+    assert_eq!(ndjson.retention.as_ref().unwrap().max_age_seconds, None);
+    assert_eq!(
+        ndjson
+            .retention
+            .as_ref()
+            .unwrap()
+            .cleanup_interval_seconds
+            .unwrap()
+            .get(),
+        30
+    );
+    assert_eq!(
+        ndjson
+            .retention
+            .unwrap()
+            .max_segments_per_cleanup
+            .unwrap()
+            .get(),
+        3
+    );
 }
 
-#[test]
-fn retention_execution_options_belong_to_their_backend() {
-    let mut document = json!({"storage": {
-        "backend": "sqlite",
-        "retention": {"max_age_seconds": 60, "cleanup_interval_seconds": 1},
-        "backends": {"sqlite": {"path": "captures.sqlite"}}
-    }});
-    assert!(serde_json::from_value::<StorageConfig>(document.clone())
-        .unwrap_err()
-        .to_string()
-        .contains("unknown field `cleanup_interval_seconds`"));
-    document["storage"]["retention"] = json!({"max_age_seconds": 60});
-    document["storage"]["backends"]["sqlite"]["retention"] = json!({"max_segments_per_cleanup": 1});
-    assert!(serde_json::from_value::<StorageConfig>(document)
-        .unwrap_err()
-        .to_string()
-        .contains("unknown field `max_segments_per_cleanup`"));
+#[tokio::test]
+async fn both_backends_expire_records_after_seven_days_by_default() {
+    for backend in ["sqlite", "ndjson"] {
+        let directory = tempfile::tempdir().unwrap();
+        // 模拟已有的不限保留期存储，先写入 8 天前和 6 天前的记录。
+        let config = configure(
+            directory.path(),
+            backend,
+            3600,
+            4096,
+            Some(json!({"max_age_seconds": 0})),
+        );
+        let store = open_store(config, StoreAccess::ReadWrite).await.unwrap();
+        let now = OffsetDateTime::now_utc();
+        let expired = request(
+            "expired",
+            &(now - Duration::days(8)).format(&Rfc3339).unwrap(),
+            "a",
+            0,
+        );
+        let retained = request(
+            "retained",
+            &(now - Duration::days(6)).format(&Rfc3339).unwrap(),
+            "a",
+            0,
+        );
+        store.append(expired.clone()).await.unwrap();
+        store.append(retained.clone()).await.unwrap();
+        drop(store);
+        assert_eq!(physical_count(directory.path(), backend), 2);
+
+        // 未配置保留期时，两个后端都继承默认 7 天并清理已有过期记录。
+        let config = configure(directory.path(), backend, 3600, 4096, None);
+        let store = open_store(config, StoreAccess::ReadWrite).await.unwrap();
+        assert_eq!(physical_count(directory.path(), backend), 1);
+        assert!(matches!(
+            store.append(expired).await,
+            Err(StorageError::ExpiredCapture)
+        ));
+        let records = store
+            .scan(CaptureFilter::default())
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(records, vec![retained]);
+    }
+}
+
+#[tokio::test]
+async fn backend_zero_retention_disables_shared_expiry() {
+    for backend in ["sqlite", "ndjson"] {
+        for age in [None, Some(0)] {
+            let directory = tempfile::tempdir().unwrap();
+            let retention = age.map(|age| json!({"max_age_seconds": age}));
+            let mut config = configure(directory.path(), backend, 3600, 4096, retention);
+            config.retention = Some(actrail_kv_storage::StorageRetentionConfig {
+                max_age_seconds: 60,
+                ..Default::default()
+            });
+            let store = open_store(config, StoreAccess::ReadWrite).await.unwrap();
+            let timestamp = (OffsetDateTime::now_utc() - Duration::days(1))
+                .format(&Rfc3339)
+                .unwrap();
+            let result = store.append(request("old", &timestamp, "a", 0)).await;
+            if age == Some(0) {
+                result.unwrap();
+                let records = store
+                    .scan(CaptureFilter::default())
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                assert_eq!(records.len(), 1);
+            } else {
+                assert!(matches!(result, Err(StorageError::ExpiredCapture)));
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -88,12 +174,13 @@ async fn ndjson_inherits_the_default_age_and_limits_files_removed_per_cleanup() 
     drop(writer);
     assert_eq!(segments(directory.path()).len(), 3);
 
-    let path = directory.path().join("storage.json");
-    let mut document: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let path = directory.path().join("storage.toml");
+    let mut document: Value =
+        config_contract::toml_edit::de::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     document["storage"]["retention"] = json!({"max_age_seconds": 60});
     document["storage"]["backends"]["ndjson"]["retention"] =
         json!({"cleanup_interval_seconds": 3600, "max_segments_per_cleanup": 1});
-    fs::write(&path, document.to_string()).unwrap();
+    fs::write(&path, toml_document(&document)).unwrap();
     let config = StorageConfig::from_file(path).unwrap();
     let writer = open_store(config, StoreAccess::ReadWrite).await.unwrap();
     assert_eq!(segments(directory.path()).len(), 2);
@@ -107,35 +194,18 @@ async fn ndjson_inherits_the_default_age_and_limits_files_removed_per_cleanup() 
         .is_empty());
 }
 
-#[test]
-fn rejects_backend_settings_outside_the_selected_backend_node() {
-    let missing = serde_json::from_value::<StorageConfig>(json!({
-        "storage": {
-            "backend": "sqlite",
-            "backends": {"ndjson": {"directory": "segments"}}
-        }
-    }))
-    .unwrap_err();
-    assert!(missing
-        .to_string()
-        .contains("missing storage.backends.sqlite"));
-
-    let flat = serde_json::from_value::<StorageConfig>(json!({
-        "storage": {
-            "backend": "sqlite",
-            "path": "captures.sqlite",
-            "backends": {"sqlite": {"path": "captures.sqlite"}}
-        }
-    }))
-    .unwrap_err();
-    assert!(flat.to_string().contains("unknown field `path`"));
-}
-
 #[tokio::test]
 async fn both_backends_filter_a_bounded_live_snapshot() {
     for backend in ["ndjson", "sqlite"] {
         let directory = tempfile::tempdir().unwrap();
-        let config = configure(directory.path(), backend, 3600, 4096, None);
+        // 固定日期语料只验证筛选与快照，显式关闭过期清理。
+        let config = configure(
+            directory.path(),
+            backend,
+            3600,
+            4096,
+            Some(json!({"max_age_seconds": 0})),
+        );
         let store = open_store(config.clone(), StoreAccess::ReadWrite)
             .await
             .unwrap();
@@ -182,7 +252,14 @@ async fn both_backends_filter_a_bounded_live_snapshot() {
 #[tokio::test]
 async fn ndjson_rotates_by_size_and_utc_time_without_splitting_rows() {
     let directory = tempfile::tempdir().unwrap();
-    let config = configure(directory.path(), "ndjson", 3600, 420, None);
+    // 固定日期语料只验证轮转与恢复，显式关闭过期清理。
+    let config = configure(
+        directory.path(),
+        "ndjson",
+        3600,
+        420,
+        Some(json!({"max_age_seconds": 0})),
+    );
     let store = open_store(config.clone(), StoreAccess::ReadWrite)
         .await
         .unwrap();
@@ -334,9 +411,9 @@ fn configure(
     if let Some(retention) = retention {
         config["retention"] = retention;
     }
-    let path = directory.join("storage.json");
+    let path = directory.join("storage.toml");
     let document = json!({"storage": {"backend": backend, "backends": {(backend): config}}});
-    fs::write(&path, document.to_string()).unwrap();
+    fs::write(&path, toml_document(&document)).unwrap();
     StorageConfig::from_file(path).unwrap()
 }
 
@@ -360,4 +437,23 @@ fn physical_count(directory: &Path, backend: &str) -> usize {
             row.get::<_, i64>(0)
         })
         .unwrap() as usize
+}
+
+// 将测试配置展开为与配置文件示例一致的 TOML 表。
+fn toml_document(value: &Value) -> String {
+    use config_contract::toml_edit::{DocumentMut, Item, Value as TomlValue};
+    fn expand(item: &mut Item) {
+        if let Item::Value(TomlValue::InlineTable(table)) = item {
+            *item = Item::Table(table.clone().into_table());
+        }
+        if let Item::Table(table) = item {
+            for (_, value) in table.iter_mut() {
+                expand(value);
+            }
+        }
+    }
+    let text = config_contract::toml_edit::ser::to_string(value).unwrap();
+    let mut document: DocumentMut = text.parse().unwrap();
+    expand(document.as_item_mut());
+    document.to_string()
 }

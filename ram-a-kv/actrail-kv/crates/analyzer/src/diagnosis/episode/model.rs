@@ -5,26 +5,7 @@ use actrail_kv_artifacts::{
     VariantEvidence,
 };
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct DiagnosisOptions {
-    pub min_stable_support: usize,
-    pub stable_support_rate: f64,
-    pub fixed_variant_max: usize,
-    pub min_blocked_bytes: usize,
-    pub min_anchor_bytes: usize,
-}
-
-impl Default for DiagnosisOptions {
-    fn default() -> Self {
-        Self {
-            min_stable_support: 3,
-            stable_support_rate: 0.8,
-            fixed_variant_max: 3,
-            min_blocked_bytes: 64,
-            min_anchor_bytes: 24,
-        }
-    }
-}
+pub use analysis_contract::config::DiagnosisConfig;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EpisodeVariant {

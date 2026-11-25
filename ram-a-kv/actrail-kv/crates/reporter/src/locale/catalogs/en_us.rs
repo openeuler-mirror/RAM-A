@@ -4,7 +4,7 @@ use crate::locale::{namespace, registry::NamespaceCatalog};
 
 const COMMON: &[(&str, &str)] = &[
     ("document_title", "LLM KV Cache Structure Diagnostics"),
-    ("html_title", "Actrail KV Structure Diagnostics"),
+    ("html_title", "actrail-kv Structure Diagnostics"),
     (
         "summary",
         "Input records: {input}; analyzed: {analyzed}; skipped: {skipped}; defects found: {defects}.",

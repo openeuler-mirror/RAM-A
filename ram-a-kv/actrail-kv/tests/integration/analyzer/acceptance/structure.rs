@@ -267,9 +267,13 @@ fn fixed_variant_threshold_is_configurable() {
     let strict = analyze_with_options(
         payloads.clone(),
         None,
-        AnalysisOptions {
-            fixed_variant_max: 1,
-            ..AnalysisOptions::default()
+        AnalyzeConfig {
+            diagnosis: actrail_kv_analyzer::config::DiagnosisConfig {
+                fixed_variant_max: 1,
+                ..Default::default()
+            },
+
+            ..AnalyzeConfig::default()
         },
     );
     assert!(has_fact(&strict, DefectFactKind::ContentVariation));

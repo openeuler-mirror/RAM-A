@@ -4,4 +4,4 @@ pub mod episode;
 mod facts;
 mod identity;
 
-pub use episode::{diagnose_template, DefectCandidate, DiagnosisOptions, EpisodeVariant};
+pub use episode::{diagnose_template, DefectCandidate, DiagnosisConfig, EpisodeVariant};

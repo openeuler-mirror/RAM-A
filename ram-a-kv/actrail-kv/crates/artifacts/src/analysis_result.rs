@@ -11,10 +11,10 @@ pub use cache_metric::{CacheMetricBasis, KvCacheMetric};
 pub use prefix_reuse::{
     PrefixReuseComposition, PrefixReuseRequest, PrefixReuseSession, PrefixReuseSummary,
 };
-pub use run_summary::{AnalysisOptionsSnapshot, AnalysisRunSummary, SkipRecord};
+pub use run_summary::{AnalysisRunSummary, SkipRecord};
 pub use session::{SessionEventType, SessionReport, SessionSwitchEvent};
 
-pub const ANALYSIS_SCHEMA_VERSION: &str = "0.1.0";
+pub const ANALYSIS_SCHEMA_VERSION: &str = "0.1.1";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

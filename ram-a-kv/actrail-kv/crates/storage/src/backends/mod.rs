@@ -9,6 +9,7 @@ use std::{
     sync::Arc,
 };
 
+use crate::config::ResolvedStorageConfig;
 use crate::{runtime::schedule_retention, CaptureStore, StorageConfig, StorageError};
 
 pub use ndjson::{AppendError, NdjsonAppender};
@@ -23,9 +24,9 @@ pub async fn open_store(
     config: StorageConfig,
     access: StoreAccess,
 ) -> Result<Arc<dyn CaptureStore>, StorageError> {
-    match config {
-        StorageConfig::Sqlite(config) => {
-            let retention = config.retention;
+    match config.into_backend()? {
+        ResolvedStorageConfig::Sqlite(config) => {
+            let retention = config.retention_policy();
             let store = Arc::new(
                 tokio::task::spawn_blocking(move || sqlite::SqliteStore::open(config, access))
                     .await??,
@@ -35,8 +36,8 @@ pub async fn open_store(
             }
             Ok(store)
         }
-        StorageConfig::Ndjson(config) => {
-            let retention = config.retention;
+        ResolvedStorageConfig::Ndjson(config) => {
+            let retention = config.retention_policy();
             let store = Arc::new(
                 tokio::task::spawn_blocking(move || ndjson::NdjsonStore::open(config, access))
                     .await??,

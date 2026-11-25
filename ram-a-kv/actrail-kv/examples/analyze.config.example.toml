@@ -1,0 +1,72 @@
+[analyzer]
+# 分析结果 JSON 输出路径
+output = "analysis.json"
+
+# 分析算法阈值和资源上限
+[analyzer.options]
+# 排名输出条数
+top_k = 20
+
+# 语料加载配置
+[analyzer.options.corpus]
+# 输入记录的字节上限
+max_record_bytes = 8388608
+# 载入记录数量上限
+max_records = 1000000
+
+# 请求投影配置
+[analyzer.options.projection]
+# 每条请求的投影单元数量上限
+max_units = 512
+# 单个文本投影单元的字节上限
+max_text_unit_bytes = 1048576
+# 比较时间窗的秒数
+comparison_window_seconds = 3600
+
+# 候选构造配置
+[analyzer.options.candidate]
+# 模板兼容度阈值
+compatibility_threshold = 0.68
+# 动态内容覆盖比例上限
+max_dynamic_coverage_ratio = 0.35
+# 模板最少成员数
+min_members = 3
+# 每条请求的候选数量上限
+max_candidates_per_request = 128
+
+# 模板与诊断共享的稳定性条件配置
+[analyzer.options.stability]
+# 稳定片段最少支持记录数
+min_stable_support = 3
+# 稳定片段支持率
+stable_support_ratio = 0.8
+# 精确匹配锚点最少字节数
+min_anchor_bytes = 24
+
+# 模板提取配置
+[analyzer.options.template]
+# 单次对齐单元格上限
+max_alignment_cells = 2000000
+# 总对齐单元格上限
+max_total_alignment_cells = 64000000
+
+# 缺陷诊断配置
+[analyzer.options.diagnosis]
+# 固定变体数量上限
+fixed_variant_max = 3
+# 纳入阻断分析的稳定内容最少字节数
+min_blocked_bytes = 64
+
+# 前缀树视图配置
+[analyzer.options.prefix_view]
+# 前缀树视图节点上限，0 关闭视图
+max_nodes = 5000
+# 前缀树节点文本摘录上限
+excerpt_bytes = 96
+
+# 会话、时间区间和最近记录筛选
+[analyzer.selection]
+# 允许的会话键集合
+session_keys = []
+# 多个区间取并集
+time_ranges = []

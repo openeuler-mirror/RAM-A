@@ -1,7 +1,9 @@
 //! 托管 NDJSON 后端隐藏分片轮转、扫描边界和保留期回收。
 
 mod appender;
+mod capacity;
 mod segments;
+use capacity::Capacity;
 
 use std::{
     fs::{self, File},
@@ -60,22 +62,24 @@ impl NdjsonStore {
     }
 
     pub(super) fn prune(&self) -> Result<(), StorageError> {
-        let Some(retention) = self.config.retention else {
-            return Ok(());
-        };
         let _boundary = exclusive_boundary(&self.config.directory)?;
-        let cutoff = retention.cutoff().unix_timestamp();
-        let max_segments = self
-            .config
-            .max_segments_per_cleanup
-            .map_or(usize::MAX, |limit| limit.get() as usize);
-        for segment in list_segments(&self.config.directory)?
-            .into_iter()
-            .filter(|segment| segment.key.end <= cutoff)
-            .take(max_segments)
-        {
-            fs::remove_file(segment.path)?;
+        if let Some(retention) = self.config.retention_policy() {
+            let cutoff = retention.cutoff().unix_timestamp();
+            let max_segments = self
+                .config
+                .retention
+                .as_ref()
+                .and_then(|settings| settings.max_segments_per_cleanup)
+                .map_or(usize::MAX, |limit| limit.get() as usize);
+            for segment in list_segments(&self.config.directory)?
+                .into_iter()
+                .filter(|segment| segment.key.end <= cutoff)
+                .take(max_segments)
+            {
+                fs::remove_file(segment.path)?;
+            }
         }
+        Capacity::reserve(&self.config, 0)?;
         Ok(())
     }
 }
@@ -94,9 +98,10 @@ impl Writer {
             .lock()
             .map_err(|_| io::Error::other("NDJSON writer lock is poisoned"))?;
         let _boundary = exclusive_boundary(&config.directory)?;
-        if let Some(retention) = config.retention {
+        if let Some(retention) = config.retention_policy() {
             retention.check(captured_at)?;
         }
+        Capacity::reserve(config, line.len() as u64)?;
         let previous = match current.as_ref() {
             Some(segment) if segment.key.in_window(key) => Some(segment.clone()),
             _ => list_segments(&config.directory)?
@@ -148,7 +153,7 @@ fn scan_store(
     let segments = {
         let boundary = File::open(snapshot_lock_path(&config.directory))?;
         FileExt::lock_shared(&boundary)?;
-        let start = filter.start(config.retention.map(RetentionConfig::cutoff));
+        let start = filter.start(config.retention_policy().map(RetentionConfig::cutoff));
         let mut segments = Vec::new();
         for segment in list_segments(&config.directory)? {
             if writer.is_closed() {

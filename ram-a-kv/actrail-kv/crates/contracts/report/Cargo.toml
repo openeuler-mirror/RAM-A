@@ -1,0 +1,13 @@
+# 独立报告配置契约，不依赖报告渲染实现。
+[package]
+name = "report-contract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+config-contract.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

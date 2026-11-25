@@ -3,7 +3,7 @@
 use std::{fs, io::Cursor, num::NonZeroUsize};
 
 use actrail_kv_analyzer::run::{
-    analyze_file, analyze_file_with_selection, analyze_reader, AnalysisOptions, CaptureTimeRange,
+    analyze_file, analyze_file_with_selection, analyze_reader, AnalyzeConfig, CaptureTimeRange,
     ReportSelection,
 };
 use serde_json::{json, Value};
@@ -17,7 +17,7 @@ fn refuses_same_input_and_output_without_modifying_corpus() {
 "#;
     fs::write(&path, original).expect("fixture");
 
-    assert!(analyze_file(&path, &path, AnalysisOptions::default()).is_err());
+    assert!(analyze_file(&path, &path, AnalyzeConfig::default()).is_err());
     assert_eq!(fs::read(&path).expect("preserved corpus"), original);
 }
 
@@ -32,7 +32,7 @@ fn refuses_output_that_is_a_hard_link_to_input() {
     fs::write(&input, original).expect("fixture");
     fs::hard_link(&input, &output).expect("hard link");
 
-    assert!(analyze_file(&input, &output, AnalysisOptions::default()).is_err());
+    assert!(analyze_file(&input, &output, AnalyzeConfig::default()).is_err());
     assert_eq!(fs::read(&input).expect("preserved corpus"), original);
 }
 
@@ -43,7 +43,7 @@ fn rejects_a_corpus_with_no_analyzable_requests() {
     let output = directory.path().join("analysis.json");
     fs::write(&input, b"not-json\n").expect("fixture");
 
-    assert!(analyze_file(&input, &output, AnalysisOptions::default()).is_err());
+    assert!(analyze_file(&input, &output, AnalyzeConfig::default()).is_err());
     assert!(!output.exists());
 }
 
@@ -70,15 +70,19 @@ fn report_selects_the_latest_matching_captures_before_the_analysis_budget() {
     ];
     let sessions = vec!["a".into(), "b".into()];
     let selection = ReportSelection::new(sessions.clone(), ranges.clone(), NonZeroUsize::new(2));
-    let options = AnalysisOptions {
-        max_records: 2,
-        ..AnalysisOptions::default()
+    let options = AnalyzeConfig {
+        corpus: actrail_kv_analyzer::config::CorpusConfig {
+            max_records: 2,
+            ..Default::default()
+        },
+
+        ..AnalyzeConfig::default()
     };
     let result = analyze_file_with_selection(&input, &output, options, &selection).unwrap();
     assert_eq!(result.run.input_records, 2);
     let expected = analyze_reader(
         Cursor::new(ndjson(&[records[0].clone(), records[6].clone()])),
-        AnalysisOptions::default(),
+        AnalyzeConfig::default(),
     )
     .unwrap();
     let ids = |result: &actrail_kv_artifacts::AnalysisResult| {
@@ -93,8 +97,7 @@ fn report_selects_the_latest_matching_captures_before_the_analysis_budget() {
 
     let selection = ReportSelection::new(sessions, ranges, None);
     let result =
-        analyze_file_with_selection(&input, &output, AnalysisOptions::default(), &selection)
-            .unwrap();
+        analyze_file_with_selection(&input, &output, AnalyzeConfig::default(), &selection).unwrap();
     assert_eq!(result.run.input_records, 4);
 }
 

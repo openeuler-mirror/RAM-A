@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+config-contract.workspace = true
 actrail-kv-artifacts.workspace = true
 actrail-kv-storage.workspace = true
 anyhow.workspace = true

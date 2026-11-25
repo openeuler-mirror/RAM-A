@@ -9,9 +9,13 @@ name = "actrail-kv-report"
 path = "src/main.rs"
 
 [dependencies]
+analysis-contract.workspace = true
+report-contract.workspace = true
+actrail-kv-settings.workspace = true
 actrail-kv-reporter.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+serde.workspace = true
 
 [lints]
 workspace = true

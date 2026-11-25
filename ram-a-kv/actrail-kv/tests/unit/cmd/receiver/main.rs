@@ -1,6 +1,7 @@
 //! 本文件验证 main 模块的行为。
 
 use super::*;
+use actrail_kv_receiver::ReceiverConfig;
 
 #[test]
 fn config_defaults_to_loopback_listener() {

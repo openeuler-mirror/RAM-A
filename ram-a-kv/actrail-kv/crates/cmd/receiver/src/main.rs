@@ -2,22 +2,19 @@
 
 use std::{net::SocketAddr, path::PathBuf};
 
-use actrail_kv_receiver::{router_with_storage, ReceiverConfig};
+use actrail_kv_receiver::{config::settings::ReceiverSettings, router_with_storage};
+use actrail_kv_settings::ConfigFile;
 use actrail_kv_storage::{open_legacy_ndjson, open_store, StorageConfig, StoreAccess};
 use anyhow::{Context, Result};
 use clap::Parser;
 
 #[derive(Debug, Parser)]
-#[command(name = "actrail-kv-receiver")]
+#[command(name = "actrail-kv-receiver", version)]
 #[command(about = "Receive and store complete model requests")]
 struct Arguments {
     #[arg(long)]
     listen: Option<SocketAddr>,
-    #[arg(
-        long,
-        required_unless_present = "storage_config",
-        conflicts_with = "storage_config"
-    )]
+    #[arg(long, conflicts_with = "storage_config")]
     output: Option<PathBuf>,
     #[arg(long)]
     storage_config: Option<PathBuf>,
@@ -25,6 +22,11 @@ struct Arguments {
     config: Option<PathBuf>,
     #[arg(long, value_parser = parse_positive_usize)]
     max_payload_bytes: Option<usize>,
+}
+
+enum CaptureTarget {
+    File(PathBuf),
+    Store(StorageConfig),
 }
 
 fn parse_positive_usize(value: &str) -> Result<usize, String> {
@@ -40,15 +42,9 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let arguments = Arguments::parse();
-    let mut config = match &arguments.config {
-        Some(path) => {
-            let raw = std::fs::read_to_string(path)
-                .with_context(|| format!("failed to read config {}", path.display()))?;
-            ReceiverConfig::from_json_str(&raw)
-                .with_context(|| format!("invalid config {}", path.display()))?
-        }
-        None => ReceiverConfig::default(),
-    };
+    let mut settings = ConfigFile::open(arguments.config.as_deref())?;
+    let file: ReceiverSettings = settings.read(&["receiver"])?;
+    let mut config = file.http;
     if let Some(listen) = arguments.listen {
         config.listen = listen.to_string();
     }
@@ -60,18 +56,32 @@ async fn main() -> Result<()> {
         .listen
         .parse()
         .with_context(|| format!("invalid listen address {}", config.listen))?;
+    let target = if let Some(path) = arguments.storage_config {
+        CaptureTarget::Store(
+            StorageConfig::from_file(&path)
+                .with_context(|| format!("failed to load storage config {}", path.display()))?,
+        )
+    } else if let Some(output) = arguments
+        .output
+        .or_else(|| file.output.map(|output| settings.resolve(output)))
+    {
+        CaptureTarget::File(output)
+    } else {
+        let storage: StorageConfig = settings.read(&["storage"])?;
+        CaptureTarget::Store(storage.resolve(settings.directory())?)
+    };
+    if let CaptureTarget::File(output) = &target {
+        settings.check_output(output)?;
+    }
+    settings.finish()?;
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("failed to bind receiver to {}", listen))?;
-    let store = if let Some(path) = arguments.storage_config {
-        let storage = StorageConfig::from_file(&path)
-            .with_context(|| format!("failed to load storage config {}", path.display()))?;
-        open_store(storage, StoreAccess::ReadWrite).await?
-    } else {
-        let output = arguments.output.context("missing receiver output")?;
-        open_legacy_ndjson(output.clone())
+    let store = match target {
+        CaptureTarget::Store(storage) => open_store(storage, StoreAccess::ReadWrite).await?,
+        CaptureTarget::File(output) => open_legacy_ndjson(output.clone())
             .await
-            .with_context(|| format!("failed to open receiver output {}", output.display()))?
+            .with_context(|| format!("failed to open receiver output {}", output.display()))?,
     };
     eprintln!("listening on {}", listener.local_addr()?);
 
