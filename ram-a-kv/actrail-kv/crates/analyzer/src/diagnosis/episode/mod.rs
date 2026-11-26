@@ -5,7 +5,7 @@ mod model;
 pub(in crate::diagnosis) mod variant;
 
 pub use locator::diagnose_template;
-pub use model::{DefectCandidate, DiagnosisOptions, EpisodeVariant};
+pub use model::{DefectCandidate, DiagnosisConfig, EpisodeVariant};
 
 #[cfg(test)]
 #[path = "../../../../../tests/unit/analyzer/diagnosis/episode/tests.rs"]

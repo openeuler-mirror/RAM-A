@@ -11,11 +11,7 @@ use tempfile::NamedTempFile;
 
 use crate::{load_result, render_html_with_locale, render_markdown_with_locale, LocaleFactory};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReportFormat {
-    Html,
-    Markdown,
-}
+use report_contract::ReportFormat;
 
 pub(crate) fn write_html_only(input: &Path, output: &Path) -> Result<()> {
     ensure_distinct_paths(input, output)?;
@@ -47,7 +43,7 @@ pub(crate) fn write_reports(
     write_atomic_set(&rendered)
 }
 
-fn report_paths(output: &Path, format: Option<ReportFormat>) -> Vec<(ReportFormat, PathBuf)> {
+pub fn report_paths(output: &Path, format: Option<ReportFormat>) -> Vec<(ReportFormat, PathBuf)> {
     if let Some(format) = format {
         return vec![(format, output.to_path_buf())];
     }

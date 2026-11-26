@@ -1,17 +1,15 @@
-//! 本文件验证 config 模块的行为。
+//! 本文件验证分析配置的业务约束。
 
 use super::*;
 
 #[test]
-fn json_round_trip_preserves_defaults() {
-    let config = AnalyzeConfig::default();
-    let json = config.to_json_pretty().expect("serialize");
-    let parsed = AnalyzeConfig::from_json_str(&json).expect("parse");
-    assert_eq!(parsed, config);
-}
-
-#[test]
-fn rejects_unknown_fields() {
-    let json = r#"{"top_k": 20, "unknown_field": 1}"#;
-    assert!(AnalyzeConfig::from_json_str(json).is_err());
+fn rejects_zero_top_k_and_non_finite_thresholds() {
+    let mut options = AnalyzeConfig {
+        top_k: 0,
+        ..AnalyzeConfig::default()
+    };
+    assert!(options.validate().is_err());
+    options.top_k = 1;
+    options.candidate.compatibility_threshold = f64::NAN;
+    assert!(options.validate().is_err());
 }

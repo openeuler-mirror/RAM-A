@@ -106,7 +106,8 @@ fn content_variants_form_one_episode_and_count_each_member_once() {
     let p2 = "stable recovery".repeat(8);
     let defect = diagnose_template(
         &template(&["north", "south", "east", "west"], &p2),
-        &DiagnosisOptions::default(),
+        &DiagnosisConfig::default(),
+        &analysis_contract::config::StabilityConfig::default(),
     )
     .pop()
     .unwrap();
@@ -125,7 +126,8 @@ fn content_variants_form_one_episode_and_count_each_member_once() {
 fn no_qualified_p2_is_a_normal_dynamic_suffix() {
     let result = diagnose_template(
         &template(&["north", "south", "east", "west"], "short"),
-        &DiagnosisOptions::default(),
+        &DiagnosisConfig::default(),
+        &analysis_contract::config::StabilityConfig::default(),
     );
     assert!(result.is_empty());
 }
@@ -143,7 +145,8 @@ fn json_equivalence_is_a_fact_on_the_same_episode() {
             ],
             &p2,
         ),
-        &DiagnosisOptions::default(),
+        &DiagnosisConfig::default(),
+        &analysis_contract::config::StabilityConfig::default(),
     )
     .pop()
     .unwrap();
@@ -162,8 +165,16 @@ fn input_and_member_order_do_not_change_region_identity() {
     reversed.members.reverse();
     reversed.member_maps.reverse();
     reversed.symbolic_members.reverse();
-    let first = diagnose_template(&original, &DiagnosisOptions::default());
-    let second = diagnose_template(&reversed, &DiagnosisOptions::default());
+    let first = diagnose_template(
+        &original,
+        &DiagnosisConfig::default(),
+        &analysis_contract::config::StabilityConfig::default(),
+    );
+    let second = diagnose_template(
+        &reversed,
+        &DiagnosisConfig::default(),
+        &analysis_contract::config::StabilityConfig::default(),
+    );
     assert_eq!(first, second);
 }
 

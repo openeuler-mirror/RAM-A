@@ -1,0 +1,24 @@
+[package]
+name = "actrail-kv-sdk-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+actrail-kv-sdk-contracts = { path = "../contracts" }
+config-contract.workspace = true
+actrail-kv-storage.workspace = true
+actrail-kv-settings.workspace = true
+same-file.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tempfile.workspace = true
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[[test]]
+name = "worker_lifecycle"
+path = "../../../../tests/integration/sdk/worker_lifecycle.rs"

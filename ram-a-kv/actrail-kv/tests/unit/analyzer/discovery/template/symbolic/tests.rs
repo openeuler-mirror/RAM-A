@@ -3,7 +3,7 @@
 use crate::{
     discovery::{
         candidate::{CandidateCohort, StructureSignature},
-        template::{RequestTemplate, TemplateExtractor, TemplateOptions},
+        template::{RequestTemplate, TemplateConfig, TemplateExtractor},
     },
     model::projection::{
         CacheSequence, CacheUnit, CacheUnitKind, ComparisonDomain, ContextCollectionKind,
@@ -64,13 +64,18 @@ fn extract(medoid: CacheSequence, members: Vec<CacheSequence>) -> RequestTemplat
         members,
         cohesion: 1.0,
     };
-    TemplateExtractor::new(TemplateOptions {
-        stable_support_ratio: 0.8,
-        min_stable_support: 3,
-        min_stable_span_bytes: 2,
-        max_alignment_cells: 100_000,
-        max_total_alignment_cells: 1_000_000,
-    })
+    TemplateExtractor::new(
+        TemplateConfig {
+            max_alignment_cells: 100_000,
+            max_total_alignment_cells: 1_000_000,
+        },
+        analysis_contract::config::StabilityConfig {
+            stable_support_ratio: 0.8,
+            min_stable_support: 3,
+            min_anchor_bytes: 2,
+            ..Default::default()
+        },
+    )
     .extract(vec![cohort])
     .templates
     .remove(0)

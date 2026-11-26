@@ -14,35 +14,18 @@ use super::{
     TemplateExtractionResult, TemplateSkip, TemplateSlot,
 };
 
-#[derive(Clone, Debug)]
-pub struct TemplateOptions {
-    pub stable_support_ratio: f64,
-    pub min_stable_support: usize,
-    pub min_stable_span_bytes: usize,
-    pub max_alignment_cells: usize,
-    pub max_total_alignment_cells: usize,
-}
-
-impl Default for TemplateOptions {
-    fn default() -> Self {
-        Self {
-            stable_support_ratio: 0.80,
-            min_stable_support: 3,
-            min_stable_span_bytes: 24,
-            max_alignment_cells: 2_000_000,
-            max_total_alignment_cells: 64_000_000,
-        }
-    }
-}
+use analysis_contract::config::StabilityConfig;
+pub use analysis_contract::config::TemplateConfig;
 
 #[derive(Clone, Debug, Default)]
 pub struct TemplateExtractor {
-    options: TemplateOptions,
+    options: TemplateConfig,
+    stability: StabilityConfig,
 }
 
 impl TemplateExtractor {
-    pub fn new(options: TemplateOptions) -> Self {
-        Self { options }
+    pub fn new(options: TemplateConfig, stability: StabilityConfig) -> Self {
+        Self { options, stability }
     }
 
     pub fn extract(&self, cohorts: Vec<CandidateCohort>) -> TemplateExtractionResult {
@@ -147,7 +130,7 @@ impl TemplateExtractor {
             .filter(|unit| unit.content == medoid.content)
             .count();
         if self.is_stable(support, total_members)
-            && medoid.content.len() >= self.options.min_stable_span_bytes
+            && medoid.content.len() >= self.stability.min_anchor_bytes
         {
             stable_spans.push(stable_span(
                 unit_index,
@@ -228,7 +211,7 @@ impl TemplateExtractor {
             } else {
                 medoid.content.len()
             };
-            if byte_end - byte_start >= self.options.min_stable_span_bytes {
+            if byte_end - byte_start >= self.stability.min_anchor_bytes {
                 accepted.push((start..cursor, byte_start..byte_end, supporters.len()));
             } else if cursor > start + 1 {
                 cursor = start + 1;
@@ -282,9 +265,9 @@ impl TemplateExtractor {
     }
 
     fn is_stable(&self, support: usize, total: usize) -> bool {
-        support >= self.options.min_stable_support
+        support >= self.stability.min_stable_support
             && (support as f64 / total.max(1) as f64) + f64::EPSILON
-                >= self.options.stable_support_ratio
+                >= self.stability.stable_support_ratio
     }
 }
 

@@ -13,33 +13,16 @@ use super::{
 const DIALECT: &str = "openai-compatible-chat";
 const ADAPTER_REVISION: &str = "1";
 
-#[derive(Clone, Debug)]
-pub struct ProjectionLimits {
-    pub max_units: usize,
-    pub max_text_unit_bytes: usize,
-}
-
-impl Default for ProjectionLimits {
-    fn default() -> Self {
-        Self {
-            max_units: 512,
-            max_text_unit_bytes: 1024 * 1024,
-        }
-    }
-}
+pub use analysis_contract::config::ProjectionConfig;
 
 #[derive(Clone, Debug)]
 pub struct RequestProjector {
-    limits: ProjectionLimits,
-    comparison_window_seconds: u64,
+    limits: ProjectionConfig,
 }
 
 impl RequestProjector {
-    pub fn new(limits: ProjectionLimits, comparison_window_seconds: u64) -> Self {
-        Self {
-            limits,
-            comparison_window_seconds,
-        }
+    pub fn new(limits: ProjectionConfig) -> Self {
+        Self { limits }
     }
 
     pub fn project(&self, record: &CorpusRecord) -> Result<CacheSequence, ProjectionSkip> {
@@ -66,7 +49,7 @@ impl RequestProjector {
             .ok_or(ProjectionSkipReason::MessagesNotArray)?;
         let domain = ComparisonGroupKey::from_record(
             record,
-            self.comparison_window_seconds,
+            self.limits.comparison_window_seconds,
             DIALECT,
             ADAPTER_REVISION,
             "openai-compatible-chat/v1",
@@ -272,7 +255,7 @@ fn content_block_value(block: &Value, base: &str) -> (String, String, bool) {
 
 impl Default for RequestProjector {
     fn default() -> Self {
-        Self::new(ProjectionLimits::default(), 3_600)
+        Self::new(ProjectionConfig::default())
     }
 }
 

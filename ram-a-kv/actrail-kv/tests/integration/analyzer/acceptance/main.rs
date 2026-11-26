@@ -2,7 +2,7 @@
 
 use std::io::Cursor;
 
-use actrail_kv_analyzer::run::{analyze_reader, AnalysisOptions};
+use actrail_kv_analyzer::run::{analyze_reader, AnalyzeConfig};
 use actrail_kv_artifacts::{AnalysisResult, DefectFactKind, MismatchPattern, SessionEventType};
 use serde_json::{json, Value};
 
@@ -15,13 +15,13 @@ fn analyze(payloads: Vec<Value>) -> AnalysisResult {
 }
 
 fn analyze_with_session(payloads: Vec<Value>, session_key: Option<&str>) -> AnalysisResult {
-    analyze_with_options(payloads, session_key, AnalysisOptions::default())
+    analyze_with_options(payloads, session_key, AnalyzeConfig::default())
 }
 
 fn analyze_with_options(
     payloads: Vec<Value>,
     session_key: Option<&str>,
-    options: AnalysisOptions,
+    options: AnalyzeConfig,
 ) -> AnalysisResult {
     let mut input = String::new();
     for payload in payloads {
@@ -45,7 +45,7 @@ fn analyze_envelopes(envelopes: Vec<Value>) -> AnalysisResult {
         input.push_str(&serde_json::to_string(&envelope).expect("fixture JSON"));
         input.push('\n');
     }
-    analyze_reader(Cursor::new(input), AnalysisOptions::default()).expect("analysis succeeds")
+    analyze_reader(Cursor::new(input), AnalyzeConfig::default()).expect("analysis succeeds")
 }
 
 mod sessions;

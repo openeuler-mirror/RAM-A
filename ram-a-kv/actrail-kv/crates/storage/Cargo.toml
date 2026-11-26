@@ -6,6 +6,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+storage-contract.workspace = true
+config-contract.workspace = true
 actrail-kv-artifacts.workspace = true
 fs2 = "0.4"
 futures-util.workspace = true
@@ -23,6 +25,10 @@ same-file.workspace = true
 [[test]]
 name = "backends"
 path = "../../tests/integration/storage/backends.rs"
+
+[[test]]
+name = "capacity"
+path = "../../tests/integration/storage/capacity.rs"
 
 [lints]
 workspace = true

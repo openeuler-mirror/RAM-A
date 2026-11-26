@@ -1,0 +1,18 @@
+# 供 SDK 与存储实现共用的配置契约，不依赖存储后端。
+[package]
+name = "storage-contract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+config-contract.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+time.workspace = true
+
+[target.'cfg(not(unix))'.dependencies]
+same-file.workspace = true
+
+[lints]
+workspace = true

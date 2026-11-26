@@ -43,7 +43,7 @@ fn sequence(id: &str, text: &str) -> CacheSequence {
 
 #[test]
 fn threshold_is_inclusive_and_input_order_does_not_change_ids() {
-    let options = CandidateOptions {
+    let options = CandidateConfig {
         compatibility_threshold: 0.0,
         max_dynamic_coverage_ratio: 1.0,
         min_members: 3,
@@ -63,7 +63,7 @@ fn threshold_is_inclusive_and_input_order_does_not_change_ids() {
 
 #[test]
 fn large_homogeneous_domain_is_not_split_by_seed_budget() {
-    let result = CandidateBuilder::new(CandidateOptions {
+    let result = CandidateBuilder::new(CandidateConfig {
         compatibility_threshold: 0.0,
         max_dynamic_coverage_ratio: 1.0,
         min_members: 2,
@@ -112,7 +112,7 @@ fn boundary_validation_rejects_bridge_members() {
     let a = format!("{common}{}", "A".repeat(100));
     let bridge = format!("{common}{}{}", "A".repeat(50), "Z".repeat(50));
     let c = format!("{common}{}", "Z".repeat(100));
-    let result = CandidateBuilder::new(CandidateOptions {
+    let result = CandidateBuilder::new(CandidateConfig {
         compatibility_threshold: 0.78,
         max_dynamic_coverage_ratio: 0.30,
         min_members: 2,

@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+analysis-contract.workspace = true
+report-contract.workspace = true
 actrail-kv-artifacts.workspace = true
 anyhow.workspace = true
 askama = "0.16"

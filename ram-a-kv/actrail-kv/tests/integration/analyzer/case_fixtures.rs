@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
 
-use actrail_kv_analyzer::run::{analyze_reader, AnalysisOptions};
+use actrail_kv_analyzer::run::{analyze_reader, AnalyzeConfig};
 use actrail_kv_artifacts::{AnalysisResult, DefectFactKind};
 
 fn fixture(name: &str) -> AnalysisResult {
@@ -13,10 +13,14 @@ fn fixture(name: &str) -> AnalysisResult {
         .join(format!("{name}.ndjson"));
     analyze_reader(
         BufReader::new(File::open(path).expect("fixture exists")),
-        AnalysisOptions {
-            max_alignment_cells: 300_000_000,
-            max_total_alignment_cells: 8_000_000_000,
-            ..AnalysisOptions::default()
+        AnalyzeConfig {
+            template: actrail_kv_analyzer::config::TemplateConfig {
+                max_alignment_cells: 300_000_000,
+                max_total_alignment_cells: 8_000_000_000,
+                ..Default::default()
+            },
+
+            ..AnalyzeConfig::default()
         },
     )
     .expect("analysis succeeds")

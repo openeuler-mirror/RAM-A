@@ -1,0 +1,14 @@
+# 分析执行与报告共同依赖的配置契约。
+[package]
+name = "analysis-contract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+config-contract.workspace = true
+serde.workspace = true
+anyhow.workspace = true
+
+[lints]
+workspace = true

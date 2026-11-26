@@ -1,0 +1,21 @@
+[package]
+name = "actrail-kv-sdk-reporter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "actrail_reporter"
+crate-type = ["cdylib"]
+
+[dependencies]
+actrail-kv-sdk-runtime = { path = "../runtime" }
+actrail-kv-sdk-contracts = { path = "../contracts" }
+actrail-kv-reporter.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+report-contract.workspace = true
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

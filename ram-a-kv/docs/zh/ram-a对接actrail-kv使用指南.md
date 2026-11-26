@@ -102,6 +102,48 @@ actrail-kv-receiver \
 
 > 端口须与 `daemon.toml` 的 `actrail_receiver_url` 一致（此处 8087）。
 
+Actrail 命令默认读取 `~/.actrail/actrail-kv/settings.toml`，并在其中补齐所需的默认设置。显式命令行参数优先。也可以将下面的设置保存为 `actrail-settings.toml`，然后运行 `actrail-kv-receiver --config actrail-settings.toml`。
+
+```toml
+[receiver]
+listen = "127.0.0.1:8087"
+output = "requests.ndjson"
+```
+
+设置文件内的相对路径以该文件所在目录为基准。省略 `--output` 和 `receiver.output` 时，receiver 使用 `[storage]`，默认写入设置文件旁的 `captures.sqlite`。
+
+### 5.1 配置采集保留期和容量
+
+共享存储同时限制采集记录的保留期和容量。容量不足时优先清理最旧的数据。
+
+| `[storage.retention]` 配置项 | 默认值 | 设置规则 |
+|---|---|---|
+| `max_age_seconds` | 7 天（`604800` 秒） | 从采集时间起算。`0` 关闭按时间清理，已有的 `0` 在升级后继续生效。 |
+| `max_size_bytes` | 256 MiB（`268435456` 字节） | 必须为正数。容量上限始终生效。 |
+
+可在 `[storage.backends.sqlite.retention]` 或 `[storage.backends.ndjson.retention]` 中覆盖对应后端的设置。
+
+将以下 SQLite 示例保存为 `actrail-settings.toml`，再运行 `actrail-kv-receiver --config actrail-settings.toml`。
+
+```toml
+[receiver]
+listen = "127.0.0.1:8087"
+
+[storage]
+backend = "sqlite"
+
+[storage.retention]
+max_age_seconds = 604800
+max_size_bytes = 268435456
+```
+
+| 后端 | 容量计量 | 按时间清理 | 按容量清理 |
+|---|---|---|---|
+| SQLite | 采集记录的 JSON 字节数。实际数据库文件可能更大。 | 分批删除过期记录 | 按采集时间删除最旧记录 |
+| 托管 NDJSON | 分片文件的总字节数 | 整个分片到期后删除 | 从最旧分片开始回收 |
+
+receiver 启动时检查过期数据，在打开可写存储和写入时检查容量。单条记录超过容量上限时，receiver 拒绝写入。分析时会跳过过期记录。
+
 ---
 
 ## 6. 接入 deepagents-middleware（二选一）
@@ -171,10 +213,28 @@ actrail-kv-report \
   --output report.html
 ```
 
+如果 receiver 使用第 5 节的 TOML 文件，analyze 和 report 可各自传入 `--config actrail-settings.toml`，并省略示例中的 `--input` 和 `--output`。analyze 读取设置指定的采集记录，report 默认读取分析产物。
+
 浏览器打开 `report.html`：
 
 - **命中率表**：每行一次请求，含 prompt / completion / TTFT / 总耗时 列；未上报值的行显示 `—`
 - **结构区**：上下文结构代理、模板、缺陷与调优建议（需 ≥3 条相似请求才出模板/缺陷）
+
+### 7.1 筛选分析记录
+
+筛选决定本次分析的输入范围。下面的命令按会话和采集时间筛选，再选取最新的 100 条记录。
+
+```bash
+actrail-kv-analyze \
+  --config actrail-settings.toml \
+  --session-key session-a \
+  --time-range 2026-11-24..2026-11-26 \
+  --last-n 100
+```
+
+`--session-key` 和 `--time-range` 可重复传入，匹配任一所选会话和任一所选时间段。时间段包含起点并排除终点，支持 UTC 日期和 RFC 3339 时间戳。单个时间段也可用 `--from` 和 `--until` 指定，可只填一端。
+
+可以在 `[analyzer.selection]` 中保存 `session_keys` 和 `last_n`，用 `[[analyzer.selection.time_ranges]]` 表设置各时间段的 `from` 和 `until`。显式命令行参数覆盖对应的筛选设置。
 
 ---
 
@@ -328,6 +388,7 @@ def main() -> int:
     from ram_a_middleware.sdk import RamAClient
 
     os.makedirs(OUT_DIR, exist_ok=True)
+    settings_path = os.path.join(OUT_DIR, "actrail-settings.toml")
     ndjson_path = os.path.join(OUT_DIR, "requests.ndjson")
     analysis_path = os.path.join(OUT_DIR, "analysis.json")
     report_path = os.path.join(OUT_DIR, "report.html")
@@ -343,7 +404,8 @@ def main() -> int:
     # 2) actrail-kv receiver
     receiver_port = free_port()
     receiver = subprocess.Popen(
-        [RECEIVER, "--listen", f"127.0.0.1:{receiver_port}", "--output", ndjson_path],
+        [RECEIVER, "--config", settings_path,
+         "--listen", f"127.0.0.1:{receiver_port}", "--output", ndjson_path],
         stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
     )
 
@@ -434,7 +496,8 @@ def main() -> int:
         print("  ttft_ms/total_ms 真实统计且在预期窗口内（300~1500 / 1000~4000），ttft < total ✓")
 
         # 7) analyze -> report
-        subprocess.run([ANALYZE, "--input", ndjson_path, "--output", analysis_path, "--top-k", "20"],
+        subprocess.run([ANALYZE, "--config", settings_path,
+                        "--input", ndjson_path, "--output", analysis_path, "--top-k", "20"],
                        check=True, capture_output=True)
         analysis = json.load(open(analysis_path, encoding="utf-8"))
         metrics = analysis.get("cache_metrics", [])
@@ -447,7 +510,8 @@ def main() -> int:
         assert rec1_metrics["total_ms"] == rec1_usage["total_ms"], rec1_metrics
         print("  analysis 透传 ttft_ms/total_ms 与 middleware 统计一致 ✓")
 
-        subprocess.run([REPORT, "--input", analysis_path, "--output", report_path],
+        subprocess.run([REPORT, "--config", settings_path,
+                        "--input", analysis_path, "--output", report_path],
                        check=True, capture_output=True)
         html = open(report_path, encoding="utf-8").read()
         tds = set()

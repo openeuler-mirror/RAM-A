@@ -1,0 +1,25 @@
+# Defines the standalone TOML configuration contract package.
+[package]
+name = "config-contract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+config-contract-derive = { path = "derive" }
+serde.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+time = "0.3"
+toml_edit = { version = "0.22", features = ["serde"] }
+
+[[test]]
+name = "config_contract"
+path = "../../../tests/integration/contracts/config.rs"
+
+[[test]]
+name = "config_derive"
+path = "../../../tests/integration/contracts/config/derive.rs"
+
+[lints]
+workspace = true

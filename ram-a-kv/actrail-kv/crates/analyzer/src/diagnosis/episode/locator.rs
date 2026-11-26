@@ -12,7 +12,8 @@ use crate::discovery::template::{
 use crate::model::projection::{ComparisonDomain, ContextCollectionKind};
 
 use super::variant::{build_variant, episode_variant, member, recovered_evidence, LocatedVariant};
-use super::{DefectCandidate, DiagnosisOptions};
+use super::{DefectCandidate, DiagnosisConfig};
+use analysis_contract::config::StabilityConfig;
 
 #[derive(Clone, Debug)]
 pub(in crate::diagnosis) struct Recovery {
@@ -25,9 +26,10 @@ pub(in crate::diagnosis) struct Recovery {
 
 pub fn diagnose_template(
     template: &RequestTemplate,
-    options: &DiagnosisOptions,
+    options: &DiagnosisConfig,
+    stability: &StabilityConfig,
 ) -> Vec<DefectCandidate> {
-    if template.symbolic_members.len() < options.min_stable_support
+    if template.symbolic_members.len() < stability.min_stable_support
         || template.coordinates.is_empty()
     {
         return vec![];
@@ -44,8 +46,13 @@ pub fn diagnose_template(
         let Some((x_start, recovery_search)) = first_mismatch_from(template, &maps, cursor) else {
             break;
         };
-        let Some(recovery) = find_recovery(template, &maps, recovery_search.max(cursor), options)
-        else {
+        let Some(recovery) = find_recovery(
+            template,
+            &maps,
+            recovery_search.max(cursor),
+            options,
+            stability,
+        ) else {
             cursor += 1;
             continue;
         };
@@ -53,7 +60,9 @@ pub fn diagnose_template(
             cursor = x_start.saturating_add(1);
             continue;
         }
-        if let Some(candidate) = build_candidate(template, &maps, x_start, &recovery, options) {
+        if let Some(candidate) =
+            build_candidate(template, &maps, x_start, &recovery, options, stability)
+        {
             candidates.push(candidate);
         }
         let next = recovery.end.max(x_start.saturating_add(1));
@@ -71,7 +80,8 @@ fn build_candidate(
     maps: &BTreeMap<&str, &MemberCoordinateMap>,
     x_start: usize,
     recovery: &Recovery,
-    options: &DiagnosisOptions,
+    options: &DiagnosisConfig,
+    stability: &StabilityConfig,
 ) -> Option<DefectCandidate> {
     let mut located = Vec::new();
     for member_id in recovery.supporter_bytes.keys() {
@@ -90,7 +100,7 @@ fn build_candidate(
         ));
     }
     located.sort_by(|left, right| left.member_id.cmp(&right.member_id));
-    if located.len() < options.min_stable_support {
+    if located.len() < stability.min_stable_support {
         return None;
     }
 
@@ -205,7 +215,8 @@ fn find_recovery(
     template: &RequestTemplate,
     maps: &BTreeMap<&str, &MemberCoordinateMap>,
     search: usize,
-    options: &DiagnosisOptions,
+    options: &DiagnosisConfig,
+    stability: &StabilityConfig,
 ) -> Option<Recovery> {
     for start in search..template.coordinates.len() {
         if template.coordinates[start].kind != CoordinateKind::Stable {
@@ -238,9 +249,9 @@ fn find_recovery(
                 });
             }
             let min_bytes = supporters.values().copied().min().unwrap_or(0);
-            if supported(supporters.len(), template.symbolic_members.len(), options)
+            if supported(supporters.len(), template.symbolic_members.len(), stability)
                 && min_bytes >= options.min_blocked_bytes
-                && min_bytes >= options.min_anchor_bytes
+                && min_bytes >= stability.min_anchor_bytes
             {
                 let anchor_chain_digest = identity::digest(
                     template.coordinates[start..]
@@ -266,9 +277,9 @@ fn find_recovery(
     None
 }
 
-fn supported(count: usize, total: usize, options: &DiagnosisOptions) -> bool {
-    count >= options.min_stable_support
-        && count as f64 / total.max(1) as f64 + f64::EPSILON >= options.stable_support_rate
+fn supported(count: usize, total: usize, stability: &StabilityConfig) -> bool {
+    count >= stability.min_stable_support
+        && count as f64 / total.max(1) as f64 + f64::EPSILON >= stability.stable_support_ratio
 }
 
 fn binding_signature(map: &MemberCoordinateMap, index: usize) -> String {

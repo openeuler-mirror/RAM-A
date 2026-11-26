@@ -2,7 +2,7 @@
 
 use crate::{
     discovery::{
-        candidate::{CandidateBuilder, CandidateOptions},
+        candidate::{CandidateBuilder, CandidateConfig},
         template::{CoordinateBindingState, SymbolicAtom},
     },
     model::projection::{
@@ -85,13 +85,18 @@ fn extract_explicit(medoid: CacheSequence, members: Vec<CacheSequence>) -> Reque
         members,
         cohesion: 0.9,
     };
-    TemplateExtractor::new(TemplateOptions {
-        stable_support_ratio: 0.8,
-        min_stable_support: 3,
-        min_stable_span_bytes: 2,
-        max_alignment_cells: 100_000,
-        max_total_alignment_cells: 1_000_000,
-    })
+    TemplateExtractor::new(
+        TemplateConfig {
+            max_alignment_cells: 100_000,
+            max_total_alignment_cells: 1_000_000,
+        },
+        analysis_contract::config::StabilityConfig {
+            stable_support_ratio: 0.8,
+            min_stable_support: 3,
+            min_anchor_bytes: 2,
+            ..Default::default()
+        },
+    )
     .extract(vec![cohort])
     .templates
     .remove(0)
@@ -103,7 +108,7 @@ fn extract(texts: &[&str]) -> RequestTemplate {
         .enumerate()
         .map(|(i, text)| sequence(&i.to_string(), text))
         .collect();
-    let cohorts = CandidateBuilder::new(CandidateOptions {
+    let cohorts = CandidateBuilder::new(CandidateConfig {
         compatibility_threshold: 0.0,
         max_dynamic_coverage_ratio: 1.0,
         min_members: 3,
@@ -111,13 +116,18 @@ fn extract(texts: &[&str]) -> RequestTemplate {
     })
     .build(sequences)
     .cohorts;
-    TemplateExtractor::new(TemplateOptions {
-        stable_support_ratio: 0.8,
-        min_stable_support: 3,
-        min_stable_span_bytes: 2,
-        max_alignment_cells: 10_000,
-        max_total_alignment_cells: 100_000,
-    })
+    TemplateExtractor::new(
+        TemplateConfig {
+            max_alignment_cells: 10_000,
+            max_total_alignment_cells: 100_000,
+        },
+        analysis_contract::config::StabilityConfig {
+            stable_support_ratio: 0.8,
+            min_stable_support: 3,
+            min_anchor_bytes: 2,
+            ..Default::default()
+        },
+    )
     .extract(cohorts)
     .templates
     .remove(0)
@@ -192,20 +202,25 @@ fn missing_units_count_against_stable_support() {
         ],
         cohesion: 0.8,
     };
-    let result = TemplateExtractor::new(TemplateOptions {
-        stable_support_ratio: 0.8,
-        min_stable_support: 3,
-        min_stable_span_bytes: 2,
-        max_alignment_cells: 10_000,
-        max_total_alignment_cells: 100_000,
-    })
+    let result = TemplateExtractor::new(
+        TemplateConfig {
+            max_alignment_cells: 10_000,
+            max_total_alignment_cells: 100_000,
+        },
+        analysis_contract::config::StabilityConfig {
+            stable_support_ratio: 0.8,
+            min_stable_support: 3,
+            min_anchor_bytes: 2,
+            ..Default::default()
+        },
+    )
     .extract(vec![cohort]);
     assert!(result.templates[0].stable_spans.is_empty());
 }
 
 #[test]
 fn complete_template_output_is_input_permutation_invariant() {
-    let options = CandidateOptions {
+    let options = CandidateConfig {
         compatibility_threshold: 0.0,
         max_dynamic_coverage_ratio: 1.0,
         min_members: 3,
@@ -222,13 +237,18 @@ fn complete_template_output_is_input_permutation_invariant() {
         let cohorts = CandidateBuilder::new(options.clone())
             .build(members)
             .cohorts;
-        TemplateExtractor::new(TemplateOptions {
-            stable_support_ratio: 0.8,
-            min_stable_support: 3,
-            min_stable_span_bytes: 2,
-            max_alignment_cells: 10_000,
-            max_total_alignment_cells: 100_000,
-        })
+        TemplateExtractor::new(
+            TemplateConfig {
+                max_alignment_cells: 10_000,
+                max_total_alignment_cells: 100_000,
+            },
+            analysis_contract::config::StabilityConfig {
+                stable_support_ratio: 0.8,
+                min_stable_support: 3,
+                min_anchor_bytes: 2,
+                ..Default::default()
+            },
+        )
         .extract(cohorts)
         .templates
         .remove(0)
@@ -261,7 +281,7 @@ fn total_text_alignment_budget_is_explicit_and_exact_text_uses_linear_fast_path(
         sequence("b", &long),
         sequence("c", &long),
     ];
-    let cohorts = CandidateBuilder::new(CandidateOptions {
+    let cohorts = CandidateBuilder::new(CandidateConfig {
         compatibility_threshold: 0.0,
         max_dynamic_coverage_ratio: 1.0,
         min_members: 3,
@@ -269,13 +289,18 @@ fn total_text_alignment_budget_is_explicit_and_exact_text_uses_linear_fast_path(
     })
     .build(sequences)
     .cohorts;
-    let exact = TemplateExtractor::new(TemplateOptions {
-        stable_support_ratio: 0.8,
-        min_stable_support: 3,
-        min_stable_span_bytes: 2,
-        max_alignment_cells: 10,
-        max_total_alignment_cells: 300_000,
-    })
+    let exact = TemplateExtractor::new(
+        TemplateConfig {
+            max_alignment_cells: 10,
+            max_total_alignment_cells: 300_000,
+        },
+        analysis_contract::config::StabilityConfig {
+            stable_support_ratio: 0.8,
+            min_stable_support: 3,
+            min_anchor_bytes: 2,
+            ..Default::default()
+        },
+    )
     .extract(cohorts);
     assert_eq!(exact.templates.len(), 1);
 
@@ -284,7 +309,7 @@ fn total_text_alignment_budget_is_explicit_and_exact_text_uses_linear_fast_path(
         sequence("y", &format!("{}y", "a".repeat(500))),
         sequence("z", &format!("{}z", "a".repeat(500))),
     ];
-    let cohorts = CandidateBuilder::new(CandidateOptions {
+    let cohorts = CandidateBuilder::new(CandidateConfig {
         compatibility_threshold: 0.0,
         max_dynamic_coverage_ratio: 1.0,
         min_members: 3,
@@ -292,13 +317,18 @@ fn total_text_alignment_budget_is_explicit_and_exact_text_uses_linear_fast_path(
     })
     .build(differing)
     .cohorts;
-    let exhausted = TemplateExtractor::new(TemplateOptions {
-        stable_support_ratio: 0.8,
-        min_stable_support: 3,
-        min_stable_span_bytes: 2,
-        max_alignment_cells: 1_000_000,
-        max_total_alignment_cells: 1_000,
-    })
+    let exhausted = TemplateExtractor::new(
+        TemplateConfig {
+            max_alignment_cells: 1_000_000,
+            max_total_alignment_cells: 1_000,
+        },
+        analysis_contract::config::StabilityConfig {
+            stable_support_ratio: 0.8,
+            min_stable_support: 3,
+            min_anchor_bytes: 2,
+            ..Default::default()
+        },
+    )
     .extract(cohorts);
     assert!(exhausted.templates.is_empty());
     assert!(exhausted.skipped[0]
@@ -316,7 +346,7 @@ fn slots_keep_true_slices_and_at_most_sixteen_examples() {
             )
         })
         .collect();
-    let cohorts = CandidateBuilder::new(CandidateOptions {
+    let cohorts = CandidateBuilder::new(CandidateConfig {
         compatibility_threshold: 0.0,
         max_dynamic_coverage_ratio: 1.0,
         min_members: 3,
@@ -324,13 +354,18 @@ fn slots_keep_true_slices_and_at_most_sixteen_examples() {
     })
     .build(sequences)
     .cohorts;
-    let template = TemplateExtractor::new(TemplateOptions {
-        stable_support_ratio: 0.8,
-        min_stable_support: 3,
-        min_stable_span_bytes: 4,
-        max_alignment_cells: 100_000,
-        max_total_alignment_cells: 2_000_000,
-    })
+    let template = TemplateExtractor::new(
+        TemplateConfig {
+            max_alignment_cells: 100_000,
+            max_total_alignment_cells: 2_000_000,
+        },
+        analysis_contract::config::StabilityConfig {
+            stable_support_ratio: 0.8,
+            min_stable_support: 3,
+            min_anchor_bytes: 4,
+            ..Default::default()
+        },
+    )
     .extract(cohorts)
     .templates
     .remove(0);
@@ -435,13 +470,18 @@ fn stable_span_requires_the_same_members_to_support_the_whole_contiguous_range()
         ],
         cohesion: 0.7,
     };
-    let result = TemplateExtractor::new(TemplateOptions {
-        stable_support_ratio: 0.6,
-        min_stable_support: 3,
-        min_stable_span_bytes: 8,
-        max_alignment_cells: 1_000,
-        max_total_alignment_cells: 10_000,
-    })
+    let result = TemplateExtractor::new(
+        TemplateConfig {
+            max_alignment_cells: 1_000,
+            max_total_alignment_cells: 10_000,
+        },
+        analysis_contract::config::StabilityConfig {
+            stable_support_ratio: 0.6,
+            min_stable_support: 3,
+            min_anchor_bytes: 8,
+            ..Default::default()
+        },
+    )
     .extract(vec![cohort]);
     assert!(result.templates[0].stable_spans.is_empty());
 }
