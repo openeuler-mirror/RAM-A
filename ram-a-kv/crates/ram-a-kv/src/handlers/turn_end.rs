@@ -140,11 +140,11 @@ impl EventHandler for TurnEndHandler {
             Err(e) => return EventResult::Err(e.to_string()),
         };
 
-        if let (Some(relay), Some(capture)) = (&ctx.actrail_relay, parsed.actrail_capture.clone()) {
+        if let (Some(sink), Some(capture)) = (&ctx.actrail_sink, parsed.actrail_capture.clone()) {
             let session_id = parsed.session_id.clone();
-            let relay = relay.clone();
+            let sink = sink.clone();
             tokio::spawn(async move {
-                relay.forward(capture, &session_id).await;
+                sink.forward(capture, &session_id).await;
             });
         }
 
@@ -211,7 +211,7 @@ mod tests {
         AppContext {
             manager: Arc::new(KvCacheManager::new(config, backend)),
             session_store: Arc::new(MemorySessionStore::new()),
-            actrail_relay: None,
+            actrail_sink: None,
             turn_start_prefetch_async: false,
         }
     }

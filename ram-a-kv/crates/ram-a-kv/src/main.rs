@@ -205,22 +205,26 @@ async fn main() {
     registry.register("health", Arc::new(HealthHandler));
     registry.register("agent_event", Arc::new(AgentEventHandler));
 
-    let actrail_relay = match crate::handlers::actrail_relay::ActrailRelay::new(&config) {
-        Some(r) => {
-            tracing::info!(url = %config.actrail_receiver_url.as_deref().unwrap_or(""),
-                           "actrail-kv relay enabled");
-            Some(Arc::new(r))
+    let actrail_sink = match crate::handlers::actrail_relay::ActrailSink::new(&config) {
+        Ok(Some(s)) => {
+            tracing::info!(lib = config.actrail_sdk_lib.as_deref().unwrap_or(""),
+                           "actrail-kv sdk enabled");
+            Some(Arc::new(s))
         }
-        None => {
-            tracing::info!("actrail-kv relay disabled (no receiver_url configured)");
+        Ok(None) => {
+            tracing::info!("actrail-kv sdk disabled (no actrail_sdk_lib configured)");
             None
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "refusing to start: actrail SDK load failed");
+            std::process::exit(1);
         }
     };
 
     let context = Arc::new(AppContext {
         manager: manager.clone(),
         session_store: session_store.clone(),
-        actrail_relay,
+        actrail_sink,
         turn_start_prefetch_async: config.turn_start_prefetch_async,
     });
 
