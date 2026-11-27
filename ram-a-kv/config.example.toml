@@ -11,6 +11,8 @@ ucm_url = "http://127.0.0.1:9003"
 # When unset/empty, actrail integration is disabled. Fill in the actual .so
 # absolute path to enable; a wrong/missing path makes the daemon refuse to start.
 # actrail_sdk_lib = "/usr/lib/actrail-kv/libactrail_receiver.so"
+# actrail_analyzer_lib = "/usr/lib/actrail-kv/libactrail_analyzer.so"
+# actrail_reporter_lib = "/usr/lib/actrail-kv/libactrail_reporter.so"
 # actrail_model_deployment_key = "GLM-5.2"
 # actrail_kv_namespace = "default"
 # turn_start prefetch: true runs it inline (blocks the caller on the router

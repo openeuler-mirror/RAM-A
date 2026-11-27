@@ -14,6 +14,7 @@
 // register event handlers, and serve HTTP.
 
 pub mod api;
+mod actrail_api;
 mod backend;
 mod daemon_config;
 mod event_registry;
@@ -234,11 +235,15 @@ async fn main() {
         session_store,
         context,
         auth_token: config.auth_token.clone(),
+        actrail_analyzer_lib: config.actrail_analyzer_lib.clone(),
+        actrail_reporter_lib: config.actrail_reporter_lib.clone(),
     });
 
     // Single route: everything flows through POST /event and the registry dispatches by "type".
     let app = Router::new()
         .route("/event", post(api::handle_event))
+        .route("/actrail/analyze", post(actrail_api::handle_analyze))
+        .route("/actrail/report", post(actrail_api::handle_report))
         .with_state(app_state.clone())
         .layer(middleware::from_fn_with_state(app_state, require_auth));
 
