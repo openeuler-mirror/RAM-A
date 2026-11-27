@@ -25,6 +25,8 @@ async-trait.workspace = true
 toml.workspace = true
 reqwest.workspace = true
 thiserror.workspace = true
+actrail-kv-sdk.workspace = true
+dirs.workspace = true
 
 [dev-dependencies]
 reqwest = { workspace = true, features = ["json"] }

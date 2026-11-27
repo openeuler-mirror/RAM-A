@@ -57,8 +57,11 @@ pub struct DaemonConfig {
     // Required when listen_addr is not a loopback address.
     #[serde(default)]
     pub auth_token: String,
+    // Path to libactrail_receiver.so. When non-empty, the daemon loads the
+    // actrail-kv receiver SDK in-process and forwards turn_end captures to it
+    // (fire-and-forget). When empty, actrail integration is disabled.
     #[serde(default)]
-    pub actrail_receiver_url: Option<String>,
+    pub actrail_sdk_lib: Option<String>,
     #[serde(default)]
     pub actrail_model_deployment_key: Option<String>,
     #[serde(default)]
@@ -108,7 +111,7 @@ impl Default for DaemonConfig {
             turn_start_prefetch: default_turn_start_prefetch(),
             turn_start_prefetch_async: false,
             auth_token: String::new(),
-            actrail_receiver_url: None,
+            actrail_sdk_lib: None,
             actrail_model_deployment_key: None,
             actrail_kv_namespace: None,
         }

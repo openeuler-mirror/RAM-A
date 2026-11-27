@@ -6,6 +6,13 @@ lmcache_url = "http://localhost:6999"
 # (POST {ucm_url}/kv/prefetch) instead of LMCache. Ignored when noop_backend = true.
 ucm_backend = false
 ucm_url = "http://127.0.0.1:9003"
+# Path to libactrail_receiver.so. When set, the daemon loads the actrail-kv
+# receiver SDK in-process and forwards turn_end captures to it (fire-and-forget).
+# When unset/empty, actrail integration is disabled. Fill in the actual .so
+# absolute path to enable; a wrong/missing path makes the daemon refuse to start.
+# actrail_sdk_lib = "/usr/lib/actrail-kv/libactrail_receiver.so"
+# actrail_model_deployment_key = "GLM-5.2"
+# actrail_kv_namespace = "default"
 # turn_start prefetch: true runs it inline (blocks the caller on the router
 # fan-out); turn_start_prefetch_async = true makes it fire-and-forget so the
 # fan-out overlaps the caller's next work (e.g. the model call).

@@ -1,15 +1,15 @@
 <!-- 本文件描述 ram-a-kv 作为 actrail-kv 采集中转入口的对接方式与使用方法。 -->
 # ram-a-kv 对接 actrail-kv
 
-actrail-kv 从 `0.2.0` 起支持两种接入方式。RAM-A daemon 通过 HTTP 转发采集请求，由 Actrail 命令行工具完成分析和报告。需要在应用进程内调用这三项能力时，可使用原生动态库。Rust 应用通过 `actrail-kv-sdk` 加载这些库。
+ram-a-kv 从 `0.2.1` 起通过 `actrail-kv-sdk` 以进程内动态库的方式调用 actrail-kv 的 receiver 能力，无需独立运行 `actrail-kv-receiver` 进程。分析与报告仍由 Actrail 命令行工具离线完成。
 
 ## 1. 架构
 
-ram-a-kv 作为推理侧 daemon，位于 Agent 与模型后端之间，可作为 actrail-kv 的采集中转入口：Agent 在 `turn_end` 事件里附带完整 LLM 请求，ram-a-kv 补齐部署维度后转发给 actrail-kv-receiver。
+ram-a-kv 作为推理侧 daemon，位于 Agent 与模型后端之间，作为 actrail-kv 的采集中转入口：Agent 在 `turn_end` 事件里附带完整 LLM 请求，ram-a-kv 补齐部署维度后，通过 SDK in-process 调用 `libactrail_receiver.so` 将采集记录写入存储。
 
 ```text
-Agent ──turn_end(含 actrail_capture)──▶ ram-a-kv ──forward──▶ actrail-kv-receiver → requests.ndjson
-                                          │                        → analyze → report.html
+Agent ──turn_end(含 actrail_capture)──▶ ram-a-kv ──SDK submit──▶ libactrail_receiver.so → captures.sqlite / captures/
+                                          │
                                           └─ KV 协调主流程不受影响
 ```
 
@@ -23,12 +23,12 @@ ram-a-kv 配置文件新增三个字段：
 
 | 字段 | 作用 |
 |---|---|
-| `actrail_receiver_url` | receiver 地址，留空 = 禁用转发 |
+| `actrail_sdk_lib` | `libactrail_receiver.so` 绝对路径，留空 = 禁用 actrail 集成 |
 | `actrail_model_deployment_key` | 模型部署标识（actrail-kv 聚类维度） |
 | `actrail_kv_namespace` | KV namespace（actrail-kv 聚类维度） |
 
 ```toml
-actrail_receiver_url = "http://127.0.0.1:8087"
+actrail_sdk_lib = "/usr/lib/actrail-kv/libactrail_receiver.so"
 actrail_model_deployment_key = "GLM-5.2"
 actrail_kv_namespace = "default"
 ```
@@ -38,18 +38,16 @@ actrail_kv_namespace = "default"
 ### 2.2 启动
 
 ```bash
-# 1. 启动 actrail-kv-receiver
-actrail-kv-receiver --listen 127.0.0.1:8087 --output requests.ndjson
-
+# 1. 确保 libactrail_receiver.so 已部署到配置指定路径
 # 2. 启动 ram-a-kv
 RAM_A_KV_CONFIG=config.toml ram-a-kv
 
 # 3. 正常使用 Agent（SDK daemon_url 指向 ram-a-kv）
 ```
 
-ram-a-kv 启动时日志输出 `actrail-kv relay enabled` 表示转发已开启。
+ram-a-kv 启动时日志输出 `actrail-kv sdk enabled` 表示 SDK 已加载；`actrail-kv sdk disabled` 表示未配置 `actrail_sdk_lib`；加载失败会拒绝启动（fail-fast）。
 
-Actrail 命令默认读取 `~/.actrail/actrail-kv/settings.toml`，并补齐所需的默认设置。可用 `--config <path>` 指定其他 TOML 文件。示例中的 `--output` 选择单文件 NDJSON。省略该参数和配置中的 `receiver.output` 时，receiver 使用 `[storage]`，默认写入设置文件旁的 `captures.sqlite`。
+actrail-kv 的 receiver 通过 SDK 读取默认设置文件 `~/.actrail/actrail-kv/settings.toml`（缺项自动补齐写回）。省略 `receiver.output` 时，receiver 使用 `[storage]`，默认写入设置文件旁的 `captures.sqlite`。
 
 SQLite 和托管 NDJSON 同时按保留期和容量清理采集记录。
 
@@ -61,40 +59,39 @@ SQLite 和托管 NDJSON 同时按保留期和容量清理采集记录。
 ### 2.3 生成报告
 
 ```bash
-actrail-kv-analyze --input requests.ndjson --output analysis.json --top-k 20
-actrail-kv-report  --input analysis.json  --output report.html
+actrail-kv-analyze --config ~/.actrail/actrail-kv/settings.toml --top-k 20
+actrail-kv-report  --config ~/.actrail/actrail-kv/settings.toml --output report.html
 ```
 
-通过 `--config` 启动 receiver 后，analyze 和 report 可指定同一份设置并省略输入、输出参数。analyze 读取配置指定的采集记录，report 默认读取分析产物。设置文件内的相对路径以该文件所在目录为基准。
+analyze 读取配置指定的采集记录，report 默认读取分析产物。设置文件内的相对路径以该文件所在目录为基准。
 
 使用 `--session-key` 筛选会话，使用 `--time-range FROM..UNTIL` 筛选采集时间。`--last-n` 在会话和时间筛选之后选取最新的 N 条记录。
 
 ### 2.4 验证
 
 ```bash
-# 日志出现 "actrail forward ok status=202" = 转发成功
+# 日志出现 "actrail sdk submit ok" = 采集成功
 tail -f ram-a-kv.log
 
 # 语料累积
-wc -l requests.ndjson
+ls -la ~/.actrail/actrail-kv/captures.sqlite
 ```
 
 ## 3. 故障隔离
 
-转发失败不影响 Agent 调模型，也不影响 ram-a-kv 的 KV 协调主流程。receiver 挂了只 warn，ram-a-kv 挂了只 warn，Agent 照常工作。
+SDK submit 失败不影响 Agent 调模型，也不影响 ram-a-kv 的 KV 协调主流程，只 warn。但 daemon 启动时若 `.so` 文件加载失败或 ABI 不匹配，daemon 拒绝启动（fail-fast），避免运行期静默丢采集。
 
-## 4. 在应用内调用 actrail-kv
+## 4. SDK 调用细节
 
-从 `0.2.0` 升到 `0.2.1` 时，Rust 应用需要同时更新 `actrail-kv-sdk` 和动态库。C 应用使用新版 `actrail.h`。导出符号的前缀改为 `actrail_kv_`。
+ram-a-kv 通过 `actrail-kv-sdk` 的 `ReceiverFactory::create(SdkConfig)` 加载 `libactrail_receiver.so`，创建一个 in-process 的 `Receiver` 实例：
 
-创建实例时，宿主提供动态库路径和绝对路径 `base_dir`。`SdkConfig.config_toml` 为 `None` 时读取默认 `~/.actrail/actrail-kv/settings.toml`，缺项会补齐写回。传入 `Some(text)` 时使用内存 TOML。`SdkOverrides` 的显式字段优先，仅对当前实例生效。
+- `library_path`：配置文件的 `actrail_sdk_lib`
+- `base_dir`：ram-a-kv 配置文件所在目录（用于显式导出的相对路径基准）
+- `config_toml`：`None`（读默认 `~/.actrail/actrail-kv/settings.toml`）
+- `overrides`：默认（不覆盖设置文件）
 
-文件配置的相对路径以设置文件所在目录为基准。内存配置和显式导出的相对路径以 `base_dir` 为基准。
+`turn_end` 时，ram-a-kv 把 `actrail_capture` 字段组装成 `CaptureInput`（含 `payload` / `source` / `session_key` / `comparison`），通过 `tokio::task::spawn_blocking` 调用 `Receiver::submit()`（同步阻塞写存储），fire-and-forget，不阻塞 `turn_end` 响应。
 
-在 Linux 上，三项能力按以下顺序使用。
+`Receiver` 实例用 `Arc<Mutex<Receiver>>` 共享，临界区仅覆盖 `submit()` 调用，锁竞争极小。
 
-1. 用 `libactrail_receiver.so` 提交请求，将采集记录写入存储。
-2. 用 `libactrail_analyzer.so` 从同一存储筛选记录，获取内存中的分析结果。
-3. 用 `libactrail_reporter.so` 渲染该结果，获取内存中的报告。需要文件时，调用方显式导出 JSON、HTML 或 Markdown。
-
-Rust 调用示例和 C 接口分别见 [sdk_pipeline.rs](../actrail-kv/crates/sdk/rust/examples/sdk_pipeline.rs) 和 [actrail.h](../actrail-kv/crates/sdk/native/contracts/include/actrail.h)。
+Rust SDK 完整调用示例见 [sdk_pipeline.rs](../actrail-kv/crates/sdk/rust/examples/sdk_pipeline.rs)，C 接口见 [actrail.h](../actrail-kv/crates/sdk/native/contracts/include/actrail.h)。

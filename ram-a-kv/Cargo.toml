@@ -25,9 +25,43 @@ clap = { version = "4.5", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tracing-subscriber = "0.3"
 tempfile = "3.9"
+anyhow = "1.0"
+libloading = "0.8"
+dirs = "5"
+time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+hex = "0.4"
+proptest = "1.7"
+same-file = "1.0"
+tower = { version = "0.5", features = ["util"] }
+fs2 = "0.4"
+askama = "0.16"
+toml_edit = "0.22"
+actrail-kv-sdk = { path = "actrail-kv/crates/sdk/rust" }
+actrail-kv-sdk-contracts = { path = "actrail-kv/crates/sdk/native/contracts" }
+actrail-kv-sdk-runtime = { path = "actrail-kv/crates/sdk/native/runtime" }
+actrail-kv-sdk-analyzer = { path = "actrail-kv/crates/sdk/native/analyzer" }
+actrail-kv-sdk-receiver = { path = "actrail-kv/crates/sdk/native/receiver" }
+actrail-kv-sdk-reporter = { path = "actrail-kv/crates/sdk/native/reporter" }
+actrail-kv-artifacts = { path = "actrail-kv/crates/artifacts" }
+actrail-kv-storage = { path = "actrail-kv/crates/storage" }
+actrail-kv-settings = { path = "actrail-kv/crates/settings" }
+actrail-kv-receiver = { path = "actrail-kv/crates/receiver" }
+actrail-kv-analyzer = { path = "actrail-kv/crates/analyzer" }
+actrail-kv-reporter = { path = "actrail-kv/crates/reporter" }
+analysis-contract = { path = "actrail-kv/crates/contracts/analysis" }
+report-contract = { path = "actrail-kv/crates/contracts/report" }
+storage-contract = { path = "actrail-kv/crates/contracts/storage" }
+config-contract = { path = "actrail-kv/crates/contracts/config" }
 
 [profile.release]
 opt-level = 3
 lto = "thin"
 codegen-units = 16
 strip = true
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
