@@ -17,6 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::Mutex;
 
@@ -48,6 +49,24 @@ pub struct SessionKvState {
     pub map: KvCacheMap,
     // Number of completed inference turns.
     pub turn_count: u32,
+    // Last time this session was touched by any mutating operation
+    // (turn_start/turn_end/snapshot_restore/session_fork/restore_session).
+    // Used by `enforce_max_sessions` (LRU) and `gc_idle` (TTL) to pick victims.
+    pub last_accessed: Instant,
+}
+
+impl SessionKvState {
+    pub fn new(map: KvCacheMap, turn_count: u32) -> Self {
+        Self {
+            map,
+            turn_count,
+            last_accessed: Instant::now(),
+        }
+    }
+
+    pub fn touch(&mut self) {
+        self.last_accessed = Instant::now();
+    }
 }
 
 // Captured snapshot of a parent session's chunk hashes at fork time.
@@ -128,11 +147,14 @@ impl KvCacheManager {
             return Ok(outcome);
         }
         let hashes = {
-            let sessions = self.sessions.lock().await;
-            sessions
-                .get(session_id)
-                .map(|s| unique_hashes(&s.map.chunk_hashes()))
-                .unwrap_or_default()
+            let mut sessions = self.sessions.lock().await;
+            match sessions.get_mut(session_id) {
+                Some(state) => {
+                    state.touch();
+                    unique_hashes(&state.map.chunk_hashes())
+                }
+                None => Vec::new(),
+            }
         };
         if hashes.is_empty() {
             return Ok(outcome);
@@ -187,10 +209,7 @@ impl KvCacheManager {
             if !sessions.contains_key(session_id) {
                 sessions.insert(
                     session_id.to_string(),
-                    SessionKvState {
-                        map: KvCacheMap::default(),
-                        turn_count: 0,
-                    },
+                    SessionKvState::new(KvCacheMap::default(), 0),
                 );
             }
             let state = sessions
@@ -199,6 +218,7 @@ impl KvCacheManager {
                     session_id: session_id.to_string(),
                 })?;
             state.turn_count += 1;
+            state.touch();
 
             match new_hashes {
                 // No KV transfer data this turn: leave the map and refcounts as-is
@@ -267,6 +287,17 @@ impl KvCacheManager {
             }
         }
 
+        // Enforce the session-count cap after the session has been created or
+        // updated. The current session was just touched so it is the freshest
+        // and will never be picked as the LRU victim here.
+        if self.config.max_sessions > 0 {
+            let extra = self.enforce_max_sessions(self.config.max_sessions).await;
+            outcome.evicted_count += extra.evicted_count;
+            if extra.backend_degraded {
+                outcome.backend_degraded = true;
+            }
+        }
+
         Ok(outcome)
     }
 
@@ -314,13 +345,9 @@ impl KvCacheManager {
 
             // Preserve turn_count so restore is not a reset.
             let turn_count = sessions.get(session_id).map(|s| s.turn_count).unwrap_or(0);
-            sessions.insert(
-                session_id.to_string(),
-                SessionKvState {
-                    map: new_map,
-                    turn_count,
-                },
-            );
+            let mut state = SessionKvState::new(new_map, turn_count);
+            state.touch();
+            sessions.insert(session_id.to_string(), state);
             to_evict
         };
 
@@ -358,6 +385,16 @@ impl KvCacheManager {
                 outcome.backend_degraded = true;
             } else {
                 outcome.prefetch_sent = true;
+            }
+        }
+
+        // Enforce the cap after inserting/refreshing the target session.
+        // The current session was just touched so it survives the LRU sweep.
+        if self.config.max_sessions > 0 {
+            let extra = self.enforce_max_sessions(self.config.max_sessions).await;
+            outcome.evicted_count += extra.evicted_count;
+            if extra.backend_degraded {
+                outcome.backend_degraded = true;
             }
         }
 
@@ -417,6 +454,86 @@ impl KvCacheManager {
         Ok(outcome)
     }
 
+    // Enforce the session-count cap by evicting least-recently-accessed sessions
+    // until `sessions.len() <= max`. Returns the aggregate outcome of the evictions.
+    //
+    // Victim selection: `last_accessed` ascending (oldest first). The freshly
+    // touched session (just inserted/updated by the caller) is never picked
+    // because it has the newest `last_accessed`.
+    //
+    // Lock order: this method acquires `sessions` then `refcounts` (the same
+    // order used by `on_turn_end`/`on_session_close`) and releases both before
+    // calling the backend, so a slow backend cannot block other sessions.
+    //
+    // `max == 0` is treated as "no cap" (returns a default outcome) so callers
+    // can invoke it unconditionally when the cap is disabled.
+    pub(crate) async fn enforce_max_sessions(&self, max: usize) -> OperationOutcome {
+        let mut outcome = OperationOutcome::default();
+        if max == 0 {
+            return outcome;
+        }
+
+        // Collect victim candidates (session_id, last_accessed) and decide how
+        // many to evict before taking them out, so we hold the sessions lock only
+        // for the duration of the selection + removal.
+        let to_evict_hashes: Vec<Vec<String>> = {
+            let mut sessions = self.sessions.lock().await;
+            if sessions.len() <= max {
+                return outcome;
+            }
+            let to_remove = sessions.len() - max;
+            // Collect (last_accessed, session_id) for all sessions, sort ascending
+            // by last_accessed, and pick the oldest `to_remove` of them.
+            let mut by_age: Vec<(Instant, String)> = sessions
+                .iter()
+                .map(|(id, st)| (st.last_accessed, id.clone()))
+                .collect();
+            by_age.sort_by_key(|(ts, _)| *ts);
+            let victims: Vec<String> = by_age
+                .into_iter()
+                .take(to_remove)
+                .map(|(_, id)| id)
+                .collect();
+
+            let mut refcounts = self.refcounts.lock().await;
+            let mut all_to_evict: Vec<Vec<String>> = Vec::with_capacity(victims.len());
+            for session_id in &victims {
+                if let Some(state) = sessions.remove(session_id) {
+                    let unique = unique_hashes(&state.map.chunk_hashes());
+                    let evicted = decrement_refcounts(&mut refcounts, &unique);
+                    if !evicted.is_empty() {
+                        all_to_evict.push(evicted);
+                    }
+                    tracing::info!(
+                        session_id = %session_id,
+                        turn_count = state.turn_count,
+                        "LRU: evicted session to enforce max_sessions cap"
+                    );
+                }
+            }
+            drop(refcounts);
+            drop(sessions);
+            all_to_evict
+        };
+
+        // Evict the collected chunks from the backend (outside the locks).
+        for hashes in to_evict_hashes {
+            let result = self.backend.evict(hashes.clone()).await;
+            if !backend_ok(&result) {
+                tracing::warn!(
+                    status = result.status,
+                    responded = result.responded,
+                    count = hashes.len(),
+                    "LMCache evict failed during max_sessions enforcement"
+                );
+                outcome.backend_degraded = true;
+            } else {
+                outcome.evicted_count += hashes.len();
+            }
+        }
+        outcome
+    }
+
     // Fork a session: capture the parent's current hash set, generate a fork_id, and
     // increment refcount for every unique hash so the parent's later `turn_end` cannot
     // evict chunks still shared with the subagent.
@@ -426,12 +543,13 @@ impl KvCacheManager {
     // reading the parent's current map at fork_end, which could release the wrong set.
     pub async fn on_session_fork(&self, session_id: &str) -> ManagerResult<ForkOutcome> {
         let hashes = {
-            let sessions = self.sessions.lock().await;
-            let Some(state) = sessions.get(session_id) else {
+            let mut sessions = self.sessions.lock().await;
+            let Some(state) = sessions.get_mut(session_id) else {
                 return Err(KvCacheError::SessionNotFound {
                     session_id: session_id.to_string(),
                 });
             };
+            state.touch();
             unique_hashes(&state.map.chunk_hashes())
         };
 
@@ -522,6 +640,8 @@ impl KvCacheManager {
     // Restore a session's state (used when recovering from SQLite). Does not touch refcounts;
     // callers are expected to invoke `rebuild_refcounts()` once all sessions have been restored.
     pub async fn restore_session(&self, session_id: &str, state: SessionKvState) {
+        let mut state = state;
+        state.touch();
         self.sessions
             .lock()
             .await
@@ -633,6 +753,7 @@ mod tests {
             debug_dir: String::new(),
             backend_url: String::new(),
             turn_start_prefetch: false,
+            max_sessions: 0,
         }
     }
 
@@ -779,18 +900,12 @@ mod tests {
         let mgr = KvCacheManager::new_noop(test_config());
         mgr.restore_session(
             "s1",
-            SessionKvState {
-                map: KvCacheMap(vec!["A".into(), "B".into()]),
-                turn_count: 1,
-            },
+            SessionKvState::new(KvCacheMap(vec!["A".into(), "B".into()]), 1),
         )
         .await;
         mgr.restore_session(
             "s2",
-            SessionKvState {
-                map: KvCacheMap(vec!["A".into(), "C".into()]),
-                turn_count: 1,
-            },
+            SessionKvState::new(KvCacheMap(vec!["A".into(), "C".into()]), 1),
         )
         .await;
         // Pre-rebuild, refcount table is empty.
@@ -829,10 +944,7 @@ mod tests {
         let mgr = KvCacheManager::new_noop(test_config());
         mgr.restore_session(
             "s1",
-            SessionKvState {
-                map: KvCacheMap(vec!["A".into(), "A".into()]),
-                turn_count: 0,
-            },
+            SessionKvState::new(KvCacheMap(vec!["A".into(), "A".into()]), 0),
         )
         .await;
         mgr.rebuild_refcounts().await;
@@ -978,10 +1090,7 @@ mod tests {
         // simulate a broken invariant.
         mgr.restore_session(
             "s1",
-            SessionKvState {
-                map: KvCacheMap(vec!["Z".into()]),
-                turn_count: 1,
-            },
+            SessionKvState::new(KvCacheMap(vec!["Z".into()]), 1),
         )
         .await;
         mgr.rebuild_refcounts().await; // refcount[Z] = 1
@@ -1000,5 +1109,122 @@ mod tests {
                 None => { /* acceptable: caller may have cleaned up */ }
             }
         }
+    }
+
+    // Helper: count sessions currently tracked by the manager.
+    async fn sessions_count(mgr: &KvCacheManager) -> usize {
+        mgr.sessions.lock().await.len()
+    }
+
+    #[tokio::test]
+    async fn enforce_max_sessions_evicts_oldest_first() {
+        // With max_sessions=2, creating a third session must evict the oldest.
+        // Each session owns a distinct hash so we can verify which one was evicted.
+        let mut cfg = test_config();
+        cfg.max_sessions = 2;
+        let mgr = KvCacheManager::new_noop(cfg);
+
+        mgr.on_turn_end("oldest", Some(vec!["A".into()]), None).await.unwrap();
+        mgr.on_turn_end("middle", Some(vec!["B".into()]), None).await.unwrap();
+        // "oldest" was created first and never touched again, so it has the
+        // oldest last_accessed. The third session creation must evict it.
+        let outcome = mgr
+            .on_turn_end("newest", Some(vec!["C".into()]), None)
+            .await
+            .unwrap();
+
+        assert_eq!(sessions_count(&mgr).await, 2, "cap must reduce to 2");
+        assert!(mgr.session_map("oldest").await.is_none(), "oldest must be evicted");
+        assert!(mgr.session_map("middle").await.is_some(), "middle survives");
+        assert!(mgr.session_map("newest").await.is_some(), "newest survives");
+        // A's refcount must be 0 (oldest was its only holder) -> evicted.
+        {
+            let refcounts = mgr.refcounts.lock().await;
+            assert!(refcounts.get("A").is_none(), "A must be evicted (refcount 0)");
+            assert!(refcounts.get("B").is_some(), "B still referenced by middle");
+            assert!(refcounts.get("C").is_some(), "C still referenced by newest");
+        }
+        assert!(outcome.evicted_count >= 1, "evicted_count must reflect the LRU eviction");
+    }
+
+    #[tokio::test]
+    async fn enforce_max_sessions_never_evicts_the_just_touched_session() {
+        // Even if max_sessions=1, the session just created/updated by turn_end
+        // must survive because it has the newest last_accessed.
+        let mut cfg = test_config();
+        cfg.max_sessions = 1;
+        let mgr = KvCacheManager::new_noop(cfg);
+
+        mgr.on_turn_end("s1", Some(vec!["A".into()]), None).await.unwrap();
+        mgr.on_turn_end("s2", Some(vec!["B".into()]), None).await.unwrap();
+        // After s2, max_sessions=1 means only one session survives; s1 (older) is dropped.
+        assert_eq!(sessions_count(&mgr).await, 1);
+        assert!(mgr.session_map("s1").await.is_none(), "older s1 must be evicted");
+        assert!(mgr.session_map("s2").await.is_some(), "newer s2 must survive");
+    }
+
+    #[tokio::test]
+    async fn enforce_max_sessions_zero_means_disabled() {
+        // max_sessions=0 must NOT evict anything; the cap is disabled.
+        let mut cfg = test_config();
+        cfg.max_sessions = 0;
+        let mgr = KvCacheManager::new_noop(cfg);
+
+        mgr.on_turn_end("s1", Some(vec!["A".into()]), None).await.unwrap();
+        mgr.on_turn_end("s2", Some(vec!["B".into()]), None).await.unwrap();
+        mgr.on_turn_end("s3", Some(vec!["C".into()]), None).await.unwrap();
+
+        assert_eq!(sessions_count(&mgr).await, 3, "max_sessions=0 disables the cap");
+    }
+
+    #[tokio::test]
+    async fn turn_end_triggers_max_sessions_enforcement() {
+        // Sanity: the on_turn_end path itself (not just a manual
+        // enforce_max_sessions call) must enforce the cap.
+        let mut cfg = test_config();
+        cfg.max_sessions = 2;
+        let mgr = KvCacheManager::new_noop(cfg);
+
+        mgr.on_turn_end("s1", Some(vec!["A".into()]), None).await.unwrap();
+        mgr.on_turn_end("s2", Some(vec!["B".into()]), None).await.unwrap();
+        // s3 pushes over the cap; s1 (oldest) must be evicted inline.
+        mgr.on_turn_end("s3", Some(vec!["C".into()]), None).await.unwrap();
+        assert_eq!(sessions_count(&mgr).await, 2);
+        assert!(mgr.session_map("s1").await.is_none(), "oldest evicted by turn_end cap");
+    }
+
+    #[tokio::test]
+    async fn snapshot_restore_triggers_max_sessions_enforcement() {
+        // snapshot_restore also creates/refreshes a session, so it must enforce the cap.
+        let mut cfg = test_config();
+        cfg.max_sessions = 2;
+        let mgr = KvCacheManager::new_noop(cfg);
+
+        mgr.on_turn_end("s1", Some(vec!["A".into()]), None).await.unwrap();
+        mgr.on_turn_end("s2", Some(vec!["B".into()]), None).await.unwrap();
+        // snapshot_restore on s3 (new session) pushes over the cap; s1 evicted.
+        mgr.on_snapshot_restore("s3", vec!["C".into()]).await.unwrap();
+        assert_eq!(sessions_count(&mgr).await, 2);
+        assert!(mgr.session_map("s1").await.is_none(), "oldest evicted by snapshot_restore cap");
+    }
+
+    #[tokio::test]
+    async fn on_turn_start_touches_last_accessed() {
+        // A session that is only read by turn_start (no turn_end) must still
+        // have its last_accessed bumped, so it is not unfairly evicted by LRU.
+        let mut cfg = test_config();
+        cfg.max_sessions = 2;
+        cfg.turn_start_prefetch = true;
+        let mgr = KvCacheManager::new_noop(cfg);
+
+        mgr.on_turn_end("s1", Some(vec!["A".into()]), None).await.unwrap();
+        mgr.on_turn_end("s2", Some(vec!["B".into()]), None).await.unwrap();
+        // Touch s1 via turn_start so s1's last_accessed becomes newer than s2's.
+        mgr.on_turn_start("s1").await.unwrap();
+        // s3 pushes over the cap; s2 (now the oldest) must be evicted, not s1.
+        mgr.on_turn_end("s3", Some(vec!["C".into()]), None).await.unwrap();
+        assert_eq!(sessions_count(&mgr).await, 2);
+        assert!(mgr.session_map("s1").await.is_some(), "s1 was touched, must survive");
+        assert!(mgr.session_map("s2").await.is_none(), "s2 is now oldest, must be evicted");
     }
 }

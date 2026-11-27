@@ -22,6 +22,7 @@
 use manager_core::KvCacheMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// Persistence backend used by the daemon for session state.
 ///
@@ -59,16 +60,72 @@ pub enum SessionStoreError {
 /// Only constructed by non-sqlite builds and by tests; a `--features sqlite`
 /// daemon always uses `SqliteSessionStore`.
 #[cfg_attr(feature = "sqlite", allow(dead_code))]
-#[derive(Default)]
 pub struct MemorySessionStore {
-    sessions: Mutex<HashMap<String, (KvCacheMap, u32)>>,
+    // (map, turn_count, last_saved_at) — the timestamp drives the LRU cap
+    // (`max_sessions`) and the idle TTL (`gc_idle`).
+    sessions: Mutex<HashMap<String, (KvCacheMap, u32, Instant)>>,
     pins: Mutex<HashSet<String>>,
+    // Hard upper bound on the number of in-memory session rows. When `save`
+    // pushes the count over this, the oldest non-pinned session is evicted.
+    // 0 disables the cap. The cap mirrors the one in `KvCacheManager` so the
+    // duplicate copy held here cannot grow unbounded even when the manager's
+    // copy is kept in check.
+    max_sessions: usize,
 }
 
 #[cfg_attr(feature = "sqlite", allow(dead_code))]
 impl MemorySessionStore {
+    // `new()` is used by tests and by the `MemorySessionStore::Default`
+    // convenience path; the binary build never instantiates it directly (it
+    // always goes through `with_max_sessions`), so silence the dead-code lint
+    // for the uncapped constructor.
+    #[allow(dead_code)]
     pub fn new() -> Self {
-        Self::default()
+        Self::with_max_sessions(0)
+    }
+
+    /// Create a store with a hard session-count cap. `max_sessions == 0`
+    /// disables the cap (the default; keeps backward-compatible behaviour
+    /// for tests and for `--features sqlite` builds that don't pass a cap).
+    pub fn with_max_sessions(max_sessions: usize) -> Self {
+        Self {
+            sessions: Mutex::new(HashMap::new()),
+            pins: Mutex::new(HashSet::new()),
+            max_sessions,
+        }
+    }
+
+    // Drop oldest non-pinned sessions until `len <= max`. Pinned sessions are
+    // always preserved (they back `snapshot_restore` after `session_suspend`).
+    // `max == 0` is a no-op.
+    fn enforce_cap(&self, max: usize) {
+        if max == 0 {
+            return;
+        }
+        let mut sessions = self.sessions.lock().unwrap();
+        if sessions.len() <= max {
+            return;
+        }
+        let pins = self.pins.lock().unwrap();
+        while sessions.len() > max {
+            // Find the oldest non-pinned entry. Linear scan is fine: the cap
+            // is small (default 2000) and we only enter this path when over.
+            let victim = sessions
+                .iter()
+                .filter(|(id, _)| !pins.contains(*id))
+                .min_by_key(|(_, (_, _, ts))| *ts)
+                .map(|(id, _)| id.clone());
+            match victim {
+                Some(id) => {
+                    sessions.remove(&id);
+                    tracing::info!(
+                        session_id = %id,
+                        "MemorySessionStore: evicted oldest session to enforce max_sessions cap"
+                    );
+                }
+                None => break, // all remaining are pinned; stop to avoid infinite loop
+            }
+        }
     }
 }
 
@@ -82,12 +139,19 @@ impl SessionStore for MemorySessionStore {
         self.sessions
             .lock()
             .unwrap()
-            .insert(session_id.to_string(), (map.clone(), turn_count));
+            .insert(session_id.to_string(), (map.clone(), turn_count, Instant::now()));
+        // Enforce the cap *after* inserting so the freshly saved session
+        // (newest timestamp) is never the victim.
+        self.enforce_cap(self.max_sessions);
         Ok(())
     }
 
     fn load(&self, session_id: &str) -> Option<(KvCacheMap, u32)> {
-        self.sessions.lock().unwrap().get(session_id).cloned()
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .map(|(map, tc, _)| (map.clone(), *tc))
     }
 
     fn remove(&self, session_id: &str) {
@@ -111,10 +175,16 @@ impl SessionStore for MemorySessionStore {
 /// Create the session store selected at build time.
 ///
 /// With the `sqlite` feature the returned store persists to `path`; without it
-/// the path is ignored and an in-memory store is returned.
-pub fn new_session_store(path: &str) -> Result<Arc<dyn SessionStore>, SessionStoreError> {
+/// the path is ignored and an in-memory store is returned. `max_sessions` is
+/// only used by the in-memory store to bound its rows; the SQLite store ignores
+/// it (its data lives on disk, not in process memory).
+pub fn new_session_store(
+    path: &str,
+    max_sessions: usize,
+) -> Result<Arc<dyn SessionStore>, SessionStoreError> {
     #[cfg(feature = "sqlite")]
     {
+        let _ = max_sessions;
         Ok(Arc::new(SqliteSessionStore::new(path)?))
     }
     #[cfg(not(feature = "sqlite"))]
@@ -124,7 +194,7 @@ pub fn new_session_store(path: &str) -> Result<Arc<dyn SessionStore>, SessionSto
             "built without the 'sqlite' feature; using in-memory session store \
              (state will not survive a daemon restart)"
         );
-        Ok(Arc::new(MemorySessionStore::new()))
+        Ok(Arc::new(MemorySessionStore::with_max_sessions(max_sessions)))
     }
 }
 
@@ -383,5 +453,47 @@ mod memory_tests {
         assert!(store.is_pinned("s1"));
         store.remove("s1");
         assert!(!store.is_pinned("s1"));
+    }
+
+    #[test]
+    fn max_sessions_evicts_oldest_non_pinned() {
+        // With max_sessions=2, the third save must evict the oldest session.
+        let store = MemorySessionStore::with_max_sessions(2);
+        store.save("oldest", &KvCacheMap(vec!["A".into()]), 1).unwrap();
+        // Bump "middle" past "oldest" by saving it again (newer timestamp).
+        store.save("middle", &KvCacheMap(vec!["B".into()]), 1).unwrap();
+        // Make "oldest" actually older than "middle" by re-saving it before "middle".
+        // We need a stable ordering, so re-save "oldest" first then "middle" then "newest".
+        store.save("oldest", &KvCacheMap(vec!["A".into()]), 1).unwrap();
+        store.save("middle", &KvCacheMap(vec!["B".into()]), 1).unwrap();
+        // Third distinct session: pushes over the cap; "oldest" must be evicted.
+        store.save("newest", &KvCacheMap(vec!["C".into()]), 1).unwrap();
+
+        let mut ids = store.list_all();
+        ids.sort();
+        assert_eq!(ids, vec!["middle".to_string(), "newest".to_string()],
+            "oldest must be evicted; middle and newest survive");
+    }
+
+    #[test]
+    fn max_sessions_never_evicts_pinned() {
+        // Pinned sessions must survive the LRU sweep even when over the cap.
+        let store = MemorySessionStore::with_max_sessions(2);
+        store.save("pinned", &KvCacheMap(vec!["A".into()]), 1).unwrap();
+        store.pin_session("pinned");
+        store.save("s2", &KvCacheMap(vec!["B".into()]), 1).unwrap();
+        // Saving s3 pushes over the cap; pinned must survive (s2 evicted instead).
+        store.save("s3", &KvCacheMap(vec!["C".into()]), 1).unwrap();
+        assert!(store.load("pinned").is_some(), "pinned must not be evicted");
+    }
+
+    #[test]
+    fn max_sessions_zero_disables_cap() {
+        // max_sessions=0 means the cap is disabled; no eviction happens.
+        let store = MemorySessionStore::with_max_sessions(0);
+        for i in 0..10 {
+            store.save(&format!("s{i}"), &KvCacheMap(vec!["A".into()]), 1).unwrap();
+        }
+        assert_eq!(store.list_all().len(), 10, "max_sessions=0 disables the cap");
     }
 }
