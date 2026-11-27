@@ -12,18 +12,18 @@
 你的 Agent 应用 (deepagents + deepagents-middleware)
    │  每次模型调用自动统计: prompt/completion tokens、TTFT、总耗时
    ▼  capture payload
-RAM-A daemon (ram-a-kv)            ← 本指南步骤 2、4
+RAM-A daemon (ram-a-kv)            ← 本指南步骤 4、6
    │  SDK in-process submit (fire-and-forget)
    ▼
 libactrail_receiver.so             ← 本指南步骤 3
    │  写入 captures.sqlite / captures/
    ▼
-actrail-kv analyze ──▶ analysis.json
+POST /actrail/analyze ──▶ libactrail_analyzer.so ──▶ analysis.json
    ▼
-actrail-kv report ──▶ report.html（命中率看板）
+POST /actrail/report  ──▶ libactrail_reporter.so ──▶ report.html（命中率看板）
 ```
 
-> 从 actrail-kv 0.2.1 起，ram-a-kv daemon 通过 `actrail-kv-sdk` 以进程内动态库方式调用 receiver 能力，**无需独立运行 `actrail-kv-receiver` 进程**。采集记录默认写入 `~/.actrail/actrail-kv/captures.sqlite`。
+> 从 actrail-kv 0.2.1 起，ram-a-kv daemon 通过 `actrail-kv-sdk` 以进程内动态库方式调用 receiver / analyzer / reporter 三项能力，**无需独立运行 actrail-kv 进程**。采集记录默认写入 `~/.actrail/actrail-kv/captures.sqlite`，分析与报告通过 RESTful 接口触发，输出到文件。
 
 ---
 
@@ -47,22 +47,24 @@ git clone https://gitcode.com/openeuler/RAM-A.git
 
 ## 3. 构建 actrail-kv 动态库与命令行工具
 
-ram-a-kv daemon 需要 `libactrail_receiver.so`（进程内加载），分析报告需要 `actrail-kv-analyze` / `actrail-kv-report` 命令。在 RAM-A 仓库根目录构建：
+ram-a-kv daemon 需要 `libactrail_receiver.so`（采集）、`libactrail_analyzer.so`（分析）、`libactrail_reporter.so`（报告）三个动态库。分析与报告也可通过 CLI 工具离线运行。在 RAM-A 仓库根目录构建：
 
 ```bash
 cd RAM-A/ram-a-kv/actrail-kv
 
-# 构建 receiver 动态库（产物：target/release/libactrail_receiver.so）
+# 构建三个动态库（产物：target/release/libactrail_{receiver,analyzer,reporter}.so）
 cargo build --release -p actrail-kv-sdk-receiver
+cargo build --release -p actrail-kv-sdk-analyzer
+cargo build --release -p actrail-kv-sdk-reporter
 
-# 安装命令行工具到 ~/.cargo/bin
+# 可选：安装命令行工具到 ~/.cargo/bin（用于离线分析/报告）
 cargo install --locked --path crates/cmd/analyze
 cargo install --locked --path crates/cmd/report
 
 cd ../..
 ```
 
-> 如果 `actrail-kv-analyze` / `actrail-kv-report` 已在 `PATH` 上，可跳过对应安装步骤。动态库路径在步骤 4 的 daemon 配置中指定。
+> 动态库路径在步骤 6 的 daemon 配置中指定。如使用 RESTful 接口进行分析与报告，CLI 工具非必需。
 
 ---
 
@@ -124,8 +126,10 @@ SDK 在打开可写存储和写入时检查容量。单条记录超过容量上�
 listen_addr = "127.0.0.1:6998"
 noop_backend = true
 session_store_path = "./sessions.db"   # 仅 --features sqlite 构建生效
-# libactrail_receiver.so 绝对路径；留空则禁用 actrail 集成
+# 三个 .so 绝对路径；actrail_sdk_lib 留空则禁用采集，另两个留空则对应接口不可用
 actrail_sdk_lib = "/path/to/RAM-A/ram-a-kv/actrail-kv/target/release/libactrail_receiver.so"
+actrail_analyzer_lib = "/path/to/RAM-A/ram-a-kv/actrail-kv/target/release/libactrail_analyzer.so"
+actrail_reporter_lib = "/path/to/RAM-A/ram-a-kv/actrail-kv/target/release/libactrail_reporter.so"
 actrail_model_deployment_key = "deepseek-v4-flash"
 actrail_kv_namespace = "default"
 ```
@@ -198,6 +202,45 @@ agent = create_deep_agent(...)        # 之后的每个模型调用自动被采�
 
 ## 8. 生成看板
 
+分析与报告可通过 RESTful 接口或 CLI 工具两种方式触发，均输出到文件。
+
+### 8.1 方式 A：RESTful 接口（推荐，无需额外进程）
+
+```bash
+# 分析
+curl -s -X POST http://127.0.0.1:6998/actrail/analyze \
+  -H 'Content-Type: application/json' \
+  -d '{"top_k": 20, "output": "analysis.json"}' | jq
+# → {"ok":true,"data":{"output":"/abs/path/analysis.json"}}
+
+# 报告（用上一步的 analysis.json）
+curl -s -X POST http://127.0.0.1:6998/actrail/report \
+  -H 'Content-Type: application/json' \
+  -d '{"analysis": "analysis.json", "format": "html", "output": "report.html"}' | jq
+# → {"ok":true,"data":{"outputs":[{"format":"html","output":"/abs/path/report.html"}]}}
+```
+
+分析请求体字段（全部可选）：
+
+| 字段 | 说明 |
+|---|---|
+| `session_keys` | 筛选会话，JSON 数组 |
+| `time_ranges` | 筛选采集时间，`[{"from":"...","until":"..."}]` |
+| `last_n` | 取最近 N 条记录 |
+| `top_k` | 覆盖 settings.toml 的缺陷排名数量 |
+| `comparison_window_seconds` | 覆盖 settings.toml 的比较时间窗 |
+| `output` | 输出文件路径，相对路径以 daemon 配置文件目录为基准 |
+
+报告请求体字段：
+
+| 字段 | 说明 |
+|---|---|
+| `analysis` | analysis.json 文件路径（来自分析接口的输出） |
+| `format` | `"html"` / `"md"`，省略 = 同时生成两者 |
+| `output` | 输出文件路径 |
+
+### 8.2 方式 B：CLI 工具（离线）
+
 ```bash
 actrail-kv-analyze \
   --config ~/.actrail/actrail-kv/settings.toml \
@@ -210,14 +253,31 @@ actrail-kv-report \
 
 analyze 读取设置文件指定的采集记录，report 默认读取分析产物。设置文件内的相对路径以该文件所在目录为基准。
 
+CLI 与 RESTful 接口的功能与参数完全对齐。
+
 浏览器打开 `report.html`：
 
 - **命中率表**：每行一次请求，含 prompt / completion / TTFT / 总耗时 列；未上报值的行显示 `—`
 - **结构区**：上下文结构代理、模板、缺陷与调优建议（需 ≥3 条相似请求才出模板/缺陷）
 
-### 8.1 筛选分析记录
+### 8.3 筛选分析记录
 
-筛选决定本次分析的输入范围。下面的命令按会话和采集时间筛选，再选取最新的 100 条记录。
+筛选决定本次分析的输入范围。
+
+RESTful 接口方式：
+
+```bash
+curl -s -X POST http://127.0.0.1:6998/actrail/analyze \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "session_keys": ["session-a"],
+    "time_ranges": [{"from": "2026-11-24", "until": "2026-11-26"}],
+    "last_n": 100,
+    "output": "analysis.json"
+  }'
+```
+
+CLI 方式：
 
 ```bash
 actrail-kv-analyze \
@@ -227,9 +287,9 @@ actrail-kv-analyze \
   --last-n 100
 ```
 
-`--session-key` 和 `--time-range` 可重复传入，匹配任一所选会话和任一所选时间段。时间段包含起点并排除终点，支持 UTC 日期和 RFC 3339 时间戳。单个时间段也可用 `--from` 和 `--until` 指定，可只填一端。
+`session_keys` / `--session-key` 和 `time_ranges` / `--time-range` 可重复传入，匹配任一所选会话和任一所选时间段。时间段包含起点并排除终点，支持 UTC 日期和 RFC 3339 时间戳。单个时间段也可用 `--from` 和 `--until` 指定，可只填一端。
 
-可以在 `[analyzer.selection]` 中保存 `session_keys` 和 `last_n`，用 `[[analyzer.selection.time_ranges]]` 表设置各时间段的 `from` 和 `until`。显式命令行参数覆盖对应的筛选设置。
+可以在 `[analyzer.selection]` 中保存 `session_keys` 和 `last_n`，用 `[[analyzer.selection.time_ranges]]` 表设置各时间段的 `from` 和 `until`。显式参数（请求体字段或 CLI flag）覆盖对应的筛选设置。
 
 ---
 
@@ -254,6 +314,10 @@ actrail-kv-analyze \
 4. **daemon 启动失败 `actrail SDK load failed`**：检查 `actrail_sdk_lib` 路径是否正确、`.so` 文件是否存在、ABI 版本是否匹配（需 actrail-kv ≥ 0.2.1 构建的 `libactrail_receiver.so`）。
 5. **采集记录为空**：SDK submit 为 fire-and-forget，若 daemon 未起或未配 actrail 项则静默丢弃。先看 daemon 日志是否有 `actrail sdk submit ok`；若只有 `actrail sdk submit failed`，检查 `~/.actrail/actrail-kv/settings.toml` 配置与磁盘空间。
 6. **`~/.actrail/actrail-kv/` 目录不存在**：首次运行时 SDK 会自动创建并补齐默认 `settings.toml`；若权限不足需手动创建。
+7. **`/actrail/analyze` 返回 `actrail_analyzer_lib not configured`**：未配置 `actrail_analyzer_lib`，在 daemon 配置文件中填入 `libactrail_analyzer.so` 绝对路径。
+8. **`/actrail/report` 返回 `actrail_reporter_lib not configured`**：未配置 `actrail_reporter_lib`，在 daemon 配置文件中填入 `libactrail_reporter.so` 绝对路径。
+9. **分析返回 `input contains no analyzable requests`**：采集存储中无可用记录，先确认采集成功（`captures.sqlite` 有记录）。
+10. **报告返回 `failed to read analysis file`**：`analysis` 路径不存在，先用 `/actrail/analyze` 生成 analysis.json，再用返回的路径调 `/actrail/report`。
 
 ---
 

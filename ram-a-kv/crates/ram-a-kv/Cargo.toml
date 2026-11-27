@@ -26,6 +26,8 @@ toml.workspace = true
 reqwest.workspace = true
 thiserror.workspace = true
 actrail-kv-sdk.workspace = true
+actrail-kv-reporter.workspace = true
+analysis-contract.workspace = true
 dirs.workspace = true
 
 [dev-dependencies]

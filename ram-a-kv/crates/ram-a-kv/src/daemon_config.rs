@@ -63,6 +63,10 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub actrail_sdk_lib: Option<String>,
     #[serde(default)]
+    pub actrail_analyzer_lib: Option<String>,
+    #[serde(default)]
+    pub actrail_reporter_lib: Option<String>,
+    #[serde(default)]
     pub actrail_model_deployment_key: Option<String>,
     #[serde(default)]
     pub actrail_kv_namespace: Option<String>,
@@ -112,6 +116,8 @@ impl Default for DaemonConfig {
             turn_start_prefetch_async: false,
             auth_token: String::new(),
             actrail_sdk_lib: None,
+            actrail_analyzer_lib: None,
+            actrail_reporter_lib: None,
             actrail_model_deployment_key: None,
             actrail_kv_namespace: None,
         }

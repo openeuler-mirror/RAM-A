@@ -59,6 +59,8 @@ pub struct AppState {
     pub session_store: Arc<dyn crate::session_store::SessionStore>,
     pub context: Arc<AppContext>,
     pub auth_token: String,
+    pub actrail_analyzer_lib: Option<String>,
+    pub actrail_reporter_lib: Option<String>,
 }
 
 // Handle a POST /event request. Body is JSON and must contain a "type" field.
