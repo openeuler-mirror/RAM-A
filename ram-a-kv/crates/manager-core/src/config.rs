@@ -40,6 +40,16 @@ pub struct KvCacheConfig {
     // Run prefetch at turn_start (default: true).
     #[serde(default = "default_turn_start_prefetch")]
     pub turn_start_prefetch: bool,
+
+    // Hard upper bound on the number of concurrently tracked sessions.
+    // When the count is exceeded the least-recently-accessed session is evicted
+    // (mirroring `session_close`: refcount of its unique hashes is decremented
+    // and refcount==0 chunks are evicted from the backend). Pinned (suspended)
+    // sessions are never chosen. 0 disables the cap.
+    // Default: 2000 (~120MB at the typical 200-hash session size; tune down
+    // toward ~1250 when sessions routinely approach the 4096-chunk API limit).
+    #[serde(default = "default_max_sessions")]
+    pub max_sessions: usize,
 }
 
 fn default_debug_dir() -> String {
@@ -54,6 +64,10 @@ fn default_turn_start_prefetch() -> bool {
     true
 }
 
+fn default_max_sessions() -> usize {
+    2000
+}
+
 impl Default for KvCacheConfig {
     fn default() -> Self {
         Self {
@@ -63,6 +77,7 @@ impl Default for KvCacheConfig {
             debug_dir: default_debug_dir(),
             backend_url: default_backend_url(),
             turn_start_prefetch: default_turn_start_prefetch(),
+            max_sessions: default_max_sessions(),
         }
     }
 }

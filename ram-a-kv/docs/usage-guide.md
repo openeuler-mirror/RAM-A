@@ -48,6 +48,7 @@ daemon 通过环境变量 `RAM_A_KV_CONFIG` 指定配置文件路径；未设置
 | `debug_enabled` | `false` | 是否写 debug 文件 |
 | `debug_dir` | `kvcache_debug` | debug 文件输出目录 |
 | `session_store_path` | `/var/lib/ram-a-kv/sessions.db` | 会话状态持久化路径（仅 `--features sqlite` 构建生效） |
+| `max_sessions` | `2000` | 内存中并发跟踪的会话数硬上限（LRU 驱逐最旧会话；`0` 关闭）。详见第 15 节 |
 
 最小示例（参考 `config.example.toml`）：
 
@@ -272,3 +273,40 @@ RamAKvClient::session_close("s1");
 ```
 
 脚本不负责编译：先自行构建 daemon（`cargo build --release`），再按 `DAEMON_BIN`（默认 `target/release/ram-a-kv`）找到二进制；之后起 daemon、发事件、断言 `ok` / 字段。SQLite 持久化与重启恢复相关的断言只在 daemon 用 `--features sqlite` 构建时执行，默认（内存存储）构建会自动跳过并在结果里计入 `SKIP=`。支持环境变量：`DAEMON_BIN` / `TEST_DIR` / `DAEMON_URL` / `KEEP_DAEMON`。
+
+## 15. 内存管理（限制进程占用）
+
+非 `--features sqlite` 构建下，daemon 把会话状态（`session_id → chunk_hashes` 映射）全部保存在进程内存中。如果不限制，客户端崩溃后未发 `session_close` 的"僵尸会话"会无限堆积，导致内存膨胀。`max_sessions` 配置项用于把进程内存压在 ~2GB 以内。
+
+### 15.1 `max_sessions`（LRU 硬上限）
+
+`max_sessions` 限制内存中并发跟踪的会话数量。超过上限时按**最久未访问（`last_accessed`）**驱逐最旧会话，驱逐路径与 `session_close` 完全一致（减 refcount、refcount==0 的 chunk 向后端发 evict）。
+
+- 触发点：`turn_end`、`snapshot_restore`（会创建/刷新会话的操作）末尾自动调用。
+- 刚被访问的会话 `last_accessed` 最新，**绝不会被自己这次操作驱逐**。
+- **pinned（suspend）会话受保护**，不会被 LRU 选中。
+- 内存存储副本（`MemorySessionStore`）**同步**执行相同的 LRU，避免存储层副本不受控。
+- `max_sessions = 0` 关闭上限（不推荐生产使用）。
+
+### 15.2 调参公式（目标：进程内存 ≤ 2GB）
+
+非去重设计下，每个 chunk hash 在内存中有 3 份副本（`manager.sessions` + `MemorySessionStore.sessions` + `refcounts`），每份约 124~150 字节。单会话内存估算：
+
+```
+单会话 ≈ 3 × N × (124B ~ 150B) + ~200B 固定开销
+       典型(N=200, L=50B)  ≈ 60 KB
+       最坏(N=4096, L=100B) ≈ 1.3 MB     ← 接近 API 单会话上限
+```
+
+| 场景 | 单会话 | `max_sessions=2000` 总内存 |
+|---|---|---|
+| 典型（200 chunks × 50B） | ~60 KB | ~120 MB（远低于 2GB） |
+| 偏重（1000 chunks × 50B） | ~280 KB | ~560 MB |
+| 最坏（4096 chunks × 100B） | ~1.3 MB | ~2.5 GB ⚠️ 超出 2GB |
+
+**推荐配置**：
+
+- 会话 chunk 数普遍 < 1000：`max_sessions = 2000`（默认）。
+- 会话 chunk 数普遍接近 4096 上限：`max_sessions = 1250`（最坏 ~1.6GB，留 25% 余量）。
+
+> 注：`--features sqlite` 构建下会话状态主要在 SQLite（磁盘），不占进程内存；`max_sessions` 仍作用于 `manager.sessions` 的内存副本，`MemorySessionStore` 被替换为 `SqliteSessionStore`。

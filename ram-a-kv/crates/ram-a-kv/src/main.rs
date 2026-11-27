@@ -163,14 +163,18 @@ async fn main() {
         debug_dir: config.debug_dir.clone(),
         backend_url,
         turn_start_prefetch: config.turn_start_prefetch,
+        max_sessions: config.max_sessions,
     };
     let manager = Arc::new(KvCacheManager::new(core_config, backend));
 
-    let session_store = crate::session_store::new_session_store(&config.session_store_path)
-        .unwrap_or_else(|e| {
-            tracing::error!(error = %e, "session store init failed");
-            panic!("cannot initialize session store")
-        });
+    let session_store = crate::session_store::new_session_store(
+        &config.session_store_path,
+        config.max_sessions,
+    )
+    .unwrap_or_else(|e| {
+        tracing::error!(error = %e, "session store init failed");
+        panic!("cannot initialize session store")
+    });
 
     // Rehydrate every persisted session so state survives daemon restarts.
     // Skip pinned sessions: a pin means the session was suspended (released
@@ -185,7 +189,7 @@ async fn main() {
             manager
                 .restore_session(
                     &session_id,
-                    manager_core::manager::SessionKvState { map, turn_count },
+                    manager_core::manager::SessionKvState::new(map, turn_count),
                 )
                 .await;
         }

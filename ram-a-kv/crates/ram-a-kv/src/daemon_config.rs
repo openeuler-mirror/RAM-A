@@ -57,6 +57,17 @@ pub struct DaemonConfig {
     // Required when listen_addr is not a loopback address.
     #[serde(default)]
     pub auth_token: String,
+    // Hard upper bound on the number of concurrently tracked sessions in
+    // memory (both the manager's map and the in-memory session store enforce
+    // this independently). When exceeded the least-recently-accessed session
+    // is evicted (refcount of its unique hashes is decremented and
+    // refcount==0 chunks are evicted from the backend). Pinned (suspended)
+    // sessions are never chosen. 0 disables the cap.
+    // Default 2000 keeps a typical session (~200 chunk hashes) at ~120MB,
+    // well under a 2GB budget; tune down toward ~1250 when sessions routinely
+    // approach the 4096-chunk API limit.
+    #[serde(default = "default_max_sessions")]
+    pub max_sessions: usize,
     // Path to libactrail_receiver.so. When non-empty, the daemon loads the
     // actrail-kv receiver SDK in-process and forwards turn_end captures to it
     // (fire-and-forget). When empty, actrail integration is disabled.
@@ -100,6 +111,10 @@ fn default_turn_start_prefetch() -> bool {
     true
 }
 
+fn default_max_sessions() -> usize {
+    2000
+}
+
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
@@ -115,6 +130,7 @@ impl Default for DaemonConfig {
             turn_start_prefetch: default_turn_start_prefetch(),
             turn_start_prefetch_async: false,
             auth_token: String::new(),
+            max_sessions: default_max_sessions(),
             actrail_sdk_lib: None,
             actrail_analyzer_lib: None,
             actrail_reporter_lib: None,

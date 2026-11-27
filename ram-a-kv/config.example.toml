@@ -22,3 +22,7 @@ turn_start_prefetch = true
 turn_start_prefetch_async = false
 debug_enabled = false
 debug_dir = "kvcache_debug"
+
+# Max in-memory sessions; LRU eviction when exceeded. 0 disables.
+# Lower to ~1250 if sessions routinely approach the 4096-chunk limit.
+max_sessions = 2000
